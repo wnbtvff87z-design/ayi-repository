@@ -120,7 +120,7 @@ Respond ONLY with the answer, no preamble."""
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4-turbo",  # Usa gpt-4-turbo si Luna no está disponible
+            model="gpt-3.5-turbo",  # Usa gpt-3.5-turbo
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
