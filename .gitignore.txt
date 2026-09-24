@@ -1,7 +1,0 @@
-# No subas credenciales a GitHub
-.env
-*.pyc
-_pycache_/
-.DS_Store
-venv/
-*.log
