@@ -1,9 +1,7 @@
-flask==3.0.0
-twilio==9.0.0
-openai==1.45.0
-airtable-python-wrapper==0.15.3
-stripe==5.4.0
-python-dotenv==1.0.0
-requests==2.31.0
-gunicorn==21.2.0
-httpx==0.27.2
+Flask>=3.0,<4.0
+gunicorn>=21.2,<24.0
+python-dotenv>=1.0,<2.0
+twilio>=9.0,<10.0
+openai>=1.0,<4.0
+stripe>=10.0,<15.0
+requests>=2.31,<3.0
