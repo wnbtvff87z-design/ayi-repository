@@ -67,7 +67,7 @@ AIRTABLE_RESTAURANTS_TABLE = os.getenv(
 
 AIRTABLE_CONVERSATIONS_TABLE = os.getenv(
     "AIRTABLE_CONVERSATIONS_TABLE",
-    "Interacciones"
+    "Conversaciones"
 ).strip()
 
 STRIPE_SECRET_KEY = os.getenv(
@@ -79,6 +79,11 @@ STRIPE_WEBHOOK_SECRET = os.getenv(
     "STRIPE_WEBHOOK_SECRET",
     ""
 ).strip()
+
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://web-production-c74a5.up.railway.app"
+).rstrip("/")
 
 
 # =============================================================================
@@ -103,8 +108,9 @@ def utc_now_iso():
 
 def normalize_phone(phone_number):
     """
-    Normaliza números como:
+    Normaliza números telefónicos.
 
+    Ejemplos:
     whatsapp:+49 158 886 23971
     +49-158-886-23971
     +4915888623971
@@ -116,10 +122,16 @@ def normalize_phone(phone_number):
     if phone_number is None:
         return ""
 
-    value = str(phone_number).strip()
+    value = str(
+        phone_number
+    ).strip()
 
-    if value.lower().startswith("whatsapp:"):
-        value = value[len("whatsapp:"):]
+    if value.lower().startswith(
+        "whatsapp:"
+    ):
+        value = value[
+            len("whatsapp:"):
+        ]
 
     digits = re.sub(
         r"\D",
@@ -134,7 +146,7 @@ def normalize_phone(phone_number):
 
 
 def mask_phone(phone_number):
-    """Oculta parcialmente un teléfono en los logs."""
+    """Oculta parte del número para los logs."""
 
     value = normalize_phone(
         phone_number
@@ -143,26 +155,32 @@ def mask_phone(phone_number):
     if len(value) <= 7:
         return value
 
+    hidden_length = len(value) - 7
+
     return (
         value[:4]
-        + ("*" * (len(value) - 7))
+        + ("*" * hidden_length)
         + value[-3:]
     )
 
 
 def airtable_headers():
-    """Devuelve las cabeceras para Airtable."""
+    """Crea las cabeceras de Airtable."""
 
     return {
-        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization": (
+            f"Bearer {AIRTABLE_TOKEN}"
+        ),
+        "Content-Type": (
+            "application/json"
+        )
     }
 
 
 def airtable_table_url(table_name):
     """Construye la URL de una tabla Airtable."""
 
-    encoded_table_name = quote(
+    encoded_name = quote(
         table_name,
         safe=""
     )
@@ -170,20 +188,32 @@ def airtable_table_url(table_name):
     return (
         f"https://api.airtable.com/v0/"
         f"{AIRTABLE_BASE_ID}/"
-        f"{encoded_table_name}"
+        f"{encoded_name}"
     )
 
 
 def get_missing_variables():
-    """Devuelve las variables obligatorias faltantes."""
+    """Comprueba las variables necesarias."""
 
     required_variables = {
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
-        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
-        "TWILIO_PHONE": TWILIO_PHONE,
-        "AIRTABLE_TOKEN": AIRTABLE_TOKEN,
-        "AIRTABLE_BASE_ID": AIRTABLE_BASE_ID,
+        "OPENAI_API_KEY": (
+            OPENAI_API_KEY
+        ),
+        "TWILIO_ACCOUNT_SID": (
+            TWILIO_ACCOUNT_SID
+        ),
+        "TWILIO_AUTH_TOKEN": (
+            TWILIO_AUTH_TOKEN
+        ),
+        "TWILIO_PHONE": (
+            TWILIO_PHONE
+        ),
+        "AIRTABLE_TOKEN": (
+            AIRTABLE_TOKEN
+        ),
+        "AIRTABLE_BASE_ID": (
+            AIRTABLE_BASE_ID
+        ),
         "AIRTABLE_RESTAURANTS_TABLE": (
             AIRTABLE_RESTAURANTS_TABLE
         ),
@@ -208,30 +238,48 @@ def get_airtable_records(
     table_name,
     maximum_records=500
 ):
-    """Descarga registros de Airtable con paginación."""
+    """
+    Descarga registros de Airtable.
 
-    if not AIRTABLE_TOKEN or not AIRTABLE_BASE_ID:
+    La función procesa automáticamente
+    hasta 500 registros paginados.
+    """
+
+    if (
+        not AIRTABLE_TOKEN
+        or not AIRTABLE_BASE_ID
+    ):
         return {
             "success": False,
             "records": [],
             "status_code": None,
-            "error": "Missing Airtable configuration"
+            "error": (
+                "Falta la configuración "
+                "de Airtable."
+            )
         }
 
     records = []
     offset = None
 
     try:
-        while len(records) < maximum_records:
+        while (
+            len(records)
+            < maximum_records
+        ):
             parameters = {
                 "pageSize": 100
             }
 
             if offset:
-                parameters["offset"] = offset
+                parameters["offset"] = (
+                    offset
+                )
 
             response = requests.get(
-                airtable_table_url(table_name),
+                airtable_table_url(
+                    table_name
+                ),
                 headers=airtable_headers(),
                 params=parameters,
                 timeout=20
@@ -241,21 +289,29 @@ def get_airtable_records(
                 return {
                     "success": False,
                     "records": [],
-                    "status_code": response.status_code,
+                    "status_code": (
+                        response.status_code
+                    ),
                     "error": response.text
                 }
 
             response_data = response.json()
 
-            records.extend(
+            page_records = (
                 response_data.get(
                     "records",
                     []
                 )
             )
 
-            offset = response_data.get(
-                "offset"
+            records.extend(
+                page_records
+            )
+
+            offset = (
+                response_data.get(
+                    "offset"
+                )
             )
 
             if not offset:
@@ -263,7 +319,11 @@ def get_airtable_records(
 
         return {
             "success": True,
-            "records": records[:maximum_records],
+            "records": (
+                records[
+                    :maximum_records
+                ]
+            ),
             "status_code": 200,
             "error": None
         }
@@ -287,7 +347,10 @@ def get_airtable_records(
 # =============================================================================
 
 def get_restaurant_data(phone_number):
-    """Busca un restaurante comparando Twilio_Phone."""
+    """
+    Busca un restaurante utilizando
+    el campo Twilio_Phone.
+    """
 
     searched_phone = normalize_phone(
         phone_number
@@ -305,7 +368,9 @@ def get_restaurant_data(phone_number):
 
         return None
 
-    for record in airtable_result["records"]:
+    for record in airtable_result[
+        "records"
+    ]:
         fields = record.get(
             "fields",
             {}
@@ -320,7 +385,8 @@ def get_restaurant_data(phone_number):
 
         if (
             stored_phone
-            and stored_phone == searched_phone
+            and stored_phone
+            == searched_phone
         ):
             app.logger.info(
                 "Restaurante encontrado: %s",
@@ -334,7 +400,9 @@ def get_restaurant_data(phone_number):
 
     app.logger.warning(
         "Restaurante no encontrado para %s",
-        mask_phone(searched_phone)
+        mask_phone(
+            searched_phone
+        )
     )
 
     return None
@@ -348,30 +416,35 @@ def save_interaction(
     twilio_phone,
     customer_phone,
     question,
-    answer
+    answer,
+    status="Answered by AI"
 ):
     """
-    Guarda una interacción.
-
-    Si Airtable rechaza la escritura, devuelve False,
-    pero no interrumpe la respuesta de WhatsApp.
+    Guarda una interacción en la tabla
+    Conversaciones.
     """
+
+    fields = {
+        "Twilio_Phone": normalize_phone(
+            twilio_phone
+        ),
+        "Customer_Phone": normalize_phone(
+            customer_phone
+        ),
+        "Question": str(
+            question
+        ),
+        "Answer": str(
+            answer
+        ),
+        "Timestamp": utc_now_iso(),
+        "Status": status
+    }
 
     payload = {
         "records": [
             {
-                "fields": {
-                    "Twilio_Phone": normalize_phone(
-                        twilio_phone
-                    ),
-                    "Customer_Phone": normalize_phone(
-                        customer_phone
-                    ),
-                    "Question": str(question),
-                    "Answer": str(answer),
-                    "Timestamp": utc_now_iso(),
-                    "Status": "Answered by AI"
-                }
+                "fields": fields
             }
         ]
     }
@@ -430,19 +503,26 @@ def get_ai_response(
             "disponible en este momento."
         )
 
-    restaurant_name = restaurant_data.get(
-        "Nombre",
-        "el restaurante"
+    restaurant_name = (
+        restaurant_data.get(
+            "Nombre",
+            "el restaurante"
+        )
     )
 
-    restaurant_hours = restaurant_data.get(
-        "Horarios",
-        "No hay horarios disponibles."
+    restaurant_hours = (
+        restaurant_data.get(
+            "Horarios",
+            "No hay horarios disponibles."
+        )
     )
 
-    restaurant_menu = restaurant_data.get(
-        "Menu",
-        "No hay información de menú disponible."
+    restaurant_menu = (
+        restaurant_data.get(
+            "Menu",
+            "No hay información "
+            "de menú disponible."
+        )
     )
 
     system_prompt = f"""
@@ -460,8 +540,8 @@ Reglas:
 3. Usa solamente la información proporcionada.
 4. No inventes horarios, menú ni disponibilidad.
 5. No confirmes reservas automáticamente.
-6. Para solicitar una reserva, pide nombre, fecha,
-   hora y número de personas.
+6. Para solicitar una reserva, pide nombre,
+   fecha, hora y número de personas.
 7. Responde en un máximo de tres frases.
 """.strip()
 
@@ -479,11 +559,15 @@ Reglas:
                 messages=[
                     {
                         "role": "system",
-                        "content": system_prompt
+                        "content": (
+                            system_prompt
+                        )
                     },
                     {
                         "role": "user",
-                        "content": str(question)
+                        "content": str(
+                            question
+                        )
                     }
                 ],
                 max_tokens=180,
@@ -513,8 +597,9 @@ Reglas:
         )
 
         return (
-            "Lo siento, no pude procesar tu consulta. "
-            "Contacta directamente con el restaurante."
+            "Lo siento, no pude procesar "
+            "tu consulta. Contacta directamente "
+            "con el restaurante."
         )
 
 
@@ -530,17 +615,31 @@ def home():
     return jsonify({
         "name": "Ayi Reservas API",
         "status": "running",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "timestamp": utc_now_iso(),
         "endpoints": {
             "health": "/health",
-            "airtable_test": "/test-airtable",
-            "airtable_debug": "/debug-airtable",
-            "whatsapp": "/webhook-whatsapp",
-            "voice": "/webhook-voice",
-            "voice_speech": "/process-speech",
-            "voice_status": "/voice-status",
-            "stripe": "/stripe-webhook"
+            "airtable_test": (
+                "/test-airtable"
+            ),
+            "vapi_restaurant": (
+                "/vapi/restaurant"
+            ),
+            "whatsapp": (
+                "/webhook-whatsapp"
+            ),
+            "voice": (
+                "/webhook-voice"
+            ),
+            "voice_speech": (
+                "/process-speech"
+            ),
+            "voice_status": (
+                "/voice-status"
+            ),
+            "stripe": (
+                "/stripe-webhook"
+            )
         }
     }), 200
 
@@ -554,7 +653,9 @@ def home():
     methods=["GET"]
 )
 def health():
-    missing_variables = get_missing_variables()
+    missing_variables = (
+        get_missing_variables()
+    )
 
     return jsonify({
         "status": (
@@ -570,7 +671,9 @@ def health():
             "openai_configured": bool(
                 OPENAI_API_KEY
             ),
-            "openai_model": OPENAI_MODEL,
+            "openai_model": (
+                OPENAI_MODEL
+            ),
             "twilio_configured": bool(
                 TWILIO_ACCOUNT_SID
                 and TWILIO_AUTH_TOKEN
@@ -583,11 +686,14 @@ def health():
             "restaurant_table": (
                 AIRTABLE_RESTAURANTS_TABLE
             ),
-            "interaction_table": (
+            "conversation_table": (
                 AIRTABLE_CONVERSATIONS_TABLE
             ),
             "stripe_configured": bool(
                 STRIPE_SECRET_KEY
+            ),
+            "public_base_url": (
+                PUBLIC_BASE_URL
             )
         }
     }), 200
@@ -614,32 +720,31 @@ def test_airtable():
         return jsonify({
             "status": "error",
             "message": (
-                "Restaurant not found in Airtable"
+                "Restaurant not found "
+                "in Airtable"
             ),
-            "searched_phone": searched_phone,
+            "searched_phone": (
+                searched_phone
+            ),
             "expected_table": (
                 AIRTABLE_RESTAURANTS_TABLE
             ),
-            "expected_field": "Twilio_Phone",
-            "next_step": "Open /debug-airtable"
+            "expected_field": (
+                "Twilio_Phone"
+            )
         }), 404
 
     return jsonify({
         "status": "success",
-        "searched_phone": searched_phone,
+        "searched_phone": (
+            searched_phone
+        ),
         "restaurant": {
             "Nombre": restaurant.get(
                 "Nombre"
             ),
             "Twilio_Phone": restaurant.get(
                 "Twilio_Phone"
-            ),
-            "normalized_Twilio_Phone": (
-                normalize_phone(
-                    restaurant.get(
-                        "Twilio_Phone"
-                    )
-                )
             ),
             "Horarios": restaurant.get(
                 "Horarios"
@@ -652,516 +757,170 @@ def test_airtable():
 
 
 # =============================================================================
-# DEPURACIÓN DE AIRTABLE
+# VAPI: CONSULTAR RESTAURANTE
 # =============================================================================
 
 @app.route(
-    "/debug-airtable",
-    methods=["GET"]
-)
-def debug_airtable():
-    airtable_result = get_airtable_records(
-        AIRTABLE_RESTAURANTS_TABLE,
-        maximum_records=100
-    )
-
-    if not airtable_result["success"]:
-        status_code = (
-            airtable_result["status_code"]
-            or 500
-        )
-
-        return jsonify({
-            "status": "error",
-            "airtable_http_status": (
-                airtable_result["status_code"]
-            ),
-            "airtable_error": (
-                airtable_result["error"]
-            ),
-            "base_id_prefix": (
-                AIRTABLE_BASE_ID[:6]
-                if AIRTABLE_BASE_ID
-                else ""
-            ),
-            "table": (
-                AIRTABLE_RESTAURANTS_TABLE
-            )
-        }), status_code
-
-    safe_records = []
-
-    for record in airtable_result["records"]:
-        fields = record.get(
-            "fields",
-            {}
-        )
-
-        raw_phone = fields.get(
-            "Twilio_Phone"
-        )
-
-        safe_records.append({
-            "record_id": record.get("id"),
-            "Nombre": fields.get("Nombre"),
-            "Twilio_Phone_raw": raw_phone,
-            "Twilio_Phone_normalized": (
-                normalize_phone(raw_phone)
-            ),
-            "available_field_names": sorted(
-                fields.keys()
-            )
-        })
-
-    return jsonify({
-        "status": "success",
-        "airtable_http_status": (
-            airtable_result["status_code"]
-        ),
-        "base_id_prefix": (
-            AIRTABLE_BASE_ID[:6]
-            if AIRTABLE_BASE_ID
-            else ""
-        ),
-        "table": (
-            AIRTABLE_RESTAURANTS_TABLE
-        ),
-        "searched_phone_raw": (
-            TWILIO_PHONE
-        ),
-        "searched_phone_normalized": (
-            normalize_phone(
-                TWILIO_PHONE
-            )
-        ),
-        "records_found": len(
-            airtable_result["records"]
-        ),
-        "records": safe_records
-    }), 200
-
-
-# =============================================================================
-# WHATSAPP
-# =============================================================================
-
-@app.route(
-    "/webhook-whatsapp",
+    "/vapi/restaurant",
     methods=["GET", "POST"]
 )
-def webhook_whatsapp():
+def vapi_restaurant():
     """
-    Siempre devuelve una respuesta válida a Twilio,
-    incluso si Airtable u OpenAI fallan.
+    GET:
+    Comprueba que la ruta existe.
+
+    POST:
+    Recibe una consulta JSON desde Vapi.
     """
 
     if request.method == "GET":
         return jsonify({
-            "route": "/webhook-whatsapp",
             "status": "OK",
-            "twilio_method": "POST",
+            "route": "/vapi/restaurant",
+            "expected_method": "POST",
+            "expected_json": {
+                "question": (
+                    "Pregunta del cliente"
+                ),
+                "twilio_phone": (
+                    TWILIO_PHONE
+                    or "+4915888623971"
+                ),
+                "customer_phone": (
+                    "+34687378433"
+                )
+            },
             "timestamp": utc_now_iso()
         }), 200
 
     try:
-        incoming_phone = normalize_phone(
-            request.form.get(
-                "From",
+        request_data = request.get_json(
+            silent=True
+        ) or {}
+
+        question = str(
+            request_data.get(
+                "question",
                 ""
             )
-        )
-
-        destination_phone = normalize_phone(
-            request.form.get(
-                "To",
-                ""
-            )
-        )
-
-        incoming_message = request.form.get(
-            "Body",
-            ""
         ).strip()
 
-        message_sid = request.form.get(
-            "MessageSid",
-            ""
+        restaurant_phone = normalize_phone(
+            request_data.get(
+                "twilio_phone",
+                TWILIO_PHONE
+            )
+        )
+
+        customer_phone = normalize_phone(
+            request_data.get(
+                "customer_phone",
+                ""
+            )
         )
 
         app.logger.info(
-            "WhatsApp recibido. SID=%s From=%s To=%s",
-            message_sid,
-            mask_phone(incoming_phone),
-            mask_phone(destination_phone)
+            "Consulta Vapi. "
+            "RestaurantPhone=%s "
+            "CustomerPhone=%s "
+            "Question=%s",
+            mask_phone(
+                restaurant_phone
+            ),
+            mask_phone(
+                customer_phone
+            ),
+            question
         )
 
-        twiml_response = MessagingResponse()
-
-        if (
-            not incoming_phone
-            or not destination_phone
-        ):
-            twiml_response.message(
-                "No se pudo identificar el número."
-            )
-
-            return Response(
-                str(twiml_response),
-                status=200,
-                mimetype="application/xml"
-            )
-
-        if not incoming_message:
-            twiml_response.message(
-                "No recibí ningún texto."
-            )
-
-            return Response(
-                str(twiml_response),
-                status=200,
-                mimetype="application/xml"
-            )
+        if not restaurant_phone:
+            return jsonify({
+                "success": False,
+                "message": (
+                    "No se recibió el número "
+                    "del restaurante."
+                )
+            }), 200
 
         restaurant = get_restaurant_data(
-            destination_phone
+            restaurant_phone
         )
 
-        if restaurant:
+        if not restaurant:
+            return jsonify({
+                "success": False,
+                "message": (
+                    "No se encontró un restaurante "
+                    "asociado al número indicado."
+                )
+            }), 200
+
+        restaurant_name = restaurant.get(
+            "Nombre",
+            "el restaurante"
+        )
+
+        restaurant_hours = restaurant.get(
+            "Horarios",
+            "No hay horarios disponibles."
+        )
+
+        restaurant_menu = restaurant.get(
+            "Menu",
+            "No hay información "
+            "de menú disponible."
+        )
+
+        result = {
+            "success": True,
+            "restaurant": {
+                "name": restaurant_name,
+                "phone": restaurant_phone,
+                "hours": restaurant_hours,
+                "menu": restaurant_menu
+            },
+            "instructions": (
+                "Usa solamente estos datos "
+                "y no inventes información."
+            )
+        }
+
+        if question:
             answer = get_ai_response(
-                incoming_message,
+                question,
                 restaurant
             )
-        else:
-            answer = (
-                "No encontramos un restaurante "
-                "asociado a este número. "
-                "Contacta al soporte."
+
+            result["answer"] = answer
+
+            interaction_saved = (
+                save_interaction(
+                    twilio_phone=(
+                        restaurant_phone
+                    ),
+                    customer_phone=(
+                        customer_phone
+                    ),
+                    question=question,
+                    answer=answer,
+                    status=(
+                        "Answered through Vapi"
+                    )
+                )
             )
 
-        interaction_saved = save_interaction(
-            twilio_phone=destination_phone,
-            customer_phone=incoming_phone,
-            question=incoming_message,
-            answer=answer
-        )
-
-        if not interaction_saved:
-            app.logger.warning(
-                "No se guardó la interacción "
-                "en Airtable, pero se responderá "
-                "igualmente."
+            result["interaction_saved"] = (
+                interaction_saved
             )
 
-        twiml_response.message(
-            answer
-        )
-
-        return Response(
-            str(twiml_response),
-            status=200,
-            mimetype="application/xml"
-        )
+        return jsonify(
+            result
+        ), 200
 
     except Exception as exc:
         app.logger.exception(
-            "Error procesando WhatsApp: %s",
+            "Error procesando Vapi: %s",
             exc
         )
 
-        fallback_response = MessagingResponse()
-
-        fallback_response.message(
-            "Lo siento, ocurrió un error temporal. "
-            "Inténtalo nuevamente."
-        )
-
-        return Response(
-            str(fallback_response),
-            status=200,
-            mimetype="application/xml"
-        )
-
-
-# =============================================================================
-# VOICE
-# =============================================================================
-
-@app.route(
-    "/webhook-voice",
-    methods=["GET", "POST"]
-)
-def webhook_voice():
-    voice_response = VoiceResponse()
-
-    gather = Gather(
-        input="speech",
-        action="/process-speech",
-        method="POST",
-        language="es-ES",
-        speech_timeout="auto",
-        timeout=5
-    )
-
-    gather.say(
-        "Hola. Soy el asistente de Ayi Reservas. "
-        "Puedes consultar horarios, menú o solicitar "
-        "una reserva. ¿En qué puedo ayudarte?",
-        language="es-ES"
-    )
-
-    voice_response.append(
-        gather
-    )
-
-    voice_response.say(
-        "No he podido escucharte. "
-        "Vamos a intentarlo nuevamente.",
-        language="es-ES"
-    )
-
-    voice_response.redirect(
-        "/webhook-voice",
-        method="POST"
-    )
-
-    return Response(
-        str(voice_response),
-        status=200,
-        mimetype="application/xml"
-    )
-
-
-@app.route(
-    "/process-speech",
-    methods=["POST"]
-)
-def process_speech():
-    try:
-        voice_response = VoiceResponse()
-
-        speech_result = request.form.get(
-            "SpeechResult",
-            ""
-        ).strip()
-
-        caller = normalize_phone(
-            request.form.get(
-                "From",
-                ""
-            )
-        )
-
-        destination_phone = normalize_phone(
-            request.form.get(
-                "To",
-                ""
-            )
-        )
-
-        if not speech_result:
-            voice_response.say(
-                "No he podido entenderte. "
-                "Inténtalo nuevamente.",
-                language="es-ES"
-            )
-
-            voice_response.redirect(
-                "/webhook-voice",
-                method="POST"
-            )
-
-            return Response(
-                str(voice_response),
-                status=200,
-                mimetype="application/xml"
-            )
-
-        restaurant = get_restaurant_data(
-            destination_phone
-        )
-
-        if restaurant:
-            answer = get_ai_response(
-                speech_result,
-                restaurant
-            )
-        else:
-            answer = (
-                "No encontramos un restaurante "
-                "asociado a este número. "
-                "Contacta al soporte."
-            )
-
-        interaction_saved = save_interaction(
-            twilio_phone=destination_phone,
-            customer_phone=caller,
-            question=speech_result,
-            answer=answer
-        )
-
-        if not interaction_saved:
-            app.logger.warning(
-                "No se guardó la interacción de voz, "
-                "pero se responderá igualmente."
-            )
-
-        voice_response.say(
-            answer,
-            language="es-ES"
-        )
-
-        voice_response.hangup()
-
-        return Response(
-            str(voice_response),
-            status=200,
-            mimetype="application/xml"
-        )
-
-    except Exception as exc:
-        app.logger.exception(
-            "Error procesando voz: %s",
-            exc
-        )
-
-        fallback_response = VoiceResponse()
-
-        fallback_response.say(
-            "Lo siento, ocurrió un error temporal. "
-            "Inténtalo nuevamente.",
-            language="es-ES"
-        )
-
-        fallback_response.hangup()
-
-        return Response(
-            str(fallback_response),
-            status=200,
-            mimetype="application/xml"
-        )
-
-
-@app.route(
-    "/voice-status",
-    methods=["POST"]
-)
-def voice_status():
-    app.logger.info(
-        "Voice status SID=%s Status=%s",
-        request.form.get(
-            "CallSid",
-            ""
-        ),
-        request.form.get(
-            "CallStatus",
-            ""
-        )
-    )
-
-    return "", 204
-
-
-# =============================================================================
-# STRIPE
-# =============================================================================
-
-@app.route(
-    "/stripe-webhook",
-    methods=["POST"]
-)
-def stripe_webhook():
-    if not STRIPE_WEBHOOK_SECRET:
-        return jsonify({
-            "status": "error",
-            "message": (
-                "STRIPE_WEBHOOK_SECRET "
-                "is not configured"
-            )
-        }), 503
-
-    try:
-        stripe_event = (
-            stripe.Webhook.construct_event(
-                request.get_data(),
-                request.headers.get(
-                    "Stripe-Signature",
-                    ""
-                ),
-                STRIPE_WEBHOOK_SECRET
-            )
-        )
-
-    except ValueError:
-        return jsonify({
-            "status": "error",
-            "message": "Invalid Stripe payload"
-        }), 400
-
-    except stripe.error.SignatureVerificationError:
-        return jsonify({
-            "status": "error",
-            "message": "Invalid Stripe signature"
-        }), 400
-
-    return jsonify({
-        "status": "success",
-        "event_type": stripe_event.get(
-            "type",
-            ""
-        )
-    }), 200
-
-
-# =============================================================================
-# MANEJO DE ERRORES
-# =============================================================================
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        "status": "error",
-        "message": "Route not found",
-        "path": request.path
-    }), 404
-
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({
-        "status": "error",
-        "message": "Method not allowed",
-        "path": request.path,
-        "method": request.method
-    }), 405
-
-
-@app.errorhandler(500)
-def internal_server_error(error):
-    app.logger.exception(
-        "Internal server error: %s",
-        error
-    )
-
-    return jsonify({
-        "status": "error",
-        "message": "Internal server error"
-    }), 500
-
-
-# =============================================================================
-# EJECUCIÓN LOCAL
-# =============================================================================
-
-if __name__ == "__main__":
-    port = int(
-        os.getenv(
-            "PORT",
-            "8080"
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False
-    )
+  
