@@ -1,8 +1,8 @@
 import os
 import re
 from datetime import datetime, timezone
-from urllib.parse import quote, urlencode
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 import stripe
@@ -12,164 +12,400 @@ from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.twiml.voice_response import Gather, VoiceResponse
 
+
 load_dotenv()
+
 app = Flask(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-TWILIO_PHONE = os.getenv("TWILIO_PHONE", "+14155238886").strip()
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "").strip()
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
-AIRTABLE_RESTAURANTS_TABLE = os.getenv("AIRTABLE_RESTAURANTS_TABLE", "Restaurantes").strip()
-AIRTABLE_CONVERSATIONS_TABLE = os.getenv("AIRTABLE_CONVERSATIONS_TABLE", "Conversaciones").strip()
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
+
+OPENAI_API_KEY = os.getenv(
+    "OPENAI_API_KEY",
+    ""
+).strip()
+
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-4o-mini"
+).strip()
+
+TWILIO_PHONE = os.getenv(
+    "TWILIO_PHONE",
+    "+19132703471"
+).strip()
+
+TWILIO_VOICE = os.getenv(
+    "TWILIO_VOICE",
+    "Polly.Lucia-Neural"
+).strip()
+
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "https://web-production-c74a5.up.railway.app",
+    "https://web-production-c74a5.up.railway.app"
 ).rstrip("/")
-DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Madrid").strip()
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "12"))
+
+DEFAULT_TIMEZONE = os.getenv(
+    "DEFAULT_TIMEZONE",
+    "Europe/Madrid"
+).strip()
+
+HISTORY_LIMIT = int(
+    os.getenv(
+        "HISTORY_LIMIT",
+        "12"
+    )
+)
+
+MAX_VOICE_TURNS = int(
+    os.getenv(
+        "MAX_VOICE_TURNS",
+        "6"
+    )
+)
+
+AIRTABLE_TOKEN = os.getenv(
+    "AIRTABLE_TOKEN",
+    ""
+).strip()
+
+AIRTABLE_BASE_ID = os.getenv(
+    "AIRTABLE_BASE_ID",
+    ""
+).strip()
+
+AIRTABLE_RESTAURANTS_TABLE = os.getenv(
+    "AIRTABLE_RESTAURANTS_TABLE",
+    "Restaurantes"
+).strip()
+
+AIRTABLE_CONVERSATIONS_TABLE = os.getenv(
+    "AIRTABLE_CONVERSATIONS_TABLE",
+    "Conversaciones"
+).strip()
+
+STRIPE_SECRET_KEY = os.getenv(
+    "STRIPE_SECRET_KEY",
+    ""
+).strip()
+
+STRIPE_WEBHOOK_SECRET = os.getenv(
+    "STRIPE_WEBHOOK_SECRET",
+    ""
+).strip()
+
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 
+# =============================================================================
+# FUNCIONES GENERALES
+# =============================================================================
+
 def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def normalize_phone(value):
     if value is None:
         return ""
+
     value = str(value).strip()
+
     if value.lower().startswith("whatsapp:"):
         value = value[len("whatsapp:"):]
-    digits = re.sub(r"\D", "", value)
-    return f"+{digits}" if digits else ""
 
-
-def airtable_url(table):
-    return (
-        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/"
-        f"{quote(table, safe='')}"
+    digits = re.sub(
+        r"\D",
+        "",
+        value
     )
+
+    if not digits:
+        return ""
+
+    return f"+{digits}"
 
 
 def airtable_headers():
     return {
-        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
-        "Content-Type": "application/json",
+        "Authorization": (
+            f"Bearer {AIRTABLE_TOKEN}"
+        ),
+        "Content-Type": "application/json"
     }
 
 
-def list_records(table, limit=500):
-    if not AIRTABLE_TOKEN or not AIRTABLE_BASE_ID:
-        return False, [], "Falta configuración de Airtable"
+def airtable_url(table_name):
+    encoded_table = quote(
+        table_name,
+        safe=""
+    )
 
-    records = []
-    offset = None
-
-    try:
-        while len(records) < limit:
-            params = {"pageSize": 100}
-            if offset:
-                params["offset"] = offset
-
-            response = requests.get(
-                airtable_url(table),
-                headers=airtable_headers(),
-                params=params,
-                timeout=20,
-            )
-
-            if response.status_code != 200:
-                return False, [], response.text
-
-            data = response.json()
-            records.extend(data.get("records", []))
-            offset = data.get("offset")
-            if not offset:
-                break
-
-        return True, records[:limit], None
-
-    except Exception as exc:
-        app.logger.exception("Error leyendo Airtable: %s", exc)
-        return False, [], str(exc)
-
-
-def restaurant_phone(fields):
-    return normalize_phone(
-        fields.get("Business_Phone")
-        or fields.get("Twilio_Phone")
-        or fields.get("WhatsApp_Phone")
-        or fields.get("Vapi_Phone")
+    return (
+        f"https://api.airtable.com/v0/"
+        f"{AIRTABLE_BASE_ID}/"
+        f"{encoded_table}"
     )
 
 
-def get_restaurant(phone):
-    searched_phone = normalize_phone(phone)
-    success, records, error = list_records(AIRTABLE_RESTAURANTS_TABLE)
+# =============================================================================
+# AIRTABLE: LEER REGISTROS
+# =============================================================================
+
+def list_records(
+    table_name,
+    max_records=500
+):
+    records = []
+    offset = None
+
+    if (
+        not AIRTABLE_TOKEN
+        or not AIRTABLE_BASE_ID
+    ):
+        return (
+            False,
+            [],
+            "Falta configuración de Airtable"
+        )
+
+    try:
+        while len(records) < max_records:
+            parameters = {
+                "pageSize": 100
+            }
+
+            if offset:
+                parameters["offset"] = offset
+
+            response = requests.get(
+                airtable_url(table_name),
+                headers=airtable_headers(),
+                params=parameters,
+                timeout=20
+            )
+
+            if response.status_code != 200:
+                return (
+                    False,
+                    [],
+                    response.text
+                )
+
+            response_data = response.json()
+
+            records.extend(
+                response_data.get(
+                    "records",
+                    []
+                )
+            )
+
+            offset = response_data.get(
+                "offset"
+            )
+
+            if not offset:
+                break
+
+        return (
+            True,
+            records[:max_records],
+            None
+        )
+
+    except Exception as exc:
+        app.logger.exception(
+            "Error leyendo Airtable: %s",
+            exc
+        )
+
+        return (
+            False,
+            [],
+            str(exc)
+        )
+
+
+# =============================================================================
+# AIRTABLE: BUSCAR RESTAURANTE
+# =============================================================================
+
+def get_restaurant(phone_number):
+    searched_phone = normalize_phone(
+        phone_number
+    )
+
+    success, records, error = list_records(
+        AIRTABLE_RESTAURANTS_TABLE
+    )
 
     if not success:
-        app.logger.error("No se pudo leer Airtable: %s", error)
+        app.logger.error(
+            "No se pudo leer Airtable: %s",
+            error
+        )
         return None
 
     for record in records:
-        fields = record.get("fields", {})
-        if restaurant_phone(fields) == searched_phone:
+        fields = record.get(
+            "fields",
+            {}
+        )
+
+        candidate_phones = [
+            fields.get("Twilio_Phone"),
+            fields.get("Voice_Phone"),
+            fields.get("WhatsApp_Phone")
+        ]
+
+        if searched_phone and any(
+            normalize_phone(candidate)
+            == searched_phone
+            for candidate in candidate_phones
+            if candidate
+        ):
             return fields
 
     return None
 
 
-def get_conversation_history(business_phone, customer_phone, limit=HISTORY_LIMIT):
-    business_phone = normalize_phone(business_phone)
-    customer_phone = normalize_phone(customer_phone)
+# =============================================================================
+# AIRTABLE: HISTORIAL
+# =============================================================================
 
-    if not business_phone or not customer_phone:
-        return []
+def get_conversation_history(
+    business_phone,
+    customer_phone
+):
+    business_phone = normalize_phone(
+        business_phone
+    )
 
-    success, records, error = list_records(AIRTABLE_CONVERSATIONS_TABLE)
+    customer_phone = normalize_phone(
+        customer_phone
+    )
+
+    success, records, error = list_records(
+        AIRTABLE_CONVERSATIONS_TABLE
+    )
+
     if not success:
-        app.logger.warning("No se pudo recuperar el historial: %s", error)
+        app.logger.warning(
+            "No se pudo recuperar historial: %s",
+            error
+        )
         return []
 
-    matching = []
+    matching_records = []
+
     for record in records:
-        fields = record.get("fields", {})
-        if (
-            normalize_phone(fields.get("Twilio_Phone")) == business_phone
-            and normalize_phone(fields.get("Customer_Phone")) == customer_phone
-        ):
-            matching.append(fields)
+        fields = record.get(
+            "fields",
+            {}
+        )
 
-    matching.sort(key=lambda item: str(item.get("Timestamp", "")))
-    messages = []
+        same_business = (
+            normalize_phone(
+                fields.get("Twilio_Phone")
+            )
+            == business_phone
+        )
 
-    for fields in matching[-limit:]:
-        question = str(fields.get("Question", "")).strip()
-        answer = str(fields.get("Answer", "")).strip()
+        same_customer = (
+            normalize_phone(
+                fields.get("Customer_Phone")
+            )
+            == customer_phone
+        )
+
+        if same_business and same_customer:
+            matching_records.append(
+                fields
+            )
+
+    matching_records.sort(
+        key=lambda item: str(
+            item.get(
+                "Timestamp",
+                ""
+            )
+        )
+    )
+
+    history = []
+
+    for item in matching_records[
+        -HISTORY_LIMIT:
+    ]:
+        question = str(
+            item.get(
+                "Question",
+                ""
+            )
+        ).strip()
+
+        answer = str(
+            item.get(
+                "Answer",
+                ""
+            )
+        ).strip()
+
         if question:
-            messages.append({"role": "user", "content": question})
+            history.append({
+                "role": "user",
+                "content": question
+            })
+
         if answer:
-            messages.append({"role": "assistant", "content": answer})
+            history.append({
+                "role": "assistant",
+                "content": answer
+            })
 
-    return messages
+    return history
 
 
-def save_interaction(business_phone, customer_phone, question, answer, status):
+# =============================================================================
+# AIRTABLE: GUARDAR INTERACCIÓN
+# =============================================================================
+
+def save_interaction(
+    business_phone,
+    customer_phone,
+    question,
+    answer,
+    status
+):
     payload = {
         "records": [
             {
                 "fields": {
-                    "Twilio_Phone": normalize_phone(business_phone),
-                    "Customer_Phone": normalize_phone(customer_phone),
-                    "Question": str(question),
-                    "Answer": str(answer),
+                    "Twilio_Phone": (
+                        normalize_phone(
+                            business_phone
+                        )
+                    ),
+                    "Customer_Phone": (
+                        normalize_phone(
+                            customer_phone
+                        )
+                    ),
+                    "Question": str(
+                        question
+                    ),
+                    "Answer": str(
+                        answer
+                    ),
                     "Timestamp": now_iso(),
-                    "Status": status,
+                    "Status": status
                 }
             }
         ]
@@ -177,547 +413,151 @@ def save_interaction(business_phone, customer_phone, question, answer, status):
 
     try:
         response = requests.post(
-            airtable_url(AIRTABLE_CONVERSATIONS_TABLE),
+            airtable_url(
+                AIRTABLE_CONVERSATIONS_TABLE
+            ),
             headers=airtable_headers(),
             json=payload,
-            timeout=20,
+            timeout=20
         )
-        if response.status_code not in (200, 201):
-            app.logger.error("Error guardando en Airtable: %s", response.text)
+
+        if response.status_code not in (
+            200,
+            201
+        ):
+            app.logger.error(
+                "Error guardando en Airtable. "
+                "Status=%s Body=%s",
+                response.status_code,
+                response.text
+            )
+
             return False
+
         return True
+
     except Exception as exc:
-        app.logger.exception("Error guardando interacción: %s", exc)
+        app.logger.exception(
+            "Error guardando interacción: %s",
+            exc
+        )
+
         return False
 
 
-def parse_business_ranges(value):
-    text = str(value or "")
-    pattern = re.compile(
-        r"(?<!\d)(\d{1,2})(?::(\d{2}))?\s*-\s*"
-        r"(\d{1,2})(?::(\d{2}))?(?!\d)"
-    )
-    ranges = []
+# =============================================================================
+# HORARIOS Y SMART ROUTING
+# =============================================================================
 
-    for match in pattern.finditer(text):
-        start_hour = int(match.group(1))
-        start_minute = int(match.group(2) or 0)
-        end_hour = int(match.group(3))
-        end_minute = int(match.group(4) or 0)
+def parse_minutes(value):
+    value = value.strip()
 
-        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
-            continue
-        if not (0 <= start_minute <= 59 and 0 <= end_minute <= 59):
-            continue
-
-        ranges.append(
-            (start_hour * 60 + start_minute, end_hour * 60 + end_minute)
+    if ":" in value:
+        hour, minute = value.split(
+            ":",
+            1
         )
+    else:
+        hour = value
+        minute = "0"
 
-    return ranges
+    return (
+        int(hour) * 60
+        + int(minute)
+    )
 
 
 def is_business_open(restaurant):
-    timezone_name = str(
-        restaurant.get("Zona_Horaria") or DEFAULT_TIMEZONE
+    schedule = str(
+        restaurant.get(
+            "Horario_Recepcion",
+            ""
+        )
     ).strip()
 
+    timezone_name = str(
+        restaurant.get(
+            "Zona_Horaria",
+            DEFAULT_TIMEZONE
+        )
+    ).strip()
+
+    if not timezone_name:
+        timezone_name = DEFAULT_TIMEZONE
+
+    if not schedule:
+        return False
+
     try:
-        local_now = datetime.now(ZoneInfo(timezone_name))
-    except ZoneInfoNotFoundError:
-        local_now = datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+        current_time = datetime.now(
+            ZoneInfo(timezone_name)
+        )
 
-    schedule = (
-        restaurant.get("Horario_Recepcion")
-        or restaurant.get("Horarios_Routing")
-        or restaurant.get("Horarios")
-        or ""
-    )
-    ranges = parse_business_ranges(schedule)
-    current_minutes = local_now.hour * 60 + local_now.minute
+        current_minutes = (
+            current_time.hour * 60
+            + current_time.minute
+        )
 
-    for start_minutes, end_minutes in ranges:
-        if start_minutes == end_minutes:
-            return True
-        if start_minutes < end_minutes:
-            if start_minutes <= current_minutes < end_minutes:
-                return True
-        elif current_minutes >= start_minutes or current_minutes < end_minutes:
-            return True
+        for raw_range in schedule.split(","):
+            raw_range = raw_range.strip()
 
-    return False
+            if (
+                not raw_range
+                or "-" not in raw_range
+            ):
+                continue
 
+            start_text, end_text = (
+                raw_range.split(
+                    "-",
+                    1
+                )
+            )
+
+            start_minutes = parse_minutes(
+                start_text
+            )
+
+            end_minutes = parse_minutes(
+                end_text
+            )
+
+            if start_minutes <= end_minutes:
+                if (
+                    start_minutes
+                    <= current_minutes
+                    < end_minutes
+                ):
+                    return True
+
+            else:
+                if (
+                    current_minutes
+                    >= start_minutes
+                    or current_minutes
+                    < end_minutes
+                ):
+                    return True
+
+        return False
+
+    except Exception as exc:
+        app.logger.warning(
+            "Horario_Recepcion inválido: %s",
+            exc
+        )
+
+        return False
+
+
+# =============================================================================
+# CONTROL DE CONVERSACIÓN
+# =============================================================================
 
 def is_simple_greeting(message):
-    normalized = str(message or "").strip().lower()
-    return normalized in {
-        "hola",
-        "buenas",
-        "buen día",
-        "buen dia",
-        "buenas tardes",
-        "buenas noches",
-        "hey",
-    }
-
-
-def is_clearly_off_topic(message):
-    normalized = str(message or "").strip().lower()
-    blocked_terms = [
-        "printf",
-        "programación",
-        "programacion",
-        "escribe un programa",
-        "dame código",
-        "dame codigo",
-        "código en c",
-        "codigo en c",
-        "python",
-        "javascript",
-        "html",
-        "css",
-        "bitcoin",
-        "criptomoneda",
-        "elecciones",
-        "presidente",
-        "fútbol",
-        "futbol",
-        "película",
-        "pelicula",
-    ]
-    return any(term in normalized for term in blocked_terms)
-
-
-def restaurant_welcome_message(restaurant):
-    name = restaurant.get("Nombre", "nuestro restaurante")
-    return f"¡Buenas! Te damos la bienvenida a {name}. ¿En qué podemos ayudarte?"
-
-
-def off_topic_message():
-    return (
-        "Puedo ayudarte con el menú, los precios, los horarios, "
-        "la ubicación y las solicitudes de reserva del restaurante."
-    )
-
-
-def ai_answer(question, restaurant, business_phone, customer_phone):
-    if not OPENAI_API_KEY:
-        return "Lo siento, el asistente no está disponible en este momento."
-
-    if is_clearly_off_topic(question):
-        return off_topic_message()
-
-    name = restaurant.get("Nombre", "el restaurante")
-    hours = restaurant.get("Horarios", "No hay horarios disponibles.")
-    menu = restaurant.get("Menu", "No hay información de menú disponible.")
-    address = restaurant.get("Direccion", "No hay dirección disponible.")
-
-    system_prompt = f"""Eres el asistente virtual de AI Reservas para {name}.
-
-INFORMACIÓN CONFIRMADA DEL RESTAURANTE
-Nombre: {name}
-Horarios: {hours}
-Menú: {menu}
-Dirección: {address}
-
-ÁMBITO PERMITIDO
-Responde únicamente sobre el restaurante, el menú, los platos disponibles, los precios, los horarios, la dirección, las solicitudes de reserva, los cambios o cancelaciones de solicitudes, las preferencias relacionadas con una visita y los mensajes para el restaurante.
-
-No respondas preguntas sobre programación, política, deportes, entretenimiento, noticias, tecnología ni otros temas ajenos al restaurante. Si la consulta no pertenece al ámbito permitido, responde únicamente: "Puedo ayudarte con el menú, los precios, los horarios, la ubicación y las solicitudes de reserva del restaurante."
-
-REGLAS DE CONVERSACIÓN
-- Habla siempre en español.
-- Usa frases breves, claras y naturales.
-- No vuelvas a saludar si la conversación ya comenzó.
-- Revisa el historial antes de responder.
-- No solicites nuevamente datos que el cliente ya proporcionó.
-- Si el cliente proporciona varios datos juntos, conserva todos.
-- Si el cliente corrige un dato, utiliza el dato más reciente.
-- Haz como máximo una pregunta por respuesta.
-- Pregunta únicamente por el dato que realmente falta.
-- No termines cada respuesta ofreciendo ayuda genérica.
-- No menciones OpenAI, Airtable, Railway, Twilio, código ni sistemas internos.
-- No inventes menú, precios, horarios, disponibilidad ni confirmaciones.
-
-RESERVAS
-Para preparar una solicitud necesitas nombre, fecha, hora y número de personas. Antes de preguntar, revisa si esos datos ya aparecen en el historial. Si falta un único dato, pregunta solamente por ese dato. Cuando estén todos, resume la solicitud una sola vez, no vuelvas a pedir los datos e indica que quedó registrada para revisión y todavía no está confirmada. Nunca afirmes que hay mesa disponible sin confirmación explícita del sistema.
-
-RECOMENDACIONES
-Puedes dar una recomendación clara y equilibrada basándote únicamente en el menú y los precios confirmados. Si preguntan cuál opción es mejor, responde de forma concreta según criterios visibles, por ejemplo la opción más económica o la más contundente. No inventes sabor, ingredientes, tamaño, calidad ni disponibilidad.
-
-CLIENTES MOLESTOS O FRUSTRADOS
-Reconoce brevemente el inconveniente, explica el dato confirmado sin discutir y ofrece una alternativa real. No exageres la disculpa, no prometas compensaciones y no inventes soluciones.
-
-PRECISIÓN
-Utiliza exclusivamente la información confirmada del restaurante y el historial. Si no dispones de información suficiente, dilo brevemente y ofrece registrar un mensaje."""
-
-    history = get_conversation_history(business_phone, customer_phone)
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": str(question)})
-
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            max_tokens=160,
-            temperature=0.2,
-        )
-        answer = completion.choices[0].message.content
-        return answer.strip() if answer else "Lo siento, no pude procesar tu consulta."
-    except Exception as exc:
-        app.logger.exception("Error de OpenAI: %s", exc)
-        return "Lo siento, no pude procesar tu consulta en este momento."
-
-
-def voice_ai_response(restaurant, business_phone, customer_phone, greeting=True):
-    response = VoiceResponse()
-    query = urlencode(
-        {
-            "business_phone": normalize_phone(business_phone),
-            "customer_phone": normalize_phone(customer_phone),
-        }
-    )
-    gather = Gather(
-        input="speech",
-        action=f"{PUBLIC_BASE_URL}/process-speech?{query}",
-        method="POST",
-        language="es-ES",
-        speech_timeout="auto",
-        timeout=5,
-    )
-
-    if greeting:
-        name = restaurant.get("Nombre", "nuestro restaurante")
-        gather.say(
-            f"Buenas. Te damos la bienvenida a {name}. ¿En qué podemos ayudarte?",
-            language="es-ES",
-        )
-    else:
-        gather.say(
-            "No he podido escucharte. ¿Puedes repetirlo, por favor?",
-            language="es-ES",
-        )
-
-    response.append(gather)
-    response.redirect(f"{PUBLIC_BASE_URL}/voice-ai?{query}", method="POST")
-    return response
-
-
-@app.get("/")
-def home():
-    return jsonify(
-        {
-            "name": "AI Reservas API",
-            "status": "running",
-            "version": "2.6.1",
-            "timestamp": now_iso(),
-            "endpoints": {
-                "health": "/health",
-                "airtable_test": "/test-airtable",
-                "whatsapp": "/webhook-whatsapp",
-                "voice": "/webhook-voice",
-                "voice_ai": "/voice-ai",
-                "voice_speech": "/process-speech",
-                "stripe": "/stripe-webhook",
-            },
-        }
-    )
-
-
-@app.get("/health")
-def health():
-    required = {
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-        "TWILIO_PHONE": TWILIO_PHONE,
-        "AIRTABLE_TOKEN": AIRTABLE_TOKEN,
-        "AIRTABLE_BASE_ID": AIRTABLE_BASE_ID,
-        "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
-    }
-    missing = [name for name, value in required.items() if not value]
-    return jsonify(
-        {
-            "status": "OK" if not missing else "DEGRADED",
-            "missing_environment_variables": missing,
-            "timestamp": now_iso(),
-        }
-    )
-
-
-@app.get("/test-airtable")
-def test_airtable():
-    restaurant = get_restaurant(TWILIO_PHONE)
-    if not restaurant:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Restaurant not found in Airtable",
-                "searched_phone": normalize_phone(TWILIO_PHONE),
-            }
-        ), 404
-
-    return jsonify(
-        {
-            "status": "success",
-            "restaurant": restaurant,
-            "business_open": is_business_open(restaurant),
-        }
-    )
-
-
-@app.route("/webhook-whatsapp", methods=["GET", "POST"])
-def webhook_whatsapp():
-    if request.method == "GET":
-        return jsonify(
-            {
-                "status": "OK",
-                "route": "/webhook-whatsapp",
-                "expected_method": "POST",
-                "timestamp": now_iso(),
-            }
-        )
-
-    try:
-        customer_phone = normalize_phone(request.form.get("From", ""))
-        business_phone = normalize_phone(request.form.get("To", ""))
-        question = request.form.get("Body", "").strip()
-        twiml = MessagingResponse()
-
-        if not question:
-            twiml.message("No recibí ningún texto.")
-            return Response(str(twiml), mimetype="application/xml")
-
-        restaurant = get_restaurant(business_phone)
-        if not restaurant:
-            twiml.message("No encontramos un restaurante asociado a este número.")
-            return Response(str(twiml), mimetype="application/xml")
-
-        history = get_conversation_history(business_phone, customer_phone)
-
-        if not history and is_simple_greeting(question):
-            answer = restaurant_welcome_message(restaurant)
-        else:
-            answer = ai_answer(
-                question,
-                restaurant,
-                business_phone,
-                customer_phone,
-            )
-
-        save_interaction(
-            business_phone,
-            customer_phone,
-            question,
-            answer,
-            "Answered through WhatsApp",
-        )
-        twiml.message(answer)
-        return Response(str(twiml), mimetype="application/xml")
-
-    except Exception as exc:
-        app.logger.exception("Error procesando WhatsApp: %s", exc)
-        twiml = MessagingResponse()
-        twiml.message("Lo siento, ocurrió un error temporal. Inténtalo nuevamente.")
-        return Response(str(twiml), mimetype="application/xml")
-
-
-@app.route("/webhook-voice", methods=["GET", "POST"])
-def webhook_voice():
-    try:
-        customer_phone = normalize_phone(request.values.get("From", ""))
-        business_phone = normalize_phone(request.values.get("To", TWILIO_PHONE))
-        restaurant = get_restaurant(business_phone)
-
-        if not restaurant:
-            response = VoiceResponse()
-            response.say(
-                "Lo siento, no encontramos un negocio asociado a este número.",
-                language="es-ES",
-            )
-            response.hangup()
-            return Response(str(response), mimetype="application/xml")
-
-        reception_number = normalize_phone(restaurant.get("Numero_Recepcion"))
-
-        if is_business_open(restaurant) and reception_number:
-            response = VoiceResponse()
-            query = urlencode(
-                {
-                    "business_phone": business_phone,
-                    "customer_phone": customer_phone,
-                }
-            )
-            dial = response.dial(
-                caller_id=business_phone,
-                timeout=20,
-                answer_on_bridge=True,
-                action=f"{PUBLIC_BASE_URL}/voice-dial-result?{query}",
-                method="POST",
-            )
-            dial.number(reception_number)
-            return Response(str(response), mimetype="application/xml")
-
-        response = voice_ai_response(
-            restaurant,
-            business_phone,
-            customer_phone,
-            greeting=True,
-        )
-        return Response(str(response), mimetype="application/xml")
-
-    except Exception as exc:
-        app.logger.exception("Error de routing de voz: %s", exc)
-        response = VoiceResponse()
-        response.say("Lo siento, ocurrió un error temporal.", language="es-ES")
-        response.hangup()
-        return Response(str(response), mimetype="application/xml")
-
-
-@app.post("/voice-dial-result")
-def voice_dial_result():
-    dial_status = request.form.get("DialCallStatus", "").strip().lower()
-    business_phone = normalize_phone(request.args.get("business_phone", TWILIO_PHONE))
-    customer_phone = normalize_phone(request.args.get("customer_phone", ""))
-
-    if dial_status == "completed":
-        response = VoiceResponse()
-        response.hangup()
-        return Response(str(response), mimetype="application/xml")
-
-    restaurant = get_restaurant(business_phone)
-    if not restaurant:
-        response = VoiceResponse()
-        response.say("No ha sido posible atender la llamada.", language="es-ES")
-        response.hangup()
-        return Response(str(response), mimetype="application/xml")
-
-    response = voice_ai_response(
-        restaurant,
-        business_phone,
-        customer_phone,
-        greeting=True,
-    )
-    return Response(str(response), mimetype="application/xml")
-
-
-@app.route("/voice-ai", methods=["GET", "POST"])
-def voice_ai():
-    business_phone = normalize_phone(request.args.get("business_phone", TWILIO_PHONE))
-    customer_phone = normalize_phone(request.args.get("customer_phone", ""))
-    restaurant = get_restaurant(business_phone)
-
-    if not restaurant:
-        response = VoiceResponse()
-        response.say("No ha sido posible atender la llamada.", language="es-ES")
-        response.hangup()
-        return Response(str(response), mimetype="application/xml")
-
-    response = voice_ai_response(
-        restaurant,
-        business_phone,
-        customer_phone,
-        greeting=False,
-    )
-    return Response(str(response), mimetype="application/xml")
-
-
-@app.post("/process-speech")
-def process_speech():
-    try:
-        business_phone = normalize_phone(request.args.get("business_phone", TWILIO_PHONE))
-        customer_phone = normalize_phone(
-            request.args.get("customer_phone") or request.form.get("From", "")
-        )
-        speech = request.form.get("SpeechResult", "").strip()
-        restaurant = get_restaurant(business_phone)
-
-        if not restaurant:
-            response = VoiceResponse()
-            response.say("No ha sido posible atender la llamada.", language="es-ES")
-            response.hangup()
-            return Response(str(response), mimetype="application/xml")
-
-        if not speech:
-            response = voice_ai_response(
-                restaurant,
-                business_phone,
-                customer_phone,
-                greeting=False,
-            )
-            return Response(str(response), mimetype="application/xml")
-
-        answer = ai_answer(
-            speech,
-            restaurant,
-            business_phone,
-            customer_phone,
-        )
-        save_interaction(
-            business_phone,
-            customer_phone,
-            speech,
-            answer,
-            "Answered through Voice AI",
-        )
-
-        response = VoiceResponse()
-        response.say(answer, language="es-ES")
-
-        query = urlencode(
-            {
-                "business_phone": business_phone,
-                "customer_phone": customer_phone,
-            }
-        )
-        gather = Gather(
-            input="speech",
-            action=f"{PUBLIC_BASE_URL}/process-speech?{query}",
-            method="POST",
-            language="es-ES",
-            speech_timeout="auto",
-            timeout=5,
-        )
-        response.append(gather)
-        response.redirect(f"{PUBLIC_BASE_URL}/voice-ai?{query}", method="POST")
-        return Response(str(response), mimetype="application/xml")
-
-    except Exception as exc:
-        app.logger.exception("Error procesando voz: %s", exc)
-        response = VoiceResponse()
-        response.say("Lo siento, ocurrió un error temporal.", language="es-ES")
-        response.hangup()
-        return Response(str(response), mimetype="application/xml")
-
-
-@app.post("/stripe-webhook")
-def stripe_webhook():
-    if not STRIPE_WEBHOOK_SECRET:
-        return jsonify({"status": "error", "message": "Stripe no está configurado"}), 503
-
-    try:
-        event = stripe.Webhook.construct_event(
-            request.get_data(),
-            request.headers.get("Stripe-Signature", ""),
-            STRIPE_WEBHOOK_SECRET,
-        )
-        return jsonify({"status": "success", "event_type": event.get("type", "")})
-    except ValueError:
-        return jsonify({"status": "error", "message": "Payload inválido"}), 400
-    except stripe.error.SignatureVerificationError:
-        return jsonify({"status": "error", "message": "Firma inválida"}), 400
-
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify(
-        {"status": "error", "message": "Route not found", "path": request.path}
-    ), 404
-
-
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8080")),
-        debug=False,
-    )
+    normalized = str(
+        message
+    ).strip().lower()
+
+    greetings = {
+      
