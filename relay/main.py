@@ -11,8 +11,11 @@ from openai import AsyncOpenAI
 from twilio.request_validator import RequestValidator
 
 app = FastAPI()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "180"))
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
 CORE_BASE_URL = os.getenv("CORE_BASE_URL", "").rstrip("/")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "").strip()
 RELAY_PUBLIC_URL = os.getenv("RELAY_PUBLIC_URL", "").rstrip("/")
@@ -25,9 +28,13 @@ TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "es-ES").strip()
 TRANSCRIPTION_PROVIDER = os.getenv("TRANSCRIPTION_PROVIDER", "Deepgram").strip()
 TRANSCRIPTION_LANGUAGE = os.getenv("TRANSCRIPTION_LANGUAGE", "es-ES").strip()
 SPEECH_MODEL = os.getenv("SPEECH_MODEL", "nova-3-general").strip()
+SPEECH_TIMEOUT_MS = int(os.getenv("SPEECH_TIMEOUT_MS", "650"))
+SPEECH_TIMEOUT_MS = max(600, min(SPEECH_TIMEOUT_MS, 5000))
+INTERRUPT_SENSITIVITY = os.getenv("INTERRUPT_SENSITIVITY", "medium").strip()
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
 RESERVATIONS_TABLE = os.getenv("AIRTABLE_RESERVATIONS_TABLE", "Reservas").strip()
+
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -54,13 +61,25 @@ def xml_escape(value):
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"status": "OK", "relay_ws_configured": bool(RELAY_WS_URL), "core_configured": bool(CORE_BASE_URL and INTERNAL_API_KEY), "airtable_reservations_configured": bool(AIRTABLE_TOKEN and AIRTABLE_BASE_ID), "tts_provider": TTS_PROVIDER, "tts_voice": TTS_VOICE})
+    return JSONResponse({"status": "OK", "relay_ws_configured": bool(RELAY_WS_URL), "core_configured": bool(CORE_BASE_URL and INTERNAL_API_KEY), "airtable_reservations_configured": bool(AIRTABLE_TOKEN and AIRTABLE_BASE_ID), "tts_provider": TTS_PROVIDER, "tts_voice": TTS_VOICE, "speech_timeout_ms": SPEECH_TIMEOUT_MS, "openai_max_tokens": OPENAI_MAX_TOKENS})
 
 
 @app.api_route("/voice", methods=["GET", "POST"])
 async def voice():
     greeting = "Buenas, has llamado a La Parrilla. ¿En qué podemos ayudarte?"
-    xml = ('<?xml version="1.0" encoding="UTF-8"?><Response>' + f'<Connect action="{xml_escape(RELAY_PUBLIC_URL)}/relay-ended"><ConversationRelay url="{xml_escape(RELAY_WS_URL)}" welcomeGreeting="{xml_escape(greeting)}" welcomeGreetingInterruptible="speech" language="{xml_escape(TTS_LANGUAGE)}" ttsProvider="{xml_escape(TTS_PROVIDER)}" voice="{xml_escape(TTS_VOICE)}" transcriptionProvider="{xml_escape(TRANSCRIPTION_PROVIDER)}" transcriptionLanguage="{xml_escape(TRANSCRIPTION_LANGUAGE)}" speechModel="{xml_escape(SPEECH_MODEL)}" interruptible="speech" interruptSensitivity="medium" speechTimeout="900" hints="reserva, menú, entrecot, vacío, terraza, comensales, mediodía, cena, teléfono, correo electrónico"/></Connect><Hangup/></Response>')
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?><Response>'
+        f'<Connect action="{xml_escape(RELAY_PUBLIC_URL)}/relay-ended">'
+        f'<ConversationRelay url="{xml_escape(RELAY_WS_URL)}" '
+        f'welcomeGreeting="{xml_escape(greeting)}" welcomeGreetingInterruptible="speech" '
+        f'language="{xml_escape(TTS_LANGUAGE)}" ttsProvider="{xml_escape(TTS_PROVIDER)}" '
+        f'voice="{xml_escape(TTS_VOICE)}" transcriptionProvider="{xml_escape(TRANSCRIPTION_PROVIDER)}" '
+        f'transcriptionLanguage="{xml_escape(TRANSCRIPTION_LANGUAGE)}" speechModel="{xml_escape(SPEECH_MODEL)}" '
+        f'interruptible="speech" interruptSensitivity="{xml_escape(INTERRUPT_SENSITIVITY)}" '
+        f'speechTimeout="{SPEECH_TIMEOUT_MS}" '
+        'hints="reserva, menú, entrecot, vacío, terraza, comensales, mediodía, cena, teléfono, correo electrónico"/>'
+        '</Connect><Hangup/></Response>'
+    )
     return Response(xml, media_type="application/xml")
 
 
@@ -77,7 +96,7 @@ def valid_signature(websocket):
 
 
 async def fetch_restaurant(phone):
-    async with httpx.AsyncClient(timeout=20) as http:
+    async with httpx.AsyncClient(timeout=12) as http:
         response = await http.post(f"{CORE_BASE_URL}/internal/restaurant", json={"phone": phone}, headers=internal_headers())
         if response.status_code != 200:
             print("Core restaurant error:", response.status_code, response.text, flush=True)
@@ -86,7 +105,7 @@ async def fetch_restaurant(phone):
 
 
 async def save_conversation(session, question, answer):
-    async with httpx.AsyncClient(timeout=20) as http:
+    async with httpx.AsyncClient(timeout=12) as http:
         response = await http.post(f"{CORE_BASE_URL}/internal/conversations", json={"business_phone": session.get("to"), "customer_phone": session.get("from"), "question": question, "answer": answer}, headers=internal_headers())
         if response.status_code != 200:
             print("Core conversation error:", response.text, flush=True)
@@ -95,7 +114,7 @@ async def save_conversation(session, question, answer):
 async def save_reservation(session):
     reservation = session["reservation"]
     fields = {"Restaurant_Phone": normalize_phone(session.get("to")), "Customer_Name": str(reservation.get("customer_name", "")).strip(), "Customer_Phone": normalize_phone(reservation.get("customer_phone")), "Customer_Email": str(reservation.get("customer_email", "")).strip(), "Reservation_Date": str(reservation.get("reservation_date", "")).strip(), "Reservation_Time": str(reservation.get("reservation_time", "")).strip(), "Party_Size": int(reservation.get("party_size")), "Notes": str(reservation.get("notes", "")).strip(), "Status": "Pendiente de confirmación", "Call_ID": str(session.get("call_sid", "")), "Created_At": datetime.now(timezone.utc).isoformat()}
-    async with httpx.AsyncClient(timeout=20) as http:
+    async with httpx.AsyncClient(timeout=12) as http:
         response = await http.post(airtable_url(RESERVATIONS_TABLE), headers=airtable_headers(), json={"records": [{"fields": fields}]})
         if response.status_code not in (200, 201):
             print("Airtable reservation error:", response.text, flush=True)
@@ -105,9 +124,20 @@ async def save_reservation(session):
 
 async def model_turn(session, user_text):
     restaurant, state = session["restaurant"], session["reservation"]
-    prompt = (f"Eres la recepción telefónica de {restaurant.get('name', 'La Parrilla')}. Habla en español natural, cálido, alegre y profesional, con una o dos frases por turno. No digas espontáneamente que eres una IA; si te preguntan directamente, responde con honestidad que eres la recepción automática. Solo responde sobre restaurante, menú, precios, horarios, ubicación, reservas y mensajes. Horarios: {restaurant.get('hours', '')}. Menú: {restaurant.get('menu', '')}. Dirección: {restaurant.get('address', '')}. Para una reserva reúne nombre, fecha, hora, número de personas, teléfono y correo electrónico. Conserva lo dicho y pregunta solo por el siguiente dato faltante. Si no entiendes un dato, pide repetir solo ese dato. Antes de guardar, resume los seis datos y pide confirmación explícita. Solo confirmed=true si confirma claramente. La solicitud queda pendiente de confirmación. No cierres por un simple gracias. should_end_call=true solo cuando el contexto completo indique que terminó. Estado actual: {json.dumps(state, ensure_ascii=False)}. Devuelve solo JSON válido con reply, intent, reservation, confirmed y should_end_call. reservation contiene customer_name, reservation_date, reservation_time, party_size, customer_phone, customer_email y notes.")
-    messages = [{"role": "system", "content": prompt}, *session["history"][-16:], {"role": "user", "content": user_text}]
-    completion = await openai_client.chat.completions.create(model=OPENAI_MODEL, messages=messages, response_format={"type": "json_object"}, temperature=0.35, max_tokens=350)
+    prompt = (
+        f"Eres la recepción telefónica de {restaurant.get('name', 'La Parrilla')}. Habla en español natural, cálido, alegre y profesional. "
+        "La respuesta hablada debe ser muy breve, normalmente una frase. Formula primero la respuesta y no añadas explicaciones innecesarias. "
+        "No digas espontáneamente que eres una IA; si te preguntan directamente, responde con honestidad que eres la recepción automática. "
+        f"Solo responde sobre restaurante, menú, precios, horarios, ubicación, reservas y mensajes. Horarios: {restaurant.get('hours', '')}. "
+        f"Menú: {restaurant.get('menu', '')}. Dirección: {restaurant.get('address', '')}. "
+        "Para una reserva reúne nombre, fecha, hora, personas, teléfono y correo electrónico. Conserva lo dicho y pregunta solo por el siguiente dato faltante. "
+        "Si no entiendes un dato, pide repetir solo ese dato. Antes de guardar, resume los seis datos y pide confirmación explícita. "
+        "Solo confirmed=true si confirma claramente. La solicitud queda pendiente de confirmación. No cierres por un simple gracias. "
+        f"should_end_call=true solo cuando el contexto completo indique que terminó. Estado actual: {json.dumps(state, ensure_ascii=False)}. "
+        "Devuelve solo JSON válido con reply, intent, reservation, confirmed y should_end_call. reservation contiene customer_name, reservation_date, reservation_time, party_size, customer_phone, customer_email y notes."
+    )
+    messages = [{"role": "system", "content": prompt}, *session["history"][-12:], {"role": "user", "content": user_text}]
+    completion = await openai_client.chat.completions.create(model=OPENAI_MODEL, messages=messages, response_format={"type": "json_object"}, temperature=OPENAI_TEMPERATURE, max_tokens=OPENAI_MAX_TOKENS)
     return json.loads(completion.choices[0].message.content)
 
 
