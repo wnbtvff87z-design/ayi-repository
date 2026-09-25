@@ -34,7 +34,7 @@ async def health():
 
 @app.api_route("/voice",methods=["GET","POST"])
 async def voice():
-    greeting="Buenas, has llamado a La Parrilla de Prueba. ¿En qué podemos ayudarte?"
+    greeting="Buenas, has llamado a La Parrilla. ¿En qué podemos ayudarte?"
     xml=f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response><Connect action="{esc(RELAY_PUBLIC_URL)}/relay-ended"><ConversationRelay url="{esc(RELAY_WS_URL)}" welcomeGreeting="{esc(greeting)}" welcomeGreetingInterruptible="speech" language="{esc(TTS_LANGUAGE)}" ttsProvider="{esc(TTS_PROVIDER)}" voice="{esc(TTS_VOICE)}" transcriptionProvider="{esc(TRANSCRIPTION_PROVIDER)}" transcriptionLanguage="{esc(TRANSCRIPTION_LANGUAGE)}" speechModel="{esc(SPEECH_MODEL)}" interruptible="speech" interruptSensitivity="medium" speechTimeout="900" hints="reserva, menú, entrecot, vacío, terraza, comensales, mediodía, cena, teléfono, correo electrónico"/></Connect><Hangup/></Response>"""
     return Response(xml,media_type="application/xml")
