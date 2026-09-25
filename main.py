@@ -29,7 +29,7 @@ PUBLIC_BASE_URL = os.getenv(
     "https://web-production-c74a5.up.railway.app",
 ).rstrip("/")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Madrid").strip()
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "8"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "12"))
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -50,8 +50,10 @@ def normalize_phone(value):
 
 
 def airtable_url(table):
-    encoded_table = quote(table, safe="")
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{encoded_table}"
+    return (
+        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/"
+        f"{quote(table, safe='')}"
+    )
 
 
 def airtable_headers():
@@ -180,13 +182,10 @@ def save_interaction(business_phone, customer_phone, question, answer, status):
             json=payload,
             timeout=20,
         )
-
         if response.status_code not in (200, 201):
             app.logger.error("Error guardando en Airtable: %s", response.text)
             return False
-
         return True
-
     except Exception as exc:
         app.logger.exception("Error guardando interacción: %s", exc)
         return False
@@ -226,24 +225,15 @@ def is_business_open(restaurant):
     try:
         local_now = datetime.now(ZoneInfo(timezone_name))
     except ZoneInfoNotFoundError:
-        app.logger.warning(
-            "Zona horaria inválida %s; se usa %s",
-            timezone_name,
-            DEFAULT_TIMEZONE,
-        )
         local_now = datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
 
-    routing_schedule = (
+    schedule = (
         restaurant.get("Horario_Recepcion")
         or restaurant.get("Horarios_Routing")
         or restaurant.get("Horarios")
         or ""
     )
-    ranges = parse_business_ranges(routing_schedule)
-
-    if not ranges:
-        return False
-
+    ranges = parse_business_ranges(schedule)
     current_minutes = local_now.hour * 60 + local_now.minute
 
     for start_minutes, end_minutes in ranges:
@@ -252,16 +242,70 @@ def is_business_open(restaurant):
         if start_minutes < end_minutes:
             if start_minutes <= current_minutes < end_minutes:
                 return True
-        else:
-            if current_minutes >= start_minutes or current_minutes < end_minutes:
-                return True
+        elif current_minutes >= start_minutes or current_minutes < end_minutes:
+            return True
 
     return False
+
+
+def is_simple_greeting(message):
+    normalized = str(message or "").strip().lower()
+    return normalized in {
+        "hola",
+        "buenas",
+        "buen día",
+        "buen dia",
+        "buenas tardes",
+        "buenas noches",
+        "hey",
+    }
+
+
+def is_clearly_off_topic(message):
+    normalized = str(message or "").strip().lower()
+    blocked_terms = [
+        "printf",
+        "programación",
+        "programacion",
+        "escribe un programa",
+        "dame código",
+        "dame codigo",
+        "código en c",
+        "codigo en c",
+        "python",
+        "javascript",
+        "html",
+        "css",
+        "bitcoin",
+        "criptomoneda",
+        "elecciones",
+        "presidente",
+        "fútbol",
+        "futbol",
+        "película",
+        "pelicula",
+    ]
+    return any(term in normalized for term in blocked_terms)
+
+
+def restaurant_welcome_message(restaurant):
+    name = restaurant.get("Nombre", "nuestro restaurante")
+    return f"¡Buenas! Te damos la bienvenida a {name}. ¿En qué podemos ayudarte?"
+
+
+def off_topic_message():
+    return (
+        "Puedo ayudarte con el menú, los precios, los horarios, "
+        "la ubicación y las solicitudes de reserva del restaurante."
+    )
 
 
 def ai_answer(question, restaurant, business_phone, customer_phone):
     if not OPENAI_API_KEY:
         return "Lo siento, el asistente no está disponible en este momento."
+
+    if is_clearly_off_topic(question):
+        return off_topic_message()
 
     name = restaurant.get("Nombre", "el restaurante")
     hours = restaurant.get("Horarios", "No hay horarios disponibles.")
@@ -270,43 +314,42 @@ def ai_answer(question, restaurant, business_phone, customer_phone):
 
     system_prompt = f"""Eres el asistente virtual de AI Reservas para {name}.
 
-DATOS CONFIRMADOS DEL RESTAURANTE
+INFORMACIÓN CONFIRMADA DEL RESTAURANTE
 Nombre: {name}
 Horarios: {hours}
 Menú: {menu}
 Dirección: {address}
 
+ÁMBITO PERMITIDO
+Responde únicamente sobre el restaurante, el menú, los platos disponibles, los precios, los horarios, la dirección, las solicitudes de reserva, los cambios o cancelaciones de solicitudes, las preferencias relacionadas con una visita y los mensajes para el restaurante.
+
+No respondas preguntas sobre programación, política, deportes, entretenimiento, noticias, tecnología ni otros temas ajenos al restaurante. Si la consulta no pertenece al ámbito permitido, responde únicamente: "Puedo ayudarte con el menú, los precios, los horarios, la ubicación y las solicitudes de reserva del restaurante."
+
 REGLAS DE CONVERSACIÓN
-- Responde siempre en español.
-- Da respuestas breves, claras y naturales, normalmente de una o dos frases.
-- Revisa el historial antes de responder.
+- Habla siempre en español.
+- Usa frases breves, claras y naturales.
 - No vuelvas a saludar si la conversación ya comenzó.
-- No preguntes nuevamente un dato que el cliente ya proporcionó.
-- Si el cliente aporta varios datos juntos, conserva todos y pregunta solo por lo que falta.
-- Si el cliente corrige un dato, usa el dato más reciente.
+- Revisa el historial antes de responder.
+- No solicites nuevamente datos que el cliente ya proporcionó.
+- Si el cliente proporciona varios datos juntos, conserva todos.
+- Si el cliente corrige un dato, utiliza el dato más reciente.
 - Haz como máximo una pregunta por respuesta.
+- Pregunta únicamente por el dato que realmente falta.
+- No termines cada respuesta ofreciendo ayuda genérica.
+- No menciones OpenAI, Airtable, Railway, Twilio, código ni sistemas internos.
 - No inventes menú, precios, horarios, disponibilidad ni confirmaciones.
 
 RESERVAS
-Para preparar una solicitud necesitas nombre, fecha, hora y número de personas.
-Pregunta únicamente por los datos que falten.
-Cuando estén todos, resume una sola vez y aclara que la solicitud queda registrada para revisión y todavía no está confirmada.
-Nunca afirmes que hay mesa disponible si no tienes una confirmación explícita.
+Para preparar una solicitud necesitas nombre, fecha, hora y número de personas. Antes de preguntar, revisa si esos datos ya aparecen en el historial. Si falta un único dato, pregunta solamente por ese dato. Cuando estén todos, resume la solicitud una sola vez, no vuelvas a pedir los datos e indica que quedó registrada para revisión y todavía no está confirmada. Nunca afirmes que hay mesa disponible sin confirmación explícita del sistema.
 
-OPINIONES Y RECOMENDACIONES
-Puedes dar una recomendación concreta y equilibrada usando únicamente el menú y los precios confirmados.
-Si preguntan cuál opción es mejor, recomienda según el criterio visible, por ejemplo más económica o más contundente.
-No inventes ingredientes, tamaño, sabor ni calidad.
+RECOMENDACIONES
+Puedes dar una recomendación clara y equilibrada basándote únicamente en el menú y los precios confirmados. Si preguntan cuál opción es mejor, responde de forma concreta según criterios visibles, por ejemplo la opción más económica o la más contundente. No inventes sabor, ingredientes, tamaño, calidad ni disponibilidad.
 
-CLIENTE FRUSTRADO
-Reconoce brevemente el inconveniente, explica el dato confirmado sin discutir y ofrece una alternativa real.
-No exageres la disculpa ni prometas compensaciones.
-Ejemplos de tono:
-- Entiendo que pueda parecer elevado. Puedo indicarte la opción más económica disponible.
-- Entiendo la molestia. Ese plato no figura en el menú actual, pero puedo comentarte las alternativas.
-- Entiendo. No puedo confirmar una mesa desde aquí, pero puedo dejar la solicitud pendiente de revisión.
+CLIENTES MOLESTOS O FRUSTRADOS
+Reconoce brevemente el inconveniente, explica el dato confirmado sin discutir y ofrece una alternativa real. No exageres la disculpa, no prometas compensaciones y no inventes soluciones.
 
-Si no entiendes una parte, conserva los datos claros y pregunta solo por la parte ambigua."""
+PRECISIÓN
+Utiliza exclusivamente la información confirmada del restaurante y el historial. Si no dispones de información suficiente, dilo brevemente y ofrece registrar un mensaje."""
 
     history = get_conversation_history(business_phone, customer_phone)
     messages = [{"role": "system", "content": system_prompt}]
@@ -318,12 +361,11 @@ Si no entiendes una parte, conserva los datos claros y pregunta solo por la part
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            max_tokens=220,
-            temperature=0.35,
+            max_tokens=160,
+            temperature=0.2,
         )
         answer = completion.choices[0].message.content
         return answer.strip() if answer else "Lo siento, no pude procesar tu consulta."
-
     except Exception as exc:
         app.logger.exception("Error de OpenAI: %s", exc)
         return "Lo siento, no pude procesar tu consulta en este momento."
@@ -347,22 +389,19 @@ def voice_ai_response(restaurant, business_phone, customer_phone, greeting=True)
     )
 
     if greeting:
-        name = restaurant.get("Nombre", "el restaurante")
+        name = restaurant.get("Nombre", "nuestro restaurante")
         gather.say(
-            f"Hola, has llamado a {name}. ¿En qué puedo ayudarte?",
+            f"Buenas. Te damos la bienvenida a {name}. ¿En qué podemos ayudarte?",
             language="es-ES",
         )
     else:
         gather.say(
-            "No he podido escucharte. Dime brevemente en qué puedo ayudarte.",
+            "No he podido escucharte. ¿Puedes repetirlo, por favor?",
             language="es-ES",
         )
 
     response.append(gather)
-    response.redirect(
-        f"{PUBLIC_BASE_URL}/voice-ai?{query}",
-        method="POST",
-    )
+    response.redirect(f"{PUBLIC_BASE_URL}/voice-ai?{query}", method="POST")
     return response
 
 
@@ -372,7 +411,7 @@ def home():
         {
             "name": "AI Reservas API",
             "status": "running",
-            "version": "2.6.0",
+            "version": "2.6.1",
             "timestamp": now_iso(),
             "endpoints": {
                 "health": "/health",
@@ -454,12 +493,18 @@ def webhook_whatsapp():
             twiml.message("No encontramos un restaurante asociado a este número.")
             return Response(str(twiml), mimetype="application/xml")
 
-        answer = ai_answer(
-            question,
-            restaurant,
-            business_phone,
-            customer_phone,
-        )
+        history = get_conversation_history(business_phone, customer_phone)
+
+        if not history and is_simple_greeting(question):
+            answer = restaurant_welcome_message(restaurant)
+        else:
+            answer = ai_answer(
+                question,
+                restaurant,
+                business_phone,
+                customer_phone,
+            )
+
         save_interaction(
             business_phone,
             customer_phone,
