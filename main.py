@@ -83,12 +83,12 @@ def is_business_open(restaurant):
         return False
     timezone_name = str(restaurant.get("Zona_Horaria", DEFAULT_TIMEZONE)).strip() or DEFAULT_TIMEZONE
     current = datetime.now(ZoneInfo(timezone_name))
-    minute = current.hour * 60 + current.minute
+    current_minutes = current.hour * 60 + current.minute
     try:
         for item in schedule.split(","):
             start_text, end_text = item.strip().split("-", 1)
             start, end = parse_minutes(start_text), parse_minutes(end_text)
-            if (start <= end and start <= minute < end) or (start > end and (minute >= start or minute < end)):
+            if (start <= end and start <= current_minutes < end) or (start > end and (current_minutes >= start or current_minutes < end)):
                 return True
     except Exception:
         app.logger.exception("Horario_Recepcion inválido")
@@ -107,7 +107,7 @@ def save_conversation(business_phone, customer_phone, question, answer, status):
     return response.status_code in (200, 201)
 
 
-def get_history(business_phone, customer_phone):
+def conversation_history(business_phone, customer_phone):
     business, customer = normalize_phone(business_phone), normalize_phone(customer_phone)
     matches = []
     for record in list_records(CONVERSATIONS_TABLE):
@@ -136,14 +136,14 @@ def whatsapp_answer(question, restaurant, business_phone, customer_phone):
         "Para una reserva reúne nombre, fecha, hora, personas, teléfono y correo. Conserva lo dicho, "
         "pregunta solo por el siguiente dato faltante y no confirmes disponibilidad."
     )
-    messages = [{"role": "system", "content": prompt}, *get_history(business_phone, customer_phone), {"role": "user", "content": question}]
-    result = OpenAI(api_key=OPENAI_API_KEY).chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.25, max_tokens=180)
+    messages = [{"role": "system", "content": prompt}, *conversation_history(business_phone, customer_phone), {"role": "user", "content": question}]
+    result = OpenAI(api_key=OPENAI_API_KEY).chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.2, max_tokens=160)
     return result.choices[0].message.content.strip()
 
 
 @app.get("/")
 def home():
-    return jsonify(name="AI Reservas Core", status="running", version="3.1.0")
+    return jsonify(name="AI Reservas Core", status="running", version="3.2.0")
 
 
 @app.get("/health")
