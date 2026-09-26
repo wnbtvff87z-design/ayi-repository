@@ -1,243 +1,231 @@
-import hashlib
+import asyncio
 import hmac
+import json
 import os
-import re
 from datetime import datetime, timezone
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
+from xml.etree.ElementTree import Element, SubElement, tostring
 
-import requests
-from flask import Flask, Response, jsonify, request
-from openai import OpenAI
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.twiml.voice_response import VoiceResponse
+import httpx
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response
+from openai import AsyncOpenAI
+from twilio.request_validator import RequestValidator
 
-app = Flask(__name__)
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-TWILIO_PHONE = os.getenv("TWILIO_PHONE", "+19132703471").strip()
-RELAY_VOICE_URL = os.getenv("RELAY_VOICE_URL", "").strip()
-DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Madrid").strip()
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "12"))
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "").strip()
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
-RESTAURANTS_TABLE = os.getenv("AIRTABLE_RESTAURANTS_TABLE", "Restaurantes").strip()
-CONVERSATIONS_TABLE = os.getenv("AIRTABLE_CONVERSATIONS_TABLE", "Conversaciones").strip()
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def normalize_phone(value):
-    value = str(value or "").strip()
-    if value.lower().startswith("whatsapp:"):
-        value = value[len("whatsapp:"):]
-    digits = re.sub(r"\D", "", value)
-    return f"+{digits}" if digits else ""
+app = FastAPI()
+CORE = os.getenv('CORE_BASE_URL', '').rstrip('/')
+KEY = os.getenv('INTERNAL_API_KEY', '').strip()
+WS_URL = os.getenv('RELAY_WS_URL', '').strip()
+PUBLIC = os.getenv('RELAY_PUBLIC_URL', '').rstrip('/')
+AUTH = os.getenv('TWILIO_AUTH_TOKEN', '').strip()
+VERIFY = os.getenv('VERIFY_TWILIO_SIGNATURE', 'true').lower() == 'true'
+MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+TTS_PROVIDER = os.getenv('TTS_PROVIDER', 'ElevenLabs')
+VOICE = os.getenv('TTS_VOICE', 'bN1bDXgDIGX5lw0rtY2B')
+LANG = os.getenv('TTS_LANGUAGE', 'es-ES')
+TRANSCRIPTION_PROVIDER = os.getenv('TRANSCRIPTION_PROVIDER', 'Deepgram')
+SPEECH_MODEL = os.getenv('SPEECH_MODEL', 'nova-3-general')
+SPEECH_TIMEOUT = max(600, min(5000, int(os.getenv('SPEECH_TIMEOUT_MS', '650'))))
+INTERRUPT = os.getenv('INTERRUPT_SENSITIVITY', 'medium')
+AIRTABLE_TOKEN = os.getenv('AIRTABLE_TOKEN', '')
+AIRTABLE_BASE_ID = os.getenv('AIRTABLE_BASE_ID', '')
+RESERVATIONS = os.getenv('AIRTABLE_RESERVATIONS_TABLE', 'Reservas')
+MODE = os.getenv('TENANT_LOOKUP_MODE', 'legacy').strip().lower()
+AI = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY', '')) if os.getenv('OPENAI_API_KEY') else None
 
 
-def airtable_url(table):
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(table, safe='')}"
+def norm(v):
+    s = ''.join(c for c in str(v or '') if c.isdigit())
+    return '+' + s if s else ''
 
 
-def airtable_headers():
-    return {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
+def twiml(root):
+    return Response(b'<?xml version="1.0" encoding="UTF-8"?>' + tostring(root, encoding='utf-8'), media_type='application/xml')
 
 
-def list_records(table, limit=500):
-    records, offset = [], None
-    while len(records) < limit:
-        params = {"pageSize": 100}
-        if offset:
-            params["offset"] = offset
-        response = requests.get(airtable_url(table), headers=airtable_headers(), params=params, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        records.extend(data.get("records", []))
-        offset = data.get("offset")
-        if not offset:
-            break
-    return records[:limit]
+async def business_for(phone):
+    if not CORE or not KEY:
+        raise RuntimeError('Core no configurado')
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(CORE + '/internal/restaurant', json={'phone': norm(phone), 'channel': 'Voice'}, headers={'X-Internal-API-Key': KEY})
+        r.raise_for_status()
+        return r.json()['restaurant']
 
 
-def get_restaurant(phone):
-    target = normalize_phone(phone)
-    for record in list_records(RESTAURANTS_TABLE):
-        fields = record.get("fields", {})
-        candidates = [fields.get("Twilio_Phone"), fields.get("Voice_Phone"), fields.get("WhatsApp_Phone"), fields.get("Teléfono"), fields.get("Telefono")]
-        if target and any(normalize_phone(item) == target for item in candidates if item):
-            return fields
-    return None
+@app.get('/health')
+async def health():
+    return JSONResponse({'status': 'OK', 'relay_ws_configured': bool(WS_URL), 'core_configured': bool(CORE and KEY), 'tts_provider': TTS_PROVIDER, 'speech_timeout_ms': SPEECH_TIMEOUT, 'tenant_mode': MODE, 'signature_verification': VERIFY})
 
 
-def parse_minutes(value):
-    parts = value.strip().split(":", 1)
-    return int(parts[0]) * 60 + (int(parts[1]) if len(parts) == 2 else 0)
+@app.api_route('/voice', methods=['GET', 'POST'])
+async def voice(request: Request):
+    form = await request.form() if request.method == 'POST' else request.query_params
+    root = Element('Response')
+    try:
+        b = await business_for(form.get('To'))
+        if not WS_URL or not PUBLIC or not b.get('greeting'):
+            raise RuntimeError('Configuracion de voz incompleta')
+        connect = SubElement(root, 'Connect', {'action': PUBLIC + '/relay-ended'})
+        SubElement(connect, 'ConversationRelay', {'url': WS_URL, 'welcomeGreeting': str(b['greeting']),
+            'welcomeGreetingInterruptible': 'speech', 'language': LANG, 'ttsProvider': TTS_PROVIDER,
+            'voice': str(b.get('voice') or VOICE), 'transcriptionProvider': TRANSCRIPTION_PROVIDER,
+            'speechModel': SPEECH_MODEL, 'interruptible': 'speech', 'interruptSensitivity': INTERRUPT,
+            'speechTimeout': str(SPEECH_TIMEOUT)})
+    except Exception:
+        # Nunca saludar como otro negocio si la configuracion no existe.
+        app.logger.exception('No se pudo iniciar relay')
+        SubElement(root, 'Say', {'language': 'es-ES'}).text = 'No puedo atender esta llamada en este momento.'
+    SubElement(root, 'Hangup')
+    return twiml(root)
 
 
-def is_business_open(restaurant):
-    schedule = str(restaurant.get("Horario_Recepcion", "")).strip()
-    if not schedule:
+@app.api_route('/relay-ended', methods=['GET', 'POST'])
+async def relay_ended():
+    root = Element('Response')
+    SubElement(root, 'Hangup')
+    return twiml(root)
+
+
+def valid_signature(ws):
+    if not VERIFY:
+        return True
+    sig = ws.headers.get('x-twilio-signature', '')
+    # Esta validacion debe probarse con una llamada real tras configurar el URL publico exacto.
+    return bool(sig and AUTH and WS_URL and RequestValidator(AUTH).validate(WS_URL, {}, sig))
+
+
+async def say(ws, text):
+    await ws.send_text(json.dumps({'type': 'text', 'token': text, 'last': True, 'interruptible': True, 'preemptible': True, 'lang': LANG}, ensure_ascii=False))
+
+
+async def store_turn(session, user, reply):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(CORE + '/internal/conversations', headers={'X-Internal-API-Key': KEY}, json={
+                'business_phone': session['to'], 'business_id': session['business']['business_id'],
+                'customer_phone': session['from'], 'question': user, 'answer': reply})
+            r.raise_for_status()
+    except Exception:
+        app.logger.exception('No se pudo guardar conversacion')
+
+
+def reservation_ready(state):
+    fields = ('customer_name', 'reservation_date', 'reservation_time', 'party_size', 'customer_phone', 'customer_email')
+    return all(state.get(f) not in ('', None) for f in fields)
+
+
+async def store_reservation(session):
+    if not AIRTABLE_TOKEN or not AIRTABLE_BASE_ID:
         return False
-    timezone_name = str(restaurant.get("Zona_Horaria", DEFAULT_TIMEZONE)).strip() or DEFAULT_TIMEZONE
-    current = datetime.now(ZoneInfo(timezone_name))
-    current_minutes = current.hour * 60 + current.minute
-    try:
-        for item in schedule.split(","):
-            start_text, end_text = item.strip().split("-", 1)
-            start, end = parse_minutes(start_text), parse_minutes(end_text)
-            if (start <= end and start <= current_minutes < end) or (start > end and (current_minutes >= start or current_minutes < end)):
-                return True
-    except Exception:
-        app.logger.exception("Horario_Recepcion inválido")
-    return False
+    s, b = session['reservation'], session['business']
+    fields = {'Restaurant_Phone': norm(session['to']), 'Customer_Name': str(s['customer_name']),
+        'Customer_Phone': norm(s['customer_phone']), 'Customer_Email': str(s['customer_email']),
+        'Reservation_Date': str(s['reservation_date']), 'Reservation_Time': str(s['reservation_time']),
+        'Party_Size': int(s['party_size']), 'Notes': str(s.get('notes') or ''),
+        'Status': 'Pendiente de confirmación', 'Call_ID': session['call_sid'],
+        'Created_At': datetime.now(timezone.utc).isoformat()}
+    if MODE == 'new':
+        fields['Business_ID'] = b['business_id']
+    endpoint = 'https://api.airtable.com/v0/' + quote(AIRTABLE_BASE_ID, safe='') + '/' + quote(RESERVATIONS, safe='')
+    async with httpx.AsyncClient(timeout=10) as client:
+        # Dedupe para reintentos de la misma llamada; no sustituye una transaccion atomica.
+        formula = '{Call_ID}="' + session['call_sid'].replace('"', '\\"') + '"'
+        previous = await client.get(endpoint, headers={'Authorization': 'Bearer ' + AIRTABLE_TOKEN}, params={'filterByFormula': formula, 'maxRecords': 1})
+        previous.raise_for_status()
+        if previous.json().get('records'):
+            return True
+        response = await client.post(endpoint, headers={'Authorization': 'Bearer ' + AIRTABLE_TOKEN, 'Content-Type': 'application/json'}, json={'records': [{'fields': fields}]})
+        response.raise_for_status()
+        return True
 
 
-def authorized_internal_request():
-    configured = str(os.getenv("INTERNAL_API_KEY", "")).strip()
-    received = str(request.headers.get("X-Internal-API-Key", "")).strip()
-    return bool(configured and received and hmac.compare_digest(configured, received))
-
-
-def save_conversation(business_phone, customer_phone, question, answer, status):
-    payload = {"records": [{"fields": {"Twilio_Phone": normalize_phone(business_phone), "Customer_Phone": normalize_phone(customer_phone), "Question": str(question), "Answer": str(answer), "Timestamp": now_iso(), "Status": status}}]}
-    response = requests.post(airtable_url(CONVERSATIONS_TABLE), headers=airtable_headers(), json=payload, timeout=20)
-    return response.status_code in (200, 201)
-
-
-def conversation_history(business_phone, customer_phone):
-    business, customer = normalize_phone(business_phone), normalize_phone(customer_phone)
-    matches = []
-    for record in list_records(CONVERSATIONS_TABLE):
-        fields = record.get("fields", {})
-        if normalize_phone(fields.get("Twilio_Phone")) == business and normalize_phone(fields.get("Customer_Phone")) == customer:
-            matches.append(fields)
-    matches.sort(key=lambda item: str(item.get("Timestamp", "")))
-    messages = []
-    for item in matches[-HISTORY_LIMIT:]:
-        if item.get("Question"):
-            messages.append({"role": "user", "content": str(item["Question"])})
-        if item.get("Answer"):
-            messages.append({"role": "assistant", "content": str(item["Answer"])})
-    return messages
-
-
-def whatsapp_answer(question, restaurant, business_phone, customer_phone):
-    if not OPENAI_API_KEY:
-        return "Lo siento, el servicio no está disponible en este momento."
-    name = restaurant.get("Nombre", "La Parrilla")
-    prompt = (
-        f"Eres la recepción escrita de {name}. Responde en español natural, cordial y breve. "
-        "Solo trata restaurante, menú, precios, horarios, ubicación, reservas y mensajes. "
-        f"Horarios: {restaurant.get('Horarios', '')}. Menú: {restaurant.get('Menu', '')}. "
-        f"Dirección: {restaurant.get('Dirección') or restaurant.get('Direccion') or ''}. "
-        "Para una reserva reúne nombre, fecha, hora, personas, teléfono y correo. Conserva lo dicho, "
-        "pregunta solo por el siguiente dato faltante y no confirmes disponibilidad."
-    )
-    messages = [{"role": "system", "content": prompt}, *conversation_history(business_phone, customer_phone), {"role": "user", "content": question}]
-    result = OpenAI(api_key=OPENAI_API_KEY).chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.2, max_tokens=160)
-    return result.choices[0].message.content.strip()
-
-
-@app.get("/")
-def home():
-    return jsonify(name="AI Reservas Core", status="running", version="3.2.0")
-
-
-@app.get("/health")
-def health():
-    return jsonify(status="OK", relay_enabled=bool(RELAY_VOICE_URL), twilio_phone=TWILIO_PHONE, timestamp=now_iso())
-
-
-@app.get("/internal-auth-debug")
-def internal_auth_debug():
-    key = str(os.getenv("INTERNAL_API_KEY", "")).strip()
-    digest = hashlib.sha256(key.encode()).hexdigest()[:12] if key else ""
-    return jsonify(service=os.getenv("RAILWAY_SERVICE_NAME", ""), deployment_id=os.getenv("RAILWAY_DEPLOYMENT_ID", ""), variable_present=bool(key), variable_length=len(key), variable_hash=digest, expected_header="X-Internal-API-Key")
-
-
-@app.get("/test-airtable")
-def test_airtable():
-    restaurant = get_restaurant(TWILIO_PHONE)
-    if not restaurant:
-        return jsonify(status="error", message="Restaurant not found"), 404
-    return jsonify(status="success", business_open=is_business_open(restaurant), restaurant=restaurant)
-
-
-@app.route("/webhook-voice", methods=["GET", "POST"])
-def webhook_voice():
-    response = VoiceResponse()
-    business_phone = normalize_phone(request.form.get("To", TWILIO_PHONE))
-    restaurant = get_restaurant(business_phone)
-    if not restaurant:
-        response.say("No he podido identificar el restaurante asociado a esta llamada.", language="es-ES")
-        response.hangup()
+async def model_turn(session, user):
+    b = session['business']
+    style = ('Habla en español con calidez, naturalidad y puntuación apropiada para voz. '
+        'Usa frases breves, comas para pausas naturales y preguntas claras. No repitas muletillas. '
+        'Si alguien hace una broma ligera, responde brevemente y vuelve al tema. '
+        'Si está frustrado, reconoce el problema sin exagerar y ofrece solo alternativas verificadas. '
+        'Si no entendiste un nombre o dato, pregunta únicamente por ese dato. '
+        'No finjas ser una persona si te lo preguntan directamente. ')
+    scope = ('Negocio: ' + b['name'] + '. Sector: ' + b['sector'] + '. Horarios: ' + b['hours'] + '. '
+        'Menú: ' + b['menu'] + '. Dirección: ' + b['address'] + '. '
+        'Nunca inventes disponibilidad ni coberturas de seguros. ')
+    if b['sector'] == 'restaurante' and b['allow_reservations']:
+        scope += ('Puedes recoger solicitudes de reserva, no confirmarlas. Pide nombre, fecha, hora, personas, teléfono y correo, '
+                  'solo los datos que falten. Lee un resumen y pregunta si es correcto. '
+                  'Devuelve confirmed=true solo cuando la persona confirma claramente el resumen del turno anterior. ')
     else:
-        reception = normalize_phone(restaurant.get("Numero_Recepcion"))
-        if is_business_open(restaurant) and reception:
-            dial = response.dial(action="/voice-dial-result", method="POST", timeout=20, answer_on_bridge=True)
-            dial.number(reception)
-        elif RELAY_VOICE_URL:
-            response.redirect(RELAY_VOICE_URL, method="POST")
-        else:
-            response.say("La atención automática no está configurada en este momento.", language="es-ES")
-            response.hangup()
-    return Response(str(response), mimetype="application/xml")
+        scope += ('No registres reservas de restaurante. Para solicitudes de otro sector, ofrece revisión humana. ')
+    scope += ('No reveles datos de pólizas ni respondas sobre coberturas personales; no hay verificación de identidad ni búsqueda documental implementadas. ')
+    scope += ('No cierres por un simple gracias; should_end_call solo cuando el contexto indique despedida clara. ')
+    scope += ('Estado actual: ' + json.dumps(session['reservation'], ensure_ascii=False) + '. '
+              'Devuelve JSON válido: reply, intent, reservation, confirmed, should_end_call. '
+              'reservation puede incluir customer_name, reservation_date, reservation_time, party_size, customer_phone, customer_email, notes.')
+    if AI is None:
+        raise RuntimeError('OpenAI no configurado')
+    messages = [{'role': 'system', 'content': style + scope}, *session['history'][-12:], {'role': 'user', 'content': user}]
+    result = await AI.chat.completions.create(model=MODEL, messages=messages, response_format={'type': 'json_object'}, max_tokens=int(os.getenv('OPENAI_MAX_TOKENS', '300')), temperature=float(os.getenv('OPENAI_TEMPERATURE', '0.35')))
+    return json.loads(result.choices[0].message.content or '{}')
 
 
-@app.post("/voice-dial-result")
-def voice_dial_result():
-    response = VoiceResponse()
-    if request.form.get("DialCallStatus", "").lower() == "completed":
-        response.hangup()
-    elif RELAY_VOICE_URL:
-        response.redirect(RELAY_VOICE_URL, method="POST")
-    else:
-        response.say("Recepción no está disponible en este momento.", language="es-ES")
-        response.hangup()
-    return Response(str(response), mimetype="application/xml")
-
-
-@app.route("/webhook-whatsapp", methods=["GET", "POST"])
-def webhook_whatsapp():
-    if request.method == "GET":
-        return jsonify(status="OK", route="/webhook-whatsapp")
-    twiml = MessagingResponse()
-    business = normalize_phone(request.form.get("To", TWILIO_PHONE))
-    customer = normalize_phone(request.form.get("From", ""))
-    question = request.form.get("Body", "").strip()
+@app.websocket('/ws')
+async def ws_endpoint(ws: WebSocket):
+    if not valid_signature(ws):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    session = {'call_sid': '', 'from': '', 'to': '', 'business': None, 'reservation': {}, 'history': [], 'saved': False, 'awaiting_confirmation': False}
     try:
-        restaurant = get_restaurant(business)
-        answer = whatsapp_answer(question, restaurant, business, customer) if restaurant else "No encontramos un restaurante asociado a este número."
-        save_conversation(business, customer, question, answer, "Answered through WhatsApp")
-        twiml.message(answer)
+        while True:
+            message = json.loads(await ws.receive_text())
+            if message.get('type') == 'setup':
+                session['call_sid'] = message.get('callSid', '')
+                session['from'] = message.get('from', '')
+                session['to'] = norm(message.get('to'))
+                session['business'] = await business_for(session['to'])
+                continue
+            if message.get('type') != 'prompt' or not message.get('last', True):
+                continue
+            user = str(message.get('voicePrompt') or '').strip()
+            if not user or not session['business']:
+                continue
+            result = await model_turn(session, user)
+            b = session['business']
+            reservation = result.get('reservation') or {}
+            if not isinstance(reservation, dict):
+                reservation = {}
+            for k in ('customer_name', 'reservation_date', 'reservation_time', 'party_size', 'customer_phone', 'customer_email', 'notes'):
+                if reservation.get(k) not in ('', None):
+                    session['reservation'][k] = reservation[k]
+            reply = str(result.get('reply') or 'Perdona, ¿podés repetírmelo?').strip()
+            # Solo se acepta confirmacion en un turno posterior al resumen.
+            can_save = (b['sector'] == 'restaurante' and b['allow_reservations'] and session['awaiting_confirmation'] and result.get('confirmed') is True and reservation_ready(session['reservation']) and not session['saved'])
+            if can_save:
+                try:
+                    session['saved'] = await store_reservation(session)
+                    if session['saved']:
+                        session['awaiting_confirmation'] = False
+                    reply = 'Listo, registré tu solicitud. Queda pendiente de confirmación por el restaurante.'
+                except Exception:
+                    app.logger.exception('Error guardando reserva')
+                    reply = 'Perdona, no pude registrar la solicitud. No está confirmada; voy a dejar constancia para revisión.'
+            elif b['sector'] == 'restaurante' and b['allow_reservations'] and reservation_ready(session['reservation']) and not session['saved']:
+                if not session['awaiting_confirmation']:
+                    s = session['reservation']
+                    reply = ('Repaso: ' + str(s['reservation_date']) + ' a las ' + str(s['reservation_time']) + ', para ' + str(s['party_size']) + ' personas, a nombre de ' + str(s['customer_name']) + '. Teléfono ' + str(s['customer_phone']) + ' y correo ' + str(s['customer_email']) + '. ¿Está todo correcto?')
+                    session['awaiting_confirmation'] = True
+            await say(ws, reply)
+            session['history'].extend([{'role': 'user', 'content': user}, {'role': 'assistant', 'content': reply}])
+            asyncio.create_task(store_turn(session.copy(), user, reply))
+            if result.get('should_end_call') is True and not session['awaiting_confirmation']:
+                await ws.send_text(json.dumps({'type': 'end', 'handoffData': json.dumps({'reason': 'conversation-complete'})}))
+                break
+    except WebSocketDisconnect:
+        pass
     except Exception:
-        app.logger.exception("Error procesando WhatsApp")
-        twiml.message("Lo siento, ocurrió un error temporal. Inténtalo nuevamente.")
-    return Response(str(twiml), mimetype="application/xml")
-
-
-@app.post("/internal/restaurant")
-def internal_restaurant():
-    if not authorized_internal_request():
-        return jsonify(success=False, message="Unauthorized"), 401
-    data = request.get_json(silent=True) or {}
-    restaurant = get_restaurant(data.get("phone", ""))
-    if not restaurant:
-        return jsonify(success=False, message="Restaurant not found"), 404
-    return jsonify(success=True, restaurant={"name": restaurant.get("Nombre", "La Parrilla"), "phone": normalize_phone(data.get("phone")), "hours": restaurant.get("Horarios", ""), "menu": restaurant.get("Menu", ""), "address": restaurant.get("Dirección") or restaurant.get("Direccion") or ""})
-
-
-@app.post("/internal/conversations")
-def internal_conversations():
-    if not authorized_internal_request():
-        return jsonify(success=False, message="Unauthorized"), 401
-    data = request.get_json(silent=True) or {}
-    ok = save_conversation(data.get("business_phone"), data.get("customer_phone"), data.get("question"), data.get("answer"), "Answered through ConversationRelay")
-    return jsonify(success=ok), (200 if ok else 500)
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
+        app.logger.exception('Error de relay')
+        try:
+            await say(ws, 'Perdona, ocurrió un problema. No puedo continuar esta llamada.')
+            await ws.send_text(json.dumps({'type': 'end', 'handoffData': json.dumps({'reason': 'error'})}))
+        except Exception:
+            pass

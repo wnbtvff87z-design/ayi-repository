@@ -1,0 +1,10 @@
+CLIENTE -> numero publico del negocio -> desvio opcional -> numero tecnico exclusivo -> Twilio
+                                                                         |
+                                                                         v
+                                                              web /webhook-voice
+                                                              | Numeros -> Negocios
+                                                              + abierto -> recepcion
+                                                              + cerrado/no responde -> relay /voice -> /ws -> OpenAI + ElevenLabs
+                                                                                           | reserva pendiente en Airtable
+WhatsApp sender del negocio -> web /webhook-whatsapp -> Negocios -> OpenAI
+GitHub: web/ relay/ prompts/ tests/ ; Railway: DOS servicios, no cuatro.
