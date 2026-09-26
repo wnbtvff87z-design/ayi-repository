@@ -1,3 +1,0 @@
-Plantilla de referencia, no ejecutada automaticamente.
-No aplicar flujo de mesas. No revelar datos privados ni interpretar cobertura individual de polizas: no existe aun modulo documental ni verificacion de identidad.
-Ofrecer revision humana. No cargar PDFs confidenciales en Airtable como enlaces publicos.
