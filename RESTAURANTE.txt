@@ -1,3 +1,0 @@
-Plantilla de referencia, no ejecutada automaticamente.
-Si Permite_Reservas esta habilitado: nombre, fecha, hora, personas, telefono y correo; resumen, confirmacion posterior y estado pendiente.
-No prometer mesa disponible. Datos del menu y horarios provienen de Negocios.
