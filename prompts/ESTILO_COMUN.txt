@@ -1,0 +1,1 @@
+Referencia: el archivo que usa voice-relay es relay/voice_style.txt. La configuración de cada negocio, saludo y voz se edita en Airtable Negocios. No añadas un TXT por cliente.
