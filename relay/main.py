@@ -75,7 +75,7 @@ async def model_turn(s,user):
       'updates incluye SOLAMENTE datos nuevos o correcciones explícitas de ESTE turno, nunca repitas los anteriores. Campos: customer_name,reservation_date (AAAA-MM-DD),reservation_time (HH:MM),party_size,customer_phone,customer_email,code,notes. '
       'No saludes otra vez. No repitas la ficha completa. Para crear reúne nombre, fecha, hora, personas, teléfono y correo. Para modificar/cancelar solicita código de reserva y correo asociado. '
       'Si no entendiste algo pide solo ese dato. No inventes disponibilidad. decision approve SOLO si autoriza inequívocamente la operación pendiente y NO corrige nada en este turno. '
-      'Nunca afirmes que la operación se completó; el servidor lo dirá tras guardar. Si negocio no es restaurante, no ofrezcas reservas.')
+      'No propongas una fecha u hora concreta sin verificación del servidor. Si falta día u hora, pregunta qué día u hora prefiere. Nunca afirmes que la operación se completó; el servidor lo dirá tras guardar. Si negocio no es restaurante, no ofrezcas reservas.')
     r=await ai.chat.completions.create(model=MODEL,messages=[{'role':'system','content':instructions},*s['history'][-10:],{'role':'user','content':user}],response_format={'type':'json_object'},max_tokens=MAX,temperature=TEMP)
     return json.loads(r.choices[0].message.content)
 async def booking_call(s,op,values):
@@ -83,7 +83,20 @@ async def booking_call(s,op,values):
     async with httpx.AsyncClient(timeout=20) as h:
         r=await h.post(CORE+'/internal/booking',headers={'X-Internal-API-Key':KEY},json=data)
         if r.status_code!=200:return False,(r.json().get('message') if r.headers.get('content-type','').startswith('application/json') else 'No pude completar la operación')
-        return True,r.json()
+        out=r.json()
+        return bool(out.get('success')),out
+async def availability_call(s,values):
+    data={'business_id':s['business']['business_id'],'business_phone':s['to'],'channel':'Voice',
+          'reservation_date':values['reservation_date'],'reservation_time':values['reservation_time'],'party_size':values['party_size']}
+    try:
+        async with httpx.AsyncClient(timeout=20) as h:
+            r=await h.post(CORE+'/internal/availability',headers={'X-Internal-API-Key':KEY},json=data)
+            out=r.json()
+            return (r.status_code==200 and out.get('available') is True),out.get('message','No pude comprobar la disponibilidad.')
+    except (httpx.HTTPError,ValueError):
+        log.exception('Availability check failed')
+        return False,'Ahora no puedo comprobar la disponibilidad. No voy a confirmar la reserva.'
+
 async def turn(ws,s,user):
     b=s['business'];v=s['values'];result=await model_turn(s,user)
     updates=result.get('updates') or {};updates=updates if isinstance(updates,dict) else {}
@@ -103,10 +116,13 @@ async def turn(ws,s,user):
             ok,out=await booking_call(s,op,v)
             if ok:
                 code=out.get('code','')
-                reply=(f"Listo, {str(v['customer_name']).split()[0]}. Tu reserva de prueba quedó confirmada. Tu código es {code}." if op=='create' else
-                       f"Listo, cambié tu reserva de prueba. Conservás el código {code}." if op=='modify' else 'Listo, cancelé tu reserva de prueba.')
+                reply=(f'Reserva registrada. Tu código es {code}.' if op=='create' else f'Cambio registrado. Conservás el código {code}.' if op=='modify' else 'Cancelación registrada.')
+                if not out.get('airtable_synced'):reply+=' Aviso: la copia en Airtable está pendiente; conservá el código.'
                 s['phase']='done';s['intent']=None;v.clear();s['operation_seq']+=1
-            else:reply='No pude completar la operación. '+str(out)
+            else:
+                reply=str(out) if isinstance(out,str) else str(out.get('message') or 'No pude completar la operación.')
+                s['phase']='collecting'
+                if 'ya pasaron' in reply:v.pop('reservation_date',None);v.pop('reservation_time',None)
     elif was_awaiting and result.get('decision')=='reject' and not changed:
         s['phase']='collecting';reply='Claro. ¿Qué dato querés cambiar?'
     elif op=='create' and intent in ('social','question') and not changed:
@@ -115,7 +131,13 @@ async def turn(ws,s,user):
         missing=next((k for k in ('customer_name','reservation_date','reservation_time','party_size','customer_phone','customer_email') if not v.get(k)),None)
         prompts={'customer_name':'¿A nombre de quién la hago?','reservation_date':'¿Para qué día?','reservation_time':'¿A qué hora?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono de contacto dejamos?','customer_email':'¿Qué correo usamos para la reserva?'}
         if missing:reply=prompts[missing]
-        elif s['phase']!='awaiting':s['phase']='awaiting';reply=f"Bien, {str(v['customer_name']).split()[0]}. ¿Confirmás que haga la reserva a tu nombre?"
+        elif s['phase']!='awaiting':
+            available,message=await availability_call(s,v)
+            if available:
+                s['phase']='awaiting';reply=f"Hay disponibilidad para el {v['reservation_date']} a las {v['reservation_time']}. ¿Confirmás que haga la reserva a tu nombre?"
+            else:
+                s['phase']='collecting';reply=message
+                if 'ya pasaron' in reply:v.pop('reservation_date',None);v.pop('reservation_time',None)
     elif op in ('modify','cancel'):
         if not v.get('code'):reply='¿Me decís el código de la reserva?'
         elif not v.get('customer_email'):reply='¿Cuál es el correo asociado?'
