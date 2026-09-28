@@ -5,10 +5,13 @@ from openai import OpenAI
 from booking import BookingError,availability,options,create,modify,cancel
 from temporal import norm,relative_day,explicit_time,yes,no
 log=logging.getLogger(__name__)
+try:
+ with open(os.path.join(os.path.dirname(__file__),'voice_style.txt'),encoding='utf-8') as f:VOICE_STYLE=f.read().strip()
+except OSError:VOICE_STYLE='' 
 NEEDED=('customer_name','reservation_date','reservation_time','party_size','customer_phone','customer_email')
 PROMPTS={'customer_name':'¿A nombre de quién la hago?','reservation_date':'¿Para qué día?','reservation_time':'¿A qué hora?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono de contacto dejamos?','customer_email':'¿Qué correo usamos?'}
 ALLOWED=set(NEEDED)|{'code','notes'}
-def classify(b,state,history,text):
+def classify(b,state,history,text,channel='WhatsApp'):
  key=os.getenv('OPENAI_API_KEY','')
  if not key:raise BookingError('El asistente no está configurado')
  now=datetime.now(ZoneInfo(b.get('timezone') or 'Europe/Madrid')).isoformat()
@@ -27,7 +30,7 @@ def offer(items,day):
  return 'Puedo ofrecer '+', '.join(('el '+s['date']+' a las '+s['time']) if s['date']!=day else ('a las '+s['time']) for s in items[:3])+'. ¿Cuál preferís?'
 def process(b,state,history,text,channel,external_id,customer):
  state=dict(state or {});v=dict(state.get('values') or {});phase=state.get('phase','collecting');op=state.get('intent')
- result={'intent':op,'updates':{},'decision':'approve','reply':''} if phase=='awaiting' and op and yes(text) else classify(b,state,history,text)
+ result={'intent':op,'updates':{},'decision':'approve','reply':''} if phase=='awaiting' and op and yes(text) else classify(b,state,history,text,channel)
  intent=result.get('intent','question');updates=result.get('updates') or {};updates=updates if isinstance(updates,dict) else {}
  updates={k:x for k,x in updates.items() if k in ALLOWED and x not in (None,'')}
  tz=b.get('timezone') or 'Europe/Madrid';d=relative_day(text,tz);t=explicit_time(text)
