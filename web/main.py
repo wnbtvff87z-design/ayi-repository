@@ -1,6 +1,4 @@
---- orig_main.py	2026-09-28 18:26:32.700664109 +0000
-+++ out/web/main.py	2026-09-28 18:26:42.476967241 +0000
-@@ -1,7 +1,7 @@
+
  import hmac,json,logging,os,re
  from datetime import timezone
  from datetime import datetime
