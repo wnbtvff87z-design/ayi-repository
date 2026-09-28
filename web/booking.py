@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS booking_slots(business_id text NOT NULL,slot_id text 
 CREATE TABLE IF NOT EXISTS booking_reservations(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,business_id text NOT NULL,slot_id text NOT NULL,request_id text NOT NULL,code text UNIQUE NOT NULL,name text NOT NULL,phone text NOT NULL,email text NOT NULL,party_size integer NOT NULL,status text NOT NULL DEFAULT 'Confirmada',airtable_id text,channel text NOT NULL DEFAULT 'Voice',business_phone text NOT NULL DEFAULT '',created_at timestamptz DEFAULT now(),UNIQUE(business_id,request_id));
 ALTER TABLE booking_reservations ADD COLUMN IF NOT EXISTS channel text NOT NULL DEFAULT 'Voice';
 ALTER TABLE booking_reservations ADD COLUMN IF NOT EXISTS business_phone text NOT NULL DEFAULT '';
+ALTER TABLE booking_reservations ADD COLUMN IF NOT EXISTS airtable_pending boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS customer_sessions(business_id text NOT NULL,channel text NOT NULL,customer_phone text NOT NULL,state jsonb NOT NULL DEFAULT '{}'::jsonb,updated_at timestamptz DEFAULT now(),PRIMARY KEY(business_id,channel,customer_phone));
 CREATE TABLE IF NOT EXISTS conversation_turns(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,business_id text NOT NULL,channel text NOT NULL,customer_phone text NOT NULL,external_id text NOT NULL,user_text text NOT NULL,assistant_text text NOT NULL,created_at timestamptz DEFAULT now(),UNIQUE(business_id,channel,external_id));
 CREATE INDEX IF NOT EXISTS booking_slot_status_idx ON booking_reservations(business_id,slot_id,status);
@@ -151,10 +152,14 @@ def mirror(row,slot_rec=None):
             fields['Created_At']=datetime.now(timezone.utc).isoformat()
             r=requests.post(url(table),headers=headers(),json={'fields':fields},timeout=10)
         r.raise_for_status();rec=rec or r.json()['id']
-        with db() as c:c.execute('UPDATE booking_reservations SET airtable_id=%s WHERE id=%s',(rec,row['id']))
+        with db() as c:c.execute('UPDATE booking_reservations SET airtable_id=%s,airtable_pending=false WHERE id=%s',(rec,row['id']))
         return True
     except Exception:
-        log.exception('Airtable mirror failed; PostgreSQL remains authoritative');return False
+        log.exception('Airtable mirror failed; PostgreSQL remains authoritative')
+        try:
+            with db() as c:c.execute('UPDATE booking_reservations SET airtable_pending=true WHERE id=%s',(row['id'],))
+        except Exception:log.exception('Could not mark Airtable mirror pending')
+        return False
 def create(data,b):
     enabled(b);n=party(data.get('party_size'));name=str(data.get('customer_name') or '').strip();email=str(data.get('customer_email') or '').strip();phone=str(data.get('customer_phone') or '').strip()
     if not name or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',email) or len(re.sub(r'\D','',phone))<9:raise BookingError('Faltan nombre, teléfono o correo válidos')
@@ -164,7 +169,7 @@ def create(data,b):
     with db() as c:
         old=c.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND request_id=%s',(bid,req)).fetchone()
         if old:
-            row=row_for(c,bid,old['id']);return {'success':True,'code':row['code'],'airtable_synced':bool(row['airtable_id'])}
+            row=row_for(c,bid,old['id']);return {'success':True,'code':row['code'],'airtable_synced':bool(row['airtable_id']),'already_exists':True}
     d=str(data.get('reservation_date') or '');t=str(data.get('reservation_time') or '')
     if not future(d,t,b.get('timezone') or 'Europe/Madrid'):raise BookingError('Esa fecha y hora ya pasaron')
     s=next((x for x in slots(b,d,1) if x['date']==d and x['time']==t),None)
@@ -174,12 +179,21 @@ def create(data,b):
         lock_slot(c,bid,s)
         old=c.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND request_id=%s',(bid,req)).fetchone()
         if old:
-            row=row_for(c,bid,old['id']);return {'success':True,'code':row['code'],'airtable_synced':bool(row['airtable_id'])}
+            row=row_for(c,bid,old['id']);return {'success':True,'code':row['code'],'airtable_synced':bool(row['airtable_id']),'already_exists':True}
         if occupied(c,b,s,existing)+n>s['capacity']:raise BookingError('Esa hora se ocupó; consultá alternativas')
         code='R-'+secrets.token_hex(5).upper()
         pk=c.execute('INSERT INTO booking_reservations(business_id,slot_id,request_id,code,name,phone,email,party_size,channel,business_phone) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',(bid,s['id'],req,code,name,phone,email,n,data.get('channel','Voice'),b['phone'])).fetchone()['id']
         row=row_for(c,bid,pk)
     return {'success':True,'code':code,'airtable_synced':mirror(row,s['rec'])}
+def reconcile_pending(limit=25):
+ init_schema()
+ with db() as c:
+  rows=c.execute('SELECT id,business_id FROM booking_reservations WHERE airtable_id IS NULL OR airtable_pending=true ORDER BY id LIMIT %s',(min(max(int(limit),1),100),)).fetchall()
+ results=[]
+ for item in rows:
+  with db() as c:row=row_for(c,item['business_id'],item['id'])
+  results.append({'id':item['id'],'synced':mirror(row)})
+ return results
 def identify(b,code,email):
     init_schema()
     with db() as c:r=c.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND code=%s AND lower(email)=lower(%s)',(b['business_id'],str(code or '').upper().strip(),str(email or '').strip())).fetchone()
