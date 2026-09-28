@@ -24,19 +24,25 @@ def init_schema():
         for statement in SCHEMA.split(";"):
             if statement.strip(): conn.execute(statement)
 def at_url(table,record=None):
-    base='https://api.airtable.com/v0/'+quote(os.environ['AIRTABLE_BASE_ID'],safe='')+'/'+quote(table,safe='')
+    base_id=os.getenv('AIRTABLE_BASE_ID','').strip()
+    if not re.fullmatch(r'app[A-Za-z0-9]+',base_id): raise BookingError('AIRTABLE_BASE_ID inválido: debe empezar por app, no por pat')
+    base='https://api.airtable.com/v0/'+quote(base_id,safe='')+'/'+quote(table,safe='')
     return base+('/'+quote(record,safe='') if record else '')
 def at_headers(): return {'Authorization':'Bearer '+os.environ['AIRTABLE_TOKEN'],'Content-Type':'application/json'}
 def at_formula(v): return json.dumps(str(v),ensure_ascii=False)
-def valid_date_time(day,time):
+def valid_date_time(day,time,tz="Europe/Madrid"):
     if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',str(day)) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',str(time)): raise BookingError('Necesito fecha AAAA-MM-DD y hora HH:MM')
     try: d=date.fromisoformat(day)
     except ValueError: raise BookingError('La fecha no es válida')
-    if d < datetime.now(ZoneInfo(os.getenv('DEFAULT_TIMEZONE','Europe/Madrid'))).date(): raise BookingError('Esa fecha ya pasó')
+    try: now=datetime.now(ZoneInfo(tz))
+    except (KeyError,ValueError): raise BookingError('Zona horaria del negocio inválida')
+    requested=datetime(d.year,d.month,d.day,*map(int,time.split(':')),tzinfo=ZoneInfo(tz))
+    if requested <= now: raise BookingError('Esa fecha y hora ya pasaron. ¿Qué otro día u hora preferís?')
     return d
 
-def slot_for(business_id,day,time):
-    d=valid_date_time(day,time)
+def slot_for(business,day,time):
+    business_id=business['business_id']
+    d=valid_date_time(day,time,business.get('timezone') or os.getenv('DEFAULT_TIMEZONE','Europe/Madrid'))
     slot_id=f'{business_id}-{day}-{time.replace(":", "")}'
     formula='AND({Franja_ID}='+at_formula(slot_id)+',{Business_ID}='+at_formula(business_id)+')'
     r=requests.get(at_url(os.getenv('AIRTABLE_SLOTS_TABLE','Franjas')),headers=at_headers(),params={'filterByFormula':formula,'maxRecords':2},timeout=8);r.raise_for_status()
@@ -64,7 +70,10 @@ def ensure_slot(conn,b,slot):
     conn.execute('SELECT slot_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b,slot['id']))
     conn.execute('UPDATE booking_slots SET capacity=%s WHERE business_id=%s AND slot_id=%s',(slot['capacity'],b,slot['id']))
 def occupied(conn,b,slot_id,exclude=None):
-    return conn.execute("SELECT COALESCE(SUM(party_size),0) AS n FROM booking_reservations WHERE business_id=%s AND slot_id=%s AND status='Confirmada' AND (%s IS NULL OR id<>%s)",(b,slot_id,exclude,exclude)).fetchone()['n']
+    sql="SELECT COALESCE(SUM(party_size),0) AS n FROM booking_reservations WHERE business_id=%s AND slot_id=%s AND status='Confirmada'"
+    params=(b,slot_id)
+    if exclude is not None:sql+=' AND id<>%s';params+=(exclude,)
+    return conn.execute(sql,params).fetchone()['n']
 def mirror(row,slot_id=None):
     if not (os.getenv('AIRTABLE_TOKEN') and os.getenv('AIRTABLE_BASE_ID')): return False
     try:
@@ -92,6 +101,18 @@ def mirror(row,slot_id=None):
     except Exception:
         log.exception('Airtable mirror failed; PostgreSQL remains authoritative')
         return False
+def availability(business,day,time,party_size=1):
+    """Only an open Airtable slot with sufficient PostgreSQL capacity can be offered."""
+    check_enabled(business)
+    try: party=int(party_size)
+    except (ValueError,TypeError): raise BookingError('Número de personas inválido')
+    if not 1<=party<=20: raise BookingError('Número de personas inválido')
+    slot=slot_for(business,str(day or '').strip(),str(time or '').strip())
+    init_schema()
+    with db() as conn: remaining=slot['capacity']-occupied(conn,business['business_id'],slot['id'])
+    if remaining<party:raise BookingError('No quedan plazas en esa franja. ¿Qué otro día u hora preferís?')
+    return {'available':True,'date':str(slot['date']),'time':slot['time'],'remaining':remaining}
+
 def booking_row(conn,b,id):
     return conn.execute('SELECT r.*,s.slot_date,s.start_time FROM booking_reservations r JOIN booking_slots s ON (r.business_id=s.business_id AND r.slot_id=s.slot_id) WHERE r.business_id=%s AND r.id=%s',(b,id)).fetchone()
 def create(data,business):
@@ -104,7 +125,7 @@ def create(data,business):
         old=conn.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND request_id=%s',(b,req)).fetchone()
         if old:
             row=booking_row(conn,b,old['id']); return {'success':True,'already_exists':True,'code':row['code'],'status':row['status'],'airtable_synced':bool(row['airtable_id'])}
-    slot=slot_for(b,str(data.get('reservation_date','')).strip(),str(data.get('reservation_time','')).strip())
+    slot=slot_for(business,str(data.get('reservation_date','')).strip(),str(data.get('reservation_time','')).strip())
     with db() as conn:
         ensure_slot(conn,b,slot)
         old=conn.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND request_id=%s',(b,req)).fetchone()
@@ -140,7 +161,7 @@ def modify(business,code,email,changes):
     try: party=int(changes.get('party_size') or old['party_size'])
     except (ValueError,TypeError): raise BookingError('Número de personas inválido')
     if not 1<=party<=20: raise BookingError('Número de personas inválido')
-    target=slot_for(b,day,time)
+    target=slot_for(business,day,time)
     with db() as conn:
         conn.execute('INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,capacity) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',(b,target['id'],target['date'],target['time'],target['capacity']))
         old=booking_row(conn,b,pk)
