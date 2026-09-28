@@ -1,5 +1,6 @@
 """Twilio ConversationRelay transport. Conversation logic and history live in web/core."""
 import json,logging,os,re
+from urllib.parse import urlparse
 from xml.sax.saxutils import escape
 import httpx
 from fastapi import FastAPI,Request,WebSocket,WebSocketDisconnect
@@ -10,13 +11,36 @@ def env(k):return os.getenv(k,'').strip()
 def number(v):
  digits=re.sub(r'\D','',str(v or ''))
  return '+'+digits if digits else ''
+def _form_dups(form):
+ try:return len(list(form.multi_items()))>len(dict(form))
+ except Exception:return 'unknown'
+def _diagnose(req,form,base,token,sig,query,v):
+ """Registra por que fallo la firma. Nunca registra token, firma completa, telefonos ni valores del form."""
+ try:
+  path=req.url.path;h=req.headers;host=h.get('host','');xh=h.get('x-forwarded-host','').split(',')[0].strip();xp=h.get('x-forwarded-proto','').split(',')[0].strip()
+  raw_b=os.getenv('RELAY_PUBLIC_URL','');raw_t=os.getenv('TWILIO_AUTH_TOKEN','');params=dict(form);c={}
+  if base.endswith(path):c['base_already_has_path']=base+query
+  if xh:c['forwarded_host']=(xp or 'https')+'://'+xh+path+query
+  if host:c['https_host_header']='https://'+host+path+query
+  if query:c['base_without_query']=base+path
+  if base.startswith('https://'):c['base_as_http']='http://'+base[8:]+path+query
+  match=[k for k,u in c.items() if v.validate(u,params,sig)]
+  try:
+   if v.validate(base+path+query,form,sig):match.append('form_multivalue')
+  except Exception:pass
+  pu=urlparse(base)
+  log.warning('Relay HTTP diag path=%s token_len=%s token_ws=%s url_ws=%s url_trailing_slash=%s url_scheme=%s url_host=%s url_has_path=%s sig_len=%s ctype=%s form_n=%s form_has_callsid=%s form_dup_keys=%s form_has_empty=%s has_query=%s req_host=%s xf_host=%s xf_proto=%s would_match=%s',
+   path,len(token),raw_t!=raw_t.strip(),raw_b!=raw_b.strip(),raw_b.strip().endswith('/'),pu.scheme,pu.netloc,pu.path not in ('','/'),len(sig),h.get('content-type','').split(';')[0],len(params),'CallSid' in params,_form_dups(form),any(x=='' for x in params.values()),bool(query),host,xh,xp,','.join(match) or 'none')
+ except Exception:log.exception('Relay HTTP diagnostic failed')
 def valid_http(req,form):
  base=env('RELAY_PUBLIC_URL').rstrip('/');token=env('TWILIO_AUTH_TOKEN');sig=req.headers.get('x-twilio-signature','')
  if not base or not token or not sig:
   log.warning('Relay HTTP rejected: url_set=%s token_set=%s signature_set=%s',bool(base),bool(token),bool(sig));return False
- url=base+req.url.path+('?' + req.url.query if req.url.query else '')
- valid=RequestValidator(token).validate(url,dict(form),sig)
- if not valid:log.warning('Relay HTTP signature mismatch at %s',req.url.path)
+ query=('?' + req.url.query) if req.url.query else ''
+ url=base+req.url.path+query
+ v=RequestValidator(token);valid=v.validate(url,dict(form),sig)
+ if not valid:
+  log.warning('Relay HTTP signature mismatch at %s',req.url.path);_diagnose(req,form,base,token,sig,query,v)
  return bool(valid)
 def valid_ws(ws):
  token=env('TWILIO_AUTH_TOKEN');target=env('RELAY_WS_URL');sig=ws.headers.get('x-twilio-signature','')
@@ -32,7 +56,7 @@ async def core(path,data):
   r=await h.post(base+path,headers={'X-Internal-API-Key':key},json=data)
   r.raise_for_status();return r.json()
 @app.get('/health')
-async def health():return JSONResponse({'status':'OK','core_configured':bool(env('CORE_BASE_URL') and env('INTERNAL_API_KEY')),'ws_configured':bool(env('RELAY_WS_URL'))})
+async def health():return JSONResponse({'status':'OK','build':'relay-diag1','core_configured':bool(env('CORE_BASE_URL') and env('INTERNAL_API_KEY')),'ws_configured':bool(env('RELAY_WS_URL'))})
 @app.api_route('/voice',methods=['GET','POST'])
 async def voice(req:Request):
  if req.method!='POST':return Response('Forbidden',status_code=403)
