@@ -7,7 +7,7 @@ from flask import Flask, Response, jsonify, request
 from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.twiml.voice_response import VoiceResponse
-from booking import (BookingError, init_schema, db, create, modify, cancel, get_session, put_session)
+from booking import (BookingError, init_schema, db, create, modify, cancel, availability, get_session, put_session)
 app=Flask(__name__);log=logging.getLogger(__name__)
 API=os.getenv('AIRTABLE_TOKEN','').strip(); BASE=os.getenv('AIRTABLE_BASE_ID','').strip()
 RESTAURANTS=os.getenv('AIRTABLE_RESTAURANTS_TABLE','Restaurantes');CONVERSATIONS=os.getenv('AIRTABLE_CONVERSATIONS_TABLE','Conversaciones')
@@ -21,6 +21,7 @@ def norm(value):
     if s.lower().startswith('whatsapp:'):s=s[9:]
     digits=re.sub(r'\D','',s);return '+'+digits if digits else ''
 def url(table,record=None):
+    if not re.fullmatch(r'app[A-Za-z0-9]+',BASE): raise ValueError('AIRTABLE_BASE_ID inválido: se espera app, no pat')
     u='https://api.airtable.com/v0/'+quote(BASE,safe='')+'/'+quote(table,safe='')
     return u+('/'+quote(record,safe='') if record else '')
 def headers():return {'Authorization':'Bearer '+API,'Content-Type':'application/json'}
@@ -116,7 +117,15 @@ def wa_turn(b,customer,text,sid):
         missing=next((k for k in needed if not values.get(k)),None)
         prompts={'customer_name':'¿A nombre de quién la hago?','reservation_date':'¿Para qué día?','reservation_time':'¿A qué hora?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono de contacto dejamos?','customer_email':'¿Qué correo usamos para la reserva?'}
         if missing:answer=prompts[missing]
-        elif phase!='awaiting':phase='awaiting';answer=f"Bien, {str(values['customer_name']).split()[0]}. ¿Confirmás que haga la reserva a tu nombre?"
+        elif phase!='awaiting':
+            try:
+                availability(b,values['reservation_date'],values['reservation_time'],values['party_size'])
+                phase='awaiting';answer=f"Hay disponibilidad para el {values['reservation_date']} a las {values['reservation_time']}. ¿Confirmás que haga la reserva a tu nombre?"
+            except BookingError as exc:
+                phase='collecting';answer=str(exc)
+                if 'ya pasaron' in answer:values.pop('reservation_date',None);values.pop('reservation_time',None)
+            except Exception:
+                log.exception('Availability check failed');phase='collecting';answer='Ahora no puedo comprobar la disponibilidad. No voy a confirmar la reserva.' 
     elif op in ('modify','cancel'):
         if not values.get('code'):answer='¿Me pasás el código de la reserva?'
         elif not values.get('customer_email'):answer='¿Cuál es el correo asociado a esa reserva?'
@@ -127,15 +136,17 @@ def wa_turn(b,customer,text,sid):
             if op=='create':
                 payload={**values,'request_id':'wa:'+(sid or secrets.token_hex(12)),'business_phone':b['phone'],'channel':'WhatsApp'}
                 out=create(payload,b)
-                answer='Listo, tu reserva de prueba quedó confirmada. Tu código es '+out['code']+'.' 
+                answer='Reserva registrada. Tu código es '+out['code']+'.' + ('' if out.get('airtable_synced') else ' Aviso: la copia en Airtable está pendiente; conservá este código.') 
             elif op=='modify':
                 out=modify(b,values['code'],values['customer_email'],values)
-                answer='Listo, cambié tu reserva de prueba. Conservás el código '+out['code']+'.'
+                answer='Cambio registrado. Conservás el código '+out['code']+'.' + ('' if out.get('airtable_synced') else ' Aviso: la copia en Airtable está pendiente.')
             else:
                 out=cancel(b,values['code'],values['customer_email'])
-                answer='Listo, cancelé tu reserva de prueba.'
+                answer='Cancelación registrada.' + ('' if out.get('airtable_synced') else ' Aviso: la copia en Airtable está pendiente.')
             state={'phase':'done','intent':None,'values':{}}
-        except BookingError as exc:answer=str(exc);phase='collecting'
+        except BookingError as exc:
+            answer=str(exc);phase='collecting'
+            if 'ya pasaron' in answer:values.pop('reservation_date',None);values.pop('reservation_time',None)
     if was_awaiting and decision=='reject' and not changed:
         phase='collecting';answer='Claro. ¿Qué dato querés cambiar?'
     if state.get('phase')!='done':state={'phase':phase,'intent':op,'values':values}
@@ -149,6 +160,7 @@ def health():return jsonify(status='OK',tenant_mode=MODE,relay_enabled=bool(RELA
 def booking_health():
     if not authorized():return jsonify(status='Unauthorized'),401
     try:
+        if not re.fullmatch(r'app[A-Za-z0-9]+',BASE) or not API:return jsonify(status='ERROR',message='Configurar AIRTABLE_BASE_ID (app...) y AIRTABLE_TOKEN'),503
         init_schema()
         with db() as conn:
             tables=conn.execute("SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename IN ('booking_slots','booking_reservations','whatsapp_sessions')").fetchall()
@@ -156,6 +168,7 @@ def booking_health():
     except Exception:log.exception('Booking DB health failed');return jsonify(status='ERROR'),503
 @app.get('/test-airtable')
 def test_airtable():
+    if not authorized():return jsonify(success=False,message='Unauthorized'),401
     try:
         b=lookup(PHONE,'Voice');return jsonify(success=bool(b),business=b,business_open=open_now(b)),(200 if b else 404)
     except Exception:log.exception('Airtable test failed');return jsonify(success=False),503
@@ -210,6 +223,17 @@ def internal_conversations():
         if not b or (MODE=='new' and d.get('business_id')!=b['business_id']):return jsonify(success=False,message='Business mismatch'),403
         save_conversation(b,d.get('customer_phone'),d.get('question'),d.get('answer'),'Answered through ConversationRelay');return jsonify(success=True)
     except Exception:log.exception('Conversation save failed');return jsonify(success=False),503
+@app.post('/internal/availability')
+def internal_availability():
+    if not authorized():return jsonify(success=False,message='Unauthorized'),401
+    d=request.get_json(silent=True) or {}
+    try:
+        b=lookup(d.get('business_phone'),'Voice' if d.get('channel','Voice')=='Voice' else 'WhatsApp')
+        if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False,message='Business mismatch'),403
+        return jsonify(success=True,**availability(b,d.get('reservation_date'),d.get('reservation_time'),d.get('party_size') or 1))
+    except BookingError as exc:return jsonify(success=False,message=str(exc)),409
+    except Exception:log.exception('Availability error');return jsonify(success=False,message='No pude comprobar disponibilidad'),503
+
 @app.post('/internal/booking')
 @app.post('/internal/book-test')
 def internal_booking():
