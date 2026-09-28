@@ -77,10 +77,20 @@ def authorized():
  key=os.getenv('INTERNAL_API_KEY','');got=request.headers.get('X-Internal-API-Key','')
  return bool(key and got and hmac.compare_digest(key,got))
 def twilio_valid():
- token=os.getenv('TWILIO_AUTH_TOKEN','');base=os.getenv('CORE_PUBLIC_URL','').rstrip('/')
- if not token or not base:return False
+ token=os.getenv('TWILIO_AUTH_TOKEN','').strip()
  sig=request.headers.get('X-Twilio-Signature','')
- return bool(sig and RequestValidator(token).validate(base+request.path+('?' + request.query_string.decode() if request.query_string else ''),request.form.to_dict(flat=True),sig))
+ # Prefer the public domain supplied by Railway. CORE_PUBLIC_URL remains a
+ # fallback for deployments without RAILWAY_PUBLIC_DOMAIN.
+ domain=os.getenv('RAILWAY_PUBLIC_DOMAIN','').strip()
+ base=('https://'+domain if domain else os.getenv('CORE_PUBLIC_URL','').strip()).rstrip('/')
+ if not token or not sig or not base:
+  log.warning('Twilio validation unavailable: token=%s signature=%s public_url=%s',bool(token),bool(sig),bool(base))
+  return False
+ signed_url=base+request.path
+ if request.query_string:signed_url+='?'+request.query_string.decode('latin-1')
+ valid=RequestValidator(token).validate(signed_url,request.form.to_dict(flat=True),sig)
+ if not valid:log.warning('Twilio signature invalid for path %s',request.path)
+ return bool(valid)
 def converse(b,channel,customer,text,external_id):
  if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
  init_schema();bid=b['business_id']
