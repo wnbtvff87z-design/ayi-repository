@@ -25,7 +25,7 @@ def init_schema():
             if statement.strip(): conn.execute(statement)
 def at_url(table,record=None):
     base_id=os.getenv('AIRTABLE_BASE_ID','').strip()
-    if not re.fullmatch(r'app[A-Za-z0-9]+',base_id): raise BookingError('AIRTABLE_BASE_ID inválido: debe empezar por app, no por pat')
+    if not re.fullmatch(r'app[A-Za-z0-9]+',base_id): raise BookingError('AIRTABLE_BASE_ID incorrecto: usar ID app, no token pat')
     base='https://api.airtable.com/v0/'+quote(base_id,safe='')+'/'+quote(table,safe='')
     return base+('/'+quote(record,safe='') if record else '')
 def at_headers(): return {'Authorization':'Bearer '+os.environ['AIRTABLE_TOKEN'],'Content-Type':'application/json'}
@@ -35,9 +35,9 @@ def valid_date_time(day,time,tz="Europe/Madrid"):
     try: d=date.fromisoformat(day)
     except ValueError: raise BookingError('La fecha no es válida')
     try: now=datetime.now(ZoneInfo(tz))
-    except (KeyError,ValueError): raise BookingError('Zona horaria del negocio inválida')
-    requested=datetime(d.year,d.month,d.day,*map(int,time.split(':')),tzinfo=ZoneInfo(tz))
-    if requested <= now: raise BookingError('Esa fecha y hora ya pasaron. ¿Qué otro día u hora preferís?')
+    except (KeyError,ValueError): raise BookingError('Zona horaria del negocio incorrecta')
+    target=datetime(d.year,d.month,d.day,*map(int,time.split(':')),tzinfo=ZoneInfo(tz))
+    if target<=now: raise BookingError('Esa fecha y hora ya pasaron. Indica otro día u hora.')
     return d
 
 def slot_for(business,day,time):
@@ -70,10 +70,7 @@ def ensure_slot(conn,b,slot):
     conn.execute('SELECT slot_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b,slot['id']))
     conn.execute('UPDATE booking_slots SET capacity=%s WHERE business_id=%s AND slot_id=%s',(slot['capacity'],b,slot['id']))
 def occupied(conn,b,slot_id,exclude=None):
-    sql="SELECT COALESCE(SUM(party_size),0) AS n FROM booking_reservations WHERE business_id=%s AND slot_id=%s AND status='Confirmada'"
-    params=(b,slot_id)
-    if exclude is not None:sql+=' AND id<>%s';params+=(exclude,)
-    return conn.execute(sql,params).fetchone()['n']
+    return conn.execute("SELECT COALESCE(SUM(party_size),0) AS n FROM booking_reservations WHERE business_id=%s AND slot_id=%s AND status='Confirmada' AND (%s IS NULL OR id<>%s)",(b,slot_id,exclude,exclude)).fetchone()['n']
 def mirror(row,slot_id=None):
     if not (os.getenv('AIRTABLE_TOKEN') and os.getenv('AIRTABLE_BASE_ID')): return False
     try:
@@ -102,16 +99,15 @@ def mirror(row,slot_id=None):
         log.exception('Airtable mirror failed; PostgreSQL remains authoritative')
         return False
 def availability(business,day,time,party_size=1):
-    """Only an open Airtable slot with sufficient PostgreSQL capacity can be offered."""
     check_enabled(business)
     try: party=int(party_size)
-    except (ValueError,TypeError): raise BookingError('Número de personas inválido')
-    if not 1<=party<=20: raise BookingError('Número de personas inválido')
+    except (ValueError,TypeError): raise BookingError('Numero de personas incorrecto')
+    if not 1<=party<=20: raise BookingError('Numero de personas incorrecto')
     slot=slot_for(business,str(day or '').strip(),str(time or '').strip())
     init_schema()
-    with db() as conn: remaining=slot['capacity']-occupied(conn,business['business_id'],slot['id'])
-    if remaining<party:raise BookingError('No quedan plazas en esa franja. ¿Qué otro día u hora preferís?')
-    return {'available':True,'date':str(slot['date']),'time':slot['time'],'remaining':remaining}
+    with db() as conn: used=occupied(conn,business['business_id'],slot['id'])
+    if used+party>slot['capacity']: raise BookingError('No hay plazas en esa franja. Indica otro dia u hora.')
+    return {'available':True,'date':str(slot['date']),'time':slot['time']}
 
 def booking_row(conn,b,id):
     return conn.execute('SELECT r.*,s.slot_date,s.start_time FROM booking_reservations r JOIN booking_slots s ON (r.business_id=s.business_id AND r.slot_id=s.slot_id) WHERE r.business_id=%s AND r.id=%s',(b,id)).fetchone()
