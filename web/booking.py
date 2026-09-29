@@ -214,7 +214,10 @@ def create(data,b):
  with db() as c:
   old=c.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND request_id=%s',(bid,req)).fetchone()
   if old:
-   row=row_for(c,bid,old['id']);return {'success':True,'code':row['code'],'airtable_synced':bool(row['airtable_id']) and not row['airtable_pending'],'already_exists':True}
+   row=row_for(c,bid,old['id']);existing_row=row
+ if 'existing_row' in locals():
+  synced=bool(existing_row['airtable_id']) and not existing_row['airtable_pending']
+  return {'success':True,'code':existing_row['code'],'airtable_synced':synced if synced else mirror(existing_row),'already_exists':True}
  d=str(data.get('reservation_date') or '');t=str(data.get('reservation_time') or '')
  if not future(d,t,b.get('timezone') or 'Europe/Madrid'):raise BookingError('Esa fecha y hora ya pasaron')
  s=next((x for x in slots(b,d,1) if x['date']==d and x['time']==t),None)
@@ -224,12 +227,16 @@ def create(data,b):
   lock_slot(c,bid,s)
   old=c.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND request_id=%s',(bid,req)).fetchone()
   if old:
-   row=row_for(c,bid,old['id']);return {'success':True,'code':row['code'],'airtable_synced':bool(row['airtable_id']) and not row['airtable_pending'],'already_exists':True}
-  if occupied(c,b,s,existing)+n>s['capacity']:raise BookingError('Esa hora se ocupó; consultá alternativas')
-  code='R-'+secrets.token_hex(5).upper()
-  pk=c.execute('INSERT INTO booking_reservations(business_id,slot_id,request_id,code,name,phone,email,party_size,channel,business_phone) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',(bid,s['id'],req,code,name,phone,email,n,data.get('channel','Voice'),b['phone'])).fetchone()['id']
-  row=row_for(c,bid,pk)
- return {'success':True,'code':code,'airtable_synced':mirror(row,s['rec'])}
+   row=row_for(c,bid,old['id']);raced_existing=True
+  else:
+   if occupied(c,b,s,existing)+n>s['capacity']:raise BookingError('Esa hora se ocupó; consultá alternativas')
+   code='R-'+secrets.token_hex(5).upper()
+   pk=c.execute('INSERT INTO booking_reservations(business_id,slot_id,request_id,code,name,phone,email,party_size,channel,business_phone) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',(bid,s['id'],req,code,name,phone,email,n,data.get('channel','Voice'),b['phone'])).fetchone()['id']
+   row=row_for(c,bid,pk);raced_existing=False
+ if raced_existing:
+  synced=bool(row['airtable_id']) and not row['airtable_pending']
+  return {'success':True,'code':row['code'],'airtable_synced':synced if synced else mirror(row),'already_exists':True}
+ return {'success':True,'code':row['code'],'airtable_synced':mirror(row,s['rec'])}
 def reconcile_pending(limit=25):
  init_schema()
  with db() as c:
