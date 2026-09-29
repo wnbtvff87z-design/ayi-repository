@@ -48,7 +48,7 @@ class Flow(unittest.TestCase):
    state={'phase':'awaiting','intent':'create','values':V.copy(),'pending':V.copy(),'request_id':channel+':fixed'}
    with self.subTest(channel=channel),patch.object(dialog,'classify',side_effect=AssertionError('no classifier')),patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',return_value={'success':True,'code':'R-1234567890','airtable_synced':False}) as create:
     reply,done=dialog.process(B,state,[],'sí',channel,'turn1','+34000000000')
-    self.assertEqual(done['phase'],'done');self.assertIn('agenda del equipo',reply);create.assert_called_once()
+    self.assertEqual(done['phase'],'done');self.assertEqual(reply,'Reserva registrada.');self.assertTrue(done['mirror_pending']);create.assert_called_once()
     _,done2=dialog.process(B,done,[],'sí',channel,'turn2','+34000000000')
     self.assertEqual(done2['phase'],'done');create.assert_called_once()
  def test_today_past_time_offers_later_verified_slots(self):
@@ -64,13 +64,13 @@ class Flow(unittest.TestCase):
   state={'phase':'done','intent':None,'values':{},'mirror_pending':True}
   with patch.object(dialog,'classify',side_effect=AssertionError('No model')):
    reply,new=dialog.process(B,state,[],'¿qué es la copia de gestión?','WhatsApp','turn3','+34000000000')
-   self.assertIn('agenda del equipo',reply);self.assertEqual(new,state)
+   self.assertIn('actualización interna',reply);self.assertEqual(new,state)
  def test_unavailable_offers_only_verified_options(self):
   state={'phase':'collecting','intent':'create','values':V.copy()}
   alternatives=[{'date':'2030-10-01','time':'20:00'},{'date':'2030-10-02','time':'20:30'}]
   with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':False,'alternatives':alternatives}):
    reply,updated=dialog.process(B,state,[],'quiero reservar','WhatsApp','turn1','+34000000000')
-   self.assertIn('ocho de la noche',reply);self.assertIn('2 de octubre',reply)
+   self.assertIn('ocho de la noche',reply);self.assertNotIn('2 de octubre',reply)
    self.assertNotIn('reservation_time',updated['values'])
 class VoiceRules(unittest.TestCase):
  def run_turn(self,state,text,updates=None,intent='create'):
@@ -144,7 +144,7 @@ class IdentityAndMirror(unittest.TestCase):
   self.assertIn("call_id+':%'",code)
  def test_slot_id_mismatch_is_rejected(self):
   source=(ROOT/'booking.py').read_text()
-  self.assertIn("if f.get('Franja_ID')!=expected:raise BookingError",source)
+  self.assertIn("if f.get('Franja_ID')!=expected:",source);self.assertIn('Inconsistent Airtable slot omitted',source)
  def test_reconciliation_resolves_link(self):
   source=(ROOT/'booking.py').read_text()
   self.assertIn('slot_rec=slot_rec or _mirror_slot_record(row)',source)
@@ -246,4 +246,47 @@ class NaturalBookingAndOneConfirmation(unittest.TestCase):
   with patch.object(dialog,'classify',return_value={'intent':'cancel','updates':{},'reply':''}),patch.object(dialog,'cancel_for_caller') as cancel:
    reply,state=dialog.process(B,{},[],'sí','Voice','call:1','+34000000000')
   cancel.assert_not_called()
+class NaturalAvailabilityV7(unittest.TestCase):
+ def test_two_times_today_checks_both_without_repeating_date(self):
+  today=datetime.now(ZoneInfo('Europe/Madrid')).date().isoformat()
+  state={'intent':'create','phase':'collecting','values':{'reservation_date':today,'party_size':2}}
+  def check(b,d,t,n):return {'available':t=='20:00','alternatives':[]}
+  with patch.object(dialog,'availability',side_effect=check) as availability,patch.object(dialog,'classify',side_effect=AssertionError('not needed')):
+   reply,out=dialog.process(B,state,[],'20.30 o 20hs tenes algo','WhatsApp','msg:1','+34000000000')
+  self.assertEqual(availability.call_count,2)
+  self.assertIn('ocho de la noche',reply)
+  self.assertNotIn(dialog.spoken_date(today),reply)
+  self.assertEqual(out['values']['reservation_time'],'20:00')
+  self.assertEqual(out['last_requested_field'],'customer_name')
+ def test_both_times_free_asks_choice_not_booking(self):
+  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2}}
+  with patch.object(dialog,'availability',return_value={'available':True,'alternatives':[]}),patch.object(dialog,'create') as create:
+   reply,out=dialog.process(B,state,[],'20.30 o 20hs tenes algo','WhatsApp','msg:1','+34000000000')
+  self.assertEqual(len(out['offered']),2);self.assertIn('Cuál te va mejor',reply);create.assert_not_called()
+ def test_inconsistent_slot_does_not_block_other_hours(self):
+  ns=load_booking_functions()
+  # Runtime slots implementation is inspected because offline tests have no Airtable.
+  source=(ROOT/'booking.py').read_text()
+  self.assertIn('Inconsistent Airtable slot omitted',source)
+  self.assertIn('Duplicate slot omitted',source)
+ def test_mirror_reads_persisted_record_before_clearing_pending(self):
+  source=(ROOT/'booking.py').read_text()
+  self.assertIn('verify=requests.get(url(table,rec)',source)
+  self.assertIn("returned=verify.json().get('fields',{})",source)
 if __name__=='__main__':unittest.main()
+
+class SingleTimeAvailabilityV7(unittest.TestCase):
+ def test_explicit_time_available_answers_yes_without_date(self):
+  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2}}
+  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True,'alternatives':[]}):
+   reply,out=dialog.process(B,state,[],'20hs tenes algo','WhatsApp','m:1','+34000000000')
+  self.assertIn('Sí, a las ocho de la noche tengo lugar',reply)
+  self.assertNotIn('1 de octubre',reply)
+ def test_past_option_does_not_block_other_option(self):
+  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2}}
+  def check(b,d,t,n):
+   if t=='20:00':raise BookingError('Esa fecha y hora ya pasaron')
+   return {'available':True,'alternatives':[]}
+  with patch.object(dialog,'availability',side_effect=check):
+   reply,out=dialog.process(B,state,[],'20hs o 20.30 tenes algo','WhatsApp','m:1','+34000000000')
+  self.assertEqual(out['values']['reservation_time'],'20:30')
