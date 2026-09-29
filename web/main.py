@@ -162,7 +162,7 @@ def whatsapp():
    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
    except Exception:log.exception('Conversation mirror failed')
   tw.message(answer)
- except Exception:log.exception('WhatsApp error');tw.message('No puedo completar la consulta ahora. No hay ninguna reserva confirmada.')
+ except Exception:log.exception('WhatsApp error');tw.message('No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.')
  return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
 def voice():
