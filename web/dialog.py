@@ -79,11 +79,36 @@ def _selection(text, offered, proposed=None):
         return offered[0]
     return None
 
+def _ask_missing(state, v, field, text):
+    state=_state(state,values=v)
+    previous=state.get('last_requested_field')
+    attempts=(int(state.get('missing_attempts') or 0)+1) if previous==field else 1
+    state['last_requested_field']=field
+    state['missing_attempts']=attempts
+    if attempts>=3:
+        return 'No estoy pudiendo registrar ese dato por voz. Para evitar una reserva incorrecta, podés comunicarte con recepción por otro medio. No hice ninguna reserva.',state
+    if attempts>1:
+        reason={'customer_name':'No pude identificar nombre y apellido.', 'customer_email':'No pude reconocer un correo válido. Decímelo despacio, por ejemplo: ana arroba ejemplo punto com.', 'customer_phone':'No pude reconocer un teléfono válido. Decímelo dígito por dígito.'}.get(field)
+        return (reason+' ' if reason else '')+ASK[field],state
+    return ASK[field],state
+
 def _contact_problem(v):
     if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:return 'customer_name'
     if not v.get('customer_email') or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',str(v['customer_email'])):return 'customer_email'
     if not v.get('customer_phone') or len(re.sub(r'\D','',str(v['customer_phone'])))<9:return 'customer_phone'
     return None
+
+def _spoken_email(text):
+    """Parse only an email explicitly spoken in this turn; never use stored identity."""
+    raw=clean(text).replace('á','a')
+    # ASR commonly separates punctuation into words; restrict to a single address.
+    raw=re.sub(r'\b(?:arroba|at)\b',' @ ',raw)
+    raw=re.sub(r'\b(?:punto|dot)\b',' . ',raw)
+    raw=re.sub(r'\b(?:guion bajo|guionbajo)\b',' _ ',raw)
+    raw=re.sub(r'\bguion\b',' - ',raw)
+    raw=re.sub(r'\s*([@._-])\s*',r'\1',raw)
+    candidates=re.findall(r'(?<![\w@])[a-z0-9]+(?:[._-][a-z0-9]+)*@[a-z0-9]+(?:[-][a-z0-9]+)*(?:\.[a-z0-9-]+)+',raw)
+    return candidates[0] if len(candidates)==1 and re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',candidates[0]) else None
 
 def _explicit_contact_updates(text, updates):
     """Do not let the classifier import another person's identity from context."""
@@ -93,9 +118,12 @@ def _explicit_contact_updates(text, updates):
         candidate=clean(result['customer_name'])
         if len(candidate.split())<2 or not all(re.search(r'(?<!\w)'+re.escape(part)+r'(?!\w)',normalized) for part in candidate.split()):
             result.pop('customer_name',None)
-    if 'customer_email' in result:
-        email=str(result['customer_email']).strip()
-        if email.casefold() not in text.casefold():result.pop('customer_email',None)
+    spoken_email=_spoken_email(text)
+    if spoken_email:
+        # The current utterance, not the model or a previous caller, is authoritative.
+        result['customer_email']=spoken_email
+    else:
+        result.pop('customer_email',None)
     if 'customer_phone' in result:
         phone=re.sub(r'\D','',str(result['customer_phone']))
         spoken=re.sub(r'\D','',text)
@@ -149,7 +177,7 @@ def process(b,state,history,text,channel,external_id,customer):
                 return 'Ese horario ya no está libre. ¿Querés que busque otro?',_state(state,values=v)
         except BookingError as exc:return str(exc),state
         missing=_contact_problem(v)
-        if missing:return ASK[missing],_state(state,values=v)
+        if missing:return _ask_missing(state,v,missing,text)
         return _final_summary(state,v,channel)
     # A question while awaiting consent must not consume or reset the pending snapshot.
     if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email|soy|llamo|llamame)\b',plain)):
@@ -162,6 +190,15 @@ def process(b,state,history,text,channel,external_id,customer):
     elif re.search(r'\b(reservar|reserva|mesa)\b',plain) and op not in ('modify','cancel') and (intent not in ('question','social') or 'queria' in plain or 'quiero' in plain):intent='create'
     updates=result.get('updates') if isinstance(result.get('updates'),dict) else {}
     updates=_explicit_contact_updates(text,{k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')})
+    expected=state.get('last_requested_field') if op=='create' else None
+    if expected=='customer_name' and 'customer_name' not in updates:
+        raw=re.sub(r'^(?:mi nombre es|me llamo|soy|a nombre de)\s+','',plain).strip(' .,')
+        if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,3}',raw) and not any(w in raw.split() for w in ('correo','telefono','reserva','quiero','hola')):
+            updates['customer_name']=' '.join(word.capitalize() for word in raw.split())
+    if expected=='customer_phone' and 'customer_phone' not in updates:
+        digits=re.sub(r'\D','',text)
+        if re.fullmatch(r'\d{9,15}',digits) and re.fullmatch(r'[+\d\s().-]+',text.strip()):
+            updates['customer_phone']=('+' if text.strip().startswith('+') else '')+digits
     if re.search(r'\b(?:usa|utiliza|pon|deja)\b.*\b(?:numero|telefono|movil)\b.*\b(?:llam|este)\b',plain) and customer:
         updates['customer_phone']=customer
     rel=explicit_date(text,tz) or relative_day(text,tz);exact=explicit_time(text)
@@ -169,6 +206,10 @@ def process(b,state,history,text,channel,external_id,customer):
     # Model output cannot turn a vague date/band into an exact time.
     if exact:updates['reservation_time']=exact
     else:updates.pop('reservation_time',None)
+    # A contact answer is part of the active booking even if the model calls it a question.
+    if op=='create' and state.get('last_requested_field') in ('customer_name','customer_email','customer_phone'):
+        if intent in ('question','social') and (updates or re.search(r'\b(?:correo|email|arroba|telefono|numero|nombre|soy|llamo)\b',plain)):
+            intent='create'
     weekend=bool(re.search(r'\b(?:el\s+)?(?:fin\s+de\s+semana|finde)\b',plain))
     band=requested_band(text)
     if state.get('phase')=='done' and intent not in ('create','modify','cancel','availability'):
@@ -252,7 +293,7 @@ def process(b,state,history,text,channel,external_id,customer):
             except BookingError:pass
         return str(exc),state
     missing=_contact_problem(v)
-    if missing:return ASK[missing],_state(state,values=v,checked_slot=slot_key)
+    if missing:return _ask_missing(_state(state,checked_slot=slot_key),v,missing,text)
     return _final_summary(_state(state,checked_slot=slot_key),v,channel)
 
 def _final_summary(state,v,channel):
