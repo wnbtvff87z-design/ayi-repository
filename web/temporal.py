@@ -34,3 +34,21 @@ def explicit_time(text):
  return f'{h:02d}:00'
 def yes(s):return norm(s).strip(' .!?¡¿') in {'si','si confirmo','confirmo','dale','adelante','si por favor','vale','ok','correcto'}
 def no(s):return norm(s).strip(' .!?¡¿') in {'no','no gracias','cambiar','espera','un momento'}
+
+
+def weekend_days(tz, now=None):
+    """Upcoming Saturday and Sunday in the business's local calendar."""
+    today=(now or datetime.now(ZoneInfo(tz))).date()
+    saturday=today+timedelta(days=(5-today.weekday()) % 7)
+    return saturday.isoformat(),(saturday+timedelta(days=1)).isoformat()
+
+def requested_band(text):
+    s=norm(text)
+    if re.search(r'\b(?:a\s+la\s+noche|por\s+la\s+noche|esta\s+noche|noche)\b',s):return 'night'
+    if re.search(r'\b(?:a\s+la\s+tarde|por\s+la\s+tarde|esta\s+tarde)\b',s):return 'afternoon'
+    if re.search(r'\b(?:a\s+la\s+manana|por\s+la\s+manana|esta\s+manana)\b',s):return 'morning'
+    return None
+
+def in_band(time,band):
+    h=int(time.split(':')[0])
+    return band is None or (band=='night' and h>=20) or (band=='afternoon' and 12<=h<20) or (band=='morning' and h<12)
