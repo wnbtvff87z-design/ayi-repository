@@ -148,4 +148,28 @@ class IdentityAndMirror(unittest.TestCase):
   source=(ROOT/'booking.py').read_text()
   self.assertIn('slot_rec=slot_rec or _mirror_slot_record(row)',source)
   self.assertIn("fields['Franja']=[slot_rec]",source)
+class SpokenContactFlow(unittest.TestCase):
+ def test_spoken_email_progresses_to_phone_without_classifier_email(self):
+  state={'phase':'collecting','intent':'create','values':{k:v for k,v in V.items() if k not in ('customer_email','customer_phone')},'last_requested_field':'customer_email','missing_attempts':1}
+  with patch.object(dialog,'classify',return_value={'intent':'question','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
+   reply,out=dialog.process(B,state,[],'ana arroba ejemplo punto com','Voice','call:2','+34999999999')
+  self.assertEqual(out['values']['customer_email'],'ana@ejemplo.com');self.assertEqual(out['last_requested_field'],'customer_phone');self.assertIn('teléfono',reply)
+ def test_invalid_email_no_identical_infinite_loop(self):
+  state={'phase':'collecting','intent':'create','values':{k:v for k,v in V.items() if k not in ('customer_email','customer_phone')},'last_requested_field':'customer_email','missing_attempts':1,'checked_slot':[V['reservation_date'],V['reservation_time'],'2']}
+  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}):
+   first,state=dialog.process(B,state,[],'mi correo es ana','Voice','call:2','+34999999999')
+   second,state=dialog.process(B,state,[],'mi correo es ana','Voice','call:3','+34999999999')
+  self.assertIn('No pude reconocer',first);self.assertIn('No hice ninguna reserva',second)
+ def test_name_email_phone_progress_to_summary(self):
+  state={'phase':'collecting','intent':'create','values':{k:v for k,v in V.items() if k not in ('customer_name','customer_email','customer_phone')},'checked_slot':[V['reservation_date'],V['reservation_time'],'2'],'last_requested_field':'customer_name','missing_attempts':1}
+  with patch.object(dialog,'classify',return_value={'intent':'question','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
+   a,state=dialog.process(B,state,[],'Ana Ejemplo','Voice','call:2','+34999999999')
+   b,state=dialog.process(B,state,[],'ana arroba ejemplo punto com','Voice','call:3','+34999999999')
+   c,state=dialog.process(B,state,[],'600 123 456','Voice','call:4','+34999999999')
+  self.assertIn('correo',a);self.assertIn('teléfono',b);self.assertIn('¿Querés que registre',c)
+  self.assertEqual(state['phase'],'awaiting');self.assertEqual(state['values']['customer_phone'],'600123456')
+ def test_model_cannot_inject_old_email(self):
+  self.assertNotIn('customer_email',dialog._explicit_contact_updates('hola',{'customer_email':'old@example.com'}))
+ def test_literal_email_is_accepted(self):
+  self.assertEqual(dialog._spoken_email('mi correo es ana@example.com'),'ana@example.com')
 if __name__=='__main__':unittest.main()
