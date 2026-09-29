@@ -121,4 +121,31 @@ class VoiceRules(unittest.TestCase):
   state={'phase':'awaiting','intent':'create','values':V.copy(),'pending':V.copy(),'request_id':'voice:fixed'}
   reply,out=dialog.process(B,state,[],'¿me escuchás?','Voice','voice:5','+34000000000')
   self.assertEqual(out,state)
+class IdentityAndMirror(unittest.TestCase):
+ def test_caller_number_is_not_assumed_for_booking(self):
+  state={'phase':'collecting','intent':'create','values':{k:v for k,v in V.items() if k not in ('customer_name','customer_phone','customer_email')}}
+  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
+   reply,out=dialog.process(B,state,[],'quiero reservar','Voice','call:1','+34999999999')
+  self.assertIn('Nombre',reply);self.assertNotIn('customer_phone',out['values'])
+ def test_name_change_discards_other_person_contact(self):
+  state={'phase':'awaiting','intent':'create','values':V.copy(),'pending':V.copy(),'request_id':'old'}
+  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{'customer_name':'Otra Persona'},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create') as create:
+   reply,out=dialog.process(B,state,[],'mejor a nombre de Otra Persona','Voice','call:2','+34000000000')
+  self.assertEqual(out['values']['customer_name'],'Otra Persona');self.assertNotIn('customer_email',out['values']);self.assertNotIn('customer_phone',out['values']);self.assertIn('correo',reply);create.assert_not_called()
+ def test_classifier_cannot_hallucinate_identity(self):
+  state={'phase':'collecting','intent':'create','values':{k:v for k,v in V.items() if k not in ('customer_name','customer_phone','customer_email')}}
+  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{'customer_name':'Mariano Cortina','customer_email':'mariano@example.invalid','customer_phone':'+34000000000'},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
+   reply,out=dialog.process(B,state,[],'quiero reservar','Voice','call:3','+34000000000')
+  self.assertIn('Nombre',reply);self.assertNotIn('customer_name',out['values']);self.assertNotIn('customer_email',out['values'])
+ def test_voice_session_scoped_by_call_id(self):
+  code=(ROOT/'main.py').read_text()
+  self.assertIn("current_state.get('_voice_call_id')!=call_id",code)
+  self.assertIn("call_id+':%'",code)
+ def test_slot_id_mismatch_is_rejected(self):
+  source=(ROOT/'booking.py').read_text()
+  self.assertIn("if f.get('Franja_ID')!=expected:raise BookingError",source)
+ def test_reconciliation_resolves_link(self):
+  source=(ROOT/'booking.py').read_text()
+  self.assertIn('slot_rec=slot_rec or _mirror_slot_record(row)',source)
+  self.assertIn("fields['Franja']=[slot_rec]",source)
 if __name__=='__main__':unittest.main()
