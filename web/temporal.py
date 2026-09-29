@@ -26,7 +26,7 @@ def explicit_time(text):
  m=re.search(r'(?<!\d)([01]?\d|2[0-3])\s*(?:h|hs|horas)(?!\w)',s)
  if m:return f'{int(m.group(1)):02d}:00'
  words={'una':1,'dos':2,'tres':3,'cuatro':4,'cinco':5,'seis':6,'siete':7,'ocho':8,'nueve':9,'diez':10,'once':11,'doce':12}
- m=re.search(r'\b(?:a\s+)?(?:la|las)\s+(una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|1[0-2]|[1-9])\s+(?:de\s+la\s+|del\s+)?(manana|tarde|noche|mediodia)\b',s)
+ m=re.search(r'\b(?:(?:a\s+)?(?:la|las)\s+)?(una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|1[0-2]|[1-9])\s+(?:de\s+la\s+|del\s+)?(manana|tarde|noche|mediodia)\b',s)
  if not m:return None
  h=int(m.group(1)) if m.group(1).isdigit() else words[m.group(1)]
  if m.group(2) in ('tarde','noche','mediodia') and h<12:h+=12
