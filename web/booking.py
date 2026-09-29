@@ -115,19 +115,30 @@ def occupied(c,b,slot,records,exclude=None):
   used+=n
  return used
 def options(b,start=None,party_size=1,requested_time=None,limit=5):
+ """Only offer real, open Airtable slots with capacity, ordered by customer preference."""
  n=party(party_size);ss=slots(b,start,7);records=airtable_bookings(b);init_schema();free=[]
  with db() as c:
-  for s in ss:
-   if occupied(c,b,s,records)+n<=s['capacity']:free.append(s)
- if start and hour(requested_time):
-  target=datetime.fromisoformat(day(start)+'T'+requested_time)
-  free.sort(key=lambda s:(s['date']!=day(start),abs((datetime.fromisoformat(s['date']+'T'+s['time'])-target).total_seconds()),s['date'],s['time']))
+  for slot in ss:
+   if occupied(c,b,slot,records)+n<=slot['capacity']:free.append(slot)
+ requested_day=day(start) if start else None
+ requested=hour(requested_time)
+ if requested_day and requested:
+  target=datetime.fromisoformat(requested_day+'T'+requested)
+  # First nearby times on the requested day; then the same time on later days.
+  def rank(slot):
+   clock_gap=abs((datetime.fromisoformat(requested_day+'T'+slot['time'])-target).total_seconds())
+   if slot['date']==requested_day:return (0,clock_gap,slot['time'])
+   days_after=(date.fromisoformat(slot['date'])-date.fromisoformat(requested_day)).days
+   return (1,days_after,clock_gap,slot['time'])
+  free.sort(key=rank)
+ elif requested_day:
+  free.sort(key=lambda slot:(slot['date']!=requested_day,slot['date'],slot['time']))
  return free if limit is None else free[:limit]
 def availability(b,d,t,n=1):
  if not future(d,t,b.get('timezone') or 'Europe/Madrid'):raise BookingError('Esa fecha y hora ya pasaron')
- # Never infer exact availability from the first five suggested slots.
- available=options(b,d,n,t,limit=None);exact=next((s for s in available if s['date']==day(d) and s['time']==hour(t)),None)
- return {'available':bool(exact),'alternatives':[{'date':s['date'],'time':s['time']} for s in available if s is not exact][:3]}
+ free=options(b,d,n,t,limit=None)
+ exact=next((slot for slot in free if slot['date']==day(d) and slot['time']==hour(t)),None)
+ return {'available':bool(exact),'alternatives':[] if exact else [{'date':slot['date'],'time':slot['time']} for slot in free[:5]]}
 def lock_slot(c,b,s):
  c.execute('INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,capacity) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',(b,s['id'],s['date'],s['time'],s['capacity']))
  c.execute('SELECT slot_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b,s['id']))
@@ -153,6 +164,15 @@ def mirror(row,slot_rec=None):
   r.raise_for_status();rec=rec or r.json()['id']
   with db() as c:c.execute('UPDATE booking_reservations SET airtable_id=%s,airtable_pending=false WHERE id=%s',(rec,row['id']))
   return True
+ except requests.HTTPError as exc:
+  response=getattr(exc,'response',None)
+  try:error_type=(response.json().get('error') or {}).get('type','unknown') if response is not None else 'unknown'
+  except (ValueError,AttributeError,TypeError):error_type='unknown'
+  log.warning('Airtable mirror rejected request: status=%s type=%s',getattr(response,'status_code',None),str(error_type)[:80])
+  try:
+   with db() as c:c.execute('UPDATE booking_reservations SET airtable_pending=true WHERE id=%s',(row['id'],))
+  except Exception:log.exception('Could not mark Airtable mirror pending')
+  return False
  except Exception:
   log.exception('Airtable mirror failed; PostgreSQL remains authoritative')
   try:
