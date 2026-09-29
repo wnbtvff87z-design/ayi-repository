@@ -119,8 +119,17 @@ def converse(b,channel,customer,text,external_id):
   row=c.execute('SELECT state FROM customer_sessions WHERE business_id=%s AND channel=%s AND customer_phone=%s FOR UPDATE',(bid,channel,customer)).fetchone()
   previous=c.execute('SELECT assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND external_id=%s',(bid,channel,external_id)).fetchone()
   if previous:return previous['assistant_text']
-  recent=c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 40',(bid,channel,customer)).fetchall()
-  reply,state=process(b,row['state'],list(reversed(recent)),text,channel,external_id,customer)
+  current_state=dict(row['state'] or {})
+  if channel=='Voice':
+   call_id=external_id.rsplit(':',1)[0]
+   if current_state.get('_voice_call_id')!=call_id:
+    # A caller number is not an identity. Never reuse a previous call's details.
+    current_state={}
+   recent=c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s AND external_id LIKE %s ORDER BY id DESC LIMIT 40',(bid,channel,customer,call_id+':%')).fetchall()
+  else:
+   recent=c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 40',(bid,channel,customer)).fetchall()
+  reply,state=process(b,current_state,list(reversed(recent)),text,channel,external_id,customer)
+  if channel=='Voice':state['_voice_call_id']=call_id
   c.execute('UPDATE customer_sessions SET state=%s::jsonb,updated_at=now() WHERE business_id=%s AND channel=%s AND customer_phone=%s',(json.dumps(state,ensure_ascii=False),bid,channel,customer))
   c.execute('INSERT INTO conversation_turns(business_id,channel,customer_phone,external_id,user_text,assistant_text) VALUES(%s,%s,%s,%s,%s,%s)',(bid,channel,customer,external_id,text[:4000],reply[:4000]))
   return reply
