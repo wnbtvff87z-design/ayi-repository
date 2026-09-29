@@ -38,7 +38,7 @@ def classify(b,state,history,text):
       'Devuelve JSON con intent=create|modify|cancel|availability|question|social, updates y reply. '
       'updates solo datos nuevos expresos: customer_name, reservation_date YYYY-MM-DD, reservation_time HH:MM, party_size, customer_phone, customer_email. '
       'No inventes horarios, fechas, disponibilidad, códigos, confirmaciones ni datos personales. '
-      'Si solo dice que quiere reservar, no inventes una hora. Hoy a la noche y el finde son franjas, no horas. Si pregunta algo entre medias, no borres la reserva. '
+      'Si solo dice que quiere reservar, no inventes una hora. Hoy a la noche y el finde son franjas, no horas. Si pregunta algo entre medias, no borres la reserva. Nunca infieras nombre, correo o telefono desde el numero entrante ni desde otra llamada; updates solo si el cliente los dice en este mensaje. '
       'reply solo para preguntas ajenas a la reserva; una frase breve. No prometas una reserva.')
     messages=[{'role':'system','content':instructions}]
     for turn in history[-8:]:
@@ -81,9 +81,29 @@ def _selection(text, offered, proposed=None):
 
 def _contact_problem(v):
     if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:return 'customer_name'
-    if not v.get('customer_phone') or len(re.sub(r'\D','',str(v['customer_phone'])))<9:return 'customer_phone'
     if not v.get('customer_email') or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',str(v['customer_email'])):return 'customer_email'
+    if not v.get('customer_phone') or len(re.sub(r'\D','',str(v['customer_phone'])))<9:return 'customer_phone'
     return None
+
+def _explicit_contact_updates(text, updates):
+    """Do not let the classifier import another person's identity from context."""
+    result=dict(updates)
+    normalized=clean(text)
+    if 'customer_name' in result:
+        candidate=clean(result['customer_name'])
+        if len(candidate.split())<2 or not all(re.search(r'(?<!\w)'+re.escape(part)+r'(?!\w)',normalized) for part in candidate.split()):
+            result.pop('customer_name',None)
+    if 'customer_email' in result:
+        email=str(result['customer_email']).strip()
+        if email.casefold() not in text.casefold():result.pop('customer_email',None)
+    if 'customer_phone' in result:
+        phone=re.sub(r'\D','',str(result['customer_phone']))
+        spoken=re.sub(r'\D','',text)
+        if len(phone)<9 or not spoken.endswith(phone[-9:]):
+            # Explicit opt-in to use caller ID is allowed only for this reservation.
+            if not re.search(r'\b(?:usa|utiliza|pon|deja|mi)\b.*\b(?:numero|telefono|movil)\b.*\b(?:llam|este)\b|\b(?:este|mi)\s+(?:numero|telefono)\s+(?:de|con)\s+(?:llam|contact)',normalized):
+                result.pop('customer_phone',None)
+    return result
 
 def process(b,state,history,text,channel,external_id,customer):
     state=dict(state or {});v=dict(state.get('values') or {});op=state.get('intent');phase=state.get('phase','collecting')
@@ -128,12 +148,11 @@ def process(b,state,history,text,channel,external_id,customer):
                 v.pop('reservation_time',None)
                 return 'Ese horario ya no está libre. ¿Querés que busque otro?',_state(state,values=v)
         except BookingError as exc:return str(exc),state
-        if not v.get('customer_phone') and customer:v['customer_phone']=customer
         missing=_contact_problem(v)
         if missing:return ASK[missing],_state(state,values=v)
         return _final_summary(state,v,channel)
     # A question while awaiting consent must not consume or reset the pending snapshot.
-    if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email)\b',plain)):
+    if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email|soy|llamo|llamame)\b',plain)):
         return '¿Querés que registre la reserva que te resumí?',state
     try:result=classify(b,state,history,text)
     except BookingError as exc:return str(exc),state
@@ -142,7 +161,9 @@ def process(b,state,history,text,channel,external_id,customer):
     elif re.search(r'\b(modificar|modifica|cambiar|cambia)\b',plain) and 'reserva' in plain and op!='create':intent='modify'
     elif re.search(r'\b(reservar|reserva|mesa)\b',plain) and op not in ('modify','cancel') and (intent not in ('question','social') or 'queria' in plain or 'quiero' in plain):intent='create'
     updates=result.get('updates') if isinstance(result.get('updates'),dict) else {}
-    updates={k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')}
+    updates=_explicit_contact_updates(text,{k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')})
+    if re.search(r'\b(?:usa|utiliza|pon|deja)\b.*\b(?:numero|telefono|movil)\b.*\b(?:llam|este)\b',plain) and customer:
+        updates['customer_phone']=customer
     rel=explicit_date(text,tz) or relative_day(text,tz);exact=explicit_time(text)
     if rel:updates['reservation_date']=rel
     # Model output cannot turn a vague date/band into an exact time.
@@ -162,6 +183,10 @@ def process(b,state,history,text,channel,external_id,customer):
         if not all(part in plain for part in clean(updates['customer_name']).split()):updates.pop('customer_name',None)
     if updates:
         changed={k for k,x in updates.items() if v.get(k)!=x}
+        # A new name means a new person: never carry over somebody else's contact.
+        if op=='create' and 'customer_name' in changed and v.get('customer_name'):
+            for field in ('customer_email','customer_phone'):
+                if field not in updates:v.pop(field,None)
         v.update(updates);phase='collecting'
         if changed & {'reservation_date','reservation_time','party_size'}:state.pop('checked_slot',None)
         if changed:state.pop('pending',None);state.pop('request_id',None);state.pop('offered',None);state.pop('proposed',None)
@@ -226,7 +251,6 @@ def process(b,state,history,text,channel,external_id,customer):
                 return 'Esa hora de hoy ya pasó. '+offer(rows,v['reservation_date']),_state(state,values=v,offered=_slots(rows),requested_time=requested,checked_slot=None)
             except BookingError:pass
         return str(exc),state
-    if not v.get('customer_phone') and customer:v['customer_phone']=customer
     missing=_contact_problem(v)
     if missing:return ASK[missing],_state(state,values=v,checked_slot=slot_key)
     return _final_summary(_state(state,checked_slot=slot_key),v,channel)
