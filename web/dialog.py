@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from openai import OpenAI
 from booking import BookingError, availability, options, create
 from booking_safe import cancel_for_caller, modify_for_caller
-from temporal import relative_day, explicit_time, explicit_date
+from temporal import relative_day, explicit_time, explicit_date, weekend_days, requested_band, in_band
 log=logging.getLogger(__name__)
 NEEDED=('customer_name','reservation_date','reservation_time','party_size','customer_phone','customer_email')
 ASK={'customer_name':'¿Nombre y apellido para la reserva?','reservation_date':'¿Para qué día?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono dejamos?','customer_email':'¿Qué correo dejamos?'}
@@ -38,7 +38,7 @@ def classify(b,state,history,text):
       'Devuelve JSON con intent=create|modify|cancel|availability|question|social, updates y reply. '
       'updates solo datos nuevos expresos: customer_name, reservation_date YYYY-MM-DD, reservation_time HH:MM, party_size, customer_phone, customer_email. '
       'No inventes horarios, fechas, disponibilidad, códigos, confirmaciones ni datos personales. '
-      'Si solo dice que quiere reservar, no inventes una hora. Si pregunta algo entre medias, no borres la reserva. '
+      'Si solo dice que quiere reservar, no inventes una hora. Hoy a la noche y el finde son franjas, no horas. Si pregunta algo entre medias, no borres la reserva. '
       'reply solo para preguntas ajenas a la reserva; una frase breve. No prometas una reserva.')
     messages=[{'role':'system','content':instructions}]
     for turn in history[-8:]:
@@ -57,114 +57,184 @@ def _confirmed(text):
     s=re.sub(r'[,.!?¿¡]',' ',clean(text))
     s=' '.join(s.split())
     if '?' in text or '¿' in text or re.search(r'\b(?:no|pero|mejor|cambiar|otra|otro|espera|manana|hoy|personas|telefono|correo)\b',s) or re.search(r'\d',s):return False
-    return s in {'si','si confirmo','confirmo','si por favor','confirmo la reserva','si confirmo la reserva','hace la reserva','hazla','registrala','si registrala','vale','ok','correcto','claro','dale','adelante','de acuerdo','ya te dije que si','si te dije que si'}
+    return s in {'si','si confirmo','confirmo','si por favor','confirmo la reserva','si confirmo la reserva','hace la reserva','hazla','hacela','registra','registrala','si registra','si registrala','vale','ok','correcto','claro','dale','adelante','de acuerdo','ya te dije que si','si te dije que si'}
+
+def _state(state, **changes):
+    result=dict(state)
+    result.update(changes)
+    return result
+
+def _slots(rows):
+    return [{'date':x['date'],'time':x['time']} for x in rows[:5]]
+
+def _selection(text, offered, proposed=None):
+    plain=clean(text)
+    if not offered or explicit_time(text) or explicit_date(text,'Europe/Madrid'):
+        return None
+    match=re.search(r'\b(?:la|el)\s+(primera|primero|segunda|segundo|tercera|tercero|cuarta|cuarto|quinta|quinto)\b',plain)
+    if match:
+        index={'primera':0,'primero':0,'segunda':1,'segundo':1,'tercera':2,'tercero':2,'cuarta':3,'cuarto':3,'quinta':4,'quinto':4}[match.group(1)]
+        return offered[index] if index<len(offered) else None
+    if plain in {'si','si esa','si ese','esa','ese','me sirve','dale','vale','ok','la tomo','confirmo esa'} and (len(offered)==1 or proposed==offered[0]):
+        return offered[0]
+    return None
+
+def _contact_problem(v):
+    if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:return 'customer_name'
+    if not v.get('customer_phone') or len(re.sub(r'\D','',str(v['customer_phone'])))<9:return 'customer_phone'
+    if not v.get('customer_email') or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',str(v['customer_email'])):return 'customer_email'
+    return None
 
 def process(b,state,history,text,channel,external_id,customer):
     state=dict(state or {});v=dict(state.get('values') or {});op=state.get('intent');phase=state.get('phase','collecting')
     if b.get('sector')!='restaurante' or not b.get('allow_reservations'):
         result=classify(b,state,history,text)
         return safe_reply(result.get('reply')) or 'No tengo esa información verificada.',state
-    # Never repeat a completed booking for a second affirmative.
+    plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
     if phase=='done' and _confirmed(text):return 'La reserva anterior ya quedó registrada; no hice otra.',state
-    if phase=='done' and state.get('mirror_pending') and any(term in clean(text) for term in ('copia de gestion','airtable','agenda del equipo')):
+    if phase=='done' and state.get('mirror_pending') and any(term in plain for term in ('copia de gestion','airtable','agenda del equipo')):
         return 'La reserva está guardada, pero aún no aparece en la agenda del equipo. No hagas otra; avisá al equipo para que revise la sincronización.',state
-    # Only a pending snapshot can be accepted. Never let the model authorize a write.
+    # Only the exact snapshot, directly after the final summary, authorizes a write.
     if phase=='awaiting' and op=='create' and state.get('pending')==v and _confirmed(text):
         try:
-            if not availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])['available']:
-                return 'Ese horario ya no está libre. ¿Querés que busque otro?',{'phase':'collecting','intent':'create','values':{k:x for k,x in v.items() if k!='reservation_time'}}
+            check=availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
+            if not check['available']:
+                alternatives=_slots(check.get('alternatives') or [])
+                remaining={k:x for k,x in v.items() if k!='reservation_time'}
+                return 'Ese horario ya no está libre. '+offer(alternatives,v.get('reservation_date')),_state(state,phase='collecting',values=remaining,pending=None,offered=alternatives,proposed=None,checked_slot=None)
             result=create({**v,'_confirmed':True,'request_id':state['request_id'],'channel':channel},b)
-            reply='Listo, la reserva quedó registrada.'
+            if not result.get('success'):
+                return 'El servidor no confirmó la reserva. ¿Querés que lo intente de nuevo?',state
+            reply='Reserva registrada.'
+            if result.get('code'):reply+=' Tu código es '+str(result['code'])+'.'
             if not result.get('airtable_synced'):
                 log.warning('Airtable mirror pending after booking operation')
                 reply+=' Todavía no aparece en la agenda del equipo. No hagas otra reserva; avisá al equipo para que la revise.'
-            return reply,{'phase':'done','intent':None,'values':{},'mirror_pending':not result.get('airtable_synced')}
+            return reply,{'phase':'done','intent':None,'values':{},'mirror_pending':not result.get('airtable_synced'),'result_code':result.get('code')}
         except BookingError as exc:
-            return str(exc),{'phase':'collecting','intent':'create','values':v}
-    if phase=='awaiting' and op=='create' and clean(text) in {'no','espera','mejor no'}:
-        return 'Está bien, no la registré. ¿Qué querés cambiar?',{'phase':'collecting','intent':'create','values':v}
-    if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,b.get('timezone') or 'Europe/Madrid') or relative_day(text,b.get('timezone') or 'Europe/Madrid') or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas)\b',clean(text))):
-        return 'La reserva sigue pendiente. Si querés cambiar algún dato, decímelo; si está bien, podés confirmarla.',state
-    result=classify(b,state,history,text)
+            # Keep the idempotency key and snapshot: a server timeout may have committed.
+            return str(exc)+' No tengo confirmación del servidor; conservé tus datos.',state
+    if phase=='awaiting' and op=='create' and plain in {'no','espera','mejor no'}:
+        return 'Está bien, no la registré. ¿Qué querés cambiar?',_state(state,phase='collecting',pending=None)
+    # Accept a verified offered slot without letting that acceptance register a booking.
+    selected=_selection(text,state.get('offered') or [],state.get('proposed')) if op=='create' and phase!='done' else None
+    if selected:
+        v.update(reservation_date=selected['date'],reservation_time=selected['time'])
+        state=_state(state,values=v,offered=[],proposed=None,pending=None,checked_slot=None,hour_origin='verified_alternative',phase='collecting')
+        phase='collecting'
+        if not v.get('party_size'):return ASK['party_size'],state
+        try:
+            if not availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])['available']:
+                v.pop('reservation_time',None)
+                return 'Ese horario ya no está libre. ¿Querés que busque otro?',_state(state,values=v)
+        except BookingError as exc:return str(exc),state
+        if not v.get('customer_phone') and customer:v['customer_phone']=customer
+        missing=_contact_problem(v)
+        if missing:return ASK[missing],_state(state,values=v)
+        return _final_summary(state,v,channel)
+    # A question while awaiting consent must not consume or reset the pending snapshot.
+    if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email)\b',plain)):
+        return '¿Querés que registre la reserva que te resumí?',state
+    try:result=classify(b,state,history,text)
+    except BookingError as exc:return str(exc),state
     intent=str(result.get('intent') or 'question').lower()
-    plain=clean(text)
     if re.search(r'\b(cancelar|cancela|anular|anula)\b',plain):intent='cancel'
-    elif re.search(r'\b(modificar|modifica|cambiar|cambia)\b',plain) and 'reserva' in plain:intent='modify'
+    elif re.search(r'\b(modificar|modifica|cambiar|cambia)\b',plain) and 'reserva' in plain and op!='create':intent='modify'
     elif re.search(r'\b(reservar|reserva|mesa)\b',plain) and op not in ('modify','cancel') and (intent not in ('question','social') or 'queria' in plain or 'quiero' in plain):intent='create'
     updates=result.get('updates') if isinstance(result.get('updates'),dict) else {}
-    allowed=set(NEEDED)
-    updates={k:x for k,x in updates.items() if k in allowed and x not in (None,'')}
-    tz=b.get('timezone') or 'Europe/Madrid'
-    rel=explicit_date(text,tz) or relative_day(text,tz);explicit=explicit_time(text)
+    updates={k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')}
+    rel=explicit_date(text,tz) or relative_day(text,tz);exact=explicit_time(text)
     if rel:updates['reservation_date']=rel
-    if explicit:updates['reservation_time']=explicit
-    # A choice refers only to slots actually offered in this session.
-    offered=state.get('offered') or []
-    chosen=re.search(r'\b(?:la|el)\s+(primera|primero|segunda|segundo|tercera|tercero|cuarta|cuarto|quinta|quinto)\b',plain)
-    if chosen and offered and not explicit:
-        index={'primera':0,'primero':0,'segunda':1,'segundo':1,'tercera':2,'tercero':2,'cuarta':3,'cuarto':3,'quinta':4,'quinto':4}[chosen.group(1)]
-        if index<len(offered):updates.update(reservation_date=offered[index]['date'],reservation_time=offered[index]['time'])
+    # Model output cannot turn a vague date/band into an exact time.
+    if exact:updates['reservation_time']=exact
+    else:updates.pop('reservation_time',None)
+    weekend=bool(re.search(r'\b(?:el\s+)?(?:fin\s+de\s+semana|finde)\b',plain))
+    band=requested_band(text)
     if state.get('phase')=='done' and intent not in ('create','modify','cancel','availability'):
         return safe_reply(result.get('reply')) or '¿En qué más puedo ayudarte?',state
     explicit_switch=(intent=='cancel' and re.search(r'\b(cancelar|cancela|anular|anula)\b',plain)) or (intent=='modify' and re.search(r'\b(modificar|modifica|cambiar|cambia)\b',plain) and 'reserva' in plain) or (intent=='create' and re.search(r'\b(reservar|reserva)\b',plain) and ('quiero' in plain or 'queria' in plain))
     if intent in ('create','modify','cancel') and (op is None or phase=='done' or (intent!=op and explicit_switch)):
-        op=intent;v={};phase='collecting'
+        op=intent;v={};state={};phase='collecting'
     if not op and intent=='availability':op='create'
-    # Questions in the middle preserve state without triggering availability checks.
-    if intent in ('question','social') and op and not updates and not any(x in plain for x in ('disponib','horario','turno')):
-        return safe_reply(result.get('reply')) or '¿Qué querés saber?',state if phase=='awaiting' else {'phase':'collecting','intent':op,'values':v}
+    if intent in ('question','social') and op and not updates and not weekend and not band and not any(x in plain for x in ('disponib','horario','turno')):
+        return safe_reply(result.get('reply')) or '¿Qué querés saber?',_state(state,phase=phase,intent=op,values=v)
     if op in ('cancel','modify') and updates.get('customer_name'):
-        if not all(part in plain for part in clean(updates['customer_name']).split()):
-            updates.pop('customer_name',None)
+        if not all(part in plain for part in clean(updates['customer_name']).split()):updates.pop('customer_name',None)
     if updates:
+        changed={k for k,x in updates.items() if v.get(k)!=x}
         v.update(updates);phase='collecting'
-    elif phase=='awaiting' and op=='create':
-        # A question is not consent and must not restart the confirmation loop.
-        return safe_reply(result.get('reply')) or '¿Querés que la registre?',state
+        if changed & {'reservation_date','reservation_time','party_size'}:state.pop('checked_slot',None)
+        if changed:state.pop('pending',None);state.pop('request_id',None);state.pop('offered',None);state.pop('proposed',None)
+        if 'reservation_date' in changed and 'reservation_time' not in updates:v.pop('reservation_time',None)
+        if exact:state['hour_origin']='customer'
+    elif phase=='awaiting' and op=='create':return '¿Querés que registre la reserva que te resumí?',state
     if op in ('cancel','modify'):
         if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:
-            return 'Decime nombre y apellido de la reserva.',{'phase':'collecting','intent':op,'values':v}
+            return 'Decime nombre y apellido de la reserva.',_state(state,phase='collecting',intent=op,values=v)
         try:
             if op=='cancel':
-                out=cancel_for_caller(b,v['customer_name'],customer)
-                reply='Listo, la reserva quedó cancelada.'
+                out=cancel_for_caller(b,v['customer_name'],customer);reply='Listo, la reserva quedó cancelada.'
             else:
                 changes={k:v[k] for k in ('reservation_date','reservation_time','party_size') if v.get(k)}
-                if not changes:return '¿Qué día, hora o cantidad querés cambiar?',{'phase':'collecting','intent':op,'values':v}
-                out=modify_for_caller(b,v['customer_name'],customer,changes)
-                reply='Listo, cambié la reserva.'
+                if not changes:return '¿Qué día, hora o cantidad querés cambiar?',_state(state,phase='collecting',intent=op,values=v)
+                out=modify_for_caller(b,v['customer_name'],customer,changes);reply='Listo, cambié la reserva.'
             if not out.get('airtable_synced'):reply+=' La copia de gestión está pendiente.'
             return reply,{'phase':'done','intent':None,'values':{}}
-        except BookingError as exc:return str(exc),{'phase':'collecting','intent':op,'values':v}
-    if op!='create':return safe_reply(result.get('reply')) or '¿En qué puedo ayudarte?',{'phase':'collecting','intent':None,'values':{}}
+        except BookingError as exc:return str(exc),_state(state,phase='collecting',intent=op,values=v)
+    if op!='create':return safe_reply(result.get('reply')) or '¿En qué puedo ayudarte?',_state(state,phase='collecting',intent=None,values=v)
+    if weekend and not rel:
+        saturday,sunday=weekend_days(tz)
+        v.pop('reservation_time',None);v['reservation_date']=saturday
+        state['date_range']=[saturday,sunday]
+    elif rel or 'reservation_date' in updates:
+        state.pop('date_range',None)
+    if band:state['time_band']=band
+    elif exact or 'reservation_date' in updates and not weekend:state.pop('time_band',None)
+    state=_state(state,phase='collecting',intent='create',values=v)
     if not v.get('reservation_date'):
         if intent=='availability':
-            try:return offer(options(b,None,v.get('party_size') or 1),None),{'phase':'collecting','intent':'create','values':v}
-            except BookingError as exc:return str(exc),{'phase':'collecting','intent':'create','values':v}
-        return ASK['reservation_date'],{'phase':'collecting','intent':'create','values':v}
-    if not v.get('party_size'):return ASK['party_size'],{'phase':'collecting','intent':'create','values':v}
+            if not v.get('party_size'):return ASK['party_size'],state
+            try:
+                rows=options(b,None,v['party_size'])
+                return offer(rows,None),_state(state,offered=_slots(rows))
+            except BookingError as exc:return str(exc),state
+        return ASK['reservation_date'],state
+    if not v.get('party_size'):return ASK['party_size'],state
     try:
         if not v.get('reservation_time'):
-            rows=options(b,v['reservation_date'],v['party_size'],state.get('requested_time'))
-            return offer(rows,v['reservation_date']),{'phase':'collecting','intent':'create','values':v,'offered':[{'date':s['date'],'time':s['time']} for s in rows[:5]]}
+            if state.get('date_range'):
+                start,end=state['date_range']
+                rows=[s for s in options(b,start,v['party_size'],limit=None) if start<=s['date']<=end and in_band(s['time'],state.get('time_band'))][:5]
+            else:
+                rows=[s for s in options(b,v['reservation_date'],v['party_size'],limit=None) if s['date']==v['reservation_date'] and in_band(s['time'],state.get('time_band'))][:5]
+            return offer(rows,v['reservation_date']),_state(state,offered=_slots(rows))
         slot_key=[v['reservation_date'],v['reservation_time'],str(v['party_size'])]
         check={'available':True} if state.get('checked_slot')==slot_key else availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
         if not check['available']:
             v.pop('reservation_time',None)
-            return 'Esa hora no está libre. '+offer(check['alternatives'],v.get('reservation_date')),{'phase':'collecting','intent':'create','values':v,'offered':check['alternatives'],'requested_time':slot_key[1]}
+            alternatives=_slots(check.get('alternatives') or [])
+            reply='Esa hora no está libre. '+offer(alternatives,v.get('reservation_date'))
+            if alternatives:
+                first=alternatives[0]
+                reply+=' Te propongo '+spoken_date(first['date'])+' '+spoken_time(first['time'])+'. ¿Te sirve esa?'
+            return reply,_state(state,values=v,offered=alternatives,proposed=alternatives[0] if alternatives else None,requested_time=slot_key[1],checked_slot=None)
     except BookingError as exc:
-        if 'ya pasaron' in str(exc) and v.get('reservation_date')==datetime.now(ZoneInfo(b.get('timezone') or 'Europe/Madrid')).date().isoformat():
+        if 'ya pasaron' in str(exc) and v.get('reservation_time') and v.get('reservation_date')==datetime.now(ZoneInfo(tz)).date().isoformat():
             try:
-                rows=options(b,v['reservation_date'],v['party_size'],v.get('reservation_time'),limit=5)
+                rows=options(b,v['reservation_date'],v['party_size'],v['reservation_time'],limit=5)
                 requested=v.pop('reservation_time',None)
-                return 'Esa hora de hoy ya pasó. '+offer(rows,v['reservation_date']),{'phase':'collecting','intent':'create','values':v,'offered':[{'date':item['date'],'time':item['time']} for item in rows],'requested_time':requested}
+                return 'Esa hora de hoy ya pasó. '+offer(rows,v['reservation_date']),_state(state,values=v,offered=_slots(rows),requested_time=requested,checked_slot=None)
             except BookingError:pass
-        return str(exc),{'phase':'collecting','intent':'create','values':v}
+        return str(exc),state
     if not v.get('customer_phone') and customer:v['customer_phone']=customer
-    for k in ('customer_name','customer_phone','customer_email'):
-        if not v.get(k) or (k=='customer_name' and len(clean(v[k]).split())<2):
-            return ASK[k],{'phase':'collecting','intent':'create','values':v,'checked_slot':slot_key}
-    # Ask only once; request id survives retries of the confirmation turn.
+    missing=_contact_problem(v)
+    if missing:return ASK[missing],_state(state,values=v,checked_slot=slot_key)
+    return _final_summary(_state(state,checked_slot=slot_key),v,channel)
+
+def _final_summary(state,v,channel):
     request_id=state.get('request_id') if state.get('pending')==v else None
     request_id=request_id or channel.lower()+':'+secrets.token_hex(12)
-    return 'Tengo '+spoken_date(v['reservation_date'])+' '+spoken_time(v['reservation_time'])+'. ¿La registro?',{'phase':'awaiting','intent':'create','values':v,'pending':dict(v),'request_id':request_id,'checked_slot':slot_key}
+    reply=('Tengo la reserva para '+spoken_date(v['reservation_date'])+' '+spoken_time(v['reservation_time'])+
+           ', para '+str(v['party_size'])+' personas, a nombre de '+str(v['customer_name'])+
+           ', con el correo '+str(v['customer_email'])+' y el teléfono '+str(v['customer_phone'])+'. ¿Querés que registre esta reserva?')
+    return reply,_state(state,phase='awaiting',intent='create',values=dict(v),pending=dict(v),request_id=request_id,offered=[],proposed=None)
