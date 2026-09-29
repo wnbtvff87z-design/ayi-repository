@@ -74,7 +74,7 @@ def slots(b,start=None,days=3):
  if not start:raise BookingError('Fecha inválida')
  end=(date.fromisoformat(start)+timedelta(days=days-1)).isoformat()
  rows=list_records(os.getenv('AIRTABLE_SLOTS_TABLE','Franjas'),'{Business_ID}='+json.dumps(b['business_id']))
- found=[];seen=set()
+ found=[];seen=set();duplicates=set()
  for row in rows:
   f=row.get('fields',{});d=day(f.get('Fecha'));t=hour(f.get('Hora_Inicio'))
   if not d or not t or not start<=d<=end or str(f.get('Estado','')).strip().casefold()!='abierta' or not future(d,t,tz):continue
@@ -82,11 +82,13 @@ def slots(b,start=None,days=3):
   except (TypeError,ValueError):continue
   if cap<1:continue
   key=(d,t)
-  if key in seen:raise BookingError('Franjas duplicadas para fecha y hora; revisar Airtable')
+  if key in seen:
+   duplicates.add(key);log.warning('Duplicate slot omitted for business/date/time');continue
   seen.add(key);expected=f"{b['business_id']}-{d}-{t.replace(':','')}"
-  if f.get('Franja_ID')!=expected:raise BookingError('Franja_ID no coincide con negocio, fecha y hora en Airtable; revisar Franjas')
+  if f.get('Franja_ID')!=expected:
+   log.warning('Inconsistent Airtable slot omitted');continue
   found.append({'id':expected,'rec':row['id'],'date':d,'time':t,'capacity':cap})
- return sorted(found,key=lambda s:(s['date'],s['time']))
+ return sorted((s for s in found if (s['date'],s['time']) not in duplicates),key=lambda s:(s['date'],s['time']))
 def airtable_bookings(b):
  return list_records(os.getenv('AIRTABLE_RESERVATIONS_TABLE','Reservas'),None)
 def occupied(c,b,slot,records,exclude=None):
@@ -175,8 +177,11 @@ def mirror(row,slot_rec=None):
    fields['Created_At']=datetime.now(timezone.utc).isoformat()
    r=requests.post(url(table),headers=headers(),json={'fields':fields},timeout=10)
   r.raise_for_status();payload=r.json();rec=rec or payload['id']
-  returned=payload.get('fields',{})
-  for required in ('Business_ID','Customer_Name','Customer_Phone','Customer_Email','Reservation_Date','Reservation_Time','Party_Size','Codigo_Reserva'):
+  verify=requests.get(url(table,rec),headers=headers(),timeout=10)
+  verify.raise_for_status()
+  returned=verify.json().get('fields',{})
+  if verify.json().get('id')!=rec:raise BookingError('Airtable devolvió un registro distinto')
+  for required in ('Business_ID','Customer_Name','Customer_Phone','Customer_Email','Reservation_Date','Reservation_Time','Party_Size','Status','Codigo_Reserva','Canal','Call_ID'):
    if str(returned.get(required,''))!=str(fields[required]):
     raise BookingError('Airtable no devolvió los datos esperados; copia pendiente de revisión')
   if slot_rec not in (returned.get('Franja') or []):
