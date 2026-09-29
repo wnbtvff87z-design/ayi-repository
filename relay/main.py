@@ -94,7 +94,7 @@ async def websocket(ws:WebSocket):
     try:
      out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':state['call_sid']+':'+str(state['seq']),'text':text})
      reply=out['reply']
-    except Exception:log.exception('Voice turn failed');reply='No puedo consultar ni confirmar ninguna reserva ahora.'
+    except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.'
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))
    elif kind=='error':log.error('ConversationRelay error: %s',event.get('description'))
  except WebSocketDisconnect:pass
