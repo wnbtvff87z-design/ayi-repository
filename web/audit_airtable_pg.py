@@ -4,7 +4,7 @@ import requests
 from booking import db,headers,list_records,day,hour
 
 SLOT_FIELDS={'Franja_ID','Business_ID','Fecha','Hora_Inicio','Capacidad_Personas','Estado'}
-RES_FIELDS={'Business_ID','Restaurant_Phone','Customer_Name','Customer_Phone','Customer_Email','Reservation_Date','Reservation_Time','Party_Size','Status','Codigo_Reserva','Canal','Call_ID','Franja'}
+RES_FIELDS={'Business_ID','Restaurant_Phone','Customer_Name','Customer_Phone','Customer_Email','Reservation_Date','Reservation_Time','Party_Size','Status','Codigo_Reserva','Canal','Call_ID','Franja','Created_At','Actualizada_At','Cancelada_At'}
 PG_COLUMNS={'booking_slots':{'business_id','slot_id','slot_date','start_time','capacity'},'booking_reservations':{'business_id','slot_id','request_id','code','name','phone','email','party_size','status','airtable_id','airtable_pending','channel','business_phone'}}
 
 def audit():
@@ -23,6 +23,13 @@ def audit():
   fields={f['name']:f for f in table['fields']}
   primary=next((f for f in table['fields'] if f['id']==table.get('primaryFieldId')),None)
   report['schema'][name]={'missing_fields':sorted(required-fields.keys()),'primary_field':primary['name'] if primary else None,'primary_type':primary['type'] if primary else None}
+  if name==bookings_name:
+   for field_name,required_options in (('Canal',{'Voice','WhatsApp'}),('Status',{'Confirmada','Cancelada'})):
+    field=fields.get(field_name)
+    if field and field.get('type') in ('singleSelect','multipleSelects'):
+     configured={choice.get('name') for choice in field.get('options',{}).get('choices',[])}
+     missing=sorted(required_options-configured)
+     if missing:report['issues'].append({'kind':'missing_select_options','field':field_name,'missing':missing})
   if name==bookings_name:
    computed={'formula','rollup','count','lookup','multipleLookupValues','autoNumber'}
    readonly=sorted(field for field in RES_FIELDS if field in fields and fields[field]['type'] in computed)
