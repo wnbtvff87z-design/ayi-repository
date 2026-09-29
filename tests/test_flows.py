@@ -13,7 +13,8 @@ for name in ('availability','options','create'):setattr(booking_stub,name,Mock()
 sys.modules['booking']=booking_stub
 safe=types.ModuleType('booking_safe');safe.cancel_for_caller=Mock();safe.modify_for_caller=Mock();sys.modules['booking_safe']=safe
 openai=types.ModuleType('openai');openai.OpenAI=object;sys.modules['openai']=openai
-import temporal,dialog
+import temporal,restaurant_dialog as dialog
+import dialog as router
 
 def load_booking_functions():
  tree=ast.parse((ROOT/'booking.py').read_text())
@@ -172,4 +173,31 @@ class SpokenContactFlow(unittest.TestCase):
   self.assertNotIn('customer_email',dialog._explicit_contact_updates('hola',{'customer_email':'old@example.com'}))
  def test_literal_email_is_accepted(self):
   self.assertEqual(dialog._spoken_email('mi correo es ana@example.com'),'ana@example.com')
+class SectorRouting(unittest.TestCase):
+ def test_restaurant_reaches_original_booking_flow(self):
+  with patch.object(router,'restaurant_process',return_value=('restaurant',{'phase':'collecting'})) as restaurant:
+   reply,state=router.process(B,{},[],'mesa','Voice','call:1','+34999999999')
+  self.assertEqual(reply,'restaurant');restaurant.assert_called_once()
+ def test_consulting_never_calls_restaurant_booking(self):
+  business={'business_id':'CONS-001','sector':'consultora','hours':'lunes a viernes','allow_reservations':True}
+  with patch.object(router,'restaurant_process',side_effect=AssertionError('No restaurant booking')):
+   reply,state=router.process(business,{},[],'quiero reservar una mesa','Voice','call:1','+34999999999')
+  self.assertNotIn('reserva registrada',reply.casefold());self.assertEqual(state,{})
+ def test_unknown_sector_fails_closed(self):
+  with patch.object(router,'restaurant_process',side_effect=AssertionError('No restaurant booking')):
+   reply,state=router.process({'sector':'clinica','allow_reservations':True}, {}, [],'reservar mesa','WhatsApp','1','+34999999999')
+  self.assertEqual(state,{});self.assertIn('recepción',reply)
+ def test_restaurant_config_is_isolated(self):
+  self.assertEqual(router.sector_of({'sector':'restaurante'}),'restaurante')
+  self.assertEqual(router.sector_of({'sector':'consultoría'}),'consultora')
+  self.assertEqual(router.sector_of({'sector':'sin implementar'}),'general')
+ def test_restaurant_http_endpoints_are_sector_gated(self):
+  source=(ROOT/'restaurant_routes.py').read_text()
+  for route in ('/internal/booking','/internal/availability','/internal/reconcile-pending'):
+   self.assertIn(route,source)
+  self.assertIn("str(b.get('sector') or '').casefold()!='restaurante'",source)
+ def test_main_uses_router_not_restaurant(self):
+  source=(ROOT/'main.py').read_text()
+  self.assertIn('from dialog import process',source)
+  self.assertIn("state['_sector']",source)
 if __name__=='__main__':unittest.main()
