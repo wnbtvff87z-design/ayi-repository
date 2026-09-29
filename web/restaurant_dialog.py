@@ -4,7 +4,7 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from openai import OpenAI
 from booking import BookingError, availability, options, create
-from booking_safe import cancel_for_caller, modify_for_caller
+from booking_safe import cancel_for_caller, modify_for_caller, unique_reservation
 from temporal import relative_day, explicit_time, explicit_date, weekend_days, requested_band, in_band
 log=logging.getLogger(__name__)
 NEEDED=('customer_name','reservation_date','reservation_time','party_size','customer_phone','customer_email')
@@ -70,15 +70,32 @@ def _slots(rows):
     return [{'date':x['date'],'time':x['time']} for x in rows[:5]]
 
 def _selection(text, offered, proposed=None):
+    """Resolve a unique verified option; no magic keyword like 'prefiero' required."""
+    if not offered:return None
     plain=clean(text)
-    if not offered or explicit_time(text) or explicit_date(text,'Europe/Madrid'):
-        return None
+    if re.search(r'\b(?:no|pero|mejor|otra|otro|cambiar)\b',plain):return None
     match=re.search(r'\b(?:la|el)\s+(primera|primero|segunda|segundo|tercera|tercero|cuarta|cuarto|quinta|quinto)\b',plain)
     if match:
         index={'primera':0,'primero':0,'segunda':1,'segundo':1,'tercera':2,'tercero':2,'cuarta':3,'cuarto':3,'quinta':4,'quinto':4}[match.group(1)]
         return offered[index] if index<len(offered) else None
-    if plain in {'si','si esa','si ese','esa','ese','me sirve','dale','vale','ok','la tomo','confirmo esa'} and (len(offered)==1 or proposed==offered[0]):
-        return offered[0]
+    time=explicit_time(text)
+    if not time:
+        # 'A las ocho' is meaningful only against the already offered choices.
+        words={'una':1,'dos':2,'tres':3,'cuatro':4,'cinco':5,'seis':6,'siete':7,'ocho':8,'nueve':9,'diez':10,'once':11,'doce':12}
+        m=re.search(r'\b(?:a\s+)?(?:la|las)\s+(una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|1[0-2]|[1-9])\b',plain)
+        if m:
+            hour=int(m.group(1)) if m.group(1).isdigit() else words[m.group(1)]
+            matches=[slot for slot in offered if int(slot['time'][:2])%12==hour%12 and slot['time'][3:]=='00']
+            return matches[0] if len(matches)==1 else None
+    if time:
+        matches=[slot for slot in offered if slot['time']==time]
+        if len(matches)>1:
+            day=explicit_date(text,'Europe/Madrid')
+            if day:matches=[slot for slot in matches if slot['date']==day]
+        return matches[0] if len(matches)==1 else None
+    if plain in {'si','si esa','si ese','esa','ese','me sirve','dale','vale','ok','la tomo','confirmo esa'}:
+        if len(offered)==1:return offered[0]
+        if proposed in offered:return proposed
     return None
 
 def _ask_missing(state, v, field, text):
@@ -141,9 +158,30 @@ def process(b,state,history,text,channel,external_id,customer):
         result=classify(b,state,history,text)
         return safe_reply(result.get('reply')) or 'No tengo esa información verificada.',state
     plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
-    if phase=='done' and _confirmed(text):return 'La reserva anterior ya quedó registrada; no hice otra.',state
+    if phase=='done' and _confirmed(text):return 'La operación anterior ya quedó hecha; no hice otra.',state
     if phase=='done' and state.get('mirror_pending') and any(term in plain for term in ('copia de gestion','airtable','agenda del equipo')):
         return 'La reserva está guardada, pero aún no aparece en la agenda del equipo. No hagas otra; avisá al equipo para que revise la sincronización.',state
+    if phase=='awaiting' and op in ('cancel','modify') and state.get('pending')==v and _confirmed(text):
+        try:
+            old_date=state.get('original_date')
+            code=state.get('target_code')
+            if not code or not old_date:raise BookingError('No puedo identificar con seguridad la reserva. No hice cambios.')
+            if op=='cancel':
+                out=cancel_for_caller(b,v['customer_name'],customer,expected_code=code,reservation_date=old_date)
+                reply='Listo, la reserva quedó cancelada.'
+            else:
+                changes={k:v[k] for k in ('reservation_date','reservation_time','party_size') if v.get(k)}
+                if not changes:raise BookingError('Falta indicar qué querés cambiar.')
+                out=modify_for_caller(b,v['customer_name'],customer,changes,expected_code=code,reservation_date=old_date)
+                reply='Listo, cambié la reserva.'
+            if not out.get('success'):return 'El servidor no confirmó el cambio. No puedo asegurar que se haya realizado.',state
+            if not out.get('airtable_synced'):reply+=' La copia de gestión está pendiente; no repitas la operación.'
+            return reply,{'phase':'done','intent':None,'values':{},'mirror_pending':not out.get('airtable_synced')}
+        except BookingError as exc:return str(exc),state
+    if phase=='awaiting' and op in ('cancel','modify') and plain in {'no','espera','mejor no'}:
+        return 'De acuerdo, no hice cambios. ¿Qué querés hacer?',_state(state,phase='collecting',pending=None,target_code=None)
+    if phase=='awaiting' and op in ('cancel','modify') and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|personas|telefono|correo|fecha)\b',plain)):
+        return '¿Confirmás '+('la cancelación' if op=='cancel' else 'el cambio')+'?',state
     # Only the exact snapshot, directly after the final summary, authorizes a write.
     if phase=='awaiting' and op=='create' and state.get('pending')==v and _confirmed(text):
         try:
@@ -156,7 +194,6 @@ def process(b,state,history,text,channel,external_id,customer):
             if not result.get('success'):
                 return 'El servidor no confirmó la reserva. ¿Querés que lo intente de nuevo?',state
             reply='Reserva registrada.'
-            if result.get('code'):reply+=' Tu código es '+str(result['code'])+'.'
             if not result.get('airtable_synced'):
                 log.warning('Airtable mirror pending after booking operation')
                 reply+=' Todavía no aparece en la agenda del equipo. No hagas otra reserva; avisá al equipo para que la revise.'
@@ -166,6 +203,11 @@ def process(b,state,history,text,channel,external_id,customer):
             return str(exc)+' No tengo confirmación del servidor; conservé tus datos.',state
     if phase=='awaiting' and op=='create' and plain in {'no','espera','mejor no'}:
         return 'Está bien, no la registré. ¿Qué querés cambiar?',_state(state,phase='collecting',pending=None)
+    offered=state.get('offered') or []
+    chosen_time=explicit_time(text)
+    if op=='create' and phase!='done' and offered and chosen_time and not explicit_date(text,tz):
+        if sum(slot['time']==chosen_time for slot in offered)>1:
+            return 'Tengo esa hora en más de un día. ¿Qué fecha preferís?',state
     # Accept a verified offered slot without letting that acceptance register a booking.
     selected=_selection(text,state.get('offered') or [],state.get('proposed')) if op=='create' and phase!='done' else None
     if selected:
@@ -183,7 +225,7 @@ def process(b,state,history,text,channel,external_id,customer):
         return _final_summary(state,v,channel)
     # A question while awaiting consent must not consume or reset the pending snapshot.
     if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email|soy|llamo|llamame)\b',plain)):
-        return '¿Querés que registre la reserva que te resumí?',state
+        return '¿La registro?',state
     try:result=classify(b,state,history,text)
     except BookingError as exc:return str(exc),state
     intent=str(result.get('intent') or 'question').lower()
@@ -192,7 +234,7 @@ def process(b,state,history,text,channel,external_id,customer):
     elif re.search(r'\b(reservar|reserva|mesa)\b',plain) and op not in ('modify','cancel') and (intent not in ('question','social') or 'queria' in plain or 'quiero' in plain):intent='create'
     updates=result.get('updates') if isinstance(result.get('updates'),dict) else {}
     updates=_explicit_contact_updates(text,{k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')})
-    expected=state.get('last_requested_field') if op=='create' else None
+    expected=state.get('last_requested_field') if op in ('create','cancel','modify') else None
     if expected=='customer_name' and 'customer_name' not in updates:
         raw=re.sub(r'^(?:mi nombre es|me llamo|soy|a nombre de)\s+','',plain).strip(' .,')
         if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,3}',raw) and not any(w in raw.split() for w in ('correo','telefono','reserva','quiero','hola')):
@@ -209,9 +251,9 @@ def process(b,state,history,text,channel,external_id,customer):
     if exact:updates['reservation_time']=exact
     else:updates.pop('reservation_time',None)
     # A contact answer is part of the active booking even if the model calls it a question.
-    if op=='create' and state.get('last_requested_field') in ('customer_name','customer_email','customer_phone'):
+    if op in ('create','cancel','modify') and state.get('last_requested_field') in ('customer_name','customer_email','customer_phone'):
         if intent in ('question','social') and (updates or re.search(r'\b(?:correo|email|arroba|telefono|numero|nombre|soy|llamo)\b',plain)):
-            intent='create'
+            intent=op
     weekend=bool(re.search(r'\b(?:el\s+)?(?:fin\s+de\s+semana|finde)\b',plain))
     band=requested_band(text)
     if state.get('phase')=='done' and intent not in ('create','modify','cancel','availability'):
@@ -235,20 +277,34 @@ def process(b,state,history,text,channel,external_id,customer):
         if changed:state.pop('pending',None);state.pop('request_id',None);state.pop('offered',None);state.pop('proposed',None)
         if 'reservation_date' in changed and 'reservation_time' not in updates:v.pop('reservation_time',None)
         if exact:state['hour_origin']='customer'
-    elif phase=='awaiting' and op=='create':return '¿Querés que registre la reserva que te resumí?',state
+    elif phase=='awaiting' and op=='create':return '¿La registro?',state
     if op in ('cancel','modify'):
         if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:
-            return 'Decime nombre y apellido de la reserva.',_state(state,phase='collecting',intent=op,values=v)
+            return 'Decime nombre y apellido de la reserva.',_state(state,phase='collecting',intent=op,values=v,last_requested_field='customer_name')
+        # A date supplied while identifying an existing booking disambiguates it;
+        # it is not automatically a request to move the booking to that date.
+        identifying_date=state.get('identifying_date') or (v.get('reservation_date') if op=='cancel' else None)
+        if op=='modify' and state.get('last_requested_field')=='reservation_date' and rel:
+            identifying_date=rel
+            v.pop('reservation_date',None)
         try:
-            if op=='cancel':
-                out=cancel_for_caller(b,v['customer_name'],customer);reply='Listo, la reserva quedó cancelada.'
-            else:
-                changes={k:v[k] for k in ('reservation_date','reservation_time','party_size') if v.get(k)}
-                if not changes:return '¿Qué día, hora o cantidad querés cambiar?',_state(state,phase='collecting',intent=op,values=v)
-                out=modify_for_caller(b,v['customer_name'],customer,changes);reply='Listo, cambié la reserva.'
-            if not out.get('airtable_synced'):reply+=' La copia de gestión está pendiente.'
-            return reply,{'phase':'done','intent':None,'values':{}}
-        except BookingError as exc:return str(exc),_state(state,phase='collecting',intent=op,values=v)
+            row=unique_reservation(b,v['customer_name'],customer,identifying_date)
+        except BookingError as exc:
+            if 'varias reservas' in str(exc):
+                return str(exc),_state(state,phase='collecting',intent=op,values=v,last_requested_field='reservation_date')
+            return str(exc),_state(state,phase='collecting',intent=op,values=v)
+        if op=='modify':
+            changes={k:v[k] for k in ('reservation_date','reservation_time','party_size') if v.get(k)}
+            if not changes:
+                return '¿Qué día, hora o cantidad querés cambiar?',_state(state,phase='collecting',intent=op,values=v,identifying_date=str(row['slot_date']))
+            new_date=changes.get('reservation_date') or str(row['slot_date'])
+            new_time=changes.get('reservation_time') or row['start_time']
+            if new_date==str(row['slot_date']) and new_time==row['start_time'] and int(changes.get('party_size') or row['party_size'])==int(row['party_size']):
+                return 'Esos datos ya coinciden con la reserva. ¿Qué querés cambiar?',_state(state,phase='collecting',intent=op,values=v)
+            summary='¿Confirmás cambiar la reserva de '+spoken_date(row['slot_date'])+' a '+spoken_time(row['start_time'])+' por '+spoken_date(new_date)+' '+spoken_time(new_time)+'?'
+        else:
+            summary='¿Confirmás cancelar la reserva de '+spoken_date(row['slot_date'])+' '+spoken_time(row['start_time'])+'?'
+        return summary,_state(state,phase='awaiting',intent=op,values=dict(v),pending=dict(v),target_code=row['code'],original_date=str(row['slot_date']),identifying_date=str(row['slot_date']))
     if op!='create':return safe_reply(result.get('reply')) or '¿En qué puedo ayudarte?',_state(state,phase='collecting',intent=None,values=v)
     if weekend and not rel:
         saturday,sunday=weekend_days(tz)
@@ -270,6 +326,11 @@ def process(b,state,history,text,channel,external_id,customer):
     if not v.get('party_size'):return ASK['party_size'],state
     try:
         if not v.get('reservation_time'):
+            suggestions=bool(band or state.get('time_band') or weekend or state.get('date_range') or intent=='availability' or re.search(r'\b(?:suger|opcion|horario|disponib|que horas|que hora|cuales)\b',plain))
+            if not suggestions and not state.get('offered'):
+                return '¿A qué hora te gustaría reservar?',state
+            if state.get('offered') and not suggestions:
+                return '¿Cuál de los horarios que te ofrecí te sirve?',state
             if state.get('date_range'):
                 start,end=state['date_range']
                 rows=[s for s in options(b,start,v['party_size'],limit=None) if start<=s['date']<=end and in_band(s['time'],state.get('time_band'))][:5]
@@ -301,7 +362,6 @@ def process(b,state,history,text,channel,external_id,customer):
 def _final_summary(state,v,channel):
     request_id=state.get('request_id') if state.get('pending')==v else None
     request_id=request_id or channel.lower()+':'+secrets.token_hex(12)
-    reply=('Tengo la reserva para '+spoken_date(v['reservation_date'])+' '+spoken_time(v['reservation_time'])+
-           ', para '+str(v['party_size'])+' personas, a nombre de '+str(v['customer_name'])+
-           ', con el correo '+str(v['customer_email'])+' y el teléfono '+str(v['customer_phone'])+'. ¿Querés que registre esta reserva?')
+    reply=('Para '+spoken_date(v['reservation_date'])+' '+spoken_time(v['reservation_time'])+
+           ', '+str(v['party_size'])+' personas, a nombre de '+str(v['customer_name'])+'. ¿La registro?')
     return reply,_state(state,phase='awaiting',intent='create',values=dict(v),pending=dict(v),request_id=request_id,offered=[],proposed=None)
