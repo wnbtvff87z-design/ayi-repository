@@ -8,7 +8,7 @@ from flask import Flask,Response,jsonify,request
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
-from booking import BookingError,db,init_schema,url,headers,availability,options
+from booking import BookingError,db,init_schema,url,headers
 from dialog import process
 app=Flask(__name__);log=logging.getLogger(__name__)
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
@@ -30,7 +30,7 @@ def _legacy_lookup(number):
  if len(found)>1:raise BookingError('Número duplicado en Restaurantes')
  if not found:return None
  f=found[0];name=str(f.get('Nombre') or 'Recepción')
- return {'business_id':'legacy:'+number,'name':name,'phone':number,'sector':'restaurante','allow_reservations':True,'allow_messages':True,'hours':f.get('Horarios',''),'menu':f.get('Menu',''),'address':f.get('Dirección') or f.get('Direccion') or '','timezone':f.get('Zona_Horaria') or os.getenv('DEFAULT_TIMEZONE','Europe/Madrid'),'greeting':f'Hola, buenas. {name}. ¿En qué podemos ayudarte?','voice':f.get('Voz_ID') or os.getenv('TTS_VOICE','bN1bDXgDIGX5lw0rtY2B'),'reception':f.get('Numero_Recepcion',''),'reception_hours':f.get('Horario_Recepcion','')}
+ return {'business_id':'legacy:'+number,'name':name,'phone':number,'sector':'restaurante','allow_reservations':True,'allow_messages':True,'hours':f.get('Horarios',''),'menu':f.get('Menu',''),'address':f.get('Dirección') or f.get('Direccion') or '','timezone':f.get('Zona_Horaria') or os.getenv('DEFAULT_TIMEZONE','Europe/Madrid'),'greeting':f.get('Saludo') or f'Hola, buenas. {name}. ¿En qué podemos ayudarte?','speech_style':str(f.get('Estilo_Voz') or 'neutro').strip().casefold(),'voice':f.get('Voz_ID') or os.getenv('TTS_VOICE','bN1bDXgDIGX5lw0rtY2B'),'reception':f.get('Numero_Recepcion',''),'reception_hours':f.get('Horario_Recepcion','')}
 def _tenant_lookup(number,channel):
  table=os.getenv('AIRTABLE_NUMBERS_TABLE','Numeros')
  formula='AND({Numero_E164}='+json.dumps(number)+',{Canal}='+json.dumps(channel)+',{Estado}="Activo")'
@@ -41,7 +41,7 @@ def _tenant_lookup(number,channel):
  if len(links)!=1:raise BookingError('Número sin negocio único')
  r=requests.get(url(os.getenv('AIRTABLE_BUSINESSES_TABLE','Negocios'),links[0]),headers=headers(),timeout=10);r.raise_for_status();f=r.json()['fields']
  if f.get('Estado')!='Activo' or not f.get('Business_ID'):return None
- return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or 'general').lower(),'allow_reservations':f.get('Permite_Reservas') is True,'allow_messages':f.get('Permite_Mensajes') is True,'hours':f.get('Horarios',''),'menu':f.get('Menu',''),'address':f.get('Direccion',''),'timezone':f.get('Zona_Horaria') or 'Europe/Madrid','greeting':f.get('Saludo') or 'Hola, ¿en qué puedo ayudarte?','voice':f.get('Voz_ID') or os.getenv('TTS_VOICE','bN1bDXgDIGX5lw0rtY2B'),'reception':f.get('Numero_Recepcion',''),'reception_hours':f.get('Horario_Recepcion','')}
+ return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or 'general').lower(),'allow_reservations':f.get('Permite_Reservas') is True,'allow_messages':f.get('Permite_Mensajes') is True,'hours':f.get('Horarios',''),'menu':f.get('Menu',''),'address':f.get('Direccion',''),'timezone':f.get('Zona_Horaria') or 'Europe/Madrid','greeting':f.get('Saludo') or 'Hola, ¿en qué puedo ayudarte?','speech_style':str(f.get('Estilo_Voz') or 'neutro').strip().casefold(),'voice':f.get('Voz_ID') or os.getenv('TTS_VOICE','bN1bDXgDIGX5lw0rtY2B'),'reception':f.get('Numero_Recepcion',''),'reception_hours':f.get('Horario_Recepcion','')}
 def lookup(number,channel):
  number=phone(number)
  if not number:return None
@@ -120,6 +120,8 @@ def converse(b,channel,customer,text,external_id):
   previous=c.execute('SELECT assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND external_id=%s',(bid,channel,external_id)).fetchone()
   if previous:return previous['assistant_text']
   current_state=dict(row['state'] or {})
+  if current_state.get('_sector') not in (None,str(b.get('sector') or '').strip().casefold()):
+   current_state={}
   if channel=='Voice':
    call_id=external_id.rsplit(':',1)[0]
    if current_state.get('_voice_call_id')!=call_id:
@@ -129,6 +131,7 @@ def converse(b,channel,customer,text,external_id):
   else:
    recent=c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 40',(bid,channel,customer)).fetchall()
   reply,state=process(b,current_state,list(reversed(recent)),text,channel,external_id,customer)
+  state['_sector']=str(b.get('sector') or '').strip().casefold()
   if channel=='Voice':state['_voice_call_id']=call_id
   c.execute('UPDATE customer_sessions SET state=%s::jsonb,updated_at=now() WHERE business_id=%s AND channel=%s AND customer_phone=%s',(json.dumps(state,ensure_ascii=False),bid,channel,customer))
   c.execute('INSERT INTO conversation_turns(business_id,channel,customer_phone,external_id,user_text,assistant_text) VALUES(%s,%s,%s,%s,%s,%s)',(bid,channel,customer,external_id,text[:4000],reply[:4000]))
@@ -222,40 +225,6 @@ def internal_turn():
   reply=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''))
   return jsonify(success=True,reply=reply)
  except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
-@app.post('/internal/reconcile-pending')
-def internal_reconcile_pending():
- if not authorized():return jsonify(success=False),401
- try:
-  from booking import reconcile_pending
-  result=reconcile_pending((request.get_json(silent=True) or {}).get('limit',25))
-  return jsonify(success=True,results=result)
- except Exception:log.exception('Reconciliation failed');return jsonify(success=False),503
-@app.post('/internal/booking')
-@app.post('/internal/book-test')
-def internal_booking():
- if not authorized():return jsonify(success=False),401
- d=request.get_json(silent=True) or {};action=d.get('action','create')
- if action not in ('create','modify','cancel'):return jsonify(success=False,message='Invalid action'),400
- try:
-  channel=d.get('channel','Voice');b=lookup(d.get('business_phone'),channel)
-  if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-  from booking import create,modify,cancel
-  if action=='create':out=create(d,b)
-  elif action=='modify':out=modify(b,d.get('code'),d.get('customer_email'),d)
-  else:out=cancel(b,d.get('code'),d.get('customer_email'))
-  return jsonify(out)
- except BookingError as exc:return jsonify(success=False,message=str(exc)),409
- except Exception:log.exception('Booking error');return jsonify(success=False,message='Error de reserva'),503
-@app.post('/internal/availability')
-def internal_availability():
- if not authorized():return jsonify(success=False),401
- d=request.get_json(silent=True) or {}
- try:
-  b=lookup(d.get('business_phone'),d.get('channel','Voice'))
-  if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-  if d.get('reservation_time'):out=availability(b,d.get('reservation_date'),d['reservation_time'],d.get('party_size',1))
-  else:out={'alternatives':[{'date':s['date'],'time':s['time']} for s in options(b,d.get('reservation_date'),d.get('party_size',1))[:3]]}
-  return jsonify(success=True,**out)
- except BookingError as exc:return jsonify(success=False,message=str(exc)),409
- except Exception:log.exception('Availability failed');return jsonify(success=False,message='No puedo consultar las franjas'),503
+from restaurant_routes import register_restaurant_routes
+register_restaurant_routes(app,authorized,lookup,log)
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
