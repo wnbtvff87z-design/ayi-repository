@@ -48,9 +48,9 @@ class Flow(unittest.TestCase):
    state={'phase':'awaiting','intent':'create','values':V.copy(),'pending':V.copy(),'request_id':channel+':fixed'}
    with self.subTest(channel=channel),patch.object(dialog,'classify',side_effect=AssertionError('no classifier')),patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',return_value={'success':True,'code':'R-1234567890','airtable_synced':False}) as create:
     reply,done=dialog.process(B,state,[],'sí',channel,'turn1','+34000000000')
-    self.assertEqual(done['phase'],'done');self.assertEqual(reply,'Reserva registrada.');self.assertTrue(done['mirror_pending']);create.assert_called_once()
+    self.assertEqual(done['phase'],'sync_pending');self.assertNotIn('confirmada',reply);self.assertTrue(done['mirror_pending']);create.assert_called_once()
     _,done2=dialog.process(B,done,[],'sí',channel,'turn2','+34000000000')
-    self.assertEqual(done2['phase'],'done');create.assert_called_once()
+    self.assertEqual(done2['phase'],'sync_pending');self.assertEqual(create.call_count,2)
  def test_today_past_time_offers_later_verified_slots(self):
   today=datetime.now(ZoneInfo('Europe/Madrid')).date().isoformat()
   values={**V,'reservation_date':today,'reservation_time':'00:01'}
@@ -103,7 +103,7 @@ class VoiceRules(unittest.TestCase):
   with patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',return_value={'success':True,'code':'R-ABC1234567','airtable_synced':True}) as create:
    reply,done=dialog.process(B,state,[],'sí','Voice','voice:3','+34000000000')
    again,_=dialog.process(B,done,[],'sí','Voice','voice:4','+34000000000')
-  self.assertNotIn('R-ABC1234567',reply);self.assertIn('Reserva registrada',reply);self.assertIn('no hice otra',again);create.assert_called_once()
+  self.assertNotIn('R-ABC1234567',reply);self.assertIn('quedó confirmada',reply);self.assertIn('no hice otra',again);create.assert_called_once()
  def test_yes_but_new_time_does_not_book(self):
   state={'phase':'awaiting','intent':'create','values':V.copy(),'pending':V.copy(),'request_id':'voice:fixed'}
   with patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create') as create:
@@ -225,7 +225,7 @@ class NaturalBookingAndOneConfirmation(unittest.TestCase):
   self.assertIn('¿La registro?',reply);self.assertNotIn(V['customer_email'],reply);self.assertNotIn(V['customer_phone'],reply)
   with patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',return_value={'success':True,'code':'R-SECRET1234','airtable_synced':True}) as create:
    answer,done=dialog.process(B,state,[],'Sí','Voice','call:2','+34000000000')
-  self.assertEqual(answer,'Reserva registrada.');self.assertNotIn('R-SECRET1234',answer);create.assert_called_once()
+  self.assertIn('quedó confirmada',answer);self.assertNotIn('R-SECRET1234',answer);create.assert_called_once()
  def test_cancel_needs_one_explicit_yes_and_no_repeat(self):
   row={'code':'R-SECRET','slot_date':'2030-10-01','start_time':'20:00','party_size':2}
   with patch.object(dialog,'classify',return_value={'intent':'cancel','updates':{'customer_name':'Ana Ejemplo'},'reply':''}),patch.object(dialog,'unique_reservation',return_value=row),patch.object(dialog,'cancel_for_caller',return_value={'success':True,'airtable_synced':True}) as cancel:
@@ -251,7 +251,7 @@ class NaturalAvailabilityV7(unittest.TestCase):
   today=datetime.now(ZoneInfo('Europe/Madrid')).date().isoformat()
   state={'intent':'create','phase':'collecting','values':{'reservation_date':today,'party_size':2}}
   def check(b,d,t,n):return {'available':t=='20:00','alternatives':[]}
-  with patch.object(dialog,'availability',side_effect=check) as availability,patch.object(dialog,'classify',side_effect=AssertionError('not needed')):
+  with patch.object(dialog,'availability',side_effect=check) as availability,patch.object(dialog,'classify',return_value={'intent':'availability','updates':{},'requested_times':['20:30','20:00'],'reply':''}):
    reply,out=dialog.process(B,state,[],'20.30 o 20hs tenes algo','WhatsApp','msg:1','+34000000000')
   self.assertEqual(availability.call_count,2)
   self.assertIn('ocho de la noche',reply)
@@ -260,7 +260,7 @@ class NaturalAvailabilityV7(unittest.TestCase):
   self.assertEqual(out['last_requested_field'],'customer_name')
  def test_both_times_free_asks_choice_not_booking(self):
   state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2}}
-  with patch.object(dialog,'availability',return_value={'available':True,'alternatives':[]}),patch.object(dialog,'create') as create:
+  with patch.object(dialog,'availability',return_value={'available':True,'alternatives':[]}),patch.object(dialog,'classify',return_value={'intent':'availability','updates':{},'requested_times':['20:30','20:00'],'reply':''}),patch.object(dialog,'create') as create:
    reply,out=dialog.process(B,state,[],'20.30 o 20hs tenes algo','WhatsApp','msg:1','+34000000000')
   self.assertEqual(len(out['offered']),2);self.assertIn('Cuál te va mejor',reply);create.assert_not_called()
  def test_inconsistent_slot_does_not_block_other_hours(self):
@@ -273,6 +273,58 @@ class NaturalAvailabilityV7(unittest.TestCase):
   source=(ROOT/'booking.py').read_text()
   self.assertIn('verify=requests.get(url(table,rec)',source)
   self.assertIn("returned=verify.json().get('fields',{})",source)
+class V8Regression(unittest.TestCase):
+ def test_gracias_after_completed_booking_does_not_restart(self):
+  state={'phase':'done','intent':None,'values':{}}
+  with patch.object(dialog,'classify',side_effect=AssertionError('Do not call model')):
+   reply,new=dialog.process(B,state,[],'gracias','WhatsApp','msg:2','+34000000000')
+  self.assertEqual(new,state);self.assertIn('Gracias a vos',reply)
+ def test_pending_mirror_retries_same_id_without_claiming_confirmed(self):
+  reply,state=dialog._final_summary({},V,'WhatsApp')
+  with patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',side_effect=[{'success':True,'code':'R-PRIVATE','airtable_synced':False},{'success':True,'code':'R-PRIVATE','airtable_synced':True}]) as create:
+   first,pending=dialog.process(B,state,[],'sí','WhatsApp','msg:3','+34000000000')
+   self.assertEqual(pending['phase'],'sync_pending');self.assertNotIn('confirmada',first)
+   second,done=dialog.process(B,pending,[],'gracias','WhatsApp','msg:4','+34000000000')
+  self.assertEqual(done['phase'],'done');self.assertIn('confirmada',second)
+  self.assertEqual(create.call_args_list[0].args[0]['request_id'],create.call_args_list[1].args[0]['request_id'])
+  self.assertNotIn('R-PRIVATE',first+second)
+ def test_model_multiple_times_checked_not_first_time_only(self):
+  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2}}
+  response={'intent':'availability','updates':{'reservation_time':'20:30'},'requested_times':['20:30','20:00'],'reply':''}
+  with patch.object(dialog,'classify',return_value=response),patch.object(dialog,'availability',side_effect=lambda b,d,t,n:{'available':t=='20:00','alternatives':[]}):
+   reply,out=dialog.process(B,state,[],'ocho y media u ocho de la tarde','WhatsApp','msg:5','+34000000000')
+  self.assertEqual(out['values']['reservation_time'],'20:00');self.assertIn('tengo lugar',reply)
+ def test_interpreter_strict_schema_is_shared_module(self):
+  source=(ROOT/'interpret.py').read_text()
+  self.assertIn("'strict':True",source)
+  self.assertIn("'requested_times'",source)
+  self.assertIn('from interpret import interpret',(ROOT/'restaurant_dialog.py').read_text())
+ def test_audit_detects_missing_whatsapp_option(self):
+  source=(ROOT/'audit_airtable_pg.py').read_text()
+  self.assertIn("('Canal',{'Voice','WhatsApp'})",source)
+ def test_existing_request_retries_mirror_not_second_insert(self):
+  source=(ROOT/'booking.py').read_text()
+  self.assertIn('synced if synced else mirror(existing_row)',source)
+  self.assertIn('if raced_existing:',source)
+class IdempotentMirrorV8(unittest.TestCase):
+ def test_existing_pending_pg_row_retries_mirror_without_insert(self):
+  tree=ast.parse((ROOT/'booking.py').read_text())
+  create_node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='create')
+  class Conn:
+   def __enter__(self):return self
+   def __exit__(self,*args):return False
+   def execute(self,sql,params):
+    if 'INSERT INTO booking_reservations' in sql:raise AssertionError('duplicate INSERT')
+    return self
+   def fetchone(self):return {'id':14}
+  row={'id':14,'code':'R-EXISTING','airtable_id':None,'airtable_pending':True}
+  mirror=Mock(return_value=True)
+  ns={'enabled':lambda *a,**k:None,'party':int,'re':re,'BookingError':BookingError,'init_schema':lambda:None,
+      'db':lambda:Conn(),'row_for':lambda *a:row,'mirror':mirror}
+  exec(compile(ast.Module(body=[create_node],type_ignores=[]),'booking.py','exec'),ns)
+  data={**V,'_confirmed':True,'request_id':'same-id','channel':'WhatsApp'}
+  result=ns['create'](data,B)
+  self.assertTrue(result['airtable_synced']);self.assertTrue(result['already_exists']);mirror.assert_called_once_with(row)
 if __name__=='__main__':unittest.main()
 
 class SingleTimeAvailabilityV7(unittest.TestCase):
@@ -287,6 +339,6 @@ class SingleTimeAvailabilityV7(unittest.TestCase):
   def check(b,d,t,n):
    if t=='20:00':raise BookingError('Esa fecha y hora ya pasaron')
    return {'available':True,'alternatives':[]}
-  with patch.object(dialog,'availability',side_effect=check):
+  with patch.object(dialog,'availability',side_effect=check),patch.object(dialog,'classify',return_value={'intent':'availability','updates':{},'requested_times':['20:00','20:30'],'reply':''}):
    reply,out=dialog.process(B,state,[],'20hs o 20.30 tenes algo','WhatsApp','m:1','+34000000000')
   self.assertEqual(out['values']['reservation_time'],'20:30')
