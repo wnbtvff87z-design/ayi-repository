@@ -29,6 +29,23 @@ def offer(rows, requested=None):
     parts=[(spoken_date(s['date'])+' ' if s['date']!=requested else '')+spoken_time(s['time']) for s in rows[:5]]
     return 'Tengo '+', '.join(parts)+'. ¿Cuál preferís?'
 
+def _requested_times(text):
+    """Extract multiple explicit clock times, not party sizes or dates."""
+    normalized=clean(text)
+    found=[]
+    pattern=r'(?<!\d)([01]?\d|2[0-3])\s*[:.]\s*([0-5]\d)(?!\d)|(?<!\d)([01]?\d|2[0-3])\s*(?:h|hs|horas)(?!\w)'
+    for match in re.finditer(pattern,normalized):
+        hour=int(match.group(1) or match.group(3));minute=int(match.group(2) or 0)
+        value=f'{hour:02d}:{minute:02d}'
+        if value not in found:found.append(value)
+    return found[:3]
+
+def _short_alternatives(rows,requested):
+    same=[x for x in rows if x['date']==requested]
+    if same:
+        return 'Sí tengo '+', '.join(spoken_time(x['time']) for x in same[:2])+'. ¿Te sirve alguna?'
+    return offer(rows,requested)
+
 def classify(b,state,history,text):
     key=os.getenv('OPENAI_API_KEY','')
     if not key:raise BookingError('El asistente no está configurado')
@@ -160,7 +177,7 @@ def process(b,state,history,text,channel,external_id,customer):
     plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
     if phase=='done' and _confirmed(text):return 'La operación anterior ya quedó hecha; no hice otra.',state
     if phase=='done' and state.get('mirror_pending') and any(term in plain for term in ('copia de gestion','airtable','agenda del equipo')):
-        return 'La reserva está guardada, pero aún no aparece en la agenda del equipo. No hagas otra; avisá al equipo para que revise la sincronización.',state
+        return 'La reserva está registrada. La actualización interna sigue pendiente; no hace falta repetirla.',state
     if phase=='awaiting' and op in ('cancel','modify') and state.get('pending')==v and _confirmed(text):
         try:
             old_date=state.get('original_date')
@@ -175,7 +192,7 @@ def process(b,state,history,text,channel,external_id,customer):
                 out=modify_for_caller(b,v['customer_name'],customer,changes,expected_code=code,reservation_date=old_date)
                 reply='Listo, cambié la reserva.'
             if not out.get('success'):return 'El servidor no confirmó el cambio. No puedo asegurar que se haya realizado.',state
-            if not out.get('airtable_synced'):reply+=' La copia de gestión está pendiente; no repitas la operación.'
+            if not out.get('airtable_synced'):log.warning('Airtable mirror pending after booking change')
             return reply,{'phase':'done','intent':None,'values':{},'mirror_pending':not out.get('airtable_synced')}
         except BookingError as exc:return str(exc),state
     if phase=='awaiting' and op in ('cancel','modify') and plain in {'no','espera','mejor no'}:
@@ -196,13 +213,37 @@ def process(b,state,history,text,channel,external_id,customer):
             reply='Reserva registrada.'
             if not result.get('airtable_synced'):
                 log.warning('Airtable mirror pending after booking operation')
-                reply+=' Todavía no aparece en la agenda del equipo. No hagas otra reserva; avisá al equipo para que la revise.'
+                # Keep internal sync status out of customer-facing booking confirmation.
             return reply,{'phase':'done','intent':None,'values':{},'mirror_pending':not result.get('airtable_synced'),'result_code':result.get('code')}
         except BookingError as exc:
             # Keep the idempotency key and snapshot: a server timeout may have committed.
             return str(exc)+' No tengo confirmación del servidor; conservé tus datos.',state
     if phase=='awaiting' and op=='create' and plain in {'no','espera','mejor no'}:
         return 'Está bien, no la registré. ¿Qué querés cambiar?',_state(state,phase='collecting',pending=None)
+    times=_requested_times(text)
+    if op=='create' and phase=='collecting' and len(times)>1 and v.get('reservation_date') and v.get('party_size'):
+        checks=[]
+        for t in times:
+            try:checks.append((t,availability(b,v['reservation_date'],t,v['party_size'])))
+            except BookingError as exc:
+                if 'ya pasaron' in str(exc):checks.append((t,{'available':False,'alternatives':[]}))
+                else:return str(exc),state
+        free=[t for t,result in checks if result.get('available')]
+        if len(free)==1:
+            v['reservation_time']=free[0]
+            state=_state(state,values=v,checked_slot=[v['reservation_date'],free[0],str(v['party_size'])],offered=[],proposed=None)
+            reply='A '+spoken_time(free[0]).removeprefix('a ')+' sí tengo lugar.'
+            missing=_contact_problem(v)
+            if missing:
+                question,next_state=_ask_missing(state,v,missing,text)
+                return reply+' '+question,next_state
+            summary,next_state=_final_summary(state,v,channel)
+            return reply+' '+summary,next_state
+        if len(free)>1:
+            slots=[{'date':v['reservation_date'],'time':t} for t in free]
+            return 'Sí, tengo lugar '+ ' y '.join(spoken_time(t) for t in free)+'. ¿Cuál te va mejor?',_state(state,offered=slots,proposed=None)
+        alternatives=_slots(checks[0][1].get('alternatives') or [])
+        return 'A esas horas no tengo lugar. '+_short_alternatives(alternatives,v['reservation_date']),_state(state,offered=alternatives,proposed=None)
     offered=state.get('offered') or []
     chosen_time=explicit_time(text)
     if op=='create' and phase!='done' and offered and chosen_time and not explicit_date(text,tz):
@@ -266,6 +307,7 @@ def process(b,state,history,text,channel,external_id,customer):
         return safe_reply(result.get('reply')) or '¿Qué querés saber?',_state(state,phase=phase,intent=op,values=v)
     if op in ('cancel','modify') and updates.get('customer_name'):
         if not all(part in plain for part in clean(updates['customer_name']).split()):updates.pop('customer_name',None)
+    newly_requested_time=bool(exact and op=='create' and v.get('reservation_time')!=exact and re.search(r'\b(?:tenes|tienes|hay|hueco|libre|disponib)\b',plain))
     if updates:
         changed={k for k,x in updates.items() if v.get(k)!=x}
         # A new name means a new person: never carry over somebody else's contact.
@@ -342,10 +384,7 @@ def process(b,state,history,text,channel,external_id,customer):
         if not check['available']:
             v.pop('reservation_time',None)
             alternatives=_slots(check.get('alternatives') or [])
-            reply='Esa hora no está libre. '+offer(alternatives,v.get('reservation_date'))
-            if alternatives:
-                first=alternatives[0]
-                reply+=' Te propongo '+spoken_date(first['date'])+' '+spoken_time(first['time'])+'. ¿Te sirve esa?'
+            reply='A '+spoken_time(slot_key[1]).removeprefix('a ')+' no tengo lugar. '+_short_alternatives(alternatives,v.get('reservation_date'))
             return reply,_state(state,values=v,offered=alternatives,proposed=alternatives[0] if alternatives else None,requested_time=slot_key[1],checked_slot=None)
     except BookingError as exc:
         if 'ya pasaron' in str(exc) and v.get('reservation_time') and v.get('reservation_date')==datetime.now(ZoneInfo(tz)).date().isoformat():
@@ -356,8 +395,13 @@ def process(b,state,history,text,channel,external_id,customer):
             except BookingError:pass
         return str(exc),state
     missing=_contact_problem(v)
-    if missing:return _ask_missing(_state(state,checked_slot=slot_key),v,missing,text)
-    return _final_summary(_state(state,checked_slot=slot_key),v,channel)
+    if missing:
+        question,next_state=_ask_missing(_state(state,checked_slot=slot_key),v,missing,text)
+        if newly_requested_time:return 'Sí, '+spoken_time(v['reservation_time'])+' tengo lugar. '+question,next_state
+        return question,next_state
+    summary,next_state=_final_summary(_state(state,checked_slot=slot_key),v,channel)
+    if newly_requested_time:return 'Sí, '+spoken_time(v['reservation_time'])+' tengo lugar. '+summary,next_state
+    return summary,next_state
 
 def _final_summary(state,v,channel):
     request_id=state.get('request_id') if state.get('pending')==v else None
