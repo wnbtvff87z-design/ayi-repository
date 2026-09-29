@@ -43,16 +43,24 @@ def audit():
  slots=list_records(slots_name,None);bookings=list_records(bookings_name,None)
  report['counts']={'postgresql_reservations':len(rows),'airtable_reservations':len(bookings),'airtable_slots':len(slots)}
  slot_by_id={x['id']:x for x in slots}
+ seen_slots={}
  for slot in slots:
   f=slot.get('fields',{});d=day(f.get('Fecha'));t=hour(f.get('Hora_Inicio'));bid=f.get('Business_ID')
   expected=f'{bid}-{d}-{t.replace(":", "")}' if bid and d and t else None
   if f.get('Franja_ID')!=expected:report['issues'].append({'kind':'invalid_slot_id','airtable_record':slot['id']})
+  key=(bid,d,t)
+  if key in seen_slots:report['issues'].append({'kind':'duplicate_slot','airtable_records':[seen_slots[key],slot['id']]})
+  else:seen_slots[key]=slot['id']
  by_code={}
  for item in bookings:
   f=item.get('fields',{});code=f.get('Codigo_Reserva')
   if code:by_code.setdefault(code,[]).append(item)
   if f.get('Status')=='Confirmada' and not f.get('Franja'):
    report['issues'].append({'kind':'unlinked_airtable_reservation','airtable_record':item['id']})
+ pg_codes={row['code'] for row in rows}
+ for item in bookings:
+  code=item.get('fields',{}).get('Codigo_Reserva')
+  if code and code not in pg_codes:report['issues'].append({'kind':'airtable_only_reservation','airtable_record':item['id']})
  for row in rows:
   found=by_code.get(row['code'],[])
   if not found:
