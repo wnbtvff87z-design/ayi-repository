@@ -11,7 +11,7 @@ class BookingError(Exception):pass
 booking_stub.BookingError=BookingError
 for name in ('availability','options','create'):setattr(booking_stub,name,Mock())
 sys.modules['booking']=booking_stub
-safe=types.ModuleType('booking_safe');safe.cancel_for_caller=Mock();safe.modify_for_caller=Mock();sys.modules['booking_safe']=safe
+safe=types.ModuleType('booking_safe');safe.cancel_for_caller=Mock();safe.modify_for_caller=Mock();safe.unique_reservation=Mock();sys.modules['booking_safe']=safe
 openai=types.ModuleType('openai');openai.OpenAI=object;sys.modules['openai']=openai
 import temporal,restaurant_dialog as dialog
 import dialog as router
@@ -103,7 +103,7 @@ class VoiceRules(unittest.TestCase):
   with patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',return_value={'success':True,'code':'R-ABC1234567','airtable_synced':True}) as create:
    reply,done=dialog.process(B,state,[],'sí','Voice','voice:3','+34000000000')
    again,_=dialog.process(B,done,[],'sí','Voice','voice:4','+34000000000')
-  self.assertIn('R-ABC1234567',reply);self.assertIn('no hice otra',again);create.assert_called_once()
+  self.assertNotIn('R-ABC1234567',reply);self.assertIn('Reserva registrada',reply);self.assertIn('no hice otra',again);create.assert_called_once()
  def test_yes_but_new_time_does_not_book(self):
   state={'phase':'awaiting','intent':'create','values':V.copy(),'pending':V.copy(),'request_id':'voice:fixed'}
   with patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create') as create:
@@ -167,7 +167,7 @@ class SpokenContactFlow(unittest.TestCase):
    a,state=dialog.process(B,state,[],'Ana Ejemplo','Voice','call:2','+34999999999')
    b,state=dialog.process(B,state,[],'ana arroba ejemplo punto com','Voice','call:3','+34999999999')
    c,state=dialog.process(B,state,[],'600 123 456','Voice','call:4','+34999999999')
-  self.assertIn('correo',a);self.assertIn('teléfono',b);self.assertIn('¿Querés que registre',c)
+  self.assertIn('correo',a);self.assertIn('teléfono',b);self.assertIn('¿La registro?',c)
   self.assertEqual(state['phase'],'awaiting');self.assertEqual(state['values']['customer_phone'],'600123456')
  def test_model_cannot_inject_old_email(self):
   self.assertNotIn('customer_email',dialog._explicit_contact_updates('hola',{'customer_email':'old@example.com'}))
@@ -200,4 +200,50 @@ class SectorRouting(unittest.TestCase):
   source=(ROOT/'main.py').read_text()
   self.assertIn('from dialog import process',source)
   self.assertIn("state['_sector']",source)
+class NaturalBookingAndOneConfirmation(unittest.TestCase):
+ def test_natural_spoken_time_without_prefiero_selects_offered_slot(self):
+  for text in ('Ocho de la noche','Ocho de la noche prefiero','Prefiero a las ocho de la noche','a las ocho'):
+   state={'intent':'create','phase':'collecting','values':{k:v for k,v in V.items() if k!='reservation_time'},'offered':[{'date':'2030-10-01','time':'20:00'},{'date':'2030-10-01','time':'21:00'}]}
+   with self.subTest(text=text),patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create') as create:
+    reply,out=dialog.process(B,state,[],text,'WhatsApp','msg:1','+34000000000')
+   self.assertEqual(out['values']['reservation_time'],'20:00');self.assertEqual(out['phase'],'awaiting');create.assert_not_called()
+ def test_day_without_hour_asks_hour_not_suggestions(self):
+  state={'phase':'collecting','intent':'create','values':{'reservation_date':'2030-10-01','party_size':2}}
+  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}),patch.object(dialog,'options') as options:
+   reply,out=dialog.process(B,state,[],'quiero reservar','WhatsApp','msg:1','+34000000000')
+  self.assertIn('qué hora',reply);options.assert_not_called()
+ def test_awaiting_confirmation_only_asks_short_question(self):
+  reply,state=dialog._final_summary({},V,'WhatsApp')
+  again,out=dialog.process(B,state,[],'¿me escuchás?','WhatsApp','msg:2','+34000000000')
+  self.assertEqual(again,'¿La registro?');self.assertEqual(out,state)
+ def test_greeting_does_not_start_booking(self):
+  with patch.object(dialog,'classify',return_value={'intent':'social','updates':{},'reply':'Hola, ¿en qué puedo ayudarte?'}),patch.object(dialog,'create') as create:
+   reply,out=dialog.process(B,{},[],'Hola','Voice','call:1','+34000000000')
+  self.assertIn('en qué puedo ayudarte',reply);create.assert_not_called()
+ def test_confirmation_does_not_repeat_personal_data_or_code(self):
+  reply,state=dialog._final_summary({},V,'Voice')
+  self.assertIn('¿La registro?',reply);self.assertNotIn(V['customer_email'],reply);self.assertNotIn(V['customer_phone'],reply)
+  with patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',return_value={'success':True,'code':'R-SECRET1234','airtable_synced':True}) as create:
+   answer,done=dialog.process(B,state,[],'Sí','Voice','call:2','+34000000000')
+  self.assertEqual(answer,'Reserva registrada.');self.assertNotIn('R-SECRET1234',answer);create.assert_called_once()
+ def test_cancel_needs_one_explicit_yes_and_no_repeat(self):
+  row={'code':'R-SECRET','slot_date':'2030-10-01','start_time':'20:00','party_size':2}
+  with patch.object(dialog,'classify',return_value={'intent':'cancel','updates':{'customer_name':'Ana Ejemplo'},'reply':''}),patch.object(dialog,'unique_reservation',return_value=row),patch.object(dialog,'cancel_for_caller',return_value={'success':True,'airtable_synced':True}) as cancel:
+   first,state=dialog.process(B,{},[],'Quiero cancelar mi reserva de Ana Ejemplo','Voice','call:1','+34000000000')
+   self.assertIn('¿Confirmás cancelar',first);cancel.assert_not_called()
+   again,state2=dialog.process(B,state,[],'¿Me escuchás?','Voice','call:2','+34000000000')
+   self.assertEqual(state2,state);self.assertNotIn('Ana Ejemplo',again)
+   reply,done=dialog.process(B,state,[],'sí','Voice','call:3','+34000000000')
+   self.assertIn('cancelada',reply);self.assertEqual(done['phase'],'done');cancel.assert_called_once()
+ def test_modify_needs_one_explicit_yes(self):
+  row={'code':'R-SECRET','slot_date':'2030-10-01','start_time':'20:00','party_size':2}
+  with patch.object(dialog,'classify',return_value={'intent':'modify','updates':{'customer_name':'Ana Ejemplo'},'reply':''}),patch.object(dialog,'unique_reservation',return_value=row),patch.object(dialog,'modify_for_caller',return_value={'success':True,'airtable_synced':True}) as modify:
+   first,state=dialog.process(B,{},[],'Quiero modificar mi reserva de Ana Ejemplo a las 21:00','Voice','call:1','+34000000000')
+   self.assertEqual(state['phase'],'awaiting');modify.assert_not_called()
+   reply,done=dialog.process(B,state,[],'sí','Voice','call:2','+34000000000')
+   self.assertIn('cambié',reply);modify.assert_called_once()
+ def test_no_cancel_on_ambiguous_yes(self):
+  with patch.object(dialog,'classify',return_value={'intent':'cancel','updates':{},'reply':''}),patch.object(dialog,'cancel_for_caller') as cancel:
+   reply,state=dialog.process(B,{},[],'sí','Voice','call:1','+34000000000')
+  cancel.assert_not_called()
 if __name__=='__main__':unittest.main()
