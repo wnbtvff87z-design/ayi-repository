@@ -24,7 +24,7 @@ def register_restaurant_routes(app,authorized,lookup,log):
    from booking import create,modify,cancel
    if action=='create':out=create(d,b)
    elif action=='modify':out=modify(b,d.get('code'),d.get('customer_email'),d)
-   else:out=cancel(b,d.get('code'),d.get('customer_email'))
+   else:out=cancel(b,d.get('code'),d.get('customer_email'),confirmed=d.get('_confirmed') is True)
    return jsonify(out)
   except BookingError as exc:return jsonify(success=False,message=str(exc)),409
   except Exception:log.exception('Booking error');return jsonify(success=False,message='Error de reserva'),503
