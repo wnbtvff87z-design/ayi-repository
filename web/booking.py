@@ -84,7 +84,7 @@ def slots(b,start=None,days=3):
   key=(d,t)
   if key in seen:raise BookingError('Franjas duplicadas para fecha y hora; revisar Airtable')
   seen.add(key);expected=f"{b['business_id']}-{d}-{t.replace(':','')}"
-  if f.get('Franja_ID')!=expected:log.warning('Franja_ID inconsistente; se usa Fecha/Hora_Inicio y el ID del registro')
+  if f.get('Franja_ID')!=expected:raise BookingError('Franja_ID no coincide con negocio, fecha y hora en Airtable; revisar Franjas')
   found.append({'id':expected,'rec':row['id'],'date':d,'time':t,'capacity':cap})
  return sorted(found,key=lambda s:(s['date'],s['time']))
 def airtable_bookings(b):
@@ -144,15 +144,28 @@ def lock_slot(c,b,s):
  c.execute('SELECT slot_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b,s['id']))
  c.execute('UPDATE booking_slots SET capacity=%s WHERE business_id=%s AND slot_id=%s',(s['capacity'],b,s['id']))
 def row_for(c,b,pk):return c.execute('SELECT r.*,s.slot_date,s.start_time FROM booking_reservations r JOIN booking_slots s ON r.business_id=s.business_id AND r.slot_id=s.slot_id WHERE r.business_id=%s AND r.id=%s',(b,pk)).fetchone()
+def _mirror_slot_record(row):
+ # On reconciliation, restore the linked Franja rather than creating orphan records.
+ bid=str(row['business_id']);d=day(row['slot_date']);t=hour(row['start_time'])
+ records=list_records(os.getenv('AIRTABLE_SLOTS_TABLE','Franjas'),'{Business_ID}='+json.dumps(bid))
+ matches=[r for r in records if day(r.get('fields',{}).get('Fecha'))==d and hour(r.get('fields',{}).get('Hora_Inicio'))==t and r.get('fields',{}).get('Franja_ID')==row['slot_id']]
+ if len(matches)!=1:raise BookingError('No existe una única franja válida para sincronizar la reserva')
+ return matches[0]['id']
+
 def mirror(row,slot_rec=None):
  try:
+  slot_rec=slot_rec or _mirror_slot_record(row)
   table=os.getenv('AIRTABLE_RESERVATIONS_TABLE','Reservas')
   fields={'Business_ID':row['business_id'],'Restaurant_Phone':row['business_phone'],'Customer_Name':row['name'],'Customer_Phone':row['phone'],'Customer_Email':row['email'],'Reservation_Date':str(row['slot_date']),'Reservation_Time':row['start_time'],'Party_Size':row['party_size'],'Status':row['status'],'Codigo_Reserva':row['code'],'Canal':row['channel'],'Call_ID':row['request_id']}
-  if slot_rec:fields['Franja']=[slot_rec]
+  fields['Franja']=[slot_rec]
   rec=row.get('airtable_id')
   if not rec:
    existing=list_records(table,'{Codigo_Reserva}='+json.dumps(row['code']))
    if len(existing)>1:raise BookingError('Código duplicado en Airtable')
+   if existing:
+    old=existing[0].get('fields',{})
+    if old.get('Business_ID') not in (None,row['business_id']) or old.get('Codigo_Reserva')!=row['code']:
+     raise BookingError('Conflicto entre la reserva de PostgreSQL y Airtable; requiere revisión manual')
    rec=existing[0]['id'] if existing else None
   if rec:
    fields['Actualizada_At']=datetime.now(timezone.utc).isoformat()
@@ -161,7 +174,13 @@ def mirror(row,slot_rec=None):
   else:
    fields['Created_At']=datetime.now(timezone.utc).isoformat()
    r=requests.post(url(table),headers=headers(),json={'fields':fields},timeout=10)
-  r.raise_for_status();rec=rec or r.json()['id']
+  r.raise_for_status();payload=r.json();rec=rec or payload['id']
+  returned=payload.get('fields',{})
+  for required in ('Business_ID','Customer_Name','Customer_Phone','Customer_Email','Reservation_Date','Reservation_Time','Party_Size','Codigo_Reserva'):
+   if str(returned.get(required,''))!=str(fields[required]):
+    raise BookingError('Airtable no devolvió los datos esperados; copia pendiente de revisión')
+  if slot_rec not in (returned.get('Franja') or []):
+   raise BookingError('La reserva de Airtable no quedó vinculada a la franja; copia pendiente')
   with db() as c:c.execute('UPDATE booking_reservations SET airtable_id=%s,airtable_pending=false WHERE id=%s',(rec,row['id']))
   return True
  except requests.HTTPError as exc:
@@ -183,7 +202,7 @@ def create(data,b):
  enabled(b,write=True)
  if data.get('_confirmed') is not True:raise BookingError('Falta confirmación explícita de la operación')
  n=party(data.get('party_size'));name=str(data.get('customer_name') or '').strip();email=str(data.get('customer_email') or '').strip();phone=str(data.get('customer_phone') or '').strip()
- if not name or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',email) or len(re.sub(r'\D','',phone))<9:raise BookingError('Faltan nombre, teléfono o correo válidos')
+ if len(name.split())<2 or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',email) or len(re.sub(r'\D','',phone))<9:raise BookingError('Faltan nombre, teléfono o correo válidos')
  req=str(data.get('request_id') or '').strip()
  if not req:raise BookingError('Falta identificador de operación')
  init_schema();bid=b['business_id']
