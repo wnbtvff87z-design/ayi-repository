@@ -2,11 +2,6 @@
 import logging,sys
 from booking import reconcile_pending,sync_airtable_slots
 if __name__=='__main__':
- from booking import db
- with db() as lock_conn:
-  acquired=lock_conn.execute('SELECT pg_try_advisory_lock(%s) AS locked',(918273645,)).fetchone()['locked']
-  if not acquired:
-   logging.info('Another reconciliation worker is active');sys.exit(0)
  logging.basicConfig(level=logging.INFO)
  slots=sync_airtable_slots()
  reservations=reconcile_pending(limit=25)
