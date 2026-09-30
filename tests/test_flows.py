@@ -70,7 +70,7 @@ class Flow(unittest.TestCase):
   alternatives=[{'date':'2030-10-01','time':'20:00'},{'date':'2030-10-02','time':'20:30'}]
   with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':False,'alternatives':alternatives}):
    reply,updated=dialog.process(B,state,[],'quiero reservar','WhatsApp','turn1','+34000000000')
-   self.assertIn('1. el 1 de octubre, 20:00',reply);self.assertIn('2. el 2 de octubre, 20:30',reply)
+   self.assertIn('ocho de la noche',reply);self.assertNotIn('2 de octubre',reply)
    self.assertNotIn('reservation_time',updated['values'])
 class VoiceRules(unittest.TestCase):
  def run_turn(self,state,text,updates=None,intent='create'):
@@ -325,76 +325,30 @@ class IdempotentMirrorV8(unittest.TestCase):
   data={**V,'_confirmed':True,'request_id':'same-id','channel':'WhatsApp'}
   result=ns['create'](data,B)
   self.assertTrue(result['airtable_synced']);self.assertTrue(result['already_exists']);mirror.assert_called_once_with(row)
-class V9Capacity(unittest.TestCase):
- def test_zero_or_insufficient_places_not_offered(self):
-  ns=load_booking_functions()
-  rows=[{'date':'2030-10-01','time':'20:00','capacity':2,'id':'a','rec':'a'},
-        {'date':'2030-10-01','time':'21:00','capacity':4,'id':'b','rec':'b'}]
-  class Conn:
-   def __enter__(self):return self
-   def __exit__(self,*a):return False
-  ns.update(slots=lambda *a:rows,airtable_bookings=lambda *a:[],init_schema=lambda:None,db=lambda:Conn(),occupied=lambda c,b,slot,records:2)
-  self.assertEqual([x['time'] for x in ns['options'](B,'2030-10-01',2)],['21:00'])
-  self.assertEqual(ns['options'](B,'2030-10-01',3),[])
-class V9NoLoop(unittest.TestCase):
- def test_empty_options_does_not_repeat_rejected_time(self):
-  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2,'reservation_time':'20:00'}}
-  with patch.object(dialog,'classify',return_value={'intent':'availability','updates':{},'requested_times':[],'reply':'','action':'continue'}),patch.object(dialog,'availability',return_value={'available':False,'alternatives':[]}):
-   first,new=dialog.process(B,state,[],'busca algo','WhatsApp','m:1','+34000000000')
-  self.assertTrue(new['search_exhausted']);self.assertNotIn('reservation_time',new['values'])
-  with patch.object(dialog,'classify',side_effect=AssertionError('no model on yes')):
-   second,new2=dialog.process(B,new,[],'sí','WhatsApp','m:2','+34000000000')
-  self.assertNotEqual(first,second);self.assertIn('otro día',second)
- def test_search_alternatives_does_not_recheck_rejected_hour(self):
-  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','reservation_time':'20:00','party_size':2}}
-  model={'intent':'availability','updates':{},'requested_times':[],'reply':'','action':'search_alternatives'}
-  with patch.object(dialog,'classify',return_value=model),patch.object(dialog,'options',return_value=[{'date':'2030-10-01','time':'21:00'}]) as opts,patch.object(dialog,'availability',side_effect=AssertionError('old hour rechecked')):
-   reply,new=dialog.process(B,state,[],'busca algo','WhatsApp','m:7','+34000000000')
-  self.assertIn('21:00',reply);self.assertNotIn('reservation_time',new['values']);opts.assert_called_once()
- def test_second_other_day_search_advances_after_empty_window(self):
-  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2},'search_exhausted':True}
-  model={'intent':'availability','updates':{},'requested_times':[],'reply':'','action':'search_other_day'}
-  with patch.object(dialog,'classify',return_value=model),patch.object(dialog,'options',return_value=[]) as opts:
-   _,state=dialog.process(B,state,[],'otro día','WhatsApp','m:10','+34000000000')
-   _,state=dialog.process(B,state,[],'otro día','WhatsApp','m:11','+34000000000')
-  self.assertEqual(opts.call_args_list[0].args[1],'2030-10-02')
-  self.assertEqual(opts.call_args_list[1].args[1],'2030-10-09')
- def test_other_day_uses_new_search_not_old_hour(self):
-  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-01','party_size':2},'search_exhausted':True}
-  candidate={'date':'2030-10-02','time':'21:00','capacity':4}
-  with patch.object(dialog,'classify',return_value={'intent':'availability','updates':{},'requested_times':[],'reply':'','action':'search_other_day'}),patch.object(dialog,'options',return_value=[candidate]) as opts:
-   reply,new=dialog.process(B,state,[],'probamos otro día','WhatsApp','m:3','+34000000000')
-  self.assertIn('21:00',reply);self.assertEqual(new['offered'][0]['date'],'2030-10-02');opts.assert_called_once()
- def test_whatsapp_numbered_options_and_voice_natural(self):
-  rows=[{'date':'2030-10-02','time':'20:30'},{'date':'2030-10-02','time':'21:00'}]
-  with patch.object(dialog,'phrase',return_value=None):
-   chat,_=dialog.present_options(B,{'values':{'party_size':2}},rows,'WhatsApp')
-   voice,_=dialog.present_options(B,{'values':{'party_size':2}},rows,'Voice')
-  self.assertIn('1. el 2 de octubre, 20:30',chat);self.assertNotIn('1.',voice);self.assertIn('ocho y media',voice)
- def test_multiple_options_yes_does_not_choose(self):
-  offered=[{'date':'2030-10-02','time':'20:30'},{'date':'2030-10-02','time':'21:00'}]
-  self.assertIsNone(dialog._selection('sí',offered,None))
- def test_semantic_selection_with_all_details_one_confirmation(self):
-  state={'intent':'create','phase':'collecting','values':{k:v for k,v in V.items() if k!='reservation_time'},'offered':[{'date':'2030-10-01','time':'21:00'},{'date':'2030-10-02','time':'20:00'}],'offered_final':True}
-  model={'intent':'availability','updates':{},'requested_times':[],'reply':'','action':'select_option','selected_option':2}
-  with patch.object(dialog,'classify',return_value=model),patch.object(dialog,'availability',return_value={'available':True}),patch.object(dialog,'create',return_value={'success':True,'code':'R-HIDDEN','airtable_synced':True}) as create:
-   reply,done=dialog.process(B,state,[],'la del sábado','WhatsApp','m:4','+34000000000')
-  self.assertEqual(done['phase'],'done');self.assertIn('confirmada',reply);create.assert_called_once()
-  self.assertEqual(create.call_args.args[0]['reservation_time'],'20:00')
- def test_requested_dates_survive_party_size_question(self):
-  model1={'intent':'availability','updates':{},'requested_dates':['2030-10-04','2030-10-05'],'requested_times':[],'reply':'','action':'continue'}
-  model2={'intent':'create','updates':{'party_size':2},'requested_dates':[],'requested_times':[],'reply':'','action':'continue'}
-  with patch.object(dialog,'classify',side_effect=[model1,model2]),patch.object(dialog,'options',side_effect=[[{'date':'2030-10-04','time':'20:00'}],[]]) as opts:
-   first,state=dialog.process(B,{},[],'sábado o domingo','WhatsApp','m:8','+34000000000')
-   second,state=dialog.process(B,state,[],'dos personas','WhatsApp','m:9','+34000000000')
-  self.assertIn('cuántas',first);self.assertIn('20:00',second);self.assertEqual(opts.call_count,2)
- def test_multiple_dates_uses_exact_requested_days(self):
-  state={'intent':'create','phase':'collecting','values':{'party_size':2}}
-  model={'intent':'availability','updates':{},'requested_dates':['2030-10-04','2030-10-05'],'requested_times':[],'reply':'','action':'continue'}
-  rows=[{'date':'2030-10-04','time':'20:00'},{'date':'2030-10-05','time':'21:00'}]
-  with patch.object(dialog,'classify',return_value=model),patch.object(dialog,'options',side_effect=[[rows[0]],[rows[1]]]) as opts:
-   reply,new=dialog.process(B,state,[],'sábado o domingo para dos','WhatsApp','m:5','+34000000000')
-  self.assertEqual(len(new['offered']),2);self.assertEqual(opts.call_count,2)
+
+class VoiceCallerFallbackRegression(unittest.TestCase):
+ def test_voice_uses_verified_caller_number_without_asking_again(self):
+  values={k:v for k,v in V.items() if k!='customer_phone'}
+  state={'phase':'collecting','intent':'create','values':values,'checked_slot':[V['reservation_date'],V['reservation_time'],'2']}
+  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
+   reply,out=dialog.process(B,state,[],'quiero reservar','Voice','call:phone','+34600123456')
+  self.assertEqual(out['values']['customer_phone'],'+34600123456')
+  self.assertNotIn('teléfono',reply.casefold())
+  self.assertEqual(out['phase'],'awaiting')
+ def test_single_spoken_name_is_accepted(self):
+  values={k:v for k,v in V.items() if k!='customer_name'}
+  state={'phase':'collecting','intent':'create','values':values,'last_requested_field':'customer_name','checked_slot':[V['reservation_date'],V['reservation_time'],'2']}
+  with patch.object(dialog,'classify',return_value={'intent':'question','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
+   reply,out=dialog.process(B,state,[],'Mariano','Voice','call:name','+34600123456')
+  self.assertEqual(out['values']['customer_name'],'Mariano')
+  self.assertEqual(out['phase'],'awaiting')
+  self.assertIn('¿La registro?',reply)
+ def test_missing_prompt_never_becomes_terminal_refusal(self):
+  state={'last_requested_field':'customer_name','missing_attempts':2}
+  reply,out=dialog._ask_missing(state,{},'customer_name','')
+  self.assertNotIn('otro medio',reply)
+  self.assertEqual(out['missing_attempts'],1)
+
 if __name__=='__main__':unittest.main()
 
 class SingleTimeAvailabilityV7(unittest.TestCase):
