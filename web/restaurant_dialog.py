@@ -1,14 +1,14 @@
 """Short restaurant conversation, with server-verified slots and persistent state."""
 import json, logging, os, re, secrets, unicodedata
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
-from interpret import interpret, phrase
+from interpret import interpret
 from booking import BookingError, availability, options, create
 from booking_safe import cancel_for_caller, modify_for_caller, unique_reservation
 from temporal import relative_day, explicit_time, explicit_date, weekend_days, requested_band, in_band
 log=logging.getLogger(__name__)
 NEEDED=('customer_name','reservation_date','reservation_time','party_size','customer_phone','customer_email')
-ASK={'customer_name':'¿Nombre y apellido para la reserva?','reservation_date':'¿Para qué día?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono dejamos?','customer_email':'¿Qué correo dejamos?'}
+ASK={'customer_name':'¿A qué nombre hago la reserva?','reservation_date':'¿Para qué día?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono dejamos?','customer_email':'¿Qué correo dejamos?'}
 MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
 
 def clean(s):
@@ -28,27 +28,6 @@ def offer(rows, requested=None):
     if not rows:return 'No veo horarios disponibles en las franjas consultadas. ¿Probamos otro día?'
     parts=[(spoken_date(s['date'])+' ' if s['date']!=requested else '')+spoken_time(s['time']) for s in rows[:5]]
     return 'Tengo '+', '.join(parts)+'. ¿Cuál preferís?'
-
-def present_options(b,state,rows,channel,requested=None,reason='alternative'):
-    """Only verified backend slots enter offered; render same inventory for both channels."""
-    offered=_slots(rows)
-    if not offered:
-        new=_state(state,offered=[],proposed=None,search_exhausted=True,requested_time=None,checked_slot=None,offered_final=False,values={k:v for k,v in (state.get('values') or {}).items() if k!='reservation_time'})
-        return 'No encontré horarios reservables en las fechas consultadas. ¿Qué otra fecha te gustaría probar?',new
-    lead=phrase(b,channel,reason,offered,requested)
-    if channel=='WhatsApp':
-        lead=lead or 'Estas opciones sí están disponibles:'
-        lines=[f"{i}. {spoken_date(x['date'])}, {x['time']}" for i,x in enumerate(offered,1)]
-        reply=lead+'\n'+'\n'.join(lines)
-    else:
-        lead=lead or 'Puedo ofrecerte '
-        reply=lead+' '.join((spoken_date(x['date'])+' ' if x['date']!=requested else '')+spoken_time(x['time'])+(' o' if i<len(offered)-1 else '') for i,x in enumerate(offered))
-    v=state.get('values') or {}
-    ready=bool(v.get('party_size') and not _contact_problem(v))
-    if ready:
-        reply+=('\n' if channel=='WhatsApp' else ' ')+'Para '+str(v['party_size'])+' personas a nombre de '+str(v['customer_name'])+', ¿confirmás la opción que elijas para registrarla?'
-    else:reply+=('\n' if channel=='WhatsApp' else ' ')+'¿Cuál te viene mejor?'
-    return reply,_state(state,offered=offered,proposed=offered[0] if len(offered)==1 else None,offered_final=ready,search_exhausted=False,requested_time=None)
 
 def _requested_times(text):
     """Extract multiple explicit clock times, not party sizes or dates."""
@@ -129,14 +108,16 @@ def _ask_missing(state, v, field, text):
     state['last_requested_field']=field
     state['missing_attempts']=attempts
     if attempts>=3:
-        return 'No estoy pudiendo registrar ese dato por voz. Para evitar una reserva incorrecta, podés comunicarte con recepción por otro medio. No hice ninguna reserva.',state
+        # Never trap Voice in a terminal loop. Keep the booking state and ask one short question.
+        state['missing_attempts']=1
+        return ASK[field],state
     if attempts>1:
-        reason={'customer_name':'No pude identificar nombre y apellido.', 'customer_email':'No pude reconocer un correo válido. Decímelo despacio, por ejemplo: ana arroba ejemplo punto com.', 'customer_phone':'No pude reconocer un teléfono válido. Decímelo dígito por dígito.'}.get(field)
+        reason={'customer_name':'No pude identificar el nombre.', 'customer_email':'No pude reconocer un correo válido. Decímelo despacio, por ejemplo: ana arroba ejemplo punto com.', 'customer_phone':'No pude reconocer un teléfono válido. Decímelo dígito por dígito.'}.get(field)
         return (reason+' ' if reason else '')+ASK[field],state
     return ASK[field],state
 
 def _contact_problem(v):
-    if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:return 'customer_name'
+    if not v.get('customer_name') or not re.fullmatch(r"[a-z]+(?:[ '-][a-z]+){0,5}",clean(v['customer_name'])):return 'customer_name'
     if not v.get('customer_email') or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',str(v['customer_email'])):return 'customer_email'
     if not v.get('customer_phone') or len(re.sub(r'\D','',str(v['customer_phone'])))<9:return 'customer_phone'
     return None
@@ -182,9 +163,11 @@ def process(b,state,history,text,channel,external_id,customer):
         result=classify(b,state,history,text)
         return safe_reply(result.get('reply')) or 'No tengo esa información verificada.',state
     plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
-    if phase=='collecting' and v.get('reservation_date') and v['reservation_date']<datetime.now(ZoneInfo(tz)).date().isoformat():
-        v.pop('reservation_date',None);v.pop('reservation_time',None)
-        state=_state(state,values=v,offered=[],proposed=None,checked_slot=None,date_range=None,search_exhausted=False)
+    # For Voice, the verified inbound caller number is the safe fallback contact.
+    # Do this before missing-field checks so ASR failures never create a phone loop.
+    if channel=='Voice' and customer and len(re.sub(r'\D','',str(customer)))>=9 and not v.get('customer_phone'):
+        v['customer_phone']=customer
+        state=_state(state,values=v)
     if phase=='done' and plain in {'gracias','muchas gracias','gracias por todo','perfecto gracias','vale gracias','ok gracias'}:
         return '¡Gracias a vos! Te esperamos.',state
     if phase=='done' and _confirmed(text):return 'La operación anterior ya quedó hecha; no hice otra.',state
@@ -243,14 +226,7 @@ def process(b,state,history,text,channel,external_id,customer):
             return str(exc)+' No tengo confirmación del servidor; conservé tus datos.',state
     if phase=='awaiting' and op=='create' and plain in {'no','espera','mejor no'}:
         return 'Está bien, no la registré. ¿Qué querés cambiar?',_state(state,phase='collecting',pending=None)
-    if op=='create' and len(state.get('offered') or [])>1 and _confirmed(text):
-        return '¿Cuál de las opciones preferís?',state
-    if state.get('search_exhausted') and _confirmed(text):
-        return '¿Qué otro día querés que consulte?',state
     offered=state.get('offered') or []
-    if offered and any(x['date']<datetime.now(ZoneInfo(tz)).date().isoformat() for x in offered):
-        state=_state(state,offered=[],proposed=None,offered_final=False)
-        offered=[]
     chosen_time=explicit_time(text)
     if op=='create' and phase!='done' and offered and chosen_time and not explicit_date(text,tz):
         if sum(slot['time']==chosen_time for slot in offered)>1:
@@ -269,10 +245,7 @@ def process(b,state,history,text,channel,external_id,customer):
         except BookingError as exc:return str(exc),state
         missing=_contact_problem(v)
         if missing:return _ask_missing(state,v,missing,text)
-        summary,pending=_final_summary(state,v,channel)
-        if state.get('offered_final'):
-            return process(b,pending,history,'sí',channel,external_id,customer)
-        return summary,pending
+        return _final_summary(state,v,channel)
     # A question while awaiting consent must not consume or reset the pending snapshot.
     if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email|soy|llamo|llamame)\b',plain)):
         return '¿La registro?',state
@@ -282,62 +255,6 @@ def process(b,state,history,text,channel,external_id,customer):
     if re.search(r'\b(cancelar|cancela|anular|anula)\b',plain):intent='cancel'
     elif re.search(r'\b(modificar|modifica|cambiar|cambia)\b',plain) and 'reserva' in plain and op!='create':intent='modify'
     elif re.search(r'\b(reservar|reserva|mesa)\b',plain) and op not in ('modify','cancel') and (intent not in ('question','social') or 'queria' in plain or 'quiero' in plain):intent='create'
-    if op is None and intent in ('create','availability'):op='create'
-    if op=='create' and state.get('offered') and result.get('action')=='select_option':
-        ix=result.get('selected_option')
-        if isinstance(ix,int) and not isinstance(ix,bool) and 1<=ix<=len(state['offered']):
-            selected=state['offered'][ix-1]
-            v.update(reservation_date=selected['date'],reservation_time=selected['time'])
-            state=_state(state,values=v,offered=[],proposed=None,checked_slot=None,phase='collecting')
-            try:valid=availability(b,selected['date'],selected['time'],v.get('party_size') or 1)['available']
-            except BookingError as exc:return str(exc),state
-            if not valid:
-                v.pop('reservation_time',None)
-                return 'Esa opción acaba de ocuparse. ¿Busco otras?',_state(state,values=v,offered_final=False)
-            missing=_contact_problem(v)
-            if missing:return _ask_missing(state,v,missing,text)
-            summary,pending=_final_summary(state,v,channel)
-            if state.get('offered_final'):
-                return process(b,pending,history,'sí',channel,external_id,customer)
-            return summary,pending
-    if op=='create' and result.get('action')=='search_alternatives' and v.get('party_size') and not (result.get('updates') or {}).get('reservation_date'):
-        old_time=v.pop('reservation_time',None)
-        state=_state(state,values=v,offered=[],proposed=None,checked_slot=None,phase='collecting')
-        try:rows=[x for x in options(b,v.get('reservation_date'),v['party_size'],old_time,limit=None) if not (x['date']==v.get('reservation_date') and x['time']==old_time)][:5]
-        except BookingError as exc:return str(exc),state
-        return present_options(b,state,rows,channel,v.get('reservation_date'),'alternatives')
-    if op=='create' and result.get('action')=='search_other_day' and not (result.get('updates') or {}).get('reservation_date') and not result.get('requested_dates'):
-        old=state.get('search_after') or v.get('reservation_date')
-        if not v.get('party_size'):return ASK['party_size'],_state(state,phase='collecting',intent='create',values=v)
-        target=(date.fromisoformat(old)+timedelta(days=1)).isoformat() if old else datetime.now(ZoneInfo(tz)).date().isoformat()
-        v.pop('reservation_time',None)
-        state=_state(state,values=v,offered=[],proposed=None,checked_slot=None,pending=None,request_id=None,time_band=None,date_range=None,phase='collecting',search_after=(date.fromisoformat(target)+timedelta(days=6)).isoformat())
-        try:rows=[x for x in options(b,target,v['party_size'],limit=None) if x['date']>=target][:5]
-        except BookingError as exc:return str(exc),state
-        return present_options(b,state,rows,channel,target,'other_day')
-    if op=='create' and result.get('action')!='select_option':
-        requested_dates=result.get('requested_dates') or state.get('requested_dates') or []
-        dates=[]
-        for value in requested_dates[:7]:
-            try:
-                d=date.fromisoformat(value).isoformat()
-                if d not in dates:dates.append(d)
-            except (ValueError,TypeError):pass
-        if len(dates)>1:
-            if not v.get('party_size'):
-                candidate=(result.get('updates') or {}).get('party_size')
-                if isinstance(candidate,int) and not isinstance(candidate,bool) and 1<=candidate<=20:v['party_size']=candidate
-            if not v.get('party_size'):
-                return ASK['party_size'],_state(state,values=v,intent='create',phase='collecting',requested_dates=dates)
-            v.pop('reservation_time',None)
-            state=_state(state,values=v,offered=[],proposed=None,checked_slot=None,phase='collecting',date_range=None,requested_dates=None)
-            try:
-                rows=[]
-                for d in dates:
-                    rows.extend(x for x in options(b,d,v['party_size'],limit=None) if x['date']==d)
-            except BookingError as exc:return str(exc),state
-            rows=sorted(rows,key=lambda x:(x['date'],x['time']))[:5]
-            return present_options(b,_state(state,search_after=max(dates)),rows,channel,dates[0],'requested_dates')
     updates=result.get('updates') if isinstance(result.get('updates'),dict) else {}
     updates=_explicit_contact_updates(text,{k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')})
     if 'reservation_date' in updates:
@@ -353,7 +270,7 @@ def process(b,state,history,text,channel,external_id,customer):
     expected=state.get('last_requested_field') if op in ('create','cancel','modify') else None
     if expected=='customer_name' and 'customer_name' not in updates:
         raw=re.sub(r'^(?:mi nombre es|me llamo|soy|a nombre de)\s+','',plain).strip(' .,')
-        if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,3}',raw) and not any(w in raw.split() for w in ('correo','telefono','reserva','quiero','hola')):
+        if re.fullmatch(r"[a-z]+(?:[ '-][a-z]+){0,4}",raw) and not any(w in raw.split() for w in ('correo','telefono','reserva','quiero','hola')):
             updates['customer_name']=' '.join(word.capitalize() for word in raw.split())
     if expected=='customer_phone' and 'customer_phone' not in updates:
         digits=re.sub(r'\D','',text)
@@ -460,13 +377,13 @@ def process(b,state,history,text,channel,external_id,customer):
             slots=[{'date':v['reservation_date'],'time':t} for t in free]
             return 'Sí, tengo lugar '+ ' y '.join(spoken_time(t) for t in free)+'. ¿Cuál te va mejor?',_state(state,offered=slots,proposed=None)
         alternatives=_slots(checks[0][1].get('alternatives') or [])
-        return present_options(b,_state(state,values=v),alternatives,channel,v['reservation_date'],'unavailable')
+        return 'A esas horas no tengo lugar. '+_short_alternatives(alternatives,v['reservation_date']),_state(state,offered=alternatives,proposed=None)
     if not v.get('reservation_date'):
         if intent=='availability':
             if not v.get('party_size'):return ASK['party_size'],state
             try:
                 rows=options(b,None,v['party_size'])
-                return present_options(b,state,rows,channel,None,'suggestions')
+                return offer(rows,None),_state(state,offered=_slots(rows))
             except BookingError as exc:return str(exc),state
         return ASK['reservation_date'],state
     if not v.get('party_size'):return ASK['party_size'],state
@@ -482,13 +399,14 @@ def process(b,state,history,text,channel,external_id,customer):
                 rows=[s for s in options(b,start,v['party_size'],limit=None) if start<=s['date']<=end and in_band(s['time'],state.get('time_band'))][:5]
             else:
                 rows=[s for s in options(b,v['reservation_date'],v['party_size'],limit=None) if s['date']==v['reservation_date'] and in_band(s['time'],state.get('time_band'))][:5]
-            return present_options(b,state,rows,channel,v['reservation_date'],'suggestions')
+            return offer(rows,v['reservation_date']),_state(state,offered=_slots(rows))
         slot_key=[v['reservation_date'],v['reservation_time'],str(v['party_size'])]
         check={'available':True} if state.get('checked_slot')==slot_key else availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
         if not check['available']:
             v.pop('reservation_time',None)
             alternatives=_slots(check.get('alternatives') or [])
-            return present_options(b,_state(state,values=v,checked_slot=None),alternatives,channel,v.get('reservation_date'),'unavailable')
+            reply='A '+spoken_time(slot_key[1]).removeprefix('a ')+' no tengo lugar. '+_short_alternatives(alternatives,v.get('reservation_date'))
+            return reply,_state(state,values=v,offered=alternatives,proposed=alternatives[0] if alternatives else None,requested_time=slot_key[1],checked_slot=None)
     except BookingError as exc:
         if 'ya pasaron' in str(exc) and v.get('reservation_time') and v.get('reservation_date')==datetime.now(ZoneInfo(tz)).date().isoformat():
             try:
