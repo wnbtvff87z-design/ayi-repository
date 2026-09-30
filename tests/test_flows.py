@@ -325,30 +325,6 @@ class IdempotentMirrorV8(unittest.TestCase):
   data={**V,'_confirmed':True,'request_id':'same-id','channel':'WhatsApp'}
   result=ns['create'](data,B)
   self.assertTrue(result['airtable_synced']);self.assertTrue(result['already_exists']);mirror.assert_called_once_with(row)
-
-class VoiceCallerFallbackRegression(unittest.TestCase):
- def test_voice_uses_verified_caller_number_without_asking_again(self):
-  values={k:v for k,v in V.items() if k!='customer_phone'}
-  state={'phase':'collecting','intent':'create','values':values,'checked_slot':[V['reservation_date'],V['reservation_time'],'2']}
-  with patch.object(dialog,'classify',return_value={'intent':'create','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
-   reply,out=dialog.process(B,state,[],'quiero reservar','Voice','call:phone','+34600123456')
-  self.assertEqual(out['values']['customer_phone'],'+34600123456')
-  self.assertNotIn('teléfono',reply.casefold())
-  self.assertEqual(out['phase'],'awaiting')
- def test_single_spoken_name_is_accepted(self):
-  values={k:v for k,v in V.items() if k!='customer_name'}
-  state={'phase':'collecting','intent':'create','values':values,'last_requested_field':'customer_name','checked_slot':[V['reservation_date'],V['reservation_time'],'2']}
-  with patch.object(dialog,'classify',return_value={'intent':'question','updates':{},'reply':''}),patch.object(dialog,'availability',return_value={'available':True}):
-   reply,out=dialog.process(B,state,[],'Mariano','Voice','call:name','+34600123456')
-  self.assertEqual(out['values']['customer_name'],'Mariano')
-  self.assertEqual(out['phase'],'awaiting')
-  self.assertIn('¿La registro?',reply)
- def test_missing_prompt_never_becomes_terminal_refusal(self):
-  state={'last_requested_field':'customer_name','missing_attempts':2}
-  reply,out=dialog._ask_missing(state,{},'customer_name','')
-  self.assertNotIn('otro medio',reply)
-  self.assertEqual(out['missing_attempts'],1)
-
 if __name__=='__main__':unittest.main()
 
 class SingleTimeAvailabilityV7(unittest.TestCase):

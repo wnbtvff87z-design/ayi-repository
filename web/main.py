@@ -224,6 +224,12 @@ def internal_turn():
   if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
   reply=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''))
   return jsonify(success=True,reply=reply)
+ except BookingError as exc:
+  log.info('Turn rejected safely: %s',exc)
+  return jsonify(success=True,reply=str(exc),operation_confirmed=False),200
+ except BookingError as exc:
+  log.info('Turn rejected safely: %s',exc)
+  return jsonify(success=True,reply=str(exc),operation_confirmed=False),200
  except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
 from restaurant_routes import register_restaurant_routes
 register_restaurant_routes(app,authorized,lookup,log)

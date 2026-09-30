@@ -1,5 +1,5 @@
 """Twilio ConversationRelay transport. Conversation logic and history live in web/core."""
-import json,logging,os,re
+import json,logging,os,re,time
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
 import httpx
@@ -78,7 +78,7 @@ async def relay_ended():return Response('<Response><Hangup/></Response>',media_t
 @app.websocket('/ws')
 async def websocket(ws:WebSocket):
  if not valid_ws(ws):await ws.close(code=1008);return
- await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0}
+ await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0,'last_prompt':'','last_prompt_at':0.0}
  try:
   while True:
    event=json.loads(await ws.receive_text());kind=event.get('type')
@@ -90,11 +90,15 @@ async def websocket(ws:WebSocket):
    elif kind=='prompt' and event.get('last',True) and state['business']:
     text=str(event.get('voicePrompt') or '').strip()
     if not text:continue
+    normalized=' '.join(text.casefold().split());now=time.monotonic()
+    if normalized==state['last_prompt'] and now-state['last_prompt_at']<4.0:
+     log.info('Duplicate final voice prompt ignored');continue
+    state['last_prompt']=normalized;state['last_prompt_at']=now
     state['seq']+=1
     try:
      out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':state['call_sid']+':'+str(state['seq']),'text':text})
      reply=out['reply']
-    except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.'
+    except Exception:log.exception('Voice turn failed');reply='No pude confirmar la operación por un problema interno. Podemos continuar sin volver a empezar.'
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))
    elif kind=='error':log.error('ConversationRelay error: %s',event.get('description'))
  except WebSocketDisconnect:pass

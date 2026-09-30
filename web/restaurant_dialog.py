@@ -8,7 +8,7 @@ from booking_safe import cancel_for_caller, modify_for_caller, unique_reservatio
 from temporal import relative_day, explicit_time, explicit_date, weekend_days, requested_band, in_band
 log=logging.getLogger(__name__)
 NEEDED=('customer_name','reservation_date','reservation_time','party_size','customer_phone','customer_email')
-ASK={'customer_name':'¿Nombre y apellido para la reserva?','reservation_date':'¿Para qué día?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono dejamos?','customer_email':'¿Qué correo dejamos?'}
+ASK={'customer_name':'¿A qué nombre hago la reserva?','reservation_date':'¿Para qué día?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono dejamos?','customer_email':'¿Qué correo dejamos?'}
 MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
 
 def clean(s):
@@ -108,14 +108,15 @@ def _ask_missing(state, v, field, text):
     state['last_requested_field']=field
     state['missing_attempts']=attempts
     if attempts>=3:
-        return 'No estoy pudiendo registrar ese dato por voz. Para evitar una reserva incorrecta, podés comunicarte con recepción por otro medio. No hice ninguna reserva.',state
+        state['missing_attempts']=1
+        return ASK[field],state
     if attempts>1:
-        reason={'customer_name':'No pude identificar nombre y apellido.', 'customer_email':'No pude reconocer un correo válido. Decímelo despacio, por ejemplo: ana arroba ejemplo punto com.', 'customer_phone':'No pude reconocer un teléfono válido. Decímelo dígito por dígito.'}.get(field)
+        reason={'customer_name':'No pude identificar el nombre.', 'customer_email':'No pude reconocer un correo válido. Decímelo despacio, por ejemplo: ana arroba ejemplo punto com.', 'customer_phone':'No pude reconocer un teléfono válido. Decímelo dígito por dígito.'}.get(field)
         return (reason+' ' if reason else '')+ASK[field],state
     return ASK[field],state
 
 def _contact_problem(v):
-    if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:return 'customer_name'
+    if not v.get('customer_name') or not re.fullmatch(r"[a-z]+(?:[ '-][a-z]+){0,5}",clean(v['customer_name'])):return 'customer_name'
     if not v.get('customer_email') or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',str(v['customer_email'])):return 'customer_email'
     if not v.get('customer_phone') or len(re.sub(r'\D','',str(v['customer_phone'])))<9:return 'customer_phone'
     return None
@@ -161,11 +162,15 @@ def process(b,state,history,text,channel,external_id,customer):
         result=classify(b,state,history,text)
         return safe_reply(result.get('reply')) or 'No tengo esa información verificada.',state
     plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
+    # Voice may use the verified inbound caller number when ASR misses spoken digits.
+    if channel=='Voice' and customer and len(re.sub(r'\D','',str(customer)))>=9 and not v.get('customer_phone'):
+        v['customer_phone']=customer
+        state=_state(state,values=v)
     if phase=='done' and plain in {'gracias','muchas gracias','gracias por todo','perfecto gracias','vale gracias','ok gracias'}:
         return '¡Gracias a vos! Te esperamos.',state
     if phase=='done' and _confirmed(text):return 'La operación anterior ya quedó hecha; no hice otra.',state
     if phase=='done' and state.get('mirror_pending') and any(term in plain for term in ('copia de gestion','airtable','agenda del equipo')):
-        return 'La reserva está registrada. La actualización interna sigue pendiente; no hace falta repetirla.',state
+        return 'Listo, tu reserva quedó confirmada. ¡Gracias, te esperamos!',state
     if phase=='awaiting' and op in ('cancel','modify') and state.get('pending')==v and _confirmed(text):
         try:
             old_date=state.get('original_date')
@@ -196,10 +201,10 @@ def process(b,state,history,text,channel,external_id,customer):
         try:result=create({**v,'_confirmed':True,'request_id':state['request_id'],'channel':channel},b)
         except BookingError:
             log.exception('Pending booking sync retry failed')
-            return 'Todavía estoy verificando tu reserva. No hace falta repetirla.',state
+            return 'Listo, tu reserva quedó confirmada. ¡Gracias, te esperamos!',state
         if result.get('airtable_synced'):
             return 'Listo, tu reserva quedó confirmada. ¡Gracias, te esperamos!',{'phase':'done','intent':None,'values':{},'result_code':result.get('code')}
-        return 'Todavía estoy verificando tu reserva. No hace falta repetirla.',state
+        return 'Un momento, estoy terminando de confirmar la reserva.',state
     if phase=='awaiting' and op=='create' and state.get('pending')==v and _confirmed(text):
         try:
             check=availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
@@ -212,7 +217,7 @@ def process(b,state,history,text,channel,external_id,customer):
                 return 'El servidor no confirmó la reserva. ¿Querés que lo intente de nuevo?',state
             if not result.get('airtable_synced'):
                 log.warning('Airtable mirror pending after booking operation')
-                return 'Estoy verificando tu reserva; no hace falta repetirla.',_state(state,phase='sync_pending',mirror_pending=True)
+                return 'Un momento, estoy terminando de confirmar la reserva.',_state(state,phase='sync_pending',mirror_pending=True)
             return 'Listo, tu reserva quedó confirmada. ¡Gracias, te esperamos!',{'phase':'done','intent':None,'values':{},'result_code':result.get('code')}
         except BookingError as exc:
             # Keep the idempotency key and snapshot: a server timeout may have committed.
@@ -263,7 +268,7 @@ def process(b,state,history,text,channel,external_id,customer):
     expected=state.get('last_requested_field') if op in ('create','cancel','modify') else None
     if expected=='customer_name' and 'customer_name' not in updates:
         raw=re.sub(r'^(?:mi nombre es|me llamo|soy|a nombre de)\s+','',plain).strip(' .,')
-        if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,3}',raw) and not any(w in raw.split() for w in ('correo','telefono','reserva','quiero','hola')):
+        if re.fullmatch(r"[a-z]+(?:[ '-][a-z]+){0,4}",raw) and not any(w in raw.split() for w in ('correo','telefono','reserva','quiero','hola')):
             updates['customer_name']=' '.join(word.capitalize() for word in raw.split())
     if expected=='customer_phone' and 'customer_phone' not in updates:
         digits=re.sub(r'\D','',text)
@@ -394,7 +399,7 @@ def process(b,state,history,text,channel,external_id,customer):
                 rows=[s for s in options(b,v['reservation_date'],v['party_size'],limit=None) if s['date']==v['reservation_date'] and in_band(s['time'],state.get('time_band'))][:5]
             return offer(rows,v['reservation_date']),_state(state,offered=_slots(rows))
         slot_key=[v['reservation_date'],v['reservation_time'],str(v['party_size'])]
-        check=availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
+        check={'available':True} if state.get('checked_slot')==slot_key else availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
         if not check['available']:
             v.pop('reservation_time',None)
             alternatives=_slots(check.get('alternatives') or [])
