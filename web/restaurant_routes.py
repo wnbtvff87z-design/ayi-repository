@@ -20,6 +20,17 @@ def register_restaurant_routes(app,authorized,lookup,log):
    return jsonify(success=not result['duplicate_keys'] and not result['invalid'],slot_sync=result),(200 if not result['duplicate_keys'] and not result['invalid'] else 409)
   except BookingError as exc:return jsonify(success=False,message=str(exc)),409
   except Exception:log.exception('Slot synchronization failed');return jsonify(success=False),503
+ @app.post('/internal/sync-slot-record')
+ def internal_sync_slot_record():
+  if not authorized():return jsonify(success=False),401
+  d=request.get_json(silent=True) or {}
+  try:
+   from booking import sync_airtable_record
+   if not d.get('record_id'):return jsonify(success=False,message='record_id required'),400
+   result=sync_airtable_record(d['record_id'])
+   return jsonify(result),200 if result.get('success') else 409
+  except BookingError as exc:return jsonify(success=False,message=str(exc)),409
+  except Exception:log.exception('Exact slot sync failed');return jsonify(success=False,message='Exact slot sync failed'),503
  @app.post('/internal/booking')
  @app.post('/internal/book-test')
  def internal_booking():
