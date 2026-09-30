@@ -111,10 +111,9 @@ def sync_airtable_slots(business_id=None):
   for key,items in by_key.items():
    if key in duplicate_keys:
     conflicts+=1
-    seen_ids.update(x['airtable_record_id'] for x in items)
-    c.execute("UPDATE booking_slots SET status='Cerrada',synced_at=now() WHERE business_id=%s AND slot_id=%s",key)
-    continue
-   slot=items[0]
+    # Never offer an ambiguous slot. Preserve a deterministic record id only for diagnosis.
+    slot=items[0];slot['status']='Cerrada'
+   else:slot=items[0]
    seen_ids.update(x['airtable_record_id'] for x in items)
    c.execute('''INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,end_time,capacity,status,airtable_record_id,source,synced_at)
     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'Airtable',now())
@@ -188,24 +187,28 @@ def _mirror_slot_record(row):
  with db() as c:slot=c.execute('SELECT airtable_record_id FROM booking_slots WHERE business_id=%s AND slot_id=%s',(row['business_id'],row['slot_id'])).fetchone()
  if not slot or not slot['airtable_record_id']:raise BookingError('La franja no tiene registro único de Airtable')
  return slot['airtable_record_id']
-def refresh_slot_load(b,slot_id,slot_rec=None):
- """Persist occupancy/remaining in PG and Airtable; close both when capacity is exhausted."""
+def refresh_slot_load(business_id,slot_id):
+ """Recalculate confirmed load in PostgreSQL and mirror visible load/status to Airtable."""
  init_schema()
  with db() as c:
-  slot=c.execute('SELECT capacity,status,airtable_record_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b['business_id'],slot_id)).fetchone()
-  if not slot:return None
-  used=int(c.execute("SELECT COALESCE(sum(party_size),0) AS used FROM booking_reservations WHERE business_id=%s AND slot_id=%s AND status='Confirmada'",(b['business_id'],slot_id)).fetchone()['used'] or 0)
-  remaining=max(int(slot['capacity'])-used,0);effective='Cerrada' if remaining==0 else slot['status']
-  c.execute('UPDATE booking_slots SET occupied=%s,remaining_capacity=%s,status=%s,synced_at=now() WHERE business_id=%s AND slot_id=%s',(used,remaining,effective,b['business_id'],slot_id))
- rec=slot_rec or slot['airtable_record_id']
- if rec:
-  occupied_field=os.getenv('AIRTABLE_SLOT_OCCUPIED_FIELD','Ocupadas').strip();remaining_field=os.getenv('AIRTABLE_SLOT_REMAINING_FIELD','Capacidad_Disponible').strip()
-  fields={occupied_field:used,remaining_field:remaining}
-  if remaining==0:fields['Estado']='Cerrada'
-  table=os.getenv('AIRTABLE_SLOTS_TABLE','Franjas');res=requests.patch(url(table,rec),headers=headers(),json={'fields':fields},timeout=10);res.raise_for_status()
-  verify=requests.get(url(table,rec),headers=headers(),timeout=10);verify.raise_for_status();returned=verify.json().get('fields',{})
-  if int(returned.get(occupied_field,-1))!=used or int(returned.get(remaining_field,-1))!=remaining:raise BookingError('Airtable no confirmó la capacidad disponible')
- return {'occupied':used,'remaining_capacity':remaining,'status':effective}
+  slot=c.execute('SELECT capacity,status,airtable_record_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(business_id,slot_id)).fetchone()
+  if not slot:raise BookingError('Franja inexistente en PostgreSQL')
+  used=int(c.execute("SELECT COALESCE(sum(party_size),0) AS used FROM booking_reservations WHERE business_id=%s AND slot_id=%s AND status='Confirmada'",(business_id,slot_id)).fetchone()['used'] or 0)
+  remaining=max(int(slot['capacity'])-used,0)
+  status='Cerrada' if remaining==0 else slot['status']
+  c.execute('UPDATE booking_slots SET occupied=%s,remaining_capacity=%s,status=%s,synced_at=now() WHERE business_id=%s AND slot_id=%s',(used,remaining,status,business_id,slot_id))
+ rec=slot['airtable_record_id']
+ if not rec:raise BookingError('La franja no tiene airtable_record_id')
+ occupied_field=os.getenv('AIRTABLE_SLOT_OCCUPIED_FIELD','Ocupadas').strip()
+ remaining_field=os.getenv('AIRTABLE_SLOT_REMAINING_FIELD','Capacidad_Disponible').strip()
+ fields={occupied_field:used,remaining_field:remaining}
+ if remaining==0:fields['Estado']='Cerrada'
+ table=os.getenv('AIRTABLE_SLOTS_TABLE','Franjas')
+ response=requests.patch(url(table,rec),headers=headers(),json={'fields':fields},timeout=10);response.raise_for_status()
+ verify=requests.get(url(table,rec),headers=headers(),timeout=10);verify.raise_for_status();returned=verify.json().get('fields',{})
+ if int(returned.get(occupied_field,-1))!=used or int(returned.get(remaining_field,-1))!=remaining:raise BookingError('Airtable no confirmó ocupación/capacidad disponible')
+ if remaining==0 and str(returned.get('Estado') or '').strip().casefold()!='cerrada':raise BookingError('Airtable no confirmó Estado=Cerrada')
+ return {'business_id':business_id,'slot_id':slot_id,'capacity':int(slot['capacity']),'occupied':used,'remaining_capacity':remaining,'status':status,'airtable_record_id':rec}
 
 def mirror(row,slot_rec=None):
  try:
@@ -263,8 +266,7 @@ def create(data,b):
    code='R-'+secrets.token_hex(5).upper();pk=c.execute('INSERT INTO booking_reservations(business_id,slot_id,request_id,code,name,phone,email,party_size,channel,business_phone) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',(bid,selected['id'],req,code,name,phone,email,n,data.get('channel','Voice'),b['phone'])).fetchone()['id'];row=row_for(c,bid,pk);raced=False
  if raced:
   synced=bool(row['airtable_id']) and not row['airtable_pending'];return {'success':True,'code':row['code'],'airtable_synced':synced if synced else mirror(row),'already_exists':True}
- synced=mirror(row,selected['rec']);load=refresh_slot_load(b,selected['id'],selected['rec'])
- return {'success':True,'code':row['code'],'airtable_synced':synced,'slot_load':load}
+ return {'success':True,'code':row['code'],'airtable_synced':mirror(row,selected['rec'])}
 def reconcile_pending(limit=25):
  init_schema()
  with db() as c:rows=c.execute('SELECT id,business_id FROM booking_reservations WHERE airtable_id IS NULL OR airtable_pending=true ORDER BY id LIMIT %s',(min(max(int(limit),1),100),)).fetchall()

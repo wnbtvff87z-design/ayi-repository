@@ -23,7 +23,9 @@ class SlotSync(unittest.TestCase):
   self.assertIn('status=excluded.status',source);self.assertIn('sync_airtable_slots',source)
  def test_duplicate_slot_fails_closed(self):
   source=(ROOT/'booking.py').read_text()
-  self.assertIn("slot['status']='Conflicto'",source);self.assertIn("slot['capacity']=0",source)
+  self.assertIn("slot['status']='Cerrada'",source)
+  self.assertIn("WHERE business_id=%s AND slot_id=%s",source)
+  self.assertNotIn("slot['capacity']=0",source)
  def test_whatsapp_duplicate_webhook_patch_is_silent(self):
   patch=(ROOT/'main.py.patch').read_text()
   self.assertIn("None if channel=='WhatsApp'",patch);self.assertIn('if answer:tw.message(answer)',patch)
