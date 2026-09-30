@@ -9,6 +9,11 @@ log=logging.getLogger(__name__)
 class BookingError(Exception):pass
 SCHEMA="""
 CREATE TABLE IF NOT EXISTS booking_slots(business_id text NOT NULL,slot_id text NOT NULL,slot_date date NOT NULL,start_time text NOT NULL,capacity integer NOT NULL,PRIMARY KEY(business_id,slot_id));
+ALTER TABLE booking_slots ADD COLUMN IF NOT EXISTS end_time text;
+ALTER TABLE booking_slots ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'Cerrada';
+ALTER TABLE booking_slots ADD COLUMN IF NOT EXISTS airtable_record_id text;
+ALTER TABLE booking_slots ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'Airtable';
+ALTER TABLE booking_slots ADD COLUMN IF NOT EXISTS synced_at timestamptz;
 CREATE TABLE IF NOT EXISTS booking_reservations(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,business_id text NOT NULL,slot_id text NOT NULL,request_id text NOT NULL,code text UNIQUE NOT NULL,name text NOT NULL,phone text NOT NULL,email text NOT NULL,party_size integer NOT NULL,status text NOT NULL DEFAULT 'Confirmada',airtable_id text,channel text NOT NULL DEFAULT 'Voice',business_phone text NOT NULL DEFAULT '',created_at timestamptz DEFAULT now(),UNIQUE(business_id,request_id));
 ALTER TABLE booking_reservations ADD COLUMN IF NOT EXISTS channel text NOT NULL DEFAULT 'Voice';
 ALTER TABLE booking_reservations ADD COLUMN IF NOT EXISTS business_phone text NOT NULL DEFAULT '';
@@ -17,7 +22,9 @@ CREATE TABLE IF NOT EXISTS customer_sessions(business_id text NOT NULL,channel t
 CREATE TABLE IF NOT EXISTS conversation_turns(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,business_id text NOT NULL,channel text NOT NULL,customer_phone text NOT NULL,external_id text NOT NULL,user_text text NOT NULL,assistant_text text NOT NULL,created_at timestamptz DEFAULT now(),UNIQUE(business_id,channel,external_id));
 ALTER TABLE booking_slots ADD COLUMN IF NOT EXISTS occupied integer NOT NULL DEFAULT 0;
 ALTER TABLE booking_slots ADD COLUMN IF NOT EXISTS remaining_capacity integer;
+CREATE UNIQUE INDEX IF NOT EXISTS booking_slots_airtable_record_idx ON booking_slots(airtable_record_id) WHERE airtable_record_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS booking_slot_status_idx ON booking_reservations(business_id,slot_id,status);
+CREATE INDEX IF NOT EXISTS booking_slots_open_idx ON booking_slots(business_id,status,slot_date,start_time);
 CREATE INDEX IF NOT EXISTS conversation_recent_idx ON conversation_turns(business_id,channel,customer_phone,id DESC);
 """
 def db():
@@ -70,6 +77,68 @@ def party(v):
  except (ValueError,TypeError):raise BookingError('¿Para cuántas personas?')
  if not 1<=n<=20:raise BookingError('Cantidad de personas inválida')
  return n
+def _slot_payload(record):
+ f=record.get('fields',{});bid=str(f.get('Business_ID') or '').strip();d=day(f.get('Fecha'));start=hour(f.get('Hora_Inicio'));end=hour(f.get('Hora_Fin'))
+ raw_status=str(f.get('Estado') or '').strip().casefold()
+ status={'abierta':'Abierta','disponible':'Abierta','cerrada':'Cerrada'}.get(raw_status,'')
+ try:capacity=int(f.get('Capacidad_Personas'))
+ except (TypeError,ValueError):capacity=-1
+ expected=f'{bid}-{d}-{start.replace(":","")}' if bid and d and start else None
+ issues=[]
+ if not bid:issues.append('Business_ID')
+ if not d:issues.append('Fecha')
+ if not start:issues.append('Hora_Inicio')
+ if not end:issues.append('Hora_Fin')
+ if capacity<0:issues.append('Capacidad_Personas')
+ if status not in ('Abierta','Cerrada'):issues.append('Estado')
+ if expected and f.get('Franja_ID')!=expected:issues.append('Franja_ID')
+ slot={'business_id':bid,'slot_id':expected,'slot_date':d,'start_time':start,'end_time':end,'capacity':capacity,'status':status,'airtable_record_id':record.get('id')}
+ return (slot if not issues else None),issues
+def sync_airtable_slots(business_id=None):
+ """Import Airtable slot controls; invalid, missing, and duplicate records fail closed."""
+ init_schema();table=os.getenv('AIRTABLE_SLOTS_TABLE','Franjas')
+ formula='{Business_ID}='+json.dumps(business_id) if business_id else None
+ records=list_records(table,formula);invalid=[];by_key={};seen_ids=set()
+ for record in records:
+  record_id=record.get('id')
+  if record_id:seen_ids.add(record_id)
+  slot,issues=_slot_payload(record)
+  if not slot:
+   invalid.append({'airtable_record_id':record_id,'fields':issues})
+   continue
+  by_key.setdefault((slot['business_id'],slot['slot_id']),[]).append(slot)
+ imported=closed=conflicts=0
+ with db() as c:
+  for key,items in by_key.items():
+   if len(items)>1:
+    conflicts+=1
+    c.execute("""UPDATE booking_slots SET status='Cerrada',remaining_capacity=0,synced_at=now()
+     WHERE business_id=%s AND slot_id=%s""",key)
+    continue
+   slot=items[0]
+   c.execute("""INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,end_time,capacity,status,airtable_record_id,source,synced_at,remaining_capacity)
+    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'Airtable',now(),%s)
+    ON CONFLICT(business_id,slot_id) DO UPDATE SET slot_date=excluded.slot_date,start_time=excluded.start_time,
+    end_time=excluded.end_time,capacity=excluded.capacity,status=excluded.status,airtable_record_id=excluded.airtable_record_id,
+    source='Airtable',synced_at=now(),remaining_capacity=GREATEST(excluded.capacity-booking_slots.occupied,0)""",
+    (slot['business_id'],slot['slot_id'],slot['slot_date'],slot['start_time'],slot['end_time'],slot['capacity'],slot['status'],slot['airtable_record_id'],slot['capacity']))
+   imported+=1
+   closed+=slot['status']!='Abierta' or slot['capacity']==0
+  if business_id:
+   existing=c.execute("SELECT slot_id,airtable_record_id FROM booking_slots WHERE business_id=%s AND source='Airtable'",(business_id,)).fetchall()
+   for row in existing:
+    if row['airtable_record_id'] not in seen_ids:
+     c.execute("UPDATE booking_slots SET status='Cerrada',synced_at=now() WHERE business_id=%s AND slot_id=%s",(business_id,row['slot_id']))
+  else:
+   existing=c.execute("SELECT business_id,slot_id,airtable_record_id FROM booking_slots WHERE source='Airtable'").fetchall()
+   for row in existing:
+    if row['airtable_record_id'] not in seen_ids:
+     c.execute("UPDATE booking_slots SET status='Cerrada',synced_at=now() WHERE business_id=%s AND slot_id=%s",(row['business_id'],row['slot_id']))
+  # Invalid records that previously populated PG are blocked by their Airtable record id.
+  for item in invalid:
+   if item['airtable_record_id']:
+    c.execute("UPDATE booking_slots SET status='Cerrada',synced_at=now() WHERE airtable_record_id=%s",(item['airtable_record_id'],))
+ return {'airtable_records':len(records),'imported':imported,'closed_or_blocked':closed,'duplicate_keys':conflicts,'invalid':invalid}
 def slots(b,start=None,days=3):
  enabled(b);tz=b.get('timezone') or 'Europe/Madrid'
  start=day(start) if start else datetime.now(ZoneInfo(tz)).date().isoformat()
@@ -144,9 +213,12 @@ def availability(b,d,t,n=1):
  exact=next((slot for slot in free if slot['date']==day(d) and slot['time']==hour(t)),None)
  return {'available':bool(exact),'alternatives':[] if exact else [{'date':slot['date'],'time':slot['time']} for slot in free[:5]]}
 def lock_slot(c,b,s):
- c.execute('INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,capacity) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',(b,s['id'],s['date'],s['time'],s['capacity']))
+ c.execute("""INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,capacity,status,airtable_record_id,source,synced_at)
+  VALUES(%s,%s,%s,%s,%s,'Abierta',%s,'Airtable',now())
+  ON CONFLICT(business_id,slot_id) DO UPDATE SET slot_date=excluded.slot_date,start_time=excluded.start_time,
+  capacity=excluded.capacity,status=excluded.status,airtable_record_id=excluded.airtable_record_id,source='Airtable',synced_at=now()""",
+  (b,s['id'],s['date'],s['time'],s['capacity'],s['rec']))
  c.execute('SELECT slot_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b,s['id']))
- c.execute('UPDATE booking_slots SET capacity=%s WHERE business_id=%s AND slot_id=%s',(s['capacity'],b,s['id']))
 def row_for(c,b,pk):return c.execute('SELECT r.*,s.slot_date,s.start_time FROM booking_reservations r JOIN booking_slots s ON r.business_id=s.business_id AND r.slot_id=s.slot_id WHERE r.business_id=%s AND r.id=%s',(b,pk)).fetchone()
 def _mirror_slot_record(row):
  # On reconciliation, restore the linked Franja rather than creating orphan records.
@@ -257,7 +329,7 @@ def create(data,b):
   else:
    if occupied(c,b,s,existing)+n>s['capacity']:raise BookingError('Esa hora se ocupó; consultá alternativas')
    code='R-'+secrets.token_hex(5).upper()
-   pk=c.execute('INSERT INTO booking_reservations(business_id,slot_id,request_id,code,name,phone,email,party_size,channel,business_phone) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',(bid,s['id'],req,code,name,phone,email,n,data.get('channel','Voice'),b['phone'])).fetchone()['id']
+   pk=c.execute('INSERT INTO booking_reservations(business_id,slot_id,request_id,code,name,phone,email,party_size,channel,business_phone) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',(bid,s['id'],req,code,name,phone,email,n,data.get('channel','Voice'),b['phone'])).fetchone()['id']
    row=row_for(c,bid,pk);raced_existing=False
  if raced_existing:
   synced=bool(row['airtable_id']) and not row['airtable_pending']
@@ -298,12 +370,14 @@ def modify(b,code,email,changes):
  if not s:raise BookingError('Esa hora no está disponible')
  records=airtable_bookings(b)
  with db() as c:
-  c.execute('INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,capacity) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',(b['business_id'],s['id'],s['date'],s['time'],s['capacity']))
+  c.execute("""INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,capacity,status,airtable_record_id,source,synced_at)
+   VALUES(%s,%s,%s,%s,%s,'Abierta',%s,'Airtable',now()) ON CONFLICT DO NOTHING""",
+   (b['business_id'],s['id'],s['date'],s['time'],s['capacity'],s['rec']))
   for sid in sorted({old['slot_id'],s['id']}):c.execute('SELECT slot_id FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b['business_id'],sid))
   old=row_for(c,b['business_id'],pk)
   if old['status']!='Confirmada':raise BookingError('La reserva está cancelada')
   if occupied(c,b,s,records,pk)+n>s['capacity']:raise BookingError('No hay sitio para el cambio; tu reserva original sigue igual')
-  c.execute('UPDATE booking_slots SET capacity=%s WHERE business_id=%s AND slot_id=%s',(s['capacity'],b['business_id'],s['id']))
+  c.execute("UPDATE booking_slots SET capacity=%s,status='Abierta',airtable_record_id=%s,source='Airtable',synced_at=now() WHERE business_id=%s AND slot_id=%s",(s['capacity'],s['rec'],b['business_id'],s['id']))
   c.execute('UPDATE booking_reservations SET slot_id=%s,party_size=%s WHERE id=%s',(s['id'],n,pk));row=row_for(c,b['business_id'],pk)
  synced=mirror(row,s['rec']);load=refresh_slot_load(b,s['id'],s['rec'])
  return {'success':True,'code':row['code'],'airtable_synced':synced,'slot_load':load}
