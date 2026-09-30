@@ -78,7 +78,8 @@ def party(value):
 
 def _slot_payload(record):
  f=record.get('fields',{});bid=str(f.get('Business_ID') or '').strip();d=day(f.get('Fecha'));start=hour(f.get('Hora_Inicio'));end=hour(f.get('Hora_Fin'))
- status=str(f.get('Estado') or '').strip().capitalize()
+ raw_status=str(f.get('Estado') or '').strip().casefold()
+ status={'disponible':'Abierta','abierta':'Abierta','cerrada':'Cerrada'}.get(raw_status,'')
  try:capacity=int(f.get('Capacidad_Personas'))
  except (TypeError,ValueError):capacity=-1
  expected=f'{bid}-{d}-{start.replace(":","")}' if bid and d and start else None
@@ -106,12 +107,16 @@ def sync_airtable_slots(business_id=None):
  imported=closed=conflicts=0;seen_ids=set()
  with db() as c:
   for key,items in by_key.items():
+   seen_ids.update(x['airtable_record_id'] for x in items)
    if key in duplicate_keys:
     conflicts+=1
-    # Never offer an ambiguous slot. Preserve a deterministic record id only for diagnosis.
-    slot=items[0];slot['status']='Conflicto';slot['capacity']=0
-   else:slot=items[0]
-   seen_ids.update(x['airtable_record_id'] for x in items)
+    # Duplicate/ambiguous Airtable slots are omitted, never inserted as zero-capacity rows.
+    # Close an earlier valid row without changing capacity, for DBs enforcing capacity > 0.
+    c.execute("UPDATE booking_slots SET status='Cerrada',synced_at=now() WHERE business_id=%s AND slot_id=%s",key)
+    closed+=1
+    log.warning('Duplicate slot omitted business_id=%s slot_id=%s records=%s',key[0],key[1],len(items))
+    continue
+   slot=items[0]
    c.execute('''INSERT INTO booking_slots(business_id,slot_id,slot_date,start_time,end_time,capacity,status,airtable_record_id,source,synced_at)
     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'Airtable',now())
     ON CONFLICT(business_id,slot_id) DO UPDATE SET slot_date=excluded.slot_date,start_time=excluded.start_time,end_time=excluded.end_time,
@@ -124,8 +129,8 @@ def sync_airtable_slots(business_id=None):
   else:existing=c.execute("SELECT business_id,slot_id,airtable_record_id FROM booking_slots WHERE source='Airtable'").fetchall()
   for row in existing:
    if row['airtable_record_id'] and row['airtable_record_id'] not in seen_ids:
-    if business_id:c.execute("UPDATE booking_slots SET status='Cerrada',capacity=0,synced_at=now() WHERE business_id=%s AND slot_id=%s",(business_id,row['slot_id']))
-    else:c.execute("UPDATE booking_slots SET status='Cerrada',capacity=0,synced_at=now() WHERE business_id=%s AND slot_id=%s",(row['business_id'],row['slot_id']))
+    if business_id:c.execute("UPDATE booking_slots SET status='Cerrada',synced_at=now() WHERE business_id=%s AND slot_id=%s",(business_id,row['slot_id']))
+    else:c.execute("UPDATE booking_slots SET status='Cerrada',synced_at=now() WHERE business_id=%s AND slot_id=%s",(row['business_id'],row['slot_id']))
  return {'airtable_records':len(records),'imported':imported,'closed_or_blocked':closed,'duplicate_keys':conflicts,'invalid':invalid}
 
 def slots(b,start=None,days=3):
