@@ -17,13 +17,13 @@ class SlotSync(unittest.TestCase):
   self.assertIsNone(slot);self.assertIn('Franja_ID',issues)
  def test_zero_capacity_is_valid_but_never_open_inventory(self):
   source=(ROOT/'booking.py').read_text()
-  self.assertIn("casefold()!='abierta'",source);self.assertIn('if cap<1:continue',source)
+  self.assertIn("status='Abierta' AND capacity>0",source)
  def test_manual_status_is_upserted_to_pg(self):
   source=(ROOT/'booking.py').read_text()
   self.assertIn('status=excluded.status',source);self.assertIn('sync_airtable_slots',source)
  def test_duplicate_slot_fails_closed(self):
   source=(ROOT/'booking.py').read_text()
-  self.assertIn('if len(items)>1:',source);self.assertIn("SET status='Cerrada',remaining_capacity=0",source)
+  self.assertIn("slot['status']='Conflicto'",source);self.assertIn("slot['capacity']=0",source)
  def test_whatsapp_duplicate_webhook_patch_is_silent(self):
   patch=(ROOT/'main.py.patch').read_text()
   self.assertIn("None if channel=='WhatsApp'",patch);self.assertIn('if answer:tw.message(answer)',patch)

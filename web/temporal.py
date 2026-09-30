@@ -21,12 +21,7 @@ def explicit_date(text,tz):
  except ValueError:return None
 
 def explicit_time(text):
- s=norm(text)
- # A bare number such as '8 personas' is a quantity, never a clock time.
- if re.search(r'\b(?:para\s+)?(?:[1-9]|1\d|20|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\s+personas?\b',s):
-  quantity_span=re.search(r'\b(?:para\s+)?(?:[1-9]|1\d|20|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\s+personas?\b',s).span()
- else:quantity_span=None
- m=re.search(r'(?<!\d)([01]?\d|2[0-3])\s*[:.]\s*([0-5]\d)(?!\d)',s)
+ s=norm(text);m=re.search(r'(?<!\d)([01]?\d|2[0-3])\s*[:.]\s*([0-5]\d)(?!\d)',s)
  if m:return f'{int(m.group(1)):02d}:{m.group(2)}'
  m=re.search(r'(?<!\d)([01]?\d|2[0-3])\s*(?:h|hs|horas)(?!\w)',s)
  if m:return f'{int(m.group(1)):02d}:00'

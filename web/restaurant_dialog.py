@@ -274,12 +274,9 @@ def process(b,state,history,text,channel,external_id,customer):
     rel=updates.get('reservation_date') or explicit_date(text,tz) or relative_day(text,tz)
     deterministic_times=_requested_times(text)
     deterministic_exact=explicit_time(text)
-    # Time is accepted only when the CURRENT user text contains an explicit clock expression.
-    # Never trust a model-generated time that is absent from the current utterance.
     extracted_times=deterministic_times or ([deterministic_exact] if deterministic_exact else [])
     exact=deterministic_exact or (deterministic_times[0] if len(deterministic_times)==1 else None)
-    if not exact:
-        updates.pop('reservation_time',None)
+    if not exact:updates.pop('reservation_time',None)
     if len(extracted_times)==1 and not exact and re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',str(extracted_times[0])):exact=extracted_times[0]
     if len(extracted_times)>1:exact=None;updates.pop('reservation_time',None)
     if rel:updates['reservation_date']=rel
