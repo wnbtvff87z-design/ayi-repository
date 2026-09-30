@@ -118,7 +118,10 @@ def converse(b,channel,customer,text,external_id):
   c.execute('INSERT INTO customer_sessions(business_id,channel,customer_phone) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING',(bid,channel,customer))
   row=c.execute('SELECT state FROM customer_sessions WHERE business_id=%s AND channel=%s AND customer_phone=%s FOR UPDATE',(bid,channel,customer)).fetchone()
   previous=c.execute('SELECT assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND external_id=%s',(bid,channel,external_id)).fetchone()
-  if previous:return previous['assistant_text']
+  # Twilio can retry the same WhatsApp webhook when a response is slow.
+  # The turn is already committed, so acknowledge the retry without sending
+  # the same customer-facing message a second or third time.
+  if previous:return None if channel=='WhatsApp' else previous['assistant_text']
   current_state=dict(row['state'] or {})
   if current_state.get('_sector') not in (None,str(b.get('sector') or '').strip().casefold()):
    current_state={}
@@ -158,10 +161,10 @@ def whatsapp():
   if not b:answer='No puedo identificar el negocio asociado a este número.'
   elif not text:answer='No recibí ningún texto. ¿Me lo repetís?'
   else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''))
-  if b and text:
+  if b and text and answer:
    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
    except Exception:log.exception('Conversation mirror failed')
-  tw.message(answer)
+  if answer:tw.message(answer)
  except Exception:log.exception('WhatsApp error');tw.message('No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.')
  return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
