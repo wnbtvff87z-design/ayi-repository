@@ -166,12 +166,49 @@ def _explicit_contact_updates(text, updates):
                 result.pop('customer_phone',None)
     return result
 
+def _new_booking_request(text):
+    """Only an explicit new request, not a contact answer or date correction."""
+    q=clean(text)
+    return bool(re.search(r'\b(?:quiero|queria|quisiera|deseo|necesito|hacer|hazme|nueva|otra)\b.{0,50}\b(?:reserva|reservar|mesa)\b|\b(?:nueva|otra)\s+reserva\b',q))
+
+def _party_from_current_turn(text, expected=False):
+    """Accept a party size only when this turn explicitly supplies it."""
+    q=clean(text)
+    words={'una':1,'uno':1,'dos':2,'tres':3,'cuatro':4,'cinco':5,'seis':6,'siete':7,'ocho':8,'nueve':9,'diez':10}
+    token=r'(?:[1-9]|1[0-9]|20|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)'
+    m=re.search(r'\b(?:para|somos|seremos|mesa\s+para|reserva\s+para)\s+(?:unas?\s+)?('+token+r')\s*(?:personas|comensales|pax)?\b',q)
+    if not m:m=re.search(r'\b('+token+r')\s+(?:personas|comensales|pax)\b',q)
+    if not m and expected:m=re.fullmatch(r'\s*('+token+r')\s*',q)
+    if not m:return None
+    value=words.get(m.group(1)) if not m.group(1).isdigit() else int(m.group(1))
+    return value if 1<=value<=20 else None
+
+def _party_verified(state, values):
+    return bool(state.get('party_confirmed') and state.get('operation_id') and values.get('party_size'))
+
 def process(b,state,history,text,channel,external_id,customer):
     state=dict(state or {});v=dict(state.get('values') or {});op=state.get('intent');phase=state.get('phase','collecting')
+    # Old sessions predate operation IDs. Never trust their party size or offers.
+    if op=='create' and not state.get('operation_id'):
+        state={};v={};op=None;phase='collecting'
+    # An explicit new booking must not inherit date, party, contacts or offers.
+    new_request=_new_booking_request(text) and phase not in ('awaiting','sync_pending')
+    if new_request:
+        state={};v={};op=None;phase='collecting'
+    if op=='create' and not _party_verified(state,v):
+        v.pop('party_size',None)
+        state.pop('offered',None);state.pop('proposed',None);state.pop('checked_slot',None)
+        state['values']=v
     if b.get('sector')!='restaurante' or not b.get('allow_reservations'):
         result=classify(b,state,history,text)
         return safe_reply(result.get('reply')) or 'No tengo esa información verificada.',state
     plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
+    if op=='create' and phase=='sync_pending' and not _party_verified(state,v):
+        return 'No puedo verificar la reserva anterior con seguridad. No la repitas; contactá con recepción.',state
+    if op=='create' and phase=='awaiting' and not _party_verified(state,v):
+        state=_state(state,phase='collecting',values=v,pending=None,request_id=None,
+                     offered=[],proposed=None,last_requested_field='party_size')
+        return ASK['party_size'],state
     now=datetime.now(ZoneInfo(tz))
     expiry=state.get('pending_expires_at')
     if phase=='awaiting' and expiry:
@@ -216,7 +253,7 @@ def process(b,state,history,text,channel,external_id,customer):
     # Only the exact snapshot, directly after the final summary, authorizes a write.
     if phase=='sync_pending' and op in ('cancel','modify'):
         return 'El cambio quedó pendiente de verificación interna. No hace falta repetirlo.',state
-    if phase=='sync_pending' and op=='create' and state.get('pending')==v:
+    if phase=='sync_pending' and op=='create' and state.get('pending')==v and _party_verified(state,v):
         try:result=create({**v,'_confirmed':True,'request_id':state['request_id'],'channel':channel},b)
         except BookingError:
             log.exception('Pending booking sync retry failed')
@@ -224,7 +261,7 @@ def process(b,state,history,text,channel,external_id,customer):
         if result.get('airtable_synced'):
             return 'Listo, tu reserva quedó confirmada. ¡Gracias, te esperamos!',{'phase':'done','intent':None,'values':{},'result_code':result.get('code')}
         return 'Todavía estoy verificando tu reserva. No hace falta repetirla.',state
-    if phase=='awaiting' and op=='create' and state.get('pending')==v and _confirmed(text):
+    if phase=='awaiting' and op=='create' and state.get('pending')==v and _confirmed(text) and _party_verified(state,v):
         try:
             check=availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
             if not check['available']:
@@ -254,7 +291,7 @@ def process(b,state,history,text,channel,external_id,customer):
         v.update(reservation_date=selected['date'],reservation_time=selected['time'])
         state=_state(state,values=v,offered=[],proposed=None,pending=None,checked_slot=None,hour_origin='verified_alternative',phase='collecting',time_band=None,date_range=None,requested_time=None)
         phase='collecting'
-        if not v.get('party_size'):return ASK['party_size'],state
+        if not _party_verified(state,v):return ASK['party_size'],_state(state,values=v,last_requested_field='party_size',offered=[],proposed=None)
         try:
             if not availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])['available']:
                 v.pop('reservation_time',None)
@@ -268,7 +305,7 @@ def process(b,state,history,text,channel,external_id,customer):
     # A question while awaiting consent must not consume or reset the pending snapshot.
     if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email|soy|llamo|llamame)\b',plain)):
         return '¿La registro?',state
-    try:result=classify(b,state,history,text)
+    try:result=classify(b,state,[] if new_request else history,text)
     except BookingError as exc:return str(exc),state
     intent=str(result.get('intent') or 'question').lower()
     if re.search(r'\b(cancelar|cancela|anular|anula)\b',plain):intent='cancel'
@@ -276,6 +313,8 @@ def process(b,state,history,text,channel,external_id,customer):
     elif re.search(r'\b(reservar|reserva|mesa)\b',plain) and op not in ('modify','cancel') and (intent not in ('question','social') or 'queria' in plain or 'quiero' in plain):intent='create'
     updates=result.get('updates') if isinstance(result.get('updates'),dict) else {}
     updates=_explicit_contact_updates(text,{k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')})
+    if new_request and not (explicit_date(text,tz) or relative_day(text,tz)):
+        updates.pop('reservation_date',None)
     if 'reservation_date' in updates:
         try:date.fromisoformat(str(updates['reservation_date']))
         except (ValueError,TypeError):updates.pop('reservation_date',None)
@@ -283,6 +322,11 @@ def process(b,state,history,text,channel,external_id,customer):
     if 'reservation_time' in updates and (not exact_current_time or str(updates['reservation_time'])!=exact_current_time):
         updates.pop('reservation_time',None)
     if exact_current_time:updates['reservation_time']=exact_current_time
+    supplied=_party_from_current_turn(text,state.get('last_requested_field')=='party_size')
+    if supplied is not None and (op=='create' or intent in ('create','availability')):
+        updates['party_size']=supplied
+    else:
+        updates.pop('party_size',None)
     if 'party_size' in updates:
         try:
             if not 1<=int(updates['party_size'])<=20:updates.pop('party_size',None)
@@ -331,7 +375,10 @@ def process(b,state,history,text,channel,external_id,customer):
     explicit_switch=(intent=='cancel' and re.search(r'\b(cancelar|cancela|anular|anula)\b',plain)) or (intent=='modify' and re.search(r'\b(modificar|modifica|cambiar|cambia)\b',plain) and 'reserva' in plain) or (intent=='create' and re.search(r'\b(reservar|reserva)\b',plain) and ('quiero' in plain or 'queria' in plain))
     if intent in ('create','modify','cancel') and (op is None or phase=='done' or (intent!=op and explicit_switch)):
         op=intent;v={};state={};phase='collecting'
-    if not op and intent=='availability':op='create'
+        if op=='create':state['operation_id']=secrets.token_hex(12)
+    if op=='create' and not state.get('operation_id'):
+        state['operation_id']=secrets.token_hex(12)
+    if not op and intent=='availability':op='create';state['operation_id']=secrets.token_hex(12)
     if intent in ('question','social') and op and not updates and not weekend and not band and not any(x in plain for x in ('disponib','horario','turno')):
         return safe_reply(result.get('reply')) or '¿Qué querés saber?',_state(state,phase=phase,intent=op,values=v)
     if op in ('cancel','modify') and updates.get('customer_name'):
@@ -344,6 +391,7 @@ def process(b,state,history,text,channel,external_id,customer):
             for field in ('customer_email','customer_phone'):
                 if field not in updates:v.pop(field,None)
         v.update(updates);phase='collecting'
+        if op=='create' and 'party_size' in updates:state['party_confirmed']=True
         if changed & {'reservation_date','reservation_time','party_size'}:state.pop('checked_slot',None)
         if changed:state.pop('pending',None);state.pop('request_id',None);state.pop('offered',None);state.pop('proposed',None)
         if 'reservation_date' in changed and 'reservation_time' not in updates:v.pop('reservation_time',None)
@@ -391,7 +439,7 @@ def process(b,state,history,text,channel,external_id,customer):
         return _ask_missing(state,v,_contact_problem(v),text)
     # Availability choices come only from the current message, never history.
     times=_requested_times(text)
-    if op=='create' and len(times)>1 and v.get('reservation_date') and v.get('party_size'):
+    if op=='create' and len(times)>1 and v.get('reservation_date') and _party_verified(state,v):
         checks=[]
         for t in times:
             try:checks.append((t,availability(b,v['reservation_date'],t,v['party_size'])))
@@ -414,9 +462,11 @@ def process(b,state,history,text,channel,external_id,customer):
             return 'Sí, tengo lugar '+ ' y '.join(spoken_time(t) for t in free)+'. ¿Cuál te va mejor?',_state(state,offered=slots,proposed=None)
         alternatives=_slots(checks[0][1].get('alternatives') or [])
         return 'A esas horas no tengo lugar. '+_short_alternatives(alternatives,v['reservation_date']),_state(state,offered=alternatives,proposed=None)
+    if op=='create' and not _party_verified(state,v):
+        return ASK['party_size'],_state(state,values=v,intent='create',last_requested_field='party_size',offered=[],proposed=None)
     if not v.get('reservation_date'):
         if intent=='availability':
-            if not v.get('party_size'):return ASK['party_size'],state
+            if not _party_verified(state,v):return ASK['party_size'],_state(state,values=v,last_requested_field='party_size',offered=[],proposed=None)
             try:
                 rows=options(b,None,v['party_size'])
                 return offer(rows,None,channel),_state(state,offered=_slots(rows))
@@ -461,6 +511,7 @@ def process(b,state,history,text,channel,external_id,customer):
     return summary,next_state
 
 def _final_summary(state,v,channel):
+    if not _party_verified(state,v):return ASK['party_size'],_state(state,phase='collecting',pending=None,values={k:x for k,x in v.items() if k!='party_size'},last_requested_field='party_size')
     request_id=state.get('request_id') if state.get('pending')==v else None
     request_id=request_id or channel.lower()+':'+secrets.token_hex(12)
     reply=('Para '+spoken_date(v['reservation_date'])+' '+spoken_time(v['reservation_time'])+

@@ -1,6 +1,5 @@
 import hmac,json,logging,os,re,time,threading
-from datetime import timezone
-from datetime import datetime
+from datetime import timezone, datetime, timedelta
 from urllib.parse import quote,urlparse
 from zoneinfo import ZoneInfo
 import requests
@@ -118,25 +117,36 @@ def twilio_valid():
    request.path,reason,request.method,bool(token),len(token),raw_t!=token,bool(base),raw_b!=raw_b.strip(),raw_b.strip().endswith('/'),pu.scheme,pu.netloc,pu.path not in ('','/'),bool(sig),len(sig),request.mimetype,len(request.form),'CallSid' in request.form,any(len(v)>1 for _,v in request.form.lists()),bool(query),request.headers.get('Host',''),request.headers.get('X-Forwarded-Host',''),request.headers.get('X-Forwarded-Proto',''),','.join(match) or 'none')
  except Exception:log.exception('twilio_403 diagnostic failed')
  return False
+def session_ttl():
+ try:return max(5,min(int(os.getenv('CONVERSATION_IDLE_MINUTES','30')),1440))
+ except ValueError:return 30
+
+def session_expired(updated_at, now=None):
+ if not updated_at:return True
+ now=now or datetime.now(timezone.utc)
+ if updated_at.tzinfo is None:updated_at=updated_at.replace(tzinfo=timezone.utc)
+ return now-updated_at>timedelta(minutes=session_ttl())
+
 def converse(b,channel,customer,text,external_id):
  if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
  init_schema();bid=b['business_id']
  # Serialize each customer conversation. Keep full history in PostgreSQL, pass recent turns to model.
  with db() as c:
   c.execute('INSERT INTO customer_sessions(business_id,channel,customer_phone) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING',(bid,channel,customer))
-  row=c.execute('SELECT state FROM customer_sessions WHERE business_id=%s AND channel=%s AND customer_phone=%s FOR UPDATE',(bid,channel,customer)).fetchone()
+  row=c.execute('SELECT state,updated_at FROM customer_sessions WHERE business_id=%s AND channel=%s AND customer_phone=%s FOR UPDATE',(bid,channel,customer)).fetchone()
   previous=c.execute('SELECT assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND external_id=%s',(bid,channel,external_id)).fetchone()
   if previous:return None if channel=='WhatsApp' else previous['assistant_text']
-  current_state=dict(row['state'] or {})
+  expired=session_expired(row['updated_at'])
+  current_state={} if expired else dict(row['state'] or {})
   if current_state.get('_sector') not in (None,str(b.get('sector') or '').strip().casefold()):
    current_state={}
   if channel=='Voice':
    call_id=external_id.split(':',1)[0]
    if current_state.get('_voice_call_id')!=call_id:
     current_state={}
-   recent=c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s AND external_id LIKE %s ORDER BY id DESC LIMIT 40',(bid,channel,customer,call_id+':%')).fetchall()
+   recent=[] if expired else c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s AND external_id LIKE %s AND created_at >= %s ORDER BY id DESC LIMIT 40',(bid,channel,customer,call_id+':%',datetime.now(timezone.utc)-timedelta(minutes=session_ttl()))).fetchall()
   else:
-   recent=c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 40',(bid,channel,customer)).fetchall()
+   recent=[] if expired else c.execute('SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s AND created_at >= %s ORDER BY id DESC LIMIT 40',(bid,channel,customer,datetime.now(timezone.utc)-timedelta(minutes=session_ttl()))).fetchall()
   reply,state=process(b,current_state,list(reversed(recent)),text,channel,external_id,customer)
   state['_sector']=str(b.get('sector') or '').strip().casefold()
   if channel=='Voice':state['_voice_call_id']=call_id
