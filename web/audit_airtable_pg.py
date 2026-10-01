@@ -3,9 +3,9 @@ import json,os,re
 import requests
 from booking import db,headers,list_records,day,hour
 
-SLOT_FIELDS={'Franja_ID','Business_ID','Fecha','Hora_Inicio','Capacidad_Personas','Estado'}
+SLOT_FIELDS={'Franja_ID','Business_ID','Fecha','Hora_Inicio','Hora_Fin','Capacidad_Personas','Estado','Reservas','Ocupadas','Capacidad_Disponible'}
 RES_FIELDS={'Business_ID','Restaurant_Phone','Customer_Name','Customer_Phone','Customer_Email','Reservation_Date','Reservation_Time','Party_Size','Status','Codigo_Reserva','Canal','Call_ID','Franja','Created_At','Actualizada_At','Cancelada_At'}
-PG_COLUMNS={'booking_slots':{'business_id','slot_id','slot_date','start_time','capacity'},'booking_reservations':{'business_id','slot_id','request_id','code','name','phone','email','party_size','status','airtable_id','airtable_pending','channel','business_phone'}}
+PG_COLUMNS={'booking_slots':{'business_id','slot_id','slot_date','start_time','end_time','capacity','admin_status','status','occupied','remaining_capacity','airtable_record_id','synced_at'},'booking_reservations':{'business_id','slot_id','request_id','code','name','phone','email','party_size','status','airtable_id','airtable_pending','channel','business_phone'}}
 
 def audit():
  base=os.getenv('AIRTABLE_BASE_ID','').strip()
@@ -30,6 +30,12 @@ def audit():
      configured={choice.get('name') for choice in field.get('options',{}).get('choices',[])}
      missing=sorted(required_options-configured)
      if missing:report['issues'].append({'kind':'missing_select_options','field':field_name,'missing':missing})
+  if name==slots_name:
+   computed={'formula','rollup','count','lookup','multipleLookupValues','autoNumber'}
+   wrong=sorted(field for field in ('Ocupadas','Capacidad_Disponible') if field in fields and fields[field]['type'] in computed)
+   if wrong:report['issues'].append({'kind':'slot_load_fields_not_writable','fields':wrong})
+   for field in ('Hora_Fin','Ocupadas','Capacidad_Disponible'):
+    if field not in fields:report['issues'].append({'kind':'missing_required_slot_field','field':field})
   if name==bookings_name:
    computed={'formula','rollup','count','lookup','multipleLookupValues','autoNumber'}
    readonly=sorted(field for field in RES_FIELDS if field in fields and fields[field]['type'] in computed)
@@ -55,6 +61,10 @@ def audit():
   f=slot.get('fields',{});d=day(f.get('Fecha'));t=hour(f.get('Hora_Inicio'));bid=f.get('Business_ID')
   expected=f'{bid}-{d}-{t.replace(":", "")}' if bid and d and t else None
   if f.get('Franja_ID')!=expected:report['issues'].append({'kind':'invalid_slot_id','airtable_record':slot['id']})
+  try:
+   capacity=int(f.get('Capacidad_Personas'));occupied=int(f.get('Ocupadas',0));remaining=int(f.get('Capacidad_Disponible',capacity-occupied))
+   if remaining!=max(capacity-occupied,0):report['issues'].append({'kind':'slot_load_mismatch','airtable_record':slot['id']})
+  except (TypeError,ValueError):report['issues'].append({'kind':'invalid_slot_load_values','airtable_record':slot['id']})
   key=(bid,d,t)
   if key in seen_slots:report['issues'].append({'kind':'duplicate_slot','airtable_records':[seen_slots[key],slot['id']]})
   else:seen_slots[key]=slot['id']

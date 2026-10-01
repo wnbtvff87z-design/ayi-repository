@@ -1,36 +1,17 @@
 """Restaurant-only HTTP endpoints. Register on generic core without changing URLs."""
 from flask import jsonify,request
 from booking import BookingError,availability,options
+
+
 def register_restaurant_routes(app,authorized,lookup,log):
  @app.post('/internal/reconcile-pending')
  def internal_reconcile_pending():
   if not authorized():return jsonify(success=False),401
   try:
-   from booking import reconcile_pending,sync_airtable_slots
-   slots=sync_airtable_slots();result=reconcile_pending((request.get_json(silent=True) or {}).get('limit',25))
-   return jsonify(success=True,slot_sync=slots,results=result)
+   from booking import reconcile_pending
+   result=reconcile_pending((request.get_json(silent=True) or {}).get('limit',25))
+   return jsonify(success=True,results=result)
   except Exception:log.exception('Reconciliation failed');return jsonify(success=False),503
- @app.post('/internal/sync-slots')
- def internal_sync_slots():
-  if not authorized():return jsonify(success=False),401
-  try:
-   from booking import sync_airtable_slots
-   business_id=str((request.get_json(silent=True) or {}).get('business_id') or '').strip() or None
-   result=sync_airtable_slots(business_id)
-   return jsonify(success=not result['duplicate_keys'] and not result['invalid'],slot_sync=result),(200 if not result['duplicate_keys'] and not result['invalid'] else 409)
-  except BookingError as exc:return jsonify(success=False,message=str(exc)),409
-  except Exception:log.exception('Slot synchronization failed');return jsonify(success=False),503
- @app.post('/internal/sync-slot-record')
- def internal_sync_slot_record():
-  if not authorized():return jsonify(success=False),401
-  d=request.get_json(silent=True) or {}
-  try:
-   from booking import sync_airtable_record
-   if not d.get('record_id'):return jsonify(success=False,message='record_id required'),400
-   result=sync_airtable_record(d['record_id'])
-   return jsonify(result),200 if result.get('success') else 409
-  except BookingError as exc:return jsonify(success=False,message=str(exc)),409
-  except Exception:log.exception('Exact slot sync failed');return jsonify(success=False,message='Exact slot sync failed'),503
  @app.post('/internal/booking')
  @app.post('/internal/book-test')
  def internal_booking():
