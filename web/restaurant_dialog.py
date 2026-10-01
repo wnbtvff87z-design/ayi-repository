@@ -561,15 +561,23 @@ def process(b,state,history,text,channel,external_id,customer):
         if not v.get('reservation_time'):
             suggestions=bool(band or state.get('time_band') or weekend or state.get('date_range') or intent=='availability' or re.search(r'\b(?:suger|opcion|horario|disponib|que horas|que hora|cuales)\b',plain))
             if not suggestions and not state.get('offered'):
-                return '¿A qué hora te gustaría reservar?',state
+                if state.get('last_requested_field')!='reservation_time':
+                    return '¿A qué hora te gustaría reservar?',_state(state,last_requested_field='reservation_time')
+                # Do not repeat the same question when the answer was vague or
+                # speech recognition did not produce an exact time.
+                suggestions=True
             if state.get('offered') and not suggestions:
-                return '¿Cuál de los horarios que te ofrecí te sirve?',state
+                return ('No pude identificar cuál horario elegiste. Decime el número de la opción '
+                        'o proponé otra fecha u hora.'),_state(state,last_requested_field='reservation_time')
             if state.get('date_range'):
                 start,end=state['date_range']
                 rows=[s for s in options(b,start,v['party_size'],limit=None) if start<=s['date']<=end and in_band(s['time'],state.get('time_band'))][:5]
             else:
                 rows=[s for s in options(b,v['reservation_date'],v['party_size'],limit=None) if s['date']==v['reservation_date'] and in_band(s['time'],state.get('time_band'))][:5]
-            return offer(rows,v['reservation_date'],channel),_state(state,offered=_slots(rows))
+            if not rows:
+                return ('No veo horarios disponibles para ese día en la franja consultada. '
+                        '¿Querés probar otro día o una hora diferente?'),_state(state,offered=[],last_requested_field='reservation_time')
+            return offer(rows,v['reservation_date'],channel),_state(state,offered=_slots(rows),last_requested_field='reservation_time')
         slot_key=[v['reservation_date'],v['reservation_time'],str(v['party_size'])]
         check={'available':True} if state.get('checked_slot')==slot_key else availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
         if not check['available']:
