@@ -78,6 +78,16 @@ def test_exact_time_is_checked_without_reoffering_when_available():
         assert new['chosen_slot']=={'date':'2030-10-02','time':'20:00'}
         available.assert_called_once();opts.assert_not_called()
 
+def test_explicit_alternative_time_replaces_chosen_slot():
+    state={'intent':'create','phase':'collecting','operation_id':'op','party_confirmed':True,
+           'values':{'reservation_date':'2030-10-02','reservation_time':'20:00','party_size':3},
+           'chosen_slot':{'date':'2030-10-02','time':'20:00'},'checked_slot':['2030-10-02','20:00','3']}
+    with patch.object(d,'classify',side_effect=model),patch.object(d,'availability',return_value={'available':True,'alternatives':[]}) as available:
+        reply,new=d.process(B,state,[],'21:00','WhatsApp','alternate','+34612345678')
+    assert new['values']['reservation_time']=='21:00'
+    assert new['chosen_slot']=={'date':'2030-10-02','time':'21:00'}
+    available.assert_called_once_with(B,'2030-10-02','21:00',3)
+
 def test_unavailable_exact_time_offers_verified_alternatives():
     for channel in ('WhatsApp','Voice'):
         state={'intent':'create','phase':'collecting','operation_id':'op','party_confirmed':True,
