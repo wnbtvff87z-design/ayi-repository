@@ -10,12 +10,21 @@ log=logging.getLogger(__name__)
 NEEDED=('customer_name','reservation_date','reservation_time','party_size','customer_phone','customer_email')
 ASK={'customer_name':'¿Nombre y apellido para la reserva?','reservation_date':'¿Para qué día?','party_size':'¿Para cuántas personas?','customer_phone':'¿Qué teléfono dejamos?','customer_email':'¿Qué correo dejamos?'}
 MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
+WEEKDAYS=('lunes','martes','miércoles','jueves','viernes','sábado','domingo')
 
 def clean(s):
     return ' '.join(''.join(c for c in unicodedata.normalize('NFKD',str(s or '').casefold()) if not unicodedata.combining(c)).split())
 
-def spoken_date(s):
-    d=date.fromisoformat(str(s)[:10]);return f'el {d.day} de {MONTHS[d.month-1]}'
+def spoken_date(s, today=None):
+    """Natural Spanish label; the stored ISO date is never changed."""
+    d=date.fromisoformat(str(s)[:10])
+    today=today or datetime.now(ZoneInfo('Europe/Madrid')).date()
+    weekday=WEEKDAYS[d.weekday()]
+    if (d.year,d.month)==(today.year,today.month):
+        return f'el {weekday} {d.day}'
+    if d.year==today.year:
+        return f'el {weekday} {d.day} de {MONTHS[d.month-1]}'
+    return f'el {weekday} {d.day} de {MONTHS[d.month-1]} de {d.year}'
 
 def spoken_time(s):
     h,m=map(int,s.split(':'));n=h%12 or 12
@@ -563,8 +572,6 @@ def process(b,state,history,text,channel,external_id,customer):
             if not suggestions and not state.get('offered'):
                 if state.get('last_requested_field')!='reservation_time':
                     return '¿A qué hora te gustaría reservar?',_state(state,last_requested_field='reservation_time')
-                # Do not repeat the same question when the answer was vague or
-                # speech recognition did not produce an exact time.
                 suggestions=True
             if state.get('offered') and not suggestions:
                 return ('No pude identificar cuál horario elegiste. Decime el número de la opción '
