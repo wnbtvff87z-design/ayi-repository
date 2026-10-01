@@ -18,7 +18,7 @@ def interpret(business,state,history,text):
     timezone=business.get('timezone') or 'Europe/Madrid'
     system=('Sos un intérprete de mensajes para una recepción. Devolvé solo datos del mensaje ACTUAL en JSON; '
       'usa el estado y la conversación para resolver referencias sin inventar información. '
-      'Las horas son HH:MM en formato 24 horas; requested_times contiene TODAS las horas propuestas, sin duplicados, '
+      'Las horas son HH:MM en formato 24 horas; requested_times contiene SOLO las horas escritas o dichas en el mensaje ACTUAL, nunca horas del historial, del estado ni de opciones previas, sin duplicados, '
       'por ejemplo 20:30 o 20:00, y reservation_time solo cuando haya UNA hora inequívoca. '
       '8 de la tarde = 20:00 si es inequívoco; hoy y mañana se resuelven según la zona horaria indicada. '
       'No conviertas "esta noche" en hora exacta; si hay duda, needs_clarification=true. '

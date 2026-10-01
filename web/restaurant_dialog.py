@@ -185,7 +185,7 @@ def process(b,state,history,text,channel,external_id,customer):
                 v.pop('reservation_date',None);v.pop('reservation_time',None);state=_state(state,values=v,checked_slot=None)
         except ValueError:
             v.pop('reservation_date',None);v.pop('reservation_time',None);state=_state(state,values=v,checked_slot=None)
-    if phase=='done' and plain in {'gracias','muchas gracias','gracias por todo','perfecto gracias','vale gracias','ok gracias'}:
+    if phase=='done' and re.search(r'\b(?:gracias|excelente|perfecto|genial)\b',plain):
         return '¡Gracias a vos! Te esperamos.',state
     if phase=='done' and _confirmed(text):return 'La operación anterior ya quedó hecha; no hice otra.',state
     if phase=='done' and state.get('mirror_pending') and any(term in plain for term in ('copia de gestion','airtable','agenda del equipo')):
@@ -252,7 +252,7 @@ def process(b,state,history,text,channel,external_id,customer):
     selected=_selection(text,state.get('offered') or [],state.get('proposed')) if op=='create' and phase!='done' else None
     if selected:
         v.update(reservation_date=selected['date'],reservation_time=selected['time'])
-        state=_state(state,values=v,offered=[],proposed=None,pending=None,checked_slot=None,hour_origin='verified_alternative',phase='collecting')
+        state=_state(state,values=v,offered=[],proposed=None,pending=None,checked_slot=None,hour_origin='verified_alternative',phase='collecting',time_band=None,date_range=None,requested_time=None)
         phase='collecting'
         if not v.get('party_size'):return ASK['party_size'],state
         try:
@@ -386,7 +386,11 @@ def process(b,state,history,text,channel,external_id,customer):
     if band:state['time_band']=band
     elif exact or 'reservation_date' in updates and not weekend:state.pop('time_band',None)
     state=_state(state,phase='collecting',intent='create',values=v)
-    times=[t for t in result.get('requested_times',[]) if re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',str(t))][:3] if isinstance(result.get('requested_times'),list) else _requested_times(text)
+    # After a verified slot, contact answers only advance contact collection.
+    if state.get('checked_slot') and _contact_problem(v):
+        return _ask_missing(state,v,_contact_problem(v),text)
+    # Availability choices come only from the current message, never history.
+    times=_requested_times(text)
     if op=='create' and len(times)>1 and v.get('reservation_date') and v.get('party_size'):
         checks=[]
         for t in times:

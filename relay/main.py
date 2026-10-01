@@ -83,7 +83,7 @@ async def relay_ended():return Response('<Response><Hangup/></Response>',media_t
 @app.websocket('/ws')
 async def websocket(ws:WebSocket):
  if not valid_ws(ws):await ws.close(code=1008);return
- await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0}
+ await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0,'processed_ids':set()}
  try:
   while True:
    event=json.loads(await ws.receive_text());kind=event.get('type')
@@ -96,9 +96,17 @@ async def websocket(ws:WebSocket):
     text=str(event.get('voicePrompt') or '').strip()
     if not text:continue
     state['seq']+=1
+    external_id=event_external_id(event,state['call_sid'],text)
+    if external_id in state['processed_ids']:
+     log.info('Duplicate ConversationRelay prompt ignored')
+     continue
+    state['processed_ids'].add(external_id)
+    if len(state['processed_ids'])>200:
+     state['processed_ids']={external_id}
     try:
-     out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':event_external_id(event,state['call_sid'],text),'text':text})
-     reply=out['reply']
+     out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':external_id,'text':text})
+     reply=out.get('reply')
+     if not reply:continue
     except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.'
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))
    elif kind=='error':log.error('ConversationRelay error: %s',event.get('description'))

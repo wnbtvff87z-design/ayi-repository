@@ -189,7 +189,7 @@ def refresh_slot_load(business_id,slot_id):
  rec=slot['airtable_record_id'];mirrored=False
  if rec:
   try:
-   fields={os.getenv('AIRTABLE_SLOT_OCCUPIED_FIELD','Ocupadas'):used,os.getenv('AIRTABLE_SLOT_REMAINING_FIELD','Capacidad_Disponible'):remaining,'Estado':status}
+   fields={os.getenv('AIRTABLE_SLOT_OCCUPIED_FIELD','Ocupadas'):used,os.getenv('AIRTABLE_SLOT_REMAINING_FIELD','Capacidad_Disponible'):remaining,os.getenv('AIRTABLE_SLOT_OPERATIONAL_STATUS_FIELD','Estado_Operativo'):status}
    r=requests.patch(url(os.getenv('AIRTABLE_SLOTS_TABLE','Franjas'),rec),headers=headers(),json={'fields':fields},timeout=10);r.raise_for_status();mirrored=True
   except Exception:log.exception('Slot load mirror failed; PostgreSQL remains authoritative')
  return {'success':True,'occupied':used,'remaining_capacity':remaining,'status':status,'airtable_synced':mirrored}
