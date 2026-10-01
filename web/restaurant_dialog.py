@@ -206,6 +206,63 @@ def _other_time_question(text):
     return bool(re.search(r'\b(?:otro|otra|otros|otras|mas)\b.{0,30}\b(?:hora|horario|opcion|turno|disponib)',q)
                 or re.search(r'\b(?:tenes|tienes|hay)\b.{0,25}\b(?:otro|otra|mas)\b',q))
 
+def _correction_field(text):
+    """Identify only a field explicitly named by the caller."""
+    q=clean(text)
+    names=(('customer_email',r'\b(?:correo|email|mail)\b'),
+           ('customer_phone',r'\b(?:telefono|movil|numero de contacto)\b'),
+           ('party_size',r'\b(?:personas|comensales|cantidad)\b'),
+           ('reservation_date',r'\b(?:fecha|dia)\b'),
+           ('reservation_time',r'\b(?:hora|horario)\b'),
+           ('customer_name',r'\b(?:nombre|apellido)\b'))
+    matches=[field for field,pattern in names if re.search(pattern,q)]
+    return matches[0] if len(matches)==1 else None
+
+def _corrected_value(field,text,tz,model_updates=None):
+    """Never infer a correction from old history or the model alone."""
+    q=clean(text)
+    if field=='customer_email':return _spoken_email(text)
+    if field=='customer_phone':
+        digits=re.sub(r'\D','',text)
+        return ('+' if text.strip().startswith('+') else '')+digits if 9<=len(digits)<=15 else None
+    if field=='party_size':return _party_from_current_turn(text,True)
+    if field=='reservation_date':return explicit_date(text,tz) or relative_day(text,tz)
+    if field=='reservation_time':return explicit_time(text)
+    if field=='customer_name':
+        candidate=(model_updates or {}).get('customer_name')
+        if candidate and len(clean(candidate).split())>=2 and all(part in q for part in clean(candidate).split()):return candidate
+        raw=re.sub(r'^(?:mi nombre es|me llamo|soy|a nombre de|el nombre es|nombre|apellido)\s+','',text.strip(),flags=re.I).strip(' .,')
+        if re.fullmatch(r'[^\W\d_]+(?:[ -][^\W\d_]+){1,3}',raw,re.UNICODE) and not any(w in clean(raw).split() for w in ('cambiar','corregir','equivocado','incorrecto','mal','nombre','apellido')):
+            return ' '.join(word.capitalize() for word in raw.split())
+    return None
+
+def _apply_final_correction(b,state,values,field,value,channel):
+    updated=dict(values)
+    updated[field]=value
+    if field=='party_size':
+        updated[field]=int(value)
+    # Only a changed date/hour/capacity requires a new availability check.
+    if field in ('reservation_date','reservation_time','party_size'):
+        try:
+            check=availability(b,updated['reservation_date'],updated['reservation_time'],updated['party_size'])
+        except BookingError as exc:return str(exc),state
+        if not check.get('available'):
+            if field=='reservation_date':
+                return 'Ese día a esa hora no está disponible. Decime otra fecha u hora.',_state(state,correction_field='reservation_date')
+            if field=='reservation_time':
+                return 'Esa hora no está disponible. Decime otra hora.',_state(state,correction_field='reservation_time')
+            return 'No hay lugar para esa cantidad en ese horario. Decime otra cantidad, fecha u hora.',_state(state,correction_field='party_size')
+    next_state=_state(state,phase='collecting',values=updated,pending=None,request_id=None,
+                      pending_expires_at=None,correction_field=None,confirmation_reminder_sent=False)
+    if field in ('reservation_date','reservation_time','party_size'):
+        next_state['checked_slot']=[updated['reservation_date'],updated['reservation_time'],str(updated['party_size'])]
+        next_state['chosen_slot']={'date':updated['reservation_date'],'time':updated['reservation_time']}
+    # Preserve the other fields; the revised summary alone asks for fresh consent.
+    summary,next_state=_final_summary(next_state,updated,channel)
+    if field=='customer_phone':summary='Actualicé el teléfono a '+str(value)+'. '+summary
+    elif field=='customer_email':summary='Actualicé el correo a '+str(value)+'. '+summary
+    return summary,next_state
+
 def process(b,state,history,text,channel,external_id,customer):
     state=dict(state or {});v=dict(state.get('values') or {});op=state.get('intent');phase=state.get('phase','collecting')
     # Old sessions predate operation IDs. Never trust their party size or offers.
@@ -301,6 +358,33 @@ def process(b,state,history,text,channel,external_id,customer):
         if result.get('airtable_synced'):
             return 'Listo, tu reserva quedó confirmada. ¡Gracias, te esperamos!',{'phase':'done','intent':None,'values':{},'result_code':result.get('code')}
         return 'Todavía estoy verificando tu reserva. No hace falta repetirla.',state
+    if op=='create' and phase=='awaiting' and state.get('correction_field'):
+        field=state['correction_field']
+        model_updates={}
+        if field=='customer_name':
+            try:model_updates=(classify(b,state,[],text) or {}).get('updates') or {}
+            except BookingError:pass
+        value=_corrected_value(field,text,tz,model_updates)
+        if value is None:
+            return 'No pude identificar el dato corregido. '+ASK.get(field,'Decime el dato correcto.'),state
+        return _apply_final_correction(b,state,v,field,value,channel)
+    if op=='create' and phase=='awaiting' and not state.get('pending') and not state.get('correction_field'):
+        field=_correction_field(text)
+        if field:return ASK.get(field,'Decime el dato correcto.'),_state(state,correction_field=field)
+    if op=='create' and phase=='awaiting' and state.get('pending')==v and not _confirmed(text):
+        field=_correction_field(text)
+        correction_words=bool(re.search(r'\b(?:mal|incorrecto|equivocado|corregir|corrige|cambiar|cambia|modificar|modifica|mejor|en vez de)\b',plain))
+        if correction_words and not field:
+            if explicit_time(text):field='reservation_time'
+            elif explicit_date(text,tz) or relative_day(text,tz):field='reservation_date'
+            elif _spoken_email(text):field='customer_email'
+        if field and correction_words:
+            value=_corrected_value(field,text,tz)
+            next_state=_state(state,pending=None,request_id=None,pending_expires_at=None,correction_field=field)
+            if value is None:return 'De acuerdo. '+ASK.get(field,'Decime el dato correcto.'),next_state
+            return _apply_final_correction(b,next_state,v,field,value,channel)
+        if correction_words and not field:
+            return 'De acuerdo. ¿Qué dato querés corregir: nombre, fecha, hora, personas, teléfono o correo?',_state(state,pending=None,request_id=None,pending_expires_at=None,correction_field=None)
     if phase=='awaiting' and op=='create' and state.get('pending')==v and _confirmed(text) and _party_verified(state,v):
         try:
             check=availability(b,v['reservation_date'],v['reservation_time'],v['party_size'])
