@@ -222,8 +222,10 @@ def process(b,state,history,text,channel,external_id,customer):
                 v.pop('reservation_date',None);v.pop('reservation_time',None);state=_state(state,values=v,checked_slot=None)
         except ValueError:
             v.pop('reservation_date',None);v.pop('reservation_time',None);state=_state(state,values=v,checked_slot=None)
-    if phase=='done' and re.search(r'\b(?:gracias|excelente|perfecto|genial)\b',plain):
-        return '¡Gracias a vos! Te esperamos.',state
+    if phase in ('done','closed') and re.search(r'\b(?:gracias|excelente|perfecto|genial|chau|chao|adios|hasta luego)\b',plain):
+        return '¡Gracias a vos! Hasta luego.',_state(state,phase='closed',intent=None,values={},offered=[],pending=None)
+    if phase=='closed' and not _new_booking_request(text):
+        return 'Hasta luego.',state
     if phase=='done' and _confirmed(text):return 'La operación anterior ya quedó hecha; no hice otra.',state
     if phase=='done' and state.get('mirror_pending') and any(term in plain for term in ('copia de gestion','airtable','agenda del equipo')):
         return 'La reserva está registrada. La actualización interna sigue pendiente; no hace falta repetirla.',state
@@ -302,9 +304,13 @@ def process(b,state,history,text,channel,external_id,customer):
             question,next_state=_ask_missing(state,v,missing,text)
             return ('Elegiste '+spoken_date(v['reservation_date'])+' '+spoken_time(v['reservation_time'])+'. '+question),next_state
         return _final_summary(state,v,channel)
-    # A question while awaiting consent must not consume or reset the pending snapshot.
+    # The summary already asked for confirmation. Never repeat that question.
+    if phase=='awaiting' and op=='create' and re.search(r'\b(?:chau|chao|adios|hasta luego|me voy)\b',plain):
+        return 'De acuerdo, no registré la reserva. ¡Hasta luego!',_state(state,phase='closed',intent=None,values={},pending=None,request_id=None,offered=[])
     if phase=='awaiting' and op=='create' and not (explicit_time(text) or explicit_date(text,tz) or relative_day(text,tz) or re.search(r'\b(?:cambiar|mejor|otro|otra|nombre|telefono|correo|personas|email|soy|llamo|llamame)\b',plain)):
-        return '¿La registro?',state
+        if not state.get('confirmation_reminder_sent'):
+            return 'Todavía no la registré. Si querés confirmarla, decime sí; si querés cambiar algo, decime qué.',_state(state,confirmation_reminder_sent=True)
+        return 'Te escucho.',state
     try:result=classify(b,state,[] if new_request else history,text)
     except BookingError as exc:return str(exc),state
     intent=str(result.get('intent') or 'question').lower()
@@ -396,7 +402,7 @@ def process(b,state,history,text,channel,external_id,customer):
         if changed:state.pop('pending',None);state.pop('request_id',None);state.pop('offered',None);state.pop('proposed',None)
         if 'reservation_date' in changed and 'reservation_time' not in updates:v.pop('reservation_time',None)
         if exact:state['hour_origin']='customer'
-    elif phase=='awaiting' and op=='create':return '¿La registro?',state
+    elif phase=='awaiting' and op=='create':return 'Te escucho.',state
     if op in ('cancel','modify'):
         if not v.get('customer_name') or len(clean(v['customer_name']).split())<2:
             return 'Decime nombre y apellido de la reserva.',_state(state,phase='collecting',intent=op,values=v,last_requested_field='customer_name')
@@ -517,4 +523,4 @@ def _final_summary(state,v,channel):
     reply=('Para '+spoken_date(v['reservation_date'])+' '+spoken_time(v['reservation_time'])+
            ', '+str(v['party_size'])+' personas, a nombre de '+str(v['customer_name'])+'. ¿La registro?')
     expires=(datetime.now(ZoneInfo('UTC'))+timedelta(minutes=int(os.getenv('CONFIRMATION_TTL_MINUTES','10')))).isoformat()
-    return reply,_state(state,phase='awaiting',intent='create',values=dict(v),pending=dict(v),request_id=request_id,offered=[],proposed=None,pending_expires_at=expires)
+    return reply,_state(state,phase='awaiting',intent='create',values=dict(v),pending=dict(v),request_id=request_id,offered=[],proposed=None,pending_expires_at=expires,confirmation_reminder_sent=False)

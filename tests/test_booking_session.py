@@ -92,3 +92,30 @@ def test_old_pending_without_verified_party_asks_instead_of_creating():
     assert reply=='¿Para cuántas personas?'
     assert state['pending'] is None
     create.assert_not_called()
+
+def test_awaiting_confirmation_does_not_repeat_question():
+    values={'party_size':3,'reservation_date':'2030-10-01','reservation_time':'15:00'}
+    state={'phase':'awaiting','intent':'create','operation_id':'op','party_confirmed':True,
+           'values':values,'pending':values,'request_id':'req'}
+    for channel in ('WhatsApp','Voice'):
+        reply,once=dialog.process(B,state,[],'¿Podés repetir el resumen?',channel,'one','+34600000000')
+        again,_=dialog.process(B,once,[],'no entendí',channel,'two','+34600000000')
+        assert '¿La registro?' not in reply and '¿La registro?' not in again
+        assert once['pending']==values
+
+def test_goodbye_after_booking_closes_dialogue():
+    for channel in ('WhatsApp','Voice'):
+        state={'phase':'done','intent':None,'values':{},'result_code':'R-EXAMPLE'}
+        for message in ('gracias','gracias a vos','chau','adiós'):
+            reply,new=dialog.process(B,state,[],message,channel,'bye','+34600000000')
+            assert 'Hasta luego' in reply
+            assert new['phase']=='closed'
+
+def test_goodbye_before_confirmation_does_not_book():
+    values={'party_size':3,'reservation_date':'2030-10-01','reservation_time':'15:00'}
+    state={'phase':'awaiting','intent':'create','operation_id':'op','party_confirmed':True,
+           'values':values,'pending':values,'request_id':'req'}
+    with patch.object(dialog,'create') as create:
+        reply,new=dialog.process(B,state,[],'chau','Voice','bye','+34600000000')
+    assert 'no registré' in reply and new['phase']=='closed'
+    create.assert_not_called()
