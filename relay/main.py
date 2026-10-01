@@ -83,16 +83,24 @@ async def voice(req:Request):
 async def relay_ended(req:Request):
  form=await req.form()
  if not valid_http(req,form):return Response('Forbidden',status_code=403)
- reason=''
- try:reason=json.loads(str(form.get('HandoffData') or '{}')).get('reason','')
+ payload={}
+ try:payload=json.loads(str(form.get('HandoffData') or '{}'))
  except (ValueError,TypeError,AttributeError):pass
+ if not isinstance(payload,dict):payload={}
+ reason=payload.get('reason','')
  if reason=='goodbye':
   message='¡Gracias a vos! Hasta luego.'
  elif reason=='cancelled':
   message='De acuerdo, no registré la reserva. ¡Hasta luego!'
  else:
   message=''
- say='<Say language="es-ES">'+escape(message)+'</Say>' if message else ''
+ say=''
+ if message:
+  voice_id=str(payload.get('voice_id') or '').strip()
+  if not re.fullmatch(r'[A-Za-z0-9_-]{10,100}',voice_id):
+   log.error('Invalid goodbye voice ID; refusing different TTS voice')
+  else:
+   say='<Say language="es-ES" voice="ElevenLabs.'+escape(voice_id,{'"':'&quot;'})+'">'+escape(message)+'</Say>'
  return Response('<Response>'+say+'<Hangup/></Response>',media_type='application/xml')
 @app.websocket('/ws')
 async def websocket(ws:WebSocket):
@@ -125,10 +133,10 @@ async def websocket(ws:WebSocket):
     # Do not synthesize the goodbye over WebSocket and then end immediately:
     # Twilio's signed <Connect action> callback speaks it once, then hangs up.
     if reply=='¡Gracias a vos! Hasta luego.':
-     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'goodbye'})}))
+     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'goodbye','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
      return
     if reply=='De acuerdo, no registré la reserva. ¡Hasta luego!':
-     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'cancelled'})}))
+     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'cancelled','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
      return
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))
    elif kind=='error':log.error('ConversationRelay error: %s',event.get('description'))

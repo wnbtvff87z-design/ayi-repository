@@ -96,3 +96,40 @@ def test_other_hour_when_only_one_was_offered_not_yet_selected():
  assert 'ocho' in reply
  assert new['offered']==ROWS
  classify.assert_not_called()
+
+
+def test_long_search_exact_available_requires_one_choice_then_contact():
+ for channel in ('WhatsApp','Voice'):
+  state={'intent':'create','phase':'collecting','operation_id':'op','party_confirmed':True,'negotiation_rounds':2,'values':{'reservation_date':'2030-10-02','party_size':3}}
+  with patch.object(d,'classify',side_effect=model),patch.object(d,'availability',return_value={'available':True,'alternatives':[]}) as available:
+   reply,state=d.process(B,state,[],'20:00',channel,'candidate','+34612345678')
+   assert '¿Elegís ese día y hora entonces?' in reply
+   assert state['phase']=='choosing' and state['values'].get('reservation_time') is None
+   reply,state=d.process(B,state,[],'sí',channel,'accept','+34612345678')
+  assert '¿Nombre y apellido' in reply,reply
+  assert state['values']['reservation_time']=='20:00'
+  assert available.call_count>=2
+
+def test_offered_alternative_accepted_after_long_search_does_not_reask():
+ state={'intent':'create','phase':'collecting','operation_id':'op','party_confirmed':True,'negotiation_rounds':3,'values':{'reservation_date':'2030-10-02','party_size':3},'offered':ROWS}
+ with patch.object(d,'availability',return_value={'available':True,'alternatives':[]}) as available:
+  reply,new=d.process(B,state,[],'20:00','WhatsApp','selected','+34612345678')
+ assert '¿Nombre y apellido' in reply
+ assert '¿Elegís' not in reply
+ assert new['values']['reservation_time']=='20:00'
+ available.assert_called_once()
+
+def test_long_search_rejection_keeps_search_open():
+ state={'intent':'create','phase':'choosing','operation_id':'op','party_confirmed':True,'negotiation_rounds':2,'values':{'reservation_date':'2030-10-02','party_size':3},'candidate_slot':ROWS[0]}
+ reply,new=d.process(B,state,[],'no','Voice','reject','+34612345678')
+ assert 'seguimos buscando' in reply
+ assert new['phase']=='collecting' and new.get('candidate_slot') is None
+
+
+def test_first_available_exact_time_skips_extra_choice():
+ for channel in ('WhatsApp','Voice'):
+  state={'intent':'create','phase':'collecting','operation_id':'op','party_confirmed':True,'values':{'reservation_date':'2030-10-02','party_size':3}}
+  with patch.object(d,'classify',side_effect=model),patch.object(d,'availability',return_value={'available':True,'alternatives':[]}):
+   reply,new=d.process(B,state,[],'20:00',channel,'first','+34612345678')
+  assert '¿Nombre y apellido' in reply and '¿Elegís' not in reply
+  assert new['values']['reservation_time']=='20:00'

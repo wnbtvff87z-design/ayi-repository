@@ -214,6 +214,24 @@ def process(b,state,history,text,channel,external_id,customer):
         result=classify(b,state,history,text)
         return safe_reply(result.get('reply')) or 'No tengo esa información verificada.',state
     plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
+    # A long search is not a reservation. Confirm the final candidate once,
+    # before asking for contact details, only after repeated rejections.
+    if phase=='choosing' and op=='create':
+        candidate=state.get('candidate_slot')
+        if _confirmed(text) and candidate:
+            state=_state(state,phase='collecting',candidate_slot=None,offered=[candidate],proposed=candidate,choice_confirmed=True)
+            phase='collecting'
+            text='sí esa'
+            plain=clean(text)
+        else:
+            state=_state(state,phase='collecting',candidate_slot=None,choice_confirmed=False,offered=[],proposed=None)
+            phase='collecting'
+            if plain in {'no','no gracias','todavia no','no se','prefiero otro','otra opcion'}:
+                return 'De acuerdo, seguimos buscando. ¿Qué otro día u hora querés probar?',state
+    if op=='create' and phase=='collecting' and state.get('offered') and re.search(r'\b(?:no|ninguno|ninguna)\b',plain) and not _confirmed(text) and not explicit_time(text):
+        state=_state(state,offered=[],proposed=None,negotiation_rounds=int(state.get('negotiation_rounds') or 0)+1)
+        if not (explicit_date(text,tz) or relative_day(text,tz) or requested_band(text)):
+            return 'De acuerdo, seguimos buscando. ¿Qué otro día u hora querés probar?',state
     if op=='create' and phase=='sync_pending' and not _party_verified(state,v):
         return 'No puedo verificar la reserva anterior con seguridad. No la repitas; contactá con recepción.',state
     if op=='create' and phase=='awaiting' and not _party_verified(state,v):
@@ -328,6 +346,7 @@ def process(b,state,history,text,channel,external_id,customer):
     selected=_selection(text,state.get('offered') or [],state.get('proposed')) if op=='create' and phase!='done' else None
     if selected:
         v.update(reservation_date=selected['date'],reservation_time=selected['time'])
+        state['choice_confirmed']=False
         state=_state(state,values=v,offered=[],proposed=None,pending=None,checked_slot=None,chosen_slot={'date':selected['date'],'time':selected['time']},hour_origin='verified_alternative',phase='collecting',time_band=None,date_range=None,requested_time=None)
         phase='collecting'
         if not _party_verified(state,v):return ASK['party_size'],_state(state,values=v,last_requested_field='party_size',offered=[],proposed=None)
@@ -448,6 +467,8 @@ def process(b,state,history,text,channel,external_id,customer):
     newly_requested_time=bool(exact and op=='create' and v.get('reservation_time')!=exact and re.search(r'\b(?:tenes|tienes|hay|hueco|libre|disponib)\b',plain))
     if updates:
         changed={k for k,x in updates.items() if v.get(k)!=x}
+        if op=='create' and state.get('offered') and 'reservation_date' in changed:
+            state['negotiation_rounds']=int(state.get('negotiation_rounds') or 0)+1
         # A new name means a new person: never carry over somebody else's contact.
         if op=='create' and 'customer_name' in changed and v.get('customer_name'):
             for field in ('customer_email','customer_phone'):
@@ -555,7 +576,7 @@ def process(b,state,history,text,channel,external_id,customer):
             v.pop('reservation_time',None)
             alternatives=_slots(check.get('alternatives') or [])
             reply='A '+spoken_time(slot_key[1]).removeprefix('a ')+' no tengo lugar. '+_short_alternatives(alternatives,v.get('reservation_date'))
-            return reply,_state(state,values=v,offered=alternatives,proposed=alternatives[0] if alternatives else None,requested_time=slot_key[1],checked_slot=None)
+            return reply,_state(state,values=v,offered=alternatives,proposed=alternatives[0] if alternatives else None,requested_time=slot_key[1],checked_slot=None,negotiation_rounds=int(state.get('negotiation_rounds') or 0)+1)
     except BookingError as exc:
         if 'ya pasaron' in str(exc) and v.get('reservation_time') and v.get('reservation_date')==datetime.now(ZoneInfo(tz)).date().isoformat():
             try:
@@ -564,7 +585,12 @@ def process(b,state,history,text,channel,external_id,customer):
                 return 'Esa hora de hoy ya pasó. '+offer(rows,v['reservation_date'],channel),_state(state,values=v,offered=_slots(rows),requested_time=requested,checked_slot=None)
             except BookingError:pass
         return str(exc),state
-    state=_state(state,chosen_slot={'date':v['reservation_date'],'time':v['reservation_time']},offered=[],proposed=None,time_band=None,date_range=None)
+    if int(state.get('negotiation_rounds') or 0)>=2 and not state.get('choice_confirmed') and not state.get('chosen_slot'):
+        candidate={'date':v['reservation_date'],'time':v['reservation_time']}
+        v.pop('reservation_time',None)
+        return ('Sí, '+spoken_date(candidate['date'])+' '+spoken_time(candidate['time'])+' está disponible. ¿Elegís ese día y hora entonces?',
+                _state(state,phase='choosing',values=v,candidate_slot=candidate,offered=[],proposed=None,checked_slot=None))
+    state=_state(state,chosen_slot={'date':v['reservation_date'],'time':v['reservation_time']},offered=[],proposed=None,time_band=None,date_range=None,negotiation_rounds=0,choice_confirmed=False)
     missing=_contact_problem(v)
     if missing:
         question,next_state=_ask_missing(_state(state,checked_slot=slot_key),v,missing,text)
