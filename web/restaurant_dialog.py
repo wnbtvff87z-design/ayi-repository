@@ -55,7 +55,13 @@ def _party(text,expected=False):
     token=r'(?:20|1[0-9]|[1-9]|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)'
     m=re.search(r'\b('+token+r')\s+(?:personas|comensales|pax)\b',q)
     if not m:m=re.search(r'\b(?:somos|seremos|para)\s+('+token+r')\b',q)
-    if not m and expected:m=re.fullmatch(r'('+token+r')',q)
+    if not m and expected:
+        # A reply to the party-size question may omit the word 'personas'.
+        candidates=re.findall(r'(?<![\d:])(?:20|1[0-9]|[1-9])(?![\d:])',q)
+        if len(candidates)==1 and not re.search(r'\b(?:hora|horas|las|fecha|dia|telefono|numero)\b',q):
+            value=int(candidates[0])
+            return value if 1<=value<=20 else None
+        m=re.fullmatch(r'('+token+r')',q)
     if not m:return None
     n=int(m.group(1)) if m.group(1).isdigit() else words[m.group(1)]
     return n if 1<=n<=20 else None
@@ -148,6 +154,10 @@ def _create(b,s,text,channel,tz,updates):
     elif d:v['reservation_date']=d;s.pop('weekend',None)
     t=contextual_time(text,s.get('chosen'),s.get('offered') or (),s.get('expected'))
     n=_party(text,s.get('expected')=='party_size')
+    if n is None and s.get('expected')=='party_size':
+        proposed=updates.get('party_size')
+        if isinstance(proposed,int) and 1<=proposed<=20 and re.search(r'(?<!\d)'+str(proposed)+r'(?!\d)',clean(text)):
+            n=proposed
     if n:v['party_size']=n
     if s.get('offered') and not t and not n:
         chosen=_select([{'slot_date':x['date'],'start_time':x['time'],'code':str(i)} for i,x in enumerate(s['offered'])],text,tz)
@@ -158,7 +168,11 @@ def _create(b,s,text,channel,tz,updates):
         a,bday=s['weekend'];s['expected']='reservation_date'
         return '¿Te viene mejor '+spoken_date(a)+' o '+spoken_date(bday)+'?',s
     if not v.get('reservation_date'):s['expected']='reservation_date';return '¿Para qué día sería?',s
-    if not v.get('party_size'):s['expected']='party_size';return '¿Para cuántas personas?',s
+    if not v.get('party_size'):
+        attempts=s.get('party_attempts',0)+1;s['party_attempts']=attempts;s['expected']='party_size'
+        if attempts==1:return '¿Para cuántas personas?',s
+        if attempts==2:return 'No capté la cantidad. Decime solo el número, por ejemplo: cuatro.',s
+        return 'No estoy entendiendo la cantidad por voz. No hice ninguna reserva; podemos intentarlo de nuevo o contactar con recepción.',s
     if not v.get('reservation_time'):
         rows=_available_options(b,v['reservation_date'],v['party_size'],s.get('band'))
         s['offered']=rows;s['expected']='reservation_time'
