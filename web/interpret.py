@@ -21,6 +21,7 @@ def interpret(business,state,history,text):
       'Las horas son HH:MM en formato 24 horas; requested_times contiene SOLO las horas escritas o dichas en el mensaje ACTUAL, nunca horas del historial, del estado ni de opciones previas, sin duplicados, '
       'por ejemplo 20:30 o 20:00, y reservation_time solo cuando haya UNA hora inequívoca. '
       '8 de la tarde = 20:00 si es inequívoco; hoy y mañana se resuelven según la zona horaria indicada. '
+      'Fin de semana o finde no es sábado: reservation_date=null hasta que el cliente elija sábado o domingo. Conservá la cantidad y preferencia horaria mientras preguntás qué día prefiere. '
       'No conviertas "esta noche" en hora exacta. Si falta la cantidad de personas, no es un error: intent=availability y party_size=null. '
       'Separa cantidad y hora: "3 personas a las 9 de la noche" significa party_size=3 y reservation_time=21:00; "3 personas" no menciona hora. Una hora sin periodo conserva la hora ofrecida/elegida si coincide. Dígitos de teléfono nunca son horas. updates solo datos expresamente aportados AHORA; no recuperes nombre, correo ni teléfono de otro turno. '
       'Responde brevemente a preguntas sociales y correcciones, sin repetir horarios o datos ya aceptados. Nunca anuncies una reserva, disponibilidad o una acción sin verificación. '

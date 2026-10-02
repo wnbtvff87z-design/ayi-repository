@@ -284,6 +284,12 @@ def _process_impl(b,state,history,text,channel,external_id,customer):
         result=classify(b,state,history,text)
         return safe_reply(result.get('reply')) or 'No tengo esa información verificada.',state
     plain=clean(text);tz=b.get('timezone') or 'Europe/Madrid'
+    if op=='create' and state.get('date_range'):
+        day_words=set(re.findall(r'\b(?:sabado|domingo)\b',plain))
+        if len(day_words)>1:
+            saturday,sunday=state['date_range']
+            return 'Todavía no elegimos día. ¿Preferís '+spoken_date(saturday)+' o '+spoken_date(sunday)+'?',state
+
     # A long search is not a reservation. Confirm the final candidate once,
     # before asking for contact details, only after repeated rejections.
     if phase=='choosing' and op=='create':
@@ -475,6 +481,10 @@ def _process_impl(b,state,history,text,channel,external_id,customer):
     updates=_explicit_contact_updates(text,{k:x for k,x in updates.items() if k in NEEDED and x not in (None,'')})
     if new_request and not (explicit_date(text,tz) or relative_day(text,tz)):
         updates.pop('reservation_date',None)
+    if re.search(r'\b(?:fin\s+de\s+semana|finde)\b',plain) and not (explicit_date(text,tz) or relative_day(text,tz)):
+        updates.pop('reservation_date',None)
+    if state.get('date_range') and not (explicit_date(text,tz) or relative_day(text,tz)):
+        updates.pop('reservation_date',None)
     if 'reservation_date' in updates:
         try:date.fromisoformat(str(updates['reservation_date']))
         except (ValueError,TypeError):updates.pop('reservation_date',None)
@@ -504,6 +514,10 @@ def _process_impl(b,state,history,text,channel,external_id,customer):
     if re.search(r'\b(?:usa|utiliza|pon|deja)\b.*\b(?:numero|telefono|movil)\b.*\b(?:llam|este)\b',plain) and customer:
         updates['customer_phone']=customer
     deterministic_date=explicit_date(text,tz) or relative_day(text,tz)
+    if state.get('date_range') and not re.search(r'\b(?:fin\s+de\s+semana|finde)\b',plain):
+        day_words=set(re.findall(r'\b(?:sabado|domingo)\b',plain))
+        if len(day_words)==1:
+            deterministic_date=state['date_range'][0 if 'sabado' in day_words else 1]
     if deterministic_date:updates['reservation_date']=deterministic_date
     rel=updates.get('reservation_date') or deterministic_date
     deterministic_times=[] if state.get('last_requested_field') in ('customer_name','customer_email','customer_phone') else _requested_times(text)
@@ -557,7 +571,7 @@ def _process_impl(b,state,history,text,channel,external_id,customer):
     if op=='create' and not state.get('operation_id'):
         state['operation_id']=secrets.token_hex(12)
     if not op and intent=='availability':op='create';state['operation_id']=secrets.token_hex(12)
-    if intent in ('question','social') and op and not updates and not weekend and not band and not any(x in plain for x in ('disponib','horario','turno')) and not (op=='create' and state.get('chosen_slot') and _contact_problem(v)):
+    if intent in ('question','social') and op and not updates and not weekend and not state.get('date_range') and not band and not any(x in plain for x in ('disponib','horario','turno')) and not (op=='create' and state.get('chosen_slot') and _contact_problem(v)):
         return safe_reply(result.get('reply')) or '¿Qué querés saber?',_state(state,phase=phase,intent=op,values=v)
     if op in ('cancel','modify') and updates.get('customer_name'):
         if not all(part in plain for part in clean(updates['customer_name']).split()):updates.pop('customer_name',None)
@@ -607,15 +621,23 @@ def _process_impl(b,state,history,text,channel,external_id,customer):
             summary='¿Confirmás cancelar la reserva de '+spoken_date(row['slot_date'])+' '+spoken_time(row['start_time'])+'?'
         return summary,_state(state,phase='awaiting',intent=op,values=dict(v),pending=dict(v),target_code=row['code'],original_date=str(row['slot_date']),identifying_date=str(row['slot_date']))
     if op!='create':return safe_reply(result.get('reply')) or '¿En qué puedo ayudarte?',_state(state,phase='collecting',intent=None,values=v)
-    if weekend and not explicit_date(text,tz):
+    if weekend and not (explicit_date(text,tz) or relative_day(text,tz)):
         saturday,sunday=weekend_days(tz)
-        v.pop('reservation_time',None);v['reservation_date']=saturday
+        v.pop('reservation_date',None)
         state['date_range']=[saturday,sunday]
+        state.pop('checked_slot',None)
+        state.pop('chosen_slot',None)
+        state.pop('offered',None)
     elif rel or 'reservation_date' in updates:
         state.pop('date_range',None)
     if band:state['time_band']=band
     elif exact:state.pop('time_band',None)
     state=_state(state,phase='collecting',intent='create',values=v)
+    # The weekend preference remains unresolved until the caller chooses a day.
+    if state.get('date_range') and not v.get('reservation_date'):
+        saturday,sunday=state['date_range']
+        state=_state(state,values=v,last_requested_field='reservation_date',offered=[])
+        return '¿Preferís '+spoken_date(saturday)+' o '+spoken_date(sunday)+'?',state
     # After a verified slot, contact answers only advance contact collection.
     if state.get('checked_slot') and _contact_problem(v):
         return _ask_missing(state,v,_contact_problem(v),text)
