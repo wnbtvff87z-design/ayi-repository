@@ -12,7 +12,7 @@ def norm(v):return ' '.join(''.join(c for c in unicodedata.normalize('NFKD',str(
 def label(d,t=None):
     x=date.fromisoformat(str(d)[:10]);return f'el {DAYS[x.weekday()]} {x.day}/{x.month}'+(f' a las {t}' if t else '')
 def fresh(intent):return {'intent':intent,'phase':'collecting','values':{},'offered':[],'operation_id':secrets.token_hex(12)}
-def yes(t):return norm(t).strip(' .,!?¿¡') in ('si','si confirmo','confirmo','dale','ok','vale','adelante','de acuerdo')
+def yes(t):return norm(t).strip(' .,!?¿¡') in ('si','si por favor','si porfavor','si confirmo','confirmo','dale','ok','vale','adelante','de acuerdo')
 def no(t):return norm(t).strip(' .,!?¿¡') in ('no','no gracias','espera','mejor no','un momento')
 def valid_date(v):
     try:return date.fromisoformat(str(v)) .isoformat()
@@ -219,9 +219,40 @@ def _manage(s,text,parsed,channel,tz,customer):
     s['pending']={'operation':'modify','code':row['code'],'old_date':old_d,'old_time':old_t,'changes':{'reservation_date':dest,'reservation_time':dest_t,'party_size':n}}
     s['phase']='awaiting'
     return _reply(s,f'Tu reserva actual es {label(old_d,old_t)}. La cambiaría a {label(dest,dest_t)} para {n} personas. ¿Confirmás?',True)
+def _availability_only(s,text,parsed,channel,tz):
+    """Read-only availability; never collect contacts or create a pending booking."""
+    u=parsed.get('updates') or {}
+    if no(text) or re.search(r'\b(?:no|nono|me quedo con|con la del|gracias)\b',norm(text)) and s.get('phase')=='inquiry':
+        return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, mantenemos la reserva anterior. ¿Necesitás algo más?',True)
+    d,conflict=_date(text,u,tz,s)
+    if conflict:return _reply(s,conflict,True)
+    if d:s['values']['reservation_date']=d
+    n=_party(text,u.get('party_size'),s.get('expected'))
+    if n:s['values']['party_size']=n
+    if not s['values'].get('reservation_date'):
+        s['expected']='reservation_date';return _reply(s,'¿Para qué día querés consultar disponibilidad?',True)
+    # Unknown party size is not silently assumed to be one person.
+    if not s['values'].get('party_size'):
+        s['expected']='party_size';return _reply(s,'¿Para cuántas personas consulto disponibilidad? No voy a hacer otra reserva.',True)
+    rows=_slots(s['business'],s['values']['reservation_date'],s['values']['party_size'])
+    s['phase']='inquiry';s['expected']=None
+    if not rows:return _reply(s,'No veo mesas disponibles ese día. No hice ninguna reserva.',True)
+    s['offered']=rows[:3 if channel=='Voice' else 8]
+    times=', '.join(x['time'] for x in s['offered'])
+    return _reply(s,f'Para {s["values"]["party_size"]} personas tengo {label(s["values"]["reservation_date"])} a las {times}. Solo es una consulta; ¿querés reservar alguna?',True)
 def _process_internal(b,state,history,text,channel,external_id,customer):
     s=dict(state or {});s['values']=dict(s.get('values') or {});s['business']=b
     if b.get('sector')!='restaurante' or not b.get('allow_reservations'):return 'No tengo reservas habilitadas para este negocio.',s
+    # Resolve exact confirmations and refusals before model calls. Never confirm a mixed correction.
+    if s.get('phase')=='sync_pending':
+        return _reply(s,'La operación está pendiente de verificación. No la repitas; contactá con recepción.',True)
+    if s.get('phase')=='awaiting' and s.get('pending'):
+        if yes(text):return _confirm(s,customer,channel)
+        if no(text):
+            s.pop('pending',None);s['phase']='done';s['intent']=None
+            return _reply(s,'De acuerdo, no hice cambios. ¿Necesitás algo más?',True)
+    if s.get('intent')=='availability' and s.get('phase') in ('inquiry','collecting') and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',norm(text)):
+        return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, mantenemos la reserva anterior. ¿Necesitás algo más?',True)
     try:parsed=interpret(b,{k:v for k,v in s.items() if k!='business'},history,text)
     except Exception:
         log.exception('Interpretation unavailable');return _reply(s,'No pude entender bien tu pedido. No hice cambios; ¿me lo repetís?')
@@ -232,8 +263,10 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     elif not s.get('intent') or s.get('phase') in ('done','closed'):
         if intent not in ('create','cancel','modify','availability'):
             return _reply(s,str(parsed.get('reply') or '¿En qué puedo ayudarte?')[:220],True)
-        s=fresh('create' if intent=='availability' else intent);s['business']=b
+        s=fresh(intent);s['business']=b
     if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. No la repitas; contactá con recepción.',True)
+    if s.get('intent')=='availability':
+        return _availability_only(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid')
     if s.get('phase')=='awaiting':
         if no(text):s.pop('pending',None);s['phase']='collecting';return _reply(s,'De acuerdo, no hice cambios. ¿Querés otra cosa?',True)
         if yes(text) and s.get('pending'):return _confirm(s,customer,channel)

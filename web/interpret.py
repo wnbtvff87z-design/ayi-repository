@@ -30,7 +30,21 @@ def interpret(business,state,history,text):
     for turn in history[-8:]:
         messages.extend([{'role':'user','content':str(turn['user_text'])[:300]}, {'role':'assistant','content':str(turn['assistant_text'])[:300]}])
     messages.append({'role':'user','content':str(text)[:900]})
-    response=OpenAI(api_key=key).chat.completions.create(model=os.getenv('OPENAI_MODEL','gpt-4o-mini'),messages=messages,response_format={'type':'json_schema','json_schema':{'name':'restaurant_turn','strict':True,'schema':SCHEMA}},temperature=0,max_tokens=350)
-    parsed=json.loads(response.choices[0].message.content)
+    client=OpenAI(api_key=key)
+    model=os.getenv('OPENAI_MODEL','gpt-4o-mini')
+    if os.getenv('OPENAI_FUNCTION_CALLING','false').lower()=='true':
+        # An interpretation tool only: it has no DB, Airtable or booking side effects.
+        response=client.chat.completions.create(
+            model=model,messages=messages,
+            tools=[{'type':'function','function':{'name':'interpret_turn','description':'Extract only the caller current-turn intent and data. Availability is read-only. Do not assert a booking was created or confirmed.','strict':True,'parameters':SCHEMA}}],
+            tool_choice={'type':'function','function':{'name':'interpret_turn'}},
+            parallel_tool_calls=False)
+        calls=response.choices[0].message.tool_calls or []
+        if len(calls)!=1 or calls[0].function.name!='interpret_turn':
+            raise ValueError('Expected one interpretation tool call')
+        parsed=json.loads(calls[0].function.arguments)
+    else:
+        response=client.chat.completions.create(model=model,messages=messages,response_format={'type':'json_schema','json_schema':{'name':'restaurant_turn','strict':True,'schema':SCHEMA}},temperature=0,max_tokens=350)
+        parsed=json.loads(response.choices[0].message.content)
     parsed['updates']={k:v for k,v in parsed['updates'].items() if v is not None}
     return parsed
