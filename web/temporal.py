@@ -15,11 +15,11 @@ def relative_day(text,tz,now=None):
     elif re.search(r'(?<!de la )(?<!por la )\bmanana\b',s):days=1
     elif re.search(r'\bhoy\b',s):days=0
     else:
-        match=re.search(r'\b(?:este|proximo|el)?\s*(lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b',s)
-        if not match:return None
-        target=('lunes','martes','miercoles','jueves','viernes','sabado','domingo').index(match.group(1))
+        m=re.search(r'\b(?:este|proximo|el)?\s*(lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b',s)
+        if not m:return None
+        target=('lunes','martes','miercoles','jueves','viernes','sabado','domingo').index(m.group(1))
         days=(target-now.weekday())%7
-        if match.group(0).strip().startswith('proximo') and days==0:days=7
+        if m.group(0).strip().startswith('proximo') and days==0:days=7
     return (now.date()+timedelta(days=days)).isoformat()
 
 def explicit_date(text,tz,now=None):
@@ -63,7 +63,7 @@ def weekend_days(tz,now=None):
 
 def requested_band(text):
     s=normalized(text)
-    if re.search(r'\bmanana\b',s) and not re.search(r'\b(?:de|por)\s+la\s+manana\b',s):return None
+    if re.search(r'\bmanana\b',s) and not re.search(r'\b(?:de|por|esta)\s+la?\s*manana\b',s):return None
     if re.search(r'\b(?:de|por|esta)\s+la?\s*manana\b',s):return 'morning'
     if re.search(r'\b(?:de|por|esta)\s+la?\s*tarde\b',s):return 'afternoon'
     if re.search(r'\b(?:de|por|a|esta)\s+la?\s*noche\b',s):return 'night'
@@ -71,3 +71,25 @@ def requested_band(text):
 
 def in_band(time,band):
     h=int(time[:2]);return band is None or (band=='morning' and h<12) or (band=='afternoon' and 12<=h<20) or (band=='night' and (h>=19 or h<6))
+
+
+def contextual_time(text, chosen=None, offered=(), expected_field=None):
+    """Resolve an ambiguous clock only against the selected/verified options.
+
+    A contact answer must never become a new booking time.
+    """
+    if expected_field in ('customer_name','customer_email','customer_phone'):
+        return None
+    s=normalized(text)
+    parsed=explicit_time(text)
+    if not parsed:return None
+    explicit_period=bool(re.search(r'\b(?:de|por)\s+la\s+(?:manana|tarde|noche)\b',s))
+    if explicit_period or int(parsed[:2])>=13:return parsed
+    hour,minute=map(int,parsed.split(':'))
+    candidates=[]
+    for slot in ([chosen] if chosen else [])+list(offered or []):
+        if not isinstance(slot,dict):continue
+        t=slot.get('time')
+        if t and int(t[:2])%12==hour%12 and int(t[3:])==minute and t not in candidates:
+            candidates.append(t)
+    return candidates[0] if len(candidates)==1 else (parsed if not candidates else None)
