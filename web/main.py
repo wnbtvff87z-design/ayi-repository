@@ -136,14 +136,7 @@ def converse(b,channel,customer,text,external_id):
   row=c.execute('SELECT state,updated_at FROM customer_sessions WHERE business_id=%s AND channel=%s AND customer_phone=%s FOR UPDATE',(bid,channel,customer)).fetchone()
   previous=c.execute('SELECT assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND external_id=%s',(bid,channel,external_id)).fetchone()
   if previous:return None if channel=='WhatsApp' else previous['assistant_text']
-  # A second ASR/transport event can have a different ID but identical text.
-  # Ignore only immediate duplicates; never repeat the assistant question.
-  duplicate=c.execute('SELECT user_text,created_at FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 1',(bid,channel,customer)).fetchone()
-  if duplicate and str(duplicate['user_text'] or '').strip().casefold()==text.strip().casefold():
-   sent_at=duplicate['created_at']
-   if sent_at and sent_at.tzinfo is None:sent_at=sent_at.replace(tzinfo=timezone.utc)
-   if sent_at and timedelta(0)<=datetime.now(timezone.utc)-sent_at<timedelta(seconds=5):
-    return None
+  # Only the same external event is a duplicate. Identical words can be a new turn.
   expired=session_expired(row['updated_at'])
   current_state={} if expired else dict(row['state'] or {})
   if current_state.get('_sector') not in (None,str(b.get('sector') or '').strip().casefold()):

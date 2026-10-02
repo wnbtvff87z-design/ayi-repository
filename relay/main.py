@@ -49,11 +49,12 @@ def valid_ws(ws):
  valid=RequestValidator(token).validate(target,{},sig)
  if not valid:log.warning('Relay WS signature mismatch')
  return bool(valid)
-def event_external_id(event,call_sid,text):
- stable=event.get('eventSid') or event.get('id') or event.get('sequenceNumber') or event.get('timestamp')
- if stable:return f'{call_sid}:{stable}'
- digest=hashlib.sha256((call_sid+'\n'+text).encode('utf-8')).hexdigest()[:24]
- return f'{call_sid}:prompt:{digest}'
+def event_external_id(event,call_sid,text,sequence=None):
+ stable=event.get('eventSid') or event.get('id') or event.get('sequenceNumber')
+ if stable is not None:return f'{call_sid}:event:{stable}'
+ # A new final prompt is a new turn, even if its transcription is identical.
+ if sequence is None:raise ValueError('A turn sequence is required without event identity')
+ return f'{call_sid}:turn:{sequence}'
 async def core(path,data):
  base=env('CORE_BASE_URL').rstrip('/');key=env('INTERNAL_API_KEY')
  if not base or not key:raise RuntimeError('Core URL or internal key not configured')
@@ -118,16 +119,17 @@ async def websocket(ws:WebSocket):
     text=str(event.get('voicePrompt') or '').strip()
     if not text:continue
     state['seq']+=1
-    external_id=event_external_id(event,state['call_sid'],text)
+    external_id=event_external_id(event,state['call_sid'],text,state['seq'])
     if external_id in state['processed_ids']:
      log.info('Duplicate ConversationRelay prompt ignored')
      continue
-    state['processed_ids'].add(external_id)
+    # Mark only after core accepts the turn; failed requests may be retried.
     if len(state['processed_ids'])>200:
      state['processed_ids']={external_id}
     try:
      out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':external_id,'text':text})
      reply=out.get('reply')
+     state['processed_ids'].add(external_id)
      if not reply:continue
     except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.'
     # Do not synthesize the goodbye over WebSocket and then end immediately:

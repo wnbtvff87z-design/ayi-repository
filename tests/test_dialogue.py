@@ -15,4 +15,9 @@ class Dialogue(unittest.TestCase):
   reply,s=turn(s,'vamos a hacer 4');self.assertEqual(s['values']['party_size'],4);self.assertIn('13:00',reply)
   reply,s=turn(s,'¿me escuchás?');self.assertEqual(s['values']['party_size'],4);self.assertNotIn('13:00',reply)
   reply,s=turn(s,'el sábado a las 13');self.assertEqual(s['values']['reservation_time'],'13:00');self.assertNotIn('17:00',reply)
+ def test_name_with_final_punctuation_advances(self):
+  state={'intent':'create','phase':'collecting','values':{'reservation_date':'2030-10-05','reservation_time':'13:00','party_size':3},'expected':'customer_name'}
+  reply,state=turn(state,'Mariana Cortina.')
+  self.assertEqual(state['values']['customer_name'],'Mariana Cortina')
+  self.assertIn('correo',reply.lower())
 if __name__=='__main__':unittest.main()
