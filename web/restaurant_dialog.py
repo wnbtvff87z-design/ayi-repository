@@ -56,11 +56,10 @@ def _party(text,expected=False):
     m=re.search(r'\b('+token+r')\s+(?:personas|comensales|pax)\b',q)
     if not m:m=re.search(r'\b(?:somos|seremos|para)\s+('+token+r')\b',q)
     if not m and expected:
-        # A reply to the party-size question may omit the word 'personas'.
+        # A single number in answer to a party question is a party size, not a clock.
         candidates=re.findall(r'(?<![\d:])(?:20|1[0-9]|[1-9])(?![\d:])',q)
-        if len(candidates)==1 and not re.search(r'\b(?:hora|horas|las|fecha|dia|telefono|numero)\b',q):
-            value=int(candidates[0])
-            return value if 1<=value<=20 else None
+        if len(candidates)==1 and not re.search(r'\b(?:hora|horas|las|telefono|numero)\b',q):
+            return int(candidates[0])
         m=re.fullmatch(r'('+token+r')',q)
     if not m:return None
     n=int(m.group(1)) if m.group(1).isdigit() else words[m.group(1)]
@@ -156,24 +155,42 @@ def _create(b,s,text,channel,tz,updates):
     n=_party(text,s.get('expected')=='party_size')
     if n is None and s.get('expected')=='party_size':
         proposed=updates.get('party_size')
-        if isinstance(proposed,int) and 1<=proposed<=20 and re.search(r'(?<!\d)'+str(proposed)+r'(?!\d)',clean(text)):
-            n=proposed
+        if type(proposed) is int and 1<=proposed<=20 and re.search(r'(?<!\d)'+str(proposed)+r'(?!\d)',text):n=proposed
     if n:v['party_size']=n
     if s.get('offered') and not t and not n:
         chosen=_select([{'slot_date':x['date'],'start_time':x['time'],'code':str(i)} for i,x in enumerate(s['offered'])],text,tz)
         if chosen:v['reservation_date']=str(chosen['slot_date']);t=chosen['start_time']
+    if t and s.get('offered') and not v.get('reservation_date'):
+        hits=[x for x in s['offered'] if x['time']==t]
+        if len(hits)==1:v['reservation_date']=hits[0]['date']
+        elif len(hits)>1:return 'Esa hora está en más de un día. ¿Cuál día preferís?',s
     if t:v['reservation_time']=t
     if requested_band(text):s['band']=requested_band(text)
     if s.get('weekend') and not v.get('reservation_date'):
         a,bday=s['weekend'];s['expected']='reservation_date'
         return '¿Te viene mejor '+spoken_date(a)+' o '+spoken_date(bday)+'?',s
-    if not v.get('reservation_date'):s['expected']='reservation_date';return '¿Para qué día sería?',s
+    if not v.get('reservation_date'):
+        s['expected']='reservation_date'
+        return '¿Para qué día sería?',s
     if not v.get('party_size'):
-        attempts=s.get('party_attempts',0)+1;s['party_attempts']=attempts;s['expected']='party_size'
-        if attempts==1:return '¿Para cuántas personas?',s
-        if attempts==2:return 'No capté la cantidad. Decime solo el número, por ejemplo: cuatro.',s
-        return 'No estoy entendiendo la cantidad por voz. No hice ninguna reserva; podemos intentarlo de nuevo o contactar con recepción.',s
+        s['expected']='party_size'
+        return '¿Para cuántas personas?',s
     if not v.get('reservation_time'):
+        # An offered time can be accepted without repeating the full list.
+        if s.get('offered') and text.strip():
+            q=clean(text)
+            if re.search(r'\b(?:no|ninguna|ninguno|otra|otro)\b',q):
+                s['offered']=[]
+            elif s.get('expected')=='reservation_time':
+                day=_date(text,tz,s)
+                offered=[x for x in s['offered'] if not day or x['date']==day]
+                if day and not offered:
+                    v['reservation_date']=day;s['offered']=[]
+                elif day and len(offered)>1 and not t:
+                    s['offered']=offered
+                    return 'Para '+spoken_date(day)+' tengo '+', '.join(spoken_time(x['time']) for x in offered[:3])+'. ¿Cuál hora elegís?',s
+                elif not t and len(offered)>1:
+                    return '¿Cuál de esas horas te viene bien? También podés decir otro día u hora.',s
         rows=_available_options(b,v['reservation_date'],v['party_size'],s.get('band'))
         s['offered']=rows;s['expected']='reservation_time'
         return _offer(rows,channel),s
@@ -250,7 +267,7 @@ def process(b,state,history,text,channel,external_id,customer):
         if intent in ('question','social') and not (explicit_date(text,tz) or explicit_time(text) or _party(text)):
             return (_safe_reply(parsed.get('reply')) or 'Claro.')+' ¿Seguimos con la operación pendiente?',s
         _clear_pending(s)
-    if intent in ('question','social') and not switch and not (explicit_date(text,tz) or explicit_time(text) or _party(text)) and not _contact_updates(text,updates,s.get('expected')) and s.get('phase') not in ('choosing_original','choosing_slot') and not _select([{'slot_date':x['date'],'start_time':x['time'],'code':str(i)} for i,x in enumerate(s.get('offered') or [])],text,tz):
+    if intent in ('question','social') and not switch and not (explicit_date(text,tz) or explicit_time(text) or _party(text,s.get('expected')=='party_size')) and not _contact_updates(text,updates,s.get('expected')) and s.get('phase') not in ('choosing_original','choosing_slot') and not _select([{'slot_date':x['date'],'start_time':x['time'],'code':str(i)} for i,x in enumerate(s.get('offered') or [])],text,tz):
         return _safe_reply(parsed.get('reply')) or 'Te escucho.',s
     s['values'].update(_contact_updates(text,updates,s.get('expected')))
     try:
