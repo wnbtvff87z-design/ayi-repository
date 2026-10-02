@@ -91,8 +91,10 @@ async def relay_ended(req:Request):
  reason=payload.get('reason','')
  if reason=='goodbye':
   message='¡Gracias a vos! Hasta luego.'
+ elif reason=='verification':
+  message='La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.'
  elif reason=='cancelled':
-  message='De acuerdo, no registré la reserva. ¡Hasta luego!'
+  message='De acuerdo, no hice cambios. ¡Hasta luego!'
  else:
   message=''
  say=''
@@ -134,10 +136,13 @@ async def websocket(ws:WebSocket):
     except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.'
     # Do not synthesize the goodbye over WebSocket and then end immediately:
     # Twilio's signed <Connect action> callback speaks it once, then hangs up.
+    if reply=='La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.':
+     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'verification','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
+     return
     if reply=='¡Gracias a vos! Hasta luego.':
      await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'goodbye','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
      return
-    if reply=='De acuerdo, no registré la reserva. ¡Hasta luego!':
+    if reply=='De acuerdo, no hice cambios. ¡Hasta luego!':
      await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'cancelled','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
      return
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))

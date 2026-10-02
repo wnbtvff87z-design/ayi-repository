@@ -1,5 +1,5 @@
 """Restaurant dialogue. Understanding proposes; server validates; booking engine writes."""
-import logging,re,secrets,unicodedata
+import logging,re,secrets,unicodedata,contextvars
 from datetime import date,datetime
 from zoneinfo import ZoneInfo
 from interpret import interpret
@@ -8,11 +8,23 @@ from booking_safe import reservations_for_caller,unique_reservation,cancel_for_c
 from temporal import explicit_date,relative_day,explicit_time,weekend_days
 log=logging.getLogger(__name__)
 DAYS=('lunes','martes','miércoles','jueves','viernes','sábado','domingo')
+MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
+_CHANNEL=contextvars.ContextVar('restaurant_channel',default='WhatsApp')
+_NUMBERS=('cero','uno','dos','tres','cuatro','cinco','seis','siete','ocho','nueve','diez','once','doce','trece','catorce','quince','dieciséis','diecisiete','dieciocho','diecinueve','veinte','veintiuno','veintidós','veintitrés','veinticuatro','veinticinco','veintiséis','veintisiete','veintiocho','veintinueve')
+def _words(n):
+    return _NUMBERS[n] if n<30 else ('treinta','cuarenta','cincuenta')[n//10-3]+(' y '+_NUMBERS[n%10] if n%10 else '')
+def _spoken_time(value):
+    h,m=map(int,value.split(':'));return _words(h)+(' y '+_words(m) if m else '')
+def _voice_text(text):
+    text=re.sub(r'(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)',lambda m:_words(int(m.group(1)))+' de '+MONTHS[int(m.group(2))-1] if 1<=int(m.group(1))<=31 and 1<=int(m.group(2))<=12 else m.group(0),text)
+    text=re.sub(r'(?<!\d)([01]\d|2[0-3]):([0-5]\d)(?!\d)',lambda m:_spoken_time(m.group(0)),text)
+    return text.replace(', ','. ')
+def _goodbye(text):return bool(re.fullmatch(r'(?:chau|chao|adios|hasta luego|hasta pronto|nos vemos|gracias|muchas gracias)(?:[.! ]*)',norm(text).strip()))
 def norm(v):return ' '.join(''.join(c for c in unicodedata.normalize('NFKD',str(v or '').casefold()) if not unicodedata.combining(c)).split())
 def label(d,t=None):
-    x=date.fromisoformat(str(d)[:10]);return f'el {DAYS[x.weekday()]} {x.day}/{x.month}'+(f' a las {t}' if t else '')
+    x=date.fromisoformat(str(d)[:10]);day=f'el {DAYS[x.weekday()]} {_words(x.day)} de {MONTHS[x.month-1]}' if _CHANNEL.get()=='Voice' else f'el {DAYS[x.weekday()]} {x.day}/{x.month}';return day+(f' a las {_spoken_time(t) if _CHANNEL.get()=="Voice" else t}' if t else '')
 def fresh(intent):return {'intent':intent,'phase':'collecting','values':{},'offered':[],'operation_id':secrets.token_hex(12)}
-def yes(t):return norm(t).strip(' .,!?¿¡') in ('si','si por favor','si porfavor','si confirmo','confirmo','dale','ok','vale','adelante','de acuerdo')
+def yes(t):return ' '.join(re.sub(r'[.,!?¿¡]+',' ',norm(t)).split()) in ('si','si por favor','si porfavor','si confirma','si confirmo','confirmo','dale','ok','vale','adelante','de acuerdo')
 def no(t):return norm(t).strip(' .,!?¿¡') in ('no','no gracias','espera','mejor no','un momento')
 def valid_date(v):
     try:return date.fromisoformat(str(v)) .isoformat()
@@ -33,9 +45,13 @@ def _party(text,proposed,expected):
         if len(nums)==1:m=re.search(r'(?<![\d:])'+nums[0]+r'(?![\d:])',q)
     return int(m.group()) if m and m.group().isdigit() else int(m.group(1)) if m else None
 def _date(text,updates,tz,s):
+    q=norm(text)
+    if re.search(r'\bsabado\b',q) and re.search(r'\bdomingo\b',q):return None,'¿Preferís sábado o domingo?'
     explicit=explicit_date(text,tz)
     proposed=valid_date(updates.get('reservation_date'))
-    if explicit and proposed and explicit!=proposed:return None,'Mencionaste dos días distintos. ¿Cuál querés?'
+    if explicit and proposed and explicit!=proposed and not s.get('weekend'):
+        # The model's proposed date is not a second date spoken by the caller.
+        proposed=explicit
     d=explicit or proposed
     q=norm(text)
     if s.get('weekend'):
@@ -74,11 +90,14 @@ def _choose(rows,text,parsed,d=None):
 def _reply(s,text,changed=False):
     previous=s.get('last_base_reply')
     base=text
-    if text==previous and not changed:
+    if text==previous:
         attempts=s.get('stalls',0)+1;s['stalls']=attempts
         if attempts==1:text='No capté esa parte. '+text
-        else:text='No estoy entendiendo bien. No hice cambios; podemos probar con otra hora o hablar con recepción.'
+        else:
+            text='No quiero repetirte la misma pregunta. No hice cambios; podemos probar con otro día u hora o hablar con recepción.'
+            s['phase']='stalled'
     else:s['stalls']=0
+    if _CHANNEL.get()=='Voice':text=_voice_text(text)
     s['last_reply']=text
     s['last_base_reply']=base
     return text,s
@@ -87,8 +106,8 @@ def _offer(s,rows,channel,meal=None):
     if meal and not selected:return _reply(s,'No veo lugar para ese servicio. ¿Querés probar otro horario o día?',True)
     if not selected:return _reply(s,'No veo mesas disponibles ese día. ¿Probamos otro día?',True)
     s['offered']=selected[:3 if channel=='Voice' else 8];s['expected']='reservation_time'
-    times=', '.join(x['time'] for x in s['offered'])
-    return _reply(s,f'Tengo mesa {label(s["offered"][0]["date"])} a las {times}. ¿Cuál te viene mejor?',True)
+    times=(' o '.join('a las '+_spoken_time(x['time']) for x in s['offered']) if channel=='Voice' else ', '.join(x['time'] for x in s['offered']))
+    return _reply(s,f'Tengo mesa {label(s["offered"][0]["date"])} {times if channel=="Voice" else "a las "+times}. ¿Cuál te viene mejor?',True)
 def _confirm(s,customer,channel):
     p=s['pending'];op=p['operation']
     try:
@@ -220,39 +239,39 @@ def _manage(s,text,parsed,channel,tz,customer):
     s['phase']='awaiting'
     return _reply(s,f'Tu reserva actual es {label(old_d,old_t)}. La cambiaría a {label(dest,dest_t)} para {n} personas. ¿Confirmás?',True)
 def _availability_only(s,text,parsed,channel,tz):
-    """Read-only availability; never collect contacts or create a pending booking."""
-    u=parsed.get('updates') or {}
-    if no(text) or re.search(r'\b(?:no|nono|me quedo con|con la del|gracias)\b',norm(text)) and s.get('phase')=='inquiry':
-        return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, mantenemos la reserva anterior. ¿Necesitás algo más?',True)
-    d,conflict=_date(text,u,tz,s)
-    if conflict:return _reply(s,conflict,True)
+    """A read-only question never collects contact data or prepares a booking."""
+    u=parsed.get('updates') or {};d,conflict=_date(text,u,tz,s)
+    if conflict:return _reply(s,conflict)
     if d:s['values']['reservation_date']=d
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:s['values']['party_size']=n
     if not s['values'].get('reservation_date'):
-        s['expected']='reservation_date';return _reply(s,'¿Para qué día querés consultar disponibilidad?',True)
-    # Unknown party size is not silently assumed to be one person.
+        s['expected']='reservation_date';return _reply(s,'¿Qué día querés consultar?')
     if not s['values'].get('party_size'):
-        s['expected']='party_size';return _reply(s,'¿Para cuántas personas consulto disponibilidad? No voy a hacer otra reserva.',True)
+        s['expected']='party_size';return _reply(s,'¿Para cuántas personas consulto? No voy a registrar otra reserva.')
     rows=_slots(s['business'],s['values']['reservation_date'],s['values']['party_size'])
     s['phase']='inquiry';s['expected']=None
-    if not rows:return _reply(s,'No veo mesas disponibles ese día. No hice ninguna reserva.',True)
+    if not rows:return _reply(s,'No veo mesas disponibles ese día. No hice ninguna reserva.')
     s['offered']=rows[:3 if channel=='Voice' else 8]
-    times=', '.join(x['time'] for x in s['offered'])
-    return _reply(s,f'Para {s["values"]["party_size"]} personas tengo {label(s["values"]["reservation_date"])} a las {times}. Solo es una consulta; ¿querés reservar alguna?',True)
+    times=(' o '.join('a las '+_spoken_time(x['time']) for x in s['offered']) if channel=='Voice' else ', '.join(x['time'] for x in s['offered']))
+    return _reply(s,f'Para {s["values"]["party_size"]} personas veo mesas {label(s["values"]["reservation_date"])} {times if channel=="Voice" else "a las "+times}. Solo estoy consultando; ¿querés reservar alguna?')
 def _process_internal(b,state,history,text,channel,external_id,customer):
     s=dict(state or {});s['values']=dict(s.get('values') or {});s['business']=b
     if b.get('sector')!='restaurante' or not b.get('allow_reservations'):return 'No tengo reservas habilitadas para este negocio.',s
-    # Resolve exact confirmations and refusals before model calls. Never confirm a mixed correction.
-    if s.get('phase')=='sync_pending':
-        return _reply(s,'La operación está pendiente de verificación. No la repitas; contactá con recepción.',True)
+    if _goodbye(text):
+        if s.get('phase')=='sync_pending':return 'La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.',s
+        if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{}}
+        return '¡Gracias a vos! Hasta luego.',{'phase':'closed','intent':None,'values':{}}
+    if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. No la repitas; contactá con recepción.')
+    if s.get('phase')=='stalled':
+        s['phase']='collecting';s['stalls']=0
     if s.get('phase')=='awaiting' and s.get('pending'):
         if yes(text):return _confirm(s,customer,channel)
         if no(text):
             s.pop('pending',None);s['phase']='done';s['intent']=None
             return _reply(s,'De acuerdo, no hice cambios. ¿Necesitás algo más?',True)
-    if s.get('intent')=='availability' and s.get('phase') in ('inquiry','collecting') and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',norm(text)):
-        return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, mantenemos la reserva anterior. ¿Necesitás algo más?',True)
+    if s.get('intent')=='availability' and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',norm(text)):
+        return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, no hice otra reserva. ¿Necesitás algo más?',True)
     try:parsed=interpret(b,{k:v for k,v in s.items() if k!='business'},history,text)
     except Exception:
         log.exception('Interpretation unavailable');return _reply(s,'No pude entender bien tu pedido. No hice cambios; ¿me lo repetís?')
@@ -264,7 +283,6 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         if intent not in ('create','cancel','modify','availability'):
             return _reply(s,str(parsed.get('reply') or '¿En qué puedo ayudarte?')[:220],True)
         s=fresh(intent);s['business']=b
-    if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. No la repitas; contactá con recepción.',True)
     if s.get('intent')=='availability':
         return _availability_only(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid')
     if s.get('phase')=='awaiting':
@@ -286,6 +304,9 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         s.pop('business',None);return _reply(s,'No pude comprobar disponibilidad ahora. No hice cambios; intentemos otro momento.',True)
 
 def process(b,state,history,text,channel,external_id,customer):
-    answer,new=_process_internal(b,state,history,text,channel,external_id,customer)
-    new.pop('business',None)
-    return answer,new
+    token=_CHANNEL.set(channel)
+    try:
+        answer,new=_process_internal(b,state,history,text,channel,external_id,customer)
+        new.pop('business',None)
+        return answer,new
+    finally:_CHANNEL.reset(token)
