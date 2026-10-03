@@ -28,7 +28,7 @@ class SocialClosureTests(FlowBase):
                      'muchas gracias por todo, nos vemos'):
             with self.subTest(text=text):
                 reply, st = self.env.say(self.done_state(), text, {'intent': 'social', 'reply': 'x'})
-                self.assertEqual(st, {'phase': 'closed', 'intent': None, 'values': {}})
+                self.assertEqual(st, {'phase': 'closed', 'intent': None, 'values': {}, '_end_call_reason': 'goodbye'})
                 self.assertIn('Hasta luego', reply)
                 self.assertNotIn('?', reply)  # never asks for booking details again
         self.assertNoSideEffects(); self.assertNotIn('availability', self.env.calls)
