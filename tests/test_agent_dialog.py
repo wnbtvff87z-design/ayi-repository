@@ -5,7 +5,7 @@ from unittest.mock import patch
 WEB=Path(__file__).resolve().parents[1]/'web'
 BIZ={'sector':'restaurante','allow_reservations':True,'timezone':'Europe/Madrid','business_id':'R1'}
 
-def load(tool_calls=None,content='',rows=None):
+def load(tool_calls=None,content='',rows=None,reservations=None,writes=None):
     calls=[]
     class Completions:
         def create(self,**kw):
@@ -21,8 +21,15 @@ def load(tool_calls=None,content='',rows=None):
     booking.options=lambda b,d,n,limit=None:rows or []
     booking.create=lambda *a,**k:(_ for _ in ()).throw(AssertionError('write without confirmation'))
     safe=types.ModuleType('booking_safe')
-    for n in ('reservations_for_caller','unique_reservation','cancel_for_caller','modify_for_caller'):
-        setattr(safe,n,lambda *a,**k:[])
+    safe.reservations_for_caller=lambda *a,**k:list(reservations or [])
+    def unique(b,name,phone,d=None,t=None,code=None):
+        return next(r for r in reservations if r['code']==code)
+    safe.unique_reservation=unique
+    def write(kind):
+        def f(*a,**k):
+            (writes if writes is not None else []).append(kind);return {'success':True,'airtable_synced':True}
+        return f
+    safe.cancel_for_caller=write('cancel');safe.modify_for_caller=write('modify')
     interp=types.ModuleType('interpret');interp.interpret=lambda *a,**k:{}
     mods={'openai':fake_openai,'booking':booking,'booking_safe':safe,'interpret':interp}
     sys.path.insert(0,str(WEB))
@@ -90,3 +97,45 @@ def test_confirmation_is_python_gated():
     mod,calls=load([tc('cancel_reservation',{'customer_name':'Ana Pérez'})])
     run(mod,calls,BIZ,{},[],'cancelá','WhatsApp','s1','+34600')
     assert not mod.yes('quizás') and mod.yes('sí por favor')
+
+RES=[{'code':'A1','name':'Ana Pérez','slot_date':'2030-05-01','start_time':'20:00','party_size':2},
+     {'code':'B2','name':'Ana Pérez','slot_date':'2030-05-03','start_time':'21:00','party_size':4}]
+
+def test_multiple_reservations_ask_then_pick_then_confirm_cancel():
+    writes=[]
+    mod,calls=load([tc('cancel_reservation',{'customer_name':'Ana Pérez'})],reservations=RES,writes=writes)
+    reply,st=run(mod,calls,BIZ,{},[],'cancelá mi reserva','WhatsApp','s1','+34600')
+    assert st['phase']=='choosing_original' and len(st['choices'])==2 and '¿Cuál querés cancelar?' in reply
+    n=len(calls)
+    reply,st=run(mod,calls,BIZ,st,[],'la segunda','WhatsApp','s1','+34600')
+    assert len(calls)==n  # resolved in Python, no model call
+    assert st['phase']=='awaiting' and st['pending']['code']=='B2' and not writes
+    reply,st=run(mod,calls,BIZ,st,[],'sí','WhatsApp','s1','+34600')
+    assert writes==['cancel'] and 'cancelé' in reply
+
+def test_multiple_reservations_pick_by_number_for_modify():
+    mod,calls=load([tc('modify_reservation',{'customer_name':'Ana Pérez','new_time':'22:00'})],reservations=RES)
+    _,st=run(mod,calls,BIZ,{},[],'cambiá la hora','WhatsApp','s1','+34600')
+    reply,st=run(mod,calls,BIZ,st,[],'1','WhatsApp','s1','+34600')
+    assert st['pending']['operation']=='modify' and st['pending']['code']=='A1'
+    assert st['pending']['changes']['reservation_time']=='22:00'
+
+def test_choice_unclear_answers_and_keeps_choices():
+    mod,calls=load(content='Abrimos a las 20.',reservations=RES)
+    st={'phase':'choosing_original','choices':[{'code':'A1','date':'2030-05-01','time':'20:00'},{'code':'B2','date':'2030-05-03','time':'21:00'}],'choice_request':{'operation':'cancelar','args':{}},'values':{'customer_name':'Ana Pérez'}}
+    reply,st=run(mod,calls,BIZ,st,[],'¿a qué hora abren?','WhatsApp','s1','+34600')
+    assert st['phase']=='choosing_original' and 'número' in reply
+
+def test_tool_memory_reaches_model_and_hides_contact_data():
+    mod,calls=load([tc('check_availability',{'date':'2030-05-01','party_size':2})],rows=[{'date':'2030-05-01','time':'21:00'}])
+    _,st=run(mod,calls,BIZ,{},[],'hay lugar el 1 para 2','WhatsApp','s1','+34600')
+    assert st['tool_log'][0]['tool']=='check_availability'
+    mod2,calls2=load(content='ok')
+    run(mod2,calls2,BIZ,st,[],'gracias por la info','WhatsApp','s1','+34600')
+    system=calls2[0]['messages'][0]['content']
+    assert 'check_availability' in system and 'tengo disponibilidad' in system
+
+def test_dead_code_removed():
+    src=(WEB/'restaurant_dialog_agent.py').read_text()
+    for name in ('candidate_name','_availability_only','def fresh','relative_day','weekend_days','import interpret','from interpret'):
+        assert name not in src

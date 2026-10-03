@@ -15,7 +15,6 @@ import os
 
 from openai import OpenAI
 
-from interpret import interpret
 from booking import BookingError, availability, options, create
 from booking_safe import (
     reservations_for_caller,
@@ -23,7 +22,7 @@ from booking_safe import (
     cancel_for_caller,
     modify_for_caller,
 )
-from temporal import explicit_date, relative_day, explicit_time, weekend_days
+from temporal import explicit_date, explicit_time
 
 log = logging.getLogger(__name__)
 
@@ -188,37 +187,6 @@ def valid_time(v):
     """Validate and normalize time."""
     m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", str(v or ""))
     return m.group(0) if m else None
-
-
-def candidate_name(text, proposed, expected):
-    """Extract customer name from text."""
-    q = norm(text).strip(" .,!?¿¡")
-    if (
-        isinstance(proposed, str)
-        and len(norm(proposed).split()) >= 2
-        and norm(proposed).strip(" .,!?¿¡") in q
-    ):
-        return proposed.strip(" .,!?¿¡")
-    if expected != "customer_name":
-        return None
-    q = re.sub(r"^(?:soy|me llamo|a nombre de)\s+", "", q)
-    return (
-        q.title()
-        if re.fullmatch(r"[a-z]+(?:[ -][a-z]+){1,4}", q)
-        and not any(x in q.split() for x in ("quiero", "reserva", "cancelar", "modificar", "hola", "bien"))
-        else None
-    )
-
-
-def fresh(intent):
-    """Create fresh conversation state."""
-    return {
-        "intent": intent,
-        "phase": "collecting",
-        "values": {},
-        "offered": [],
-        "operation_id": secrets.token_hex(12),
-    }
 
 
 # ============================================================================
@@ -593,7 +561,7 @@ def _confirm_modify(s, customer, channel):
             ).get("available"):
                 s.pop("pending", None)
                 s["phase"] = "collecting"
-                s["target"].pop("reservation_time", None)
+                s["values"].pop("reservation_time", None)
                 return _reply(
                     s,
                     "Ese horario no está disponible. Tu reserva original sigue igual. ¿Probamos otra hora?",
@@ -639,43 +607,6 @@ def _confirm(s, customer, channel):
         return _reply(s, "No hay operación pendiente de confirmar.", True)
 
 
-def _availability_only(s, text, parsed, channel, tz):
-    """Handle read-only availability queries."""
-    u = parsed.get("updates") or {}
-    d, conflict = _date(text, u, tz, s)
-    if conflict:
-        return _reply(s, conflict)
-    if d:
-        s["values"]["reservation_date"] = d
-    n = _party(text, u.get("party_size"), s.get("expected"))
-    if n:
-        s["values"]["party_size"] = n
-    if not s["values"].get("reservation_date"):
-        s["expected"] = "reservation_date"
-        return _reply(s, "¿Qué día te sirve?")
-    if not s["values"].get("party_size"):
-        s["expected"] = "party_size"
-        return _reply(s, "¿Para cuántas personas querés consultar?")
-    rows = _slots(s["business"], s["values"]["reservation_date"], s["values"]["party_size"])
-    s["phase"] = "inquiry"
-    s["expected"] = None
-    if not rows:
-        return _reply(
-            s, "No veo mesas disponibles ese día. No hice ninguna reserva."
-        )
-    s["offered"] = rows[: 3 if channel == "Voice" else 8]
-    times = (
-        " o ".join("a las " + _spoken_time(x["time"]) for x in s["offered"])
-        if channel == "Voice"
-        else ", ".join(x["time"] for x in s["offered"])
-    )
-    return _reply(
-        s,
-        f'Para {s["values"]["party_size"]} personas, tengo disponibilidad {label(s["values"]["reservation_date"])} {times if channel == "Voice" else "a las " + times}.',
-        True,
-    )
-
-
 # ============================================================================
 # AGENT INTERACTION (uses OpenAI Function Calling)
 # ============================================================================
@@ -717,6 +648,10 @@ def _call_agent(b, state, history, text, channel, external_id, customer):
             messages.append({"role": "assistant", "content": str(a)[:300]})
     messages.append({"role": "user", "content": str(text)[:900]})
 
+    memory = _memory_note(state)
+    if memory:
+        messages[0]["content"] += " " + memory
+
     try:
         response = OpenAI(api_key=key).chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -733,18 +668,245 @@ def _call_agent(b, state, history, text, channel, external_id, customer):
         return None, []
 
 
+_MAX_LOG = 6
+_PRIVATE_ARGS = ("customer_phone", "customer_email")
+
+
+def _remember(s, tool, args, outcome):
+    """Keep a short, real record of tool calls and what the system answered."""
+    safe = {k: v for k, v in (args or {}).items() if k not in _PRIVATE_ARGS}
+    log_ = list(s.get("tool_log") or [])
+    log_.append({"tool": tool, "args": safe, "outcome": str(outcome)[:200]})
+    s["tool_log"] = log_[-_MAX_LOG:]
+
+
+def _memory_note(state):
+    """Text for the model with its previous tool calls and the current phase."""
+    state = state or {}
+    parts = []
+    if state.get("tool_log"):
+        parts.append(
+            "Acciones previas de tools y lo que respondió el sistema (hechos reales): "
+            + json.dumps(state["tool_log"], ensure_ascii=False)
+        )
+    if state.get("phase") == "awaiting" and state.get("pending"):
+        parts.append("Hay una operación pendiente de confirmación del cliente.")
+    if state.get("phase") == "choosing_original":
+        parts.append("Se le pidió al cliente elegir una de varias reservas.")
+    return " ".join(parts)
+
+
+def _brief(row):
+    return {
+        "code": row["code"],
+        "date": str(row["slot_date"])[:10],
+        "time": row["start_time"],
+    }
+
+
+def _ask_which(s, rows, verb, args):
+    """Several active reservations: remember them and ask which one."""
+    s["choices"] = [_brief(x) for x in rows[:5]]
+    s["choice_request"] = {"operation": verb, "args": args}
+    s["phase"] = "choosing_original"
+    s["expected"] = "original"
+    return _reply(
+        s,
+        "Encontré "
+        + ", ".join(
+            f'{i}. {label(c["date"], c["time"])}' for i, c in enumerate(s["choices"], 1)
+        )
+        + f". ¿Cuál querés {verb}?",
+        True,
+    )
+
+
+def _clear_choice(s):
+    s.pop("choices", None)
+    s.pop("choice_request", None)
+
+
+def _propose_cancel(s, row):
+    old = _brief(row)
+    s["selected_code"] = old["code"]
+    s["pending"] = {
+        "operation": "cancel",
+        "code": old["code"],
+        "old_date": old["date"],
+        "old_time": old["time"],
+    }
+    s["phase"] = "awaiting"
+    s["expected"] = None
+    return _reply(
+        s,
+        f'Voy a cancelar la reserva {label(old["date"], old["time"])}. ¿Confirmás?',
+        True,
+    )
+
+
+def _propose_modify(s, b, row, args):
+    old = _brief(row)
+    old_d, old_t = old["date"], old["time"]
+    dest = valid_date(args.get("new_date")) or old_d
+    dest_t = valid_time(args.get("new_time")) or old_t
+    new_party = args.get("new_party_size")
+    n = new_party if type(new_party) is int and 1 <= new_party <= 20 else int(row["party_size"])
+    if (dest, dest_t, n) == (old_d, old_t, int(row["party_size"])):
+        return _reply(s, "Eso coincide con tu reserva actual. ¿Qué querés cambiar?", True)
+    if (dest, dest_t) != (old_d, old_t) or n > int(row["party_size"]):
+        if not availability(b, dest, dest_t, n).get("available"):
+            return _reply(
+                s,
+                "Ese horario no está disponible. Tu reserva original sigue igual. ¿Probamos otra hora?",
+                True,
+            )
+    s["selected_code"] = old["code"]
+    s["pending"] = {
+        "operation": "modify",
+        "code": old["code"],
+        "old_date": old_d,
+        "old_time": old_t,
+        "changes": {"reservation_date": dest, "reservation_time": dest_t, "party_size": n},
+    }
+    s["phase"] = "awaiting"
+    s["expected"] = None
+    return _reply(
+        s,
+        f'Tu reserva actual es {label(old_d, old_t)}. La cambiaría a {label(dest, dest_t)} para {n} personas. ¿Confirmás?',
+        True,
+    )
+
+
+def _propose_existing(s, b, customer, verb, args, name):
+    """Find the caller's reservations and propose cancel/modify (or ask which one)."""
+    s["intent"] = verb
+    s["values"] = {"customer_name": name}
+    s["phase"] = "collecting"
+    try:
+        rows = reservations_for_caller(b, name, customer)
+        if not rows:
+            return _reply(
+                s, "No encontré una reserva activa con ese nombre. No hice cambios.", True
+            )
+        row = None
+        wanted = valid_date(args.get("reservation_date")) if verb == "cancel" else None
+        if wanted:
+            hits = [x for x in rows if str(x["slot_date"])[:10] == wanted]
+            if len(hits) == 1:
+                row = hits[0]
+        if row is None and len(rows) == 1:
+            row = rows[0]
+        if row is None:
+            return _ask_which(s, rows, verb_label(verb), args)
+        if verb == "cancel":
+            return _propose_cancel(s, row)
+        return _propose_modify(s, b, row, args)
+    except BookingError as e:
+        log.warning("%s error: %s", verb, e)
+        return _reply(s, str(e), True)
+
+
+def verb_label(verb):
+    return "cancelar" if verb == "cancel" else "modificar"
+
+
+def _resolve_choice(s, b, customer, text):
+    """Pick one of the offered reservations from the caller's reply. None if unclear."""
+    choices = s.get("choices") or []
+    rows = [{"date": c["date"], "time": c["time"]} for c in choices]
+    m = re.fullmatch(r"\D*?(\d)\D*", norm(text))
+    picked = _choose(rows, text, {"selection": int(m.group(1)) if m else None})
+    if picked is None:
+        return None
+    return choices[rows.index(picked)]
+
+
+def _run_tool(s, b, customer, channel, text, name, args, abandoned):
+    """Execute one model-proposed tool. Never writes: only reads and proposes."""
+    tz = b.get("timezone") or "Europe/Madrid"
+
+    if name == "check_availability":
+        date_str, ask = _date(text, {"reservation_date": args.get("date")}, tz, s)
+        if ask:
+            return _reply(s, ask, True)
+        party_size = _party(text, args.get("party_size"), None)
+        if not date_str or not party_size:
+            return _reply(s, "¿Para qué día y cuántas personas?", True)
+        meal = args.get("meal") if args.get("meal") in ("lunch", "dinner") else None
+        rows = _meal_filter(_slots(b, date_str, party_size), meal)
+        s["values"]["reservation_date"] = date_str
+        s["values"]["party_size"] = party_size
+        s["intent"] = "availability"
+        s["phase"] = "inquiry"
+        if not rows:
+            return _reply(s, abandoned + "No veo mesas disponibles para ese día o servicio.", True)
+        s["offered"] = rows[: 3 if channel == "Voice" else 8]
+        times = (
+            " o ".join("a las " + _spoken_time(x["time"]) for x in s["offered"])
+            if channel == "Voice"
+            else ", ".join(x["time"] for x in s["offered"])
+        )
+        return _reply(
+            s,
+            abandoned
+            + f'Para {party_size} personas, tengo disponibilidad {label(date_str)} {times if channel == "Voice" else "a las " + times}.',
+            True,
+        )
+
+    if name == "create_reservation":
+        cname = args.get("customer_name")
+        res_date = valid_date(args.get("reservation_date"))
+        res_time = valid_time(args.get("reservation_time"))
+        party = args.get("party_size")
+        if not (type(party) is int and 1 <= party <= 20):
+            party = None
+        if not (isinstance(cname, str) and len(cname.split()) >= 2):
+            return _reply(s, "¿Me decís nombre y apellido para la reserva?", True)
+        if not (res_date and res_time and party):
+            return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmás?", True)
+        try:
+            if not availability(b, res_date, res_time, party).get("available"):
+                return _reply(s, "Ese horario no está disponible. ¿Probamos otra hora?", True)
+        except BookingError as e:
+            return _reply(s, str(e), True)
+        s["intent"] = "create"
+        s["values"] = {
+            "customer_name": cname,
+            "customer_phone": customer,  # identity comes from the caller, never from the model
+            "customer_email": args.get("customer_email", ""),
+            "reservation_date": res_date,
+            "reservation_time": res_time,
+            "party_size": party,
+        }
+        s["pending"] = {
+            "operation": "create",
+            "values": dict(s["values"]),
+            "request_id": secrets.token_hex(16),
+        }
+        s["phase"] = "awaiting"
+        s["expected"] = None
+        return _reply(
+            s,
+            f'Mesa {label(res_date, res_time)} para {party} personas a nombre de {cname}. ¿La confirmo?',
+            True,
+        )
+
+    if name in ("cancel_reservation", "modify_reservation"):
+        verb = "cancel" if name == "cancel_reservation" else "modify"
+        return _propose_existing(s, b, customer, verb, args, args.get("customer_name"))
+
+    return _reply(s, "No pude interpretar eso. ¿Me repetís qué necesitás?", True)
+
+
 def _process_internal_agent(b, state, history, text, channel, external_id, customer):
     """Main agent loop using function calling."""
     s = dict(state or {})
     s["values"] = dict(s.get("values") or {})
     s["business"] = b
-    q = norm(text)
 
-    # Basic validation
     if b.get("sector") != "restaurante" or not b.get("allow_reservations"):
         return "No tengo reservas habilitadas para este negocio.", s
 
-    # Farewell detection
     if _goodbye(text):
         if s.get("phase") == "sync_pending":
             return (
@@ -758,277 +920,97 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
             )
         return "¡Gracias a vos! Hasta luego.", {"phase": "closed", "intent": None, "values": {}}
 
-    # Handle sync_pending
     if s.get("phase") == "sync_pending":
         return _reply(
             s,
             "La operación está pendiente de verificación. Si querés, te sigo ayudando con recepción.",
         )
 
-    # Handle awaiting confirmation
+    holding = None
     if s.get("phase") == "awaiting" and s.get("pending"):
         if yes(text):
-            return _confirm(s, customer, channel)
+            operation = s["pending"].get("operation")
+            answer, new = _confirm(s, customer, channel)
+            new.pop("business", None)
+            carried = dict(s)
+            _remember(carried, "confirm_" + str(operation), {}, answer)
+            new["tool_log"] = carried["tool_log"]
+            return answer, new
         if no(text):
             s.pop("pending", None)
             s["phase"] = "done"
             s["intent"] = None
             return _reply(s, "De acuerdo, no hice cambios. ¿Necesitás algo más?", True)
-        awaiting = True
-    else:
-        awaiting = False
+        holding = "awaiting"
+    elif s.get("phase") == "choosing_original" and s.get("choices"):
+        if no(text):
+            _clear_choice(s)
+            s["phase"] = "done"
+            s["intent"] = None
+            return _reply(s, "De acuerdo, no hice cambios. ¿Necesitás algo más?", True)
+        choice = _resolve_choice(s, b, customer, text)
+        if choice:
+            request = s.get("choice_request") or {}
+            verb = "cancel" if request.get("operation") == "cancelar" else "modify"
+            try:
+                row = next(
+                    (
+                        x
+                        for x in reservations_for_caller(b, s["values"].get("customer_name"), customer)
+                        if x["code"] == choice["code"]
+                    ),
+                    None,
+                )
+            except BookingError as e:
+                return _reply(s, str(e), True)
+            _clear_choice(s)
+            if row is None:
+                s["phase"] = "collecting"
+                return _reply(s, "Esa reserva ya no está activa. No hice cambios.", True)
+            if verb == "cancel":
+                answer = _propose_cancel(s, row)
+            else:
+                try:
+                    answer = _propose_modify(s, b, row, request.get("args") or {})
+                except BookingError as e:
+                    return _reply(s, str(e), True)
+            _remember(s, "choose_reservation", {"choice": choice["code"]}, answer[0])
+            return answer
+        holding = "choosing"
 
-    # Single model call per turn
-    reply_text, tool_calls = _call_agent(b, state, history, text, channel, external_id, customer)
+    reply_text, tool_calls = _call_agent(b, s, history, text, channel, external_id, customer)
 
-    if awaiting and not tool_calls:
-        # Tangential question: answer but retake confirmation
-        reply_msg = (
-            (str(reply_text)[:160] + " ¿Confirmás la operación que te resumí?")
-            if reply_text
-            else "Te escucho. ¿Confirmás la operación que te resumí?"
+    if holding and not tool_calls:
+        # Tangential question: answer but retake the open question
+        retake = (
+            "¿Confirmás la operación que te resumí?"
+            if holding == "awaiting"
+            else "Decime el número de la reserva que querés."
         )
-        return _reply(s, reply_msg, True)
-
-    if awaiting and tool_calls:
-        # New request supersedes the pending operation: drop it explicitly
-        s.pop("pending", None)
-        s["phase"] = "collecting"
+        return _reply(s, (str(reply_text)[:160] + " " + retake) if reply_text else "Te escucho. " + retake, True)
 
     if not tool_calls:
-        # No tool called, just respond
         return _reply(s, reply_text or "¿En qué puedo ayudarte?", True)
 
-    # Process tool calls (should only be one, but handle multiple)
-    for tool_call in tool_calls[:1]:
-        tool_name = tool_call.function.name
-        try:
-            tool_args = json.loads(tool_call.function.arguments)
-            if not isinstance(tool_args, dict):
-                raise ValueError
-        except (ValueError, TypeError):
-            return _reply(s, "No te entendí bien. ¿Me repetís qué necesitás?", True)
-        tz = b.get("timezone") or "Europe/Madrid"
-        abandoned = (
-            "Dejé sin efecto la operación anterior. " if awaiting else ""
-        )
+    abandoned = ""
+    if holding:
+        # A new request supersedes the open one: drop it explicitly
+        s.pop("pending", None)
+        _clear_choice(s)
+        s["phase"] = "collecting"
+        abandoned = "Dejé sin efecto la operación anterior. "
 
-        if tool_name == "check_availability":
-            # Direct availability check (no confirmation needed)
-            updates = {"reservation_date": tool_args.get("date")}
-            date_str, ask = _date(text, updates, tz, s)
-            if ask:
-                return _reply(s, ask, True)
-            party_size = _party(text, tool_args.get("party_size"), None)
-            if not date_str or not party_size:
-                return _reply(s, "¿Para qué día y cuántas personas?", True)
-            meal = tool_args.get("meal") if tool_args.get("meal") in ("lunch", "dinner") else None
-            rows = _meal_filter(_slots(b, date_str, party_size), meal)
-            s["values"]["reservation_date"] = date_str
-            s["values"]["party_size"] = party_size
-            s["intent"] = "availability"
-            s["phase"] = "inquiry"
-            if not rows:
-                return _reply(s, abandoned + "No veo mesas disponibles para ese día o servicio.", True)
-            s["offered"] = rows[: 3 if channel == "Voice" else 8]
-            times = (
-                " o ".join("a las " + _spoken_time(x["time"]) for x in s["offered"])
-                if channel == "Voice"
-                else ", ".join(x["time"] for x in s["offered"])
-            )
-            return _reply(
-                s,
-                abandoned + f'Para {party_size} personas, tengo disponibilidad {label(date_str)} {times if channel == "Voice" else "a las " + times}.',
-                True,
-            )
-
-        elif tool_name == "create_reservation":
-            # Proposed creation (needs confirmation first)
-            name = tool_args.get("customer_name")
-            phone = customer  # identity comes from the caller, never from the model
-            email = tool_args.get("customer_email", "")
-            res_date = valid_date(tool_args.get("reservation_date"))
-            res_time = valid_time(tool_args.get("reservation_time"))
-            party = tool_args.get("party_size")
-            if not (type(party) is int and 1 <= party <= 20):
-                party = None
-            if not (isinstance(name, str) and len(name.split()) >= 2):
-                return _reply(s, "¿Me decís nombre y apellido para la reserva?", True)
-            if not (res_date and res_time and party):
-                return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmás?", True)
-            try:
-                if not availability(b, res_date, res_time, party).get("available"):
-                    return _reply(s, "Ese horario no está disponible. ¿Probamos otra hora?", True)
-            except BookingError as e:
-                return _reply(s, str(e), True)
-
-            s["intent"] = "create"
-            s["values"] = {
-                "customer_name": name,
-                "customer_phone": phone,
-                "customer_email": email,
-                "reservation_date": res_date,
-                "reservation_time": res_time,
-                "party_size": party,
-            }
-            s["pending"] = {
-                "operation": "create",
-                "values": dict(s["values"]),
-                "request_id": secrets.token_hex(16),
-            }
-            s["phase"] = "awaiting"
-            s["expected"] = None
-
-            return _reply(
-                s,
-                f'Mesa {label(res_date, res_time)} para {party} personas a nombre de {name}. ¿La confirmo?',
-                True,
-            )
-
-        elif tool_name == "cancel_reservation":
-            # Proposed cancellation (needs confirmation)
-            name = tool_args.get("customer_name")
-            phone = tool_args.get("customer_phone", "")
-            res_date = tool_args.get("reservation_date", "")
-
-            s["intent"] = "cancel"
-            s["values"] = {"customer_name": name}
-            s["phase"] = "collecting"
-
-            # Query for existing reservations
-            try:
-                rows = reservations_for_caller(b, name, customer)
-                if not rows:
-                    return _reply(
-                        s,
-                        "No encontré una reserva activa con ese nombre. No hice cambios.",
-                        True,
-                    )
-                
-                row = None
-                if res_date:
-                    # Try to match by date if provided
-                    hits = [x for x in rows if str(x["slot_date"])[:10] == res_date]
-                    if len(hits) == 1:
-                        row = hits[0]
-                
-                if not row and len(rows) == 1:
-                    row = rows[0]
-                
-                if not row:
-                    # Multiple reservations, need user to select
-                    s["phase"] = "choosing_original"
-                    s["expected"] = "original"
-                    return _reply(
-                        s,
-                        "Encontré "
-                        + ", ".join(
-                            f'{i}. {label(x["slot_date"], x["start_time"])}'
-                            for i, x in enumerate(rows[:5], 1)
-                        )
-                        + ". ¿Cuál querés cancelar?",
-                        True,
-                    )
-
-                # Single reservation found
-                s["selected_code"] = row["code"]
-                s["pending"] = {
-                    "operation": "cancel",
-                    "code": row["code"],
-                    "old_date": str(row["slot_date"])[:10],
-                    "old_time": row["start_time"],
-                }
-                s["phase"] = "awaiting"
-                return _reply(
-                    s,
-                    f'Voy a cancelar la reserva {label(row["slot_date"], row["start_time"])}. ¿Confirmás?',
-                    True,
-                )
-            except BookingError as e:
-                log.warning("Cancel error: %s", e)
-                return _reply(s, str(e), True)
-
-        elif tool_name == "modify_reservation":
-            # Proposed modification (needs confirmation)
-            name = tool_args.get("customer_name")
-            phone = tool_args.get("customer_phone", "")
-            new_date = tool_args.get("new_date")
-            new_time = tool_args.get("new_time")
-            new_party = tool_args.get("new_party_size")
-
-            s["intent"] = "modify"
-            s["values"] = {"customer_name": name}
-            s["phase"] = "collecting"
-
-            try:
-                rows = reservations_for_caller(b, name, customer)
-                if not rows:
-                    return _reply(
-                        s,
-                        "No encontré una reserva activa con ese nombre. No hice cambios.",
-                        True,
-                    )
-
-                row = None
-                if len(rows) == 1:
-                    row = rows[0]
-                else:
-                    s["phase"] = "choosing_original"
-                    s["expected"] = "original"
-                    return _reply(
-                        s,
-                        "Encontré "
-                        + ", ".join(
-                            f'{i}. {label(x["slot_date"], x["start_time"])}'
-                            for i, x in enumerate(rows[:5], 1)
-                        )
-                        + ". ¿Cuál querés modificar?",
-                        True,
-                    )
-
-                # Build changes dict
-                old_d = str(row["slot_date"])[:10]
-                old_t = row["start_time"]
-                dest = new_date or old_d
-                dest_t = new_time or old_t
-                n = new_party or int(row["party_size"])
-
-                if (dest, dest_t, n) == (old_d, old_t, int(row["party_size"])):
-                    return _reply(s, "Eso coincide con tu reserva actual. ¿Qué querés cambiar?", True)
-
-                # Check availability if changing
-                if (dest, dest_t) != (old_d, old_t) or n > int(row["party_size"]):
-                    if not availability(b, dest, dest_t, n).get("available"):
-                        return _reply(
-                            s,
-                            "Ese horario no está disponible. Tu reserva original sigue igual. ¿Probamos otra hora?",
-                            True,
-                        )
-
-                s["selected_code"] = row["code"]
-                s["pending"] = {
-                    "operation": "modify",
-                    "code": row["code"],
-                    "old_date": old_d,
-                    "old_time": old_t,
-                    "changes": {
-                        "reservation_date": dest,
-                        "reservation_time": dest_t,
-                        "party_size": n,
-                    },
-                }
-                s["phase"] = "awaiting"
-                return _reply(
-                    s,
-                    f'Tu reserva actual es {label(old_d, old_t)}. La cambiaría a {label(dest, dest_t)} para {n} personas. ¿Confirmás?',
-                    True,
-                )
-            except BookingError as e:
-                log.warning("Modify error: %s", e)
-                return _reply(s, str(e), True)
-
-    # Fallback
-    return _reply(s, reply_text or "¿En qué puedo ayudarte?", True)
+    tool_call = tool_calls[0]
+    name = tool_call.function.name
+    try:
+        args = json.loads(tool_call.function.arguments)
+        if not isinstance(args, dict):
+            raise ValueError
+    except (ValueError, TypeError):
+        return _reply(s, "No te entendí bien. ¿Me repetís qué necesitás?", True)
+    answer = _run_tool(s, b, customer, channel, text, name, args, abandoned)
+    _remember(answer[1], name, args, answer[0])
+    return answer
 
 
 def process(b, state, history, text, channel, external_id, customer):
