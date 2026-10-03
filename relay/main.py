@@ -1,5 +1,5 @@
 """Twilio ConversationRelay transport. Conversation logic and history live in web/core."""
-import json,logging,os,re
+import hashlib,json,logging,os,re
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
 import httpx
@@ -49,6 +49,12 @@ def valid_ws(ws):
  valid=RequestValidator(token).validate(target,{},sig)
  if not valid:log.warning('Relay WS signature mismatch')
  return bool(valid)
+def event_external_id(event,call_sid,text,sequence=None):
+ stable=event.get('eventSid') or event.get('id') or event.get('sequenceNumber')
+ if stable is not None:return f'{call_sid}:event:{stable}'
+ # A new final prompt is a new turn, even if its transcription is identical.
+ if sequence is None:raise ValueError('A turn sequence is required without event identity')
+ return f'{call_sid}:turn:{sequence}'
 async def core(path,data):
  base=env('CORE_BASE_URL').rstrip('/');key=env('INTERNAL_API_KEY')
  if not base or not key:raise RuntimeError('Core URL or internal key not configured')
@@ -69,16 +75,40 @@ async def voice(req:Request):
   ws=escape(env('RELAY_WS_URL'),{'"':'&quot;'})
   if not ws.startswith('wss://'):raise ValueError('Secure WebSocket required')
   voice_id=escape(str(b.get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B'),{'"':'&quot;'})
-  xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="es-ES" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="es-ES" /></Connect><Hangup/></Response>'
+  action=escape(env('RELAY_PUBLIC_URL').rstrip('/')+'/relay-ended',{'"':'&quot;'})
+  xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect action="{action}" method="POST"><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="es-ES" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="es-ES" /></Connect><Hangup/></Response>'
   return Response(xml,media_type='application/xml')
  except Exception:
   log.exception('Voice setup failed');return Response('<Response><Say language="es-ES">No puedo atender ahora.</Say><Hangup/></Response>',media_type='application/xml')
-@app.api_route('/relay-ended',methods=['GET','POST'])
-async def relay_ended():return Response('<Response><Hangup/></Response>',media_type='application/xml')
+@app.api_route('/relay-ended',methods=['POST'])
+async def relay_ended(req:Request):
+ form=await req.form()
+ if not valid_http(req,form):return Response('Forbidden',status_code=403)
+ payload={}
+ try:payload=json.loads(str(form.get('HandoffData') or '{}'))
+ except (ValueError,TypeError,AttributeError):pass
+ if not isinstance(payload,dict):payload={}
+ reason=payload.get('reason','')
+ if reason=='goodbye':
+  message='¡Gracias a vos! Hasta luego.'
+ elif reason=='verification':
+  message='La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.'
+ elif reason=='cancelled':
+  message='De acuerdo, no hice cambios. ¡Hasta luego!'
+ else:
+  message=''
+ say=''
+ if message:
+  voice_id=str(payload.get('voice_id') or '').strip()
+  if not re.fullmatch(r'[A-Za-z0-9_-]{10,100}',voice_id):
+   log.error('Invalid goodbye voice ID; refusing different TTS voice')
+  else:
+   say='<Say language="es-ES" voice="ElevenLabs.'+escape(voice_id,{'"':'&quot;'})+'">'+escape(message)+'</Say>'
+ return Response('<Response>'+say+'<Hangup/></Response>',media_type='application/xml')
 @app.websocket('/ws')
 async def websocket(ws:WebSocket):
  if not valid_ws(ws):await ws.close(code=1008);return
- await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0}
+ await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0,'processed_ids':set()}
  try:
   while True:
    event=json.loads(await ws.receive_text());kind=event.get('type')
@@ -91,10 +121,30 @@ async def websocket(ws:WebSocket):
     text=str(event.get('voicePrompt') or '').strip()
     if not text:continue
     state['seq']+=1
+    external_id=event_external_id(event,state['call_sid'],text,state['seq'])
+    if external_id in state['processed_ids']:
+     log.info('Duplicate ConversationRelay prompt ignored')
+     continue
+    # Mark only after core accepts the turn; failed requests may be retried.
+    if len(state['processed_ids'])>200:
+     state['processed_ids']={external_id}
     try:
-     out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':state['call_sid']+':'+str(state['seq']),'text':text})
-     reply=out['reply']
-    except Exception:log.exception('Voice turn failed');reply='No puedo consultar ni confirmar ninguna reserva ahora.'
+     out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':external_id,'text':text})
+     reply=out.get('reply')
+     state['processed_ids'].add(external_id)
+     if not reply:continue
+    except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.'
+    # Do not synthesize the goodbye over WebSocket and then end immediately:
+    # Twilio's signed <Connect action> callback speaks it once, then hangs up.
+    if reply=='La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.':
+     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'verification','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
+     return
+    if reply=='¡Gracias a vos! Hasta luego.':
+     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'goodbye','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
+     return
+    if reply=='De acuerdo, no hice cambios. ¡Hasta luego!':
+     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':'cancelled','voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
+     return
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))
    elif kind=='error':log.error('ConversationRelay error: %s',event.get('description'))
  except WebSocketDisconnect:pass
