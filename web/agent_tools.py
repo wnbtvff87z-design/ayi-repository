@@ -205,7 +205,7 @@ def get_availability(ctx, a):
 
 def update_draft(ctx, a):
     pending = ctx.st.get('pending')
-    invalidated = bool(pending) and any(pending['args'].get(k) != v for k, v in a.items()) and _invalidate(ctx)
+    invalidated = bool(pending) and any(k in pending['args'] and pending['args'][k] != v for k, v in a.items()) and _invalidate(ctx)
     ctx.st.setdefault('draft', {}).update(a)
     return {'draft': dict(ctx.st['draft']), 'pending_operation_invalidated': bool(invalidated)}
 

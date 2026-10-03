@@ -9,10 +9,10 @@ log = logging.getLogger(__name__)
 
 SAFE_REPLY = 'Solo puedo ayudarte con las reservas y la información del restaurante. ¿En qué te puedo ayudar?'
 
-_SECRET = re.compile(r'sk-[A-Za-z0-9_-]{16,}|\bpat[A-Za-z0-9]{10,}\.[A-Fa-f0-9]{20,}|\bAC[0-9a-f]{32}\b|\b[0-9a-f]{32}\b|postgres(?:ql)?://|Bearer\s+[A-Za-z0-9._-]{16,}')
+_SECRET = re.compile(r'sk-[A-Za-z0-9_-]{16,}|\bpat[A-Za-z0-9]{10,}\.[A-Fa-f0-9]{20,}|\bAC[0-9a-f]{32}\b|postgres(?:ql)?://|Bearer\s+[A-Za-z0-9._-]{16,}')
 _ENV = re.compile(r'\b(?:OPENAI|AIRTABLE|TWILIO|INTERNAL|DATABASE|POSTGRES|ELEVENLABS|AGENT)_[A-Z0-9_]*\b|\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)*_(?:KEY|TOKEN|SECRET|PASSWORD)\b|\bDATABASE_URL\b')
 _SQL = re.compile(r'\b(?:SELECT\b.{1,200}\bFROM|INSERT\s+INTO|DELETE\s+FROM|DROP\s+(?:TABLE|DATABASE)|UPDATE\s+\w+\s+SET|UNION\s+SELECT|ALTER\s+TABLE)\b|\b(?:booking_slots|booking_reservations|customer_sessions|conversation_turns|whatsapp_outbound)\b', re.I | re.S)
-_JSON_DUMP = re.compile(r'^\s*[\[{]|"\s*[A-Za-z_]+"\s*:\s*[^,}]+,\s*"\s*[A-Za-z_]+"\s*:|```')
+_JSON_DUMP = re.compile(r'^\s*[\[{]\s*["{\[]|"\s*[A-Za-z_]+"\s*:\s*[^,}]+,\s*"\s*[A-Za-z_]+"\s*:')
 _EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
 _PHONE = re.compile(r'\+?\d[\d\s().-]{7,}\d')
 _CODE = re.compile(r'\bR-[0-9A-F]{10}\b')
