@@ -12,7 +12,7 @@ class Response:
  def __init__(self,content,status_code=200,media_type=None):self.content=content;self.status_code=status_code
 class Disconnect(Exception):pass
 ns={'Request':object,'WebSocket':object,'json':json,'log':logging.getLogger('test'),'Response':Response,'WebSocketDisconnect':Disconnect,
-    'valid_ws':lambda ws:True,'valid_http':lambda req,form:True,'number':lambda v:v,'escape':escape}
+    'valid_ws':lambda ws:True,'re':__import__('re'),'env':lambda key:'bN1bDXgDIGX5lw0rtY2B','valid_http':lambda req,form:True,'number':lambda v:v,'escape':escape}
 exec(compile(ast.Module(body=functions,type_ignores=[]),str(SOURCE),'exec'),ns)
 class WS:
  def __init__(self,reply):
@@ -24,15 +24,15 @@ class WS:
   return json.dumps(self.events.pop(0))
  async def send_text(self,value):self.sent.append(json.loads(value))
 class Request:
- async def form(self):return {'HandoffData':json.dumps({'reason':'goodbye'})}
+ async def form(self):return {'HandoffData':json.dumps({'reason':'goodbye','voice_id':'bN1bDXgDIGX5lw0rtY2B'})}
 
 def test_end_message_instead_of_speaking_twice():
  async def core(path,data):
-  return {'business':{'business_id':'REST-001'}} if path=='/internal/business' else {'reply':'¡Gracias a vos! Hasta luego.'}
- ns['core']=core;ns['event_external_id']=lambda event,call,text:'CA1:1'
+  return {'business':{'business_id':'REST-001'}} if path=='/internal/business' else {'reply':'¡Gracias a vos! Hasta luego.','action':'end_call','reason':'goodbye'}
+ ns['core']=core;ns['event_external_id']=lambda *a:'CA1:1'
  ws=WS('¡Gracias a vos! Hasta luego.')
  asyncio.run(ns['websocket'](ws))
- assert ws.sent==[{'type':'end','handoffData':'{"reason": "goodbye"}'}]
+ assert ws.sent==[{'type':'end','handoffData':'{"reason": "goodbye", "voice_id": "bN1bDXgDIGX5lw0rtY2B"}'}]
 
 def test_callback_says_goodbye_then_hangs_up():
  response=asyncio.run(ns['relay_ended'](Request()))

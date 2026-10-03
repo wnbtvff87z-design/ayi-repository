@@ -8,7 +8,7 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
-from dialog import process
+from dialog import process_turn
 app=Flask(__name__);log=logging.getLogger(__name__)
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
@@ -135,7 +135,7 @@ def duplicate_turn_reply(c, bid, channel, customer, external_id, text):
   ).fetchone()
   return row['assistant_text'] if row else None
 
-def converse(b,channel,customer,text,external_id):
+def converse_turn(b,channel,customer,text,external_id):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
   init_schema();bid=b['business_id']
   with db() as c:
@@ -155,19 +155,27 @@ def converse(b,channel,customer,text,external_id):
     state={}
    duplicate=duplicate_turn_reply(c,bid,channel,customer,external_id,text)
    if duplicate is not None:
-    return duplicate
+    last=state.get('_last_turn') or {}
+    same=last.get('external_id')==external_id
+    return {'reply':duplicate,'action':last.get('action','continue') if same else 'continue','reason':last.get('reason') if same else None}
    recent=c.execute(
     'SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 20',
     (bid,channel,customer),
    ).fetchall()
-   reply,state=process(b,state,list(reversed(recent)),text,channel,external_id,customer)
+   out=process_turn(b,state,list(reversed(recent)),text,channel,external_id,customer)
+   reply,state=out['reply'],out['state']
+   action='end_call' if out.get('action')=='end_call' else 'continue'
+   reason=out.get('reason') if action=='end_call' else None
+   state['_last_turn']={'external_id':external_id,'action':action,'reason':reason}
    state['_sector']=str(b.get('sector') or '').strip().casefold()
    if channel=='Voice':
     state['_voice_call_id']=str(external_id).split(':',1)[0]
    reply=str(reply or 'No pude responder con seguridad. ¿Podés repetirlo?')
    c.execute('UPDATE customer_sessions SET state=%s::jsonb,updated_at=now() WHERE business_id=%s AND channel=%s AND customer_phone=%s',(json.dumps(state,ensure_ascii=False),bid,channel,customer))
    c.execute('INSERT INTO conversation_turns(business_id,channel,customer_phone,external_id,user_text,assistant_text) VALUES(%s,%s,%s,%s,%s,%s)',(bid,channel,customer,external_id,text[:4000],reply[:4000]))
-   return reply
+   return {'reply':reply,'action':action,'reason':reason}
+def converse(b,channel,customer,text,external_id):
+  return converse_turn(b,channel,customer,text,external_id)['reply']
 @app.get('/')
 def home():return jsonify(name='AI Reservas Core',status='running',version='integracion-piloto+twilio-diag1')
 @app.get('/health')
@@ -254,8 +262,8 @@ def internal_turn():
   try:
    channel=d.get('channel','Voice');b=lookup(d.get('business_phone'),channel)
    if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-   reply=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''))
-   return jsonify(success=True,reply=reply)
+   out=converse_turn(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''))
+   return jsonify(success=True,reply=out['reply'],action=out['action'],reason=out['reason'])
   except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
 @app.post('/internal/reconcile-pending')
 def internal_reconcile_pending():

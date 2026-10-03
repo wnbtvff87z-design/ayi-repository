@@ -29,8 +29,8 @@ class WS:
 
 def test_end_carries_same_business_voice_and_callback_hangs_up():
  async def core(path,data):
-  return {'business':{'business_id':'test','voice':'bN1bDXgDIGX5lw0rtY2B'}} if path=='/internal/business' else {'reply':'¡Gracias a vos! Hasta luego.'}
- ns['core']=core;ns['event_external_id']=lambda event,sid,text:'CA1:1'
+  return {'business':{'business_id':'test','voice':'bN1bDXgDIGX5lw0rtY2B'}} if path=='/internal/business' else {'reply':'¡Gracias a vos! Hasta luego.','action':'end_call','reason':'goodbye'}
+ ns['core']=core;ns['event_external_id']=lambda *a:'CA1:1'
  ws=WS();asyncio.run(ns['websocket'](ws))
  assert len(ws.sent)==1 and ws.sent[0]['type']=='end'
  data=json.loads(ws.sent[0]['handoffData'])
