@@ -11,7 +11,9 @@ import json
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-import openai
+import os
+
+from openai import OpenAI
 
 from interpret import interpret
 from booking import BookingError, availability, options, create
@@ -240,6 +242,11 @@ TOOLS = [
                         "type": "integer",
                         "description": "Number of people",
                     },
+                    "meal": {
+                        "type": "string",
+                        "enum": ["lunch", "dinner"],
+                        "description": "Only if the user says comer/almorzar (lunch) or cenar (dinner)",
+                    },
                 },
                 "required": ["date", "party_size"],
             },
@@ -293,7 +300,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "cancel_reservation",
-            "description": "Cancel a reservation by name (phone is optional)",
+            "description": "Propose cancelling a reservation of the current caller by name. The phone is always taken from the caller identity, never from arguments. Requires user confirmation",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -303,7 +310,7 @@ TOOLS = [
                     },
                     "customer_phone": {
                         "type": "string",
-                        "description": "Customer phone number (optional for cancellation)",
+                        "description": "Ignored: the caller identity is used instead",
                     },
                     "reservation_date": {
                         "type": "string",
@@ -328,7 +335,7 @@ TOOLS = [
                     },
                     "customer_phone": {
                         "type": "string",
-                        "description": "Customer phone number (optional)",
+                        "description": "Ignored: the caller identity is used instead",
                     },
                     "new_date": {
                         "type": "string",
@@ -675,58 +682,52 @@ def _availability_only(s, text, parsed, channel, tz):
 
 
 def _call_agent(b, state, history, text, channel, external_id, customer):
+    """Ask the model for a reply or tool calls (OpenAI SDK >= 1.0).
+
+    Returns (reply_text, tool_calls). On any failure returns (None, []).
+    The model only proposes; writes happen in Python after an explicit yes().
     """
-    Use OpenAI to decide tool calls. Model has full context via system + history.
-    Returns (tool_name, tool_args) if model calls a tool, or (None, None) if it just replies.
-    """
+    key = os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        log.error("OPENAI_API_KEY no configurada")
+        return None, []
+    tz = b.get("timezone") or "Europe/Madrid"
+    now = datetime.now(ZoneInfo(tz))
     messages = [
         {
             "role": "system",
-            "content": """Eres un asistente de reservas para un restaurante. Tu tarea es ayudar a:
-1. Crear nuevas reservas (crear_reserva)
-2. Consultar disponibilidad (consultar_disponibilidad) 
-3. Cancelar reservas existentes (cancelar_reserva)
-4. Modificar reservas existentes (modificar_reserva)
-5. Responder preguntas generales
-
-Si el usuario pregunta sobre disponibilidad, llama a check_availability.
-Si quiere hacer una reserva nueva, llama a create_reservation cuando tengas todos los datos.
-Si quiere cancelar, llama a cancel_reservation.
-Si quiere cambiar/modificar, llama a modify_reservation.
-Si es una pregunta general o necesitas más información, responde naturalmente SIN llamar ninguna tool.
-
-Extrae la información del contexto y de mensajes anteriores cuando sea posible.
-Si el teléfono no está disponible pero tienes nombre y apellido, puedes proceder con cancel_reservation.
-""",
+            "content": (
+                "Eres el asistente de reservas de un restaurante. Ayudás a consultar disponibilidad "
+                "(check_availability), crear (create_reservation), cancelar (cancel_reservation) y "
+                "modificar (modify_reservation) reservas. Las tools de crear/cancelar/modificar solo "
+                "proponen: el sistema pide confirmación al cliente. Nunca afirmes disponibilidad ni "
+                "confirmaciones por tu cuenta. Si faltan datos, preguntalos sin llamar tools. "
+                "Preguntas generales: respondé breve sin tools. Para el nombre no inventes apellidos. "
+                f"Zona horaria {tz}; ahora es {now.isoformat()} ({DAYS[now.weekday()]}). "
+                "Fechas en YYYY-MM-DD, horas en HH:MM."
+            ),
         }
     ]
-
-    # Agregar historial (últimas 10 vueltas)
-    if history:
-        for turn in history[-10:]:
-            messages.append({"role": "user", "content": turn.get("user", "")})
-            if turn.get("assistant"):
-                messages.append({"role": "assistant", "content": turn["assistant"]})
-
-    # Mensaje actual
-    messages.append({"role": "user", "content": text})
+    for turn in list(history or [])[-10:]:
+        u = turn.get("user_text", turn.get("user", ""))
+        a = turn.get("assistant_text", turn.get("assistant", ""))
+        if u:
+            messages.append({"role": "user", "content": str(u)[:300]})
+        if a:
+            messages.append({"role": "assistant", "content": str(a)[:300]})
+    messages.append({"role": "user", "content": str(text)[:900]})
 
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
+        response = OpenAI(api_key=key).chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=messages,
             tools=TOOLS,
-            tool_choice="auto",  # Modelo decide si llamar tool o no
-            temperature=0.7,
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            temperature=0,
         )
-
-        # Extraer respuesta y tool calls
-        assistant_message = response.choices[0].message
-        reply_text = assistant_message.get("content", "")
-
-        tool_calls = getattr(assistant_message, "tool_calls", [])
-
-        return reply_text, tool_calls
+        message = response.choices[0].message
+        return message.content or "", list(message.tool_calls or [])
     except Exception as e:
         log.exception("OpenAI API call failed: %s", e)
         return None, []
@@ -773,61 +774,93 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
             s["phase"] = "done"
             s["intent"] = None
             return _reply(s, "De acuerdo, no hice cambios. ¿Necesitás algo más?", True)
-        # Tangential question (B): answer but retake confirmation
-        reply_text, tool_calls = _call_agent(b, state, history, text, channel, external_id, customer)
-        if reply_text and not tool_calls:
-            # Genuine question, not a tool call
-            reply_msg = (
-                (str(reply_text)[:160] + " ¿Confirmás la operación que te resumí?")
-                if reply_text
-                else "Te escucho. ¿Confirmás la operación que te resumí?"
-            )
-            return _reply(s, reply_msg, True)
+        awaiting = True
+    else:
+        awaiting = False
 
-    # Call agent for interpretation
+    # Single model call per turn
     reply_text, tool_calls = _call_agent(b, state, history, text, channel, external_id, customer)
+
+    if awaiting and not tool_calls:
+        # Tangential question: answer but retake confirmation
+        reply_msg = (
+            (str(reply_text)[:160] + " ¿Confirmás la operación que te resumí?")
+            if reply_text
+            else "Te escucho. ¿Confirmás la operación que te resumí?"
+        )
+        return _reply(s, reply_msg, True)
+
+    if awaiting and tool_calls:
+        # New request supersedes the pending operation: drop it explicitly
+        s.pop("pending", None)
+        s["phase"] = "collecting"
 
     if not tool_calls:
         # No tool called, just respond
         return _reply(s, reply_text or "¿En qué puedo ayudarte?", True)
 
     # Process tool calls (should only be one, but handle multiple)
-    for tool_call in tool_calls:
+    for tool_call in tool_calls[:1]:
         tool_name = tool_call.function.name
-        tool_args = json.loads(tool_call.function.arguments)
+        try:
+            tool_args = json.loads(tool_call.function.arguments)
+            if not isinstance(tool_args, dict):
+                raise ValueError
+        except (ValueError, TypeError):
+            return _reply(s, "No te entendí bien. ¿Me repetís qué necesitás?", True)
+        tz = b.get("timezone") or "Europe/Madrid"
+        abandoned = (
+            "Dejé sin efecto la operación anterior. " if awaiting else ""
+        )
 
         if tool_name == "check_availability":
             # Direct availability check (no confirmation needed)
-            date_str = tool_args.get("date")
-            party_size = tool_args.get("party_size")
-            if date_str and party_size:
-                rows = _slots(b, date_str, party_size)
-                s["values"]["reservation_date"] = date_str
-                s["values"]["party_size"] = party_size
-                s["intent"] = "availability"
-                s["phase"] = "inquiry"
-                if not rows:
-                    return _reply(s, "No veo mesas disponibles ese día.")
-                s["offered"] = rows[: 3 if channel == "Voice" else 8]
-                times = (
-                    " o ".join("a las " + _spoken_time(x["time"]) for x in s["offered"])
-                    if channel == "Voice"
-                    else ", ".join(x["time"] for x in s["offered"])
-                )
-                return _reply(
-                    s,
-                    f'Para {party_size} personas, tengo disponibilidad {label(date_str)} {times if channel == "Voice" else "a las " + times}.',
-                    True,
-                )
+            updates = {"reservation_date": tool_args.get("date")}
+            date_str, ask = _date(text, updates, tz, s)
+            if ask:
+                return _reply(s, ask, True)
+            party_size = _party(text, tool_args.get("party_size"), None)
+            if not date_str or not party_size:
+                return _reply(s, "¿Para qué día y cuántas personas?", True)
+            meal = tool_args.get("meal") if tool_args.get("meal") in ("lunch", "dinner") else None
+            rows = _meal_filter(_slots(b, date_str, party_size), meal)
+            s["values"]["reservation_date"] = date_str
+            s["values"]["party_size"] = party_size
+            s["intent"] = "availability"
+            s["phase"] = "inquiry"
+            if not rows:
+                return _reply(s, abandoned + "No veo mesas disponibles para ese día o servicio.", True)
+            s["offered"] = rows[: 3 if channel == "Voice" else 8]
+            times = (
+                " o ".join("a las " + _spoken_time(x["time"]) for x in s["offered"])
+                if channel == "Voice"
+                else ", ".join(x["time"] for x in s["offered"])
+            )
+            return _reply(
+                s,
+                abandoned + f'Para {party_size} personas, tengo disponibilidad {label(date_str)} {times if channel == "Voice" else "a las " + times}.',
+                True,
+            )
 
         elif tool_name == "create_reservation":
             # Proposed creation (needs confirmation first)
             name = tool_args.get("customer_name")
-            phone = tool_args.get("customer_phone", "")
+            phone = customer  # identity comes from the caller, never from the model
             email = tool_args.get("customer_email", "")
-            res_date = tool_args.get("reservation_date")
-            res_time = tool_args.get("reservation_time")
-            party = tool_args.get("party_size", 1)
+            res_date = valid_date(tool_args.get("reservation_date"))
+            res_time = valid_time(tool_args.get("reservation_time"))
+            party = tool_args.get("party_size")
+            if not (type(party) is int and 1 <= party <= 20):
+                party = None
+            if not (isinstance(name, str) and len(name.split()) >= 2):
+                return _reply(s, "¿Me decís nombre y apellido para la reserva?", True)
+            if not (res_date and res_time and party):
+                return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmás?", True)
+            try:
+                if not availability(b, res_date, res_time, party).get("available"):
+                    return _reply(s, "Ese horario no está disponible. ¿Probamos otra hora?", True)
+            except BookingError as e:
+                return _reply(s, str(e), True)
 
             s["intent"] = "create"
             s["values"] = {
