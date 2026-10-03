@@ -105,6 +105,22 @@ def _date(text,updates,tz,s):
         elif re.search(r'\bdomingo\b',q):d=s['weekend'][1]
     return d,None
 
+def _requested_dates(text,updates,tz):
+    q=norm(text);found=[]
+    weekdays=r'lunes|martes|miercoles|jueves|viernes|sabado|domingo'
+    for match in re.finditer(r'\b(?:(?:este|el|proximo)\s+)?(?:'+weekdays+r')\b',q):
+        d=relative_day(match.group(),tz)
+        if d and d not in found:found.append(d)
+    months=r'(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)'
+    for match in re.finditer(r'\b(?:el\s+)?[0-3]?\d\s+de\s+'+months+r'(?:\s+de\s+20\d\d)?\b',q):
+        d=explicit_date(match.group(),tz)
+        if d and d not in found:found.append(d)
+    explicit=explicit_date(text,tz)
+    proposed=valid_date(updates.get('reservation_date'))
+    if explicit and explicit not in found:found.append(explicit)
+    elif proposed and proposed not in found:found.append(proposed)
+    return sorted(found)
+
 def _slots(b,d,n):
     return [{'date':x['date'],'time':x['time']} for x in options(b,d,n,limit=None) if x['date']==d]
 
@@ -139,13 +155,12 @@ def _choose(rows,text,parsed,d=None):
 def _reply(s,text,changed=False):
     previous=s.get('last_base_reply')
     base=text
-    if text==previous:
+    if text==previous and not changed and s.get('intent') not in ('create','modify','cancel','availability'):
         attempts=s.get('stalls',0)+1;s['stalls']=attempts
         if attempts==1:
             text='No te entendí bien; te lo digo de otra forma.'
         else:
             text='No te preocupes, te muestro otra opción y seguimos con lo que te sirva.'
-            s['phase']='collecting'
     else:
         s['stalls']=0
     if _CHANNEL.get()=='Voice':text=_voice_text(text)
@@ -195,7 +210,7 @@ def _create(s,text,parsed,channel,tz,customer):
         s['weekend']=list(weekend_days(tz));v.pop('reservation_date',None)
     if d:
         if d!=v.get('reservation_date'):v.pop('reservation_time',None);s['offered']=[]
-        v['reservation_date']=d;s.pop('weekend',None)
+        v['reservation_date']=d;v.pop('requested_dates',None);s.pop('weekend',None)
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:
         if n!=v.get('party_size'):v.pop('reservation_time',None);s['offered']=[]
@@ -300,21 +315,30 @@ def _manage(s,text,parsed,channel,tz,customer):
 
 def _availability_only(s,text,parsed,channel,tz):
     """A read-only question never collects contact data or prepares a booking."""
-    u=parsed.get('updates') or {};d,conflict=_date(text,u,tz,s)
-    if conflict:return _reply(s,conflict)
-    if d:s['values']['reservation_date']=d
+    u=parsed.get('updates') or {};dates=_requested_dates(text,u,tz)
+    if dates:
+        s['values']['requested_dates']=dates
+        if len(dates)==1:s['values']['reservation_date']=dates[0]
+        else:s['values'].pop('reservation_date',None)
+    elif s['values'].get('reservation_date'):
+        dates=[s['values']['reservation_date']]
+    elif s['values'].get('requested_dates'):
+        dates=s['values']['requested_dates']
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:s['values']['party_size']=n
-    if not s['values'].get('reservation_date'):
+    if not dates:
         s['expected']='reservation_date';return _reply(s,'¿Qué día te sirve?')
     if not s['values'].get('party_size'):
         s['expected']='party_size';return _reply(s,'¿Para cuántas personas querés consultar?')
-    rows=_slots(s['business'],s['values']['reservation_date'],s['values']['party_size'])
+    rows=[]
+    for d in dates:rows.extend(_slots(s['business'],d,s['values']['party_size']))
+    rows=sorted(rows,key=lambda x:(x['date'],x['time']))
     s['phase']='inquiry';s['expected']=None
     if not rows:return _reply(s,'No veo mesas disponibles ese día. No hice ninguna reserva.')
-    s['offered']=rows[:3 if channel=='Voice' else 8]
-    times=(' o '.join('a las '+_spoken_time(x['time']) for x in s['offered']) if channel=='Voice' else ', '.join(x['time'] for x in s['offered']))
-    return _reply(s,f'Para {s["values"]["party_size"]} personas, tengo disponibilidad {label(s["values"]["reservation_date"])} {times if channel=="Voice" else "a las "+times}.',True)
+    per_date=3 if channel=='Voice' else 4
+    s['offered']=[x for d in dates for x in [r for r in rows if r['date']==d][:per_date]]
+    choices='; '.join(label(x['date'],x['time']) for x in s['offered'])
+    return _reply(s,f'Para {s["values"]["party_size"]} personas, tengo disponibilidad: {choices}. ¿Cuál te viene mejor?',True)
 
 def _process_internal(b,state,history,text,channel,external_id,customer):
     s=dict(state or {});s['values']=dict(s.get('values') or {});s['business']=b
@@ -348,13 +372,48 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         return _side_reply(s,info or str(parsed.get('reply') or 'Te escucho.')[:220])
     if s.get('intent')=='availability' and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',q):
         return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, no hice otra reserva. ¿Necesitás algo más?',True)
+    if s.get('intent')=='availability' and s.get('phase')=='inquiry':
+        offered=s.get('offered') or []
+        offered_dates=sorted({x['date'] for x in offered})
+        mentioned_dates=[d for d in _requested_dates(text,u,tz) if d in offered_dates]
+        selected_date=mentioned_dates[0] if len(mentioned_dates)==1 else None
+        candidates=[x for x in offered if not selected_date or x['date']==selected_date]
+        chosen=_choose(candidates,text,parsed,selected_date)
+        wants_booking=intent=='create' or bool(re.search(r'\b(?:reservar|reserva|apartar|hacer una mesa)\b',q))
+        if not chosen and not selected_date:
+            requested_time=valid_time(u.get('reservation_time')) or explicit_time(text)
+            matching=[x for x in offered if x['time']==requested_time] if requested_time else []
+            matching_dates=sorted({x['date'] for x in matching})
+            if len(matching_dates)>1 and not wants_booking:
+                s['offered']=matching
+                return _reply(s,'Ese horario está disponible en más de un día. ¿Cuál preferís: '+' o '.join(label(d) for d in matching_dates)+'?',True)
+        if chosen or selected_date or wants_booking:
+            booking=fresh('create');booking['business']=b
+            booking['values']={'party_size':s.get('values',{}).get('party_size')}
+            booking['values']={k:v for k,v in booking['values'].items() if v is not None}
+            if chosen:
+                booking['values'].update(reservation_date=chosen['date'],reservation_time=chosen['time'])
+                booking['values'].pop('requested_dates',None)
+            elif selected_date:
+                booking['values']['reservation_date']=selected_date
+                booking['values'].pop('requested_dates',None)
+            elif len(offered_dates)==1:
+                booking['values']['reservation_date']=offered_dates[0]
+            else:
+                booking['values']['requested_dates']=offered_dates
+                booking['expected']='reservation_date'
+                suffix=(' para ese horario' if valid_time(u.get('reservation_time')) or explicit_time(text) else '')
+                return _reply(booking,'¿Cuál de esos días preferís'+suffix+' para la reserva?',True)
+            return _create(booking,text,parsed,channel,tz,customer)
     if intent=='availability' and not manage:
         if _in_progress(s) and re.search(r'\b(?:disponib\w*|horarios?|libres?|tenes|tenias|tienen|tienes|hay)\b',q):
             detour=fresh('availability');detour['business']=b
             answer,_=_availability_only(detour,text,parsed,channel,tz)
             return _side_reply(s,answer)
-        if not _in_progress(s):
+        if not _in_progress(s) and s.get('intent')!='availability':
             s=fresh('availability');s['business']=b
+        if s.get('intent')=='availability':
+            s['business']=b
             return _availability_only(s,text,parsed,channel,tz)
 
     switch='cancel' if re.search(r'\b(?:cancelar|anular|cancela)\b',q) else 'modify' if re.search(r'\b(?:modificar|cambiar)\b.{0,30}\breserva\b|\breserva\b.{0,30}\b(?:modificar|cambiar)\b',q) else None
