@@ -135,6 +135,16 @@ def duplicate_turn_reply(c, bid, channel, customer, external_id, text):
   ).fetchone()
   return row['assistant_text'] if row else None
 
+def recent_history(c,bid,channel,customer,external_id):
+  rows=c.execute(
+    'SELECT external_id,user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 20',
+    (bid,channel,customer),
+  ).fetchall()
+  if channel=='Voice':
+    call_id=str(external_id).split(':',1)[0]
+    rows=[row for row in rows if str(row['external_id']).split(':',1)[0]==call_id]
+  return list(reversed(rows))
+
 def converse(b,channel,customer,text,external_id):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
   init_schema();bid=b['business_id']
@@ -156,11 +166,8 @@ def converse(b,channel,customer,text,external_id):
    duplicate=duplicate_turn_reply(c,bid,channel,customer,external_id,text)
    if duplicate is not None:
     return duplicate
-   recent=c.execute(
-    'SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 20',
-    (bid,channel,customer),
-   ).fetchall()
-   reply,state=process(b,state,list(reversed(recent)),text,channel,external_id,customer)
+   history=recent_history(c,bid,channel,customer,external_id)
+   reply,state=process(b,state,history,text,channel,external_id,customer)
    state['_sector']=str(b.get('sector') or '').strip().casefold()
    if channel=='Voice':
     state['_voice_call_id']=str(external_id).split(':',1)[0]

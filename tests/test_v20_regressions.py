@@ -30,6 +30,23 @@ class Regression(unittest.TestCase):
   r=(ROOT/'relay/main.py').read_text();self.assertIn('def event_external_id',r);self.assertNotIn("state['call_sid']+':'+str(state['seq'])",r)
  def test_voice_state_is_scoped_to_call(self):
   m=(ROOT/'web/main.py').read_text();self.assertIn("call_id=external_id.split(':',1)[0]",m);self.assertIn("_voice_call_id",m)
+ def test_voice_history_is_scoped_to_call(self):
+  source=(ROOT/'web/main.py').read_text();tree=ast.parse(source)
+  node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='recent_history')
+  ns={};exec(compile(ast.Module(body=[node],type_ignores=[]),str(ROOT/'web/main.py'),'exec'),ns)
+  rows=[
+   {'external_id':'CA-old:event:2','user_text':'old request','assistant_text':'old response'},
+   {'external_id':'CA-current:event:2','user_text':'same-call answer','assistant_text':'same-call prompt'},
+   {'external_id':'CA-current:event:1','user_text':'same-call request','assistant_text':'same-call response'},
+  ]
+  class Cursor:
+   def fetchall(self):return rows
+  class Connection:
+   def execute(self,*args):return Cursor()
+  history=ns['recent_history'](Connection(),'business','Voice','customer','CA-current:event:3')
+  self.assertEqual([turn['user_text'] for turn in history],['same-call request','same-call answer'])
+  whatsapp=ns['recent_history'](Connection(),'business','WhatsApp','customer','message-3')
+  self.assertEqual(len(whatsapp),3)
  def test_duplicate_whatsapp_webhook_is_silent(self):
   m=(ROOT/'web/main.py').read_text();self.assertIn("None if channel=='WhatsApp'",m);self.assertIn('if answer:tw.message(answer)',m)
  def test_cancellation_requires_explicit_confirmation(self):
