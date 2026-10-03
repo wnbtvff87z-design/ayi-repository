@@ -22,12 +22,12 @@ def _voice_text(text):
 def _goodbye(text):return bool(re.fullmatch(r'(?:chau|chao|adios|hasta luego|hasta pronto|nos vemos|gracias|muchas gracias)(?:[.! ]*)',norm(text).strip()))
 def norm(v):return ' '.join(''.join(c for c in unicodedata.normalize('NFKD',str(v or '').casefold()) if not unicodedata.combining(c)).split())
 def label(d,t=None):
-    x=date.fromisoformat(str(d)[:10]);day=f'el {DAYS[x.weekday()]} {_words(x.day)} de {MONTHS[x.month-1]}' if _CHANNEL.get()=='Voice' else f'el {DAYS[x.weekday()]} {x.day}/{x.month}';return day+(f' a las {_spoken_time(t) if _CHANNEL.get()=="Voice" else t}' if t else '')
+    x=date.fromisoformat(str(d)[:10]);day=f'el {DAYS[x.weekday()]} {_words(x.day)} de {MONTHS[x.month-1]}' if _CHANNEL.get()=='Voice' else f'el {DAYS[x.weekday()]} {x.day}/{x.month}';return day+(f' a las {_spoken_time(t)}' if t and _CHANNEL.get()=='Voice' else f' a las {t}' if t else '')
 def fresh(intent):return {'intent':intent,'phase':'collecting','values':{},'offered':[],'operation_id':secrets.token_hex(12)}
 def yes(t):return ' '.join(re.sub(r'[.,!?¿¡]+',' ',norm(t)).split()) in ('si','si por favor','si porfavor','si confirma','si confirmo','confirmo','dale','ok','vale','adelante','de acuerdo')
 def no(t):return norm(t).strip(' .,!?¿¡') in ('no','no gracias','espera','mejor no','un momento')
 def valid_date(v):
-    try:return date.fromisoformat(str(v)) .isoformat()
+    try:return date.fromisoformat(str(v)).isoformat()
     except (ValueError,TypeError):return None
 def valid_time(v):
     m=re.fullmatch(r'([01]\d|2[0-3]):([0-5]\d)',str(v or ''));return m.group(0) if m else None
@@ -50,10 +50,8 @@ def _date(text,updates,tz,s):
     explicit=explicit_date(text,tz)
     proposed=valid_date(updates.get('reservation_date'))
     if explicit and proposed and explicit!=proposed and not s.get('weekend'):
-        # The model's proposed date is not a second date spoken by the caller.
         proposed=explicit
     d=explicit or proposed
-    q=norm(text)
     if s.get('weekend'):
         if re.search(r'\bsabado\b',q):d=s['weekend'][0]
         elif re.search(r'\bdomingo\b',q):d=s['weekend'][1]
@@ -62,7 +60,6 @@ def _slots(b,d,n):
     return [{'date':x['date'],'time':x['time']} for x in options(b,d,n,limit=None) if x['date']==d]
 def _meal_filter(rows,meal):
     if not meal:return rows
-    # Prefer the restaurant's own inventory: separate service periods by the largest gap.
     hours=sorted({int(x['time'][:2])*60+int(x['time'][3:]) for x in rows})
     if len(hours)<2:return rows
     gaps=[(hours[i+1]-hours[i],i) for i in range(len(hours)-1)]
@@ -87,27 +84,32 @@ def _choose(rows,text,parsed,d=None):
         hits=[x for x in rows if x['time']==t and (not d or x['date']==d)]
         if len(hits)==1:return hits[0]
     return None
+
 def _reply(s,text,changed=False):
     previous=s.get('last_base_reply')
     base=text
     if text==previous:
         attempts=s.get('stalls',0)+1;s['stalls']=attempts
-        if attempts==1:text='No capté esa parte. '+text
+        if attempts==1:
+            text='No capté esa parte. ' + text
         else:
-            text='No quiero repetirte la misma pregunta. No hice cambios; podemos probar con otro día u hora o hablar con recepción.'
-            s['phase']='stalled'
-    else:s['stalls']=0
+            text='Puedo ayudarte con otra opción, pero no quiero repetirte la misma pregunta. Te doy otra oportunidad y seguimos con lo que te sirve.'
+            s['phase']='collecting'
+    else:
+        s['stalls']=0
     if _CHANNEL.get()=='Voice':text=_voice_text(text)
     s['last_reply']=text
     s['last_base_reply']=base
     return text,s
+
 def _offer(s,rows,channel,meal=None):
     selected=_meal_filter(rows,meal)
     if meal and not selected:return _reply(s,'No veo lugar para ese servicio. ¿Querés probar otro horario o día?',True)
     if not selected:return _reply(s,'No veo mesas disponibles ese día. ¿Probamos otro día?',True)
     s['offered']=selected[:3 if channel=='Voice' else 8];s['expected']='reservation_time'
     times=(' o '.join('a las '+_spoken_time(x['time']) for x in s['offered']) if channel=='Voice' else ', '.join(x['time'] for x in s['offered']))
-    return _reply(s,f'Tengo mesa {label(s["offered"][0]["date"])} {times if channel=="Voice" else "a las "+times}. ¿Cuál te viene mejor?',True)
+    return _reply(s,f'Tengo disponibilidad {label(s["offered"][0]["date"])} {times if channel=="Voice" else "a las "+times}. ¿Cuál te viene mejor?',True)
+
 def _confirm(s,customer,channel):
     p=s['pending'];op=p['operation']
     try:
@@ -125,14 +127,15 @@ def _confirm(s,customer,channel):
                 if (c['reservation_date'],c['reservation_time'])!=(p['old_date'],p['old_time']) or c['party_size']>int(row['party_size']):
                     if not availability(s['business'],c['reservation_date'],c['reservation_time'],c['party_size']).get('available'):
                         s.pop('pending',None);s['phase']='collecting';s['target'].pop('reservation_time',None)
-                        return _reply(s,'Ese horario se ocupó; tu reserva original sigue igual. ¿Probamos otra hora?',True)
+                        return _reply(s,'Ese horario no está disponible. Tu reserva original sigue igual. ¿Probamos otra hora?',True)
                 result=modify_for_caller(s['business'],row['name'],customer,c,expected_code=row['code'],reservation_date=p['old_date'],reservation_time=p['old_time'])
         if not result.get('success') or not result.get('airtable_synced'):
-            s['phase']='sync_pending';return _reply(s,'La operación requiere verificación; no la repitas. Contactá con recepción.',True)
+            s['phase']='sync_pending';return _reply(s,'La operación requiere verificación, pero no la repitas. Si querés, te sigo ayudando paso a paso.',True)
         return ('Listo, la reserva quedó registrada.' if op=='create' else 'Listo, cancelé esa reserva.' if op=='cancel' else 'Listo, cambié esa reserva.'),{'phase':'done','intent':None,'values':{}}
     except BookingError as exc:
         log.warning('Booking confirmation failed: %s',exc)
-        s['phase']='sync_pending';return _reply(s,'No puedo confirmar el resultado. No repitas la operación hasta verificarla con recepción.',True)
+        s['phase']='sync_pending';return _reply(s,'No pude confirmar el resultado todavía. No hicimos cambios; si querés, te ayudo a intentar otra alternativa.',True)
+
 def _create(s,text,parsed,channel,tz,customer):
     v=s['values'];u=parsed.get('updates') or {};old=dict(v)
     d,conflict=_date(text,u,tz,s)
@@ -174,8 +177,8 @@ def _create(s,text,parsed,channel,tz,customer):
     if not check.get('available'):
         old_time=v.pop('reservation_time');rows=_slots(s['business'],v['reservation_date'],v['party_size'])
         if rows:
-            reply,state=_offer(s,rows,channel,s.get('meal'));return _reply(s,f'A las {old_time} no tengo mesa. '+reply,True)
-        return _reply(s,'A esa hora no tengo mesa. ¿Querés probar otro día?',True)
+            reply,state=_offer(s,rows,channel,s.get('meal'));return _reply(s,f'A las {old_time} no hay disponibilidad. '+reply,True)
+        return _reply(s,'A esa hora no hay disponibilidad. ¿Querés probar otro día?',True)
     name=candidate_name(text,u.get('customer_name'),s.get('expected'))
     if name:v['customer_name']=name
     email=re.search(r'[a-z0-9._+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+',norm(text))
@@ -192,6 +195,7 @@ def _create(s,text,parsed,channel,tz,customer):
     s['pending']={'operation':'create','values':dict(v),'request_id':secrets.token_hex(16)}
     s['phase']='awaiting';s['expected']=None
     return _reply(s,f'Mesa {label(v["reservation_date"],v["reservation_time"])} para {v["party_size"]} personas a nombre de {v["customer_name"]}. ¿La confirmo?',True)
+
 def _manage(s,text,parsed,channel,tz,customer):
     v=s['values'];u=parsed.get('updates') or {}
     name=candidate_name(text,u.get('customer_name'),s.get('expected'))
@@ -212,7 +216,6 @@ def _manage(s,text,parsed,channel,tz,customer):
             s['phase']='choosing_original';s['expected']='original'
             return _reply(s,'Encontré '+', '.join(f'{i}. {label(x["slot_date"],x["start_time"])}' for i,x in enumerate(rows[:5],1))+'. ¿Cuál es?',True)
         s['selected_code']=row['code'];s['phase']='collecting';s['expected']=None;s['target']={}
-        # A date used to identify the original cannot also become a destination.
         text='';u={};parsed={}
     if s['intent']=='cancel':
         s['pending']={'operation':'cancel','code':row['code'],'old_date':str(row['slot_date'])[:10],'old_time':row['start_time']};s['phase']='awaiting'
@@ -227,19 +230,24 @@ def _manage(s,text,parsed,channel,tz,customer):
     if t:target['reservation_time']=t
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:target['party_size']=n
-    if not target:return _reply(s,'¿Qué día, hora o cantidad querés cambiar?')
+    if not target:
+        return _reply(s,'¿Qué día, hora o cantidad querés cambiar?')
+
     old_d=str(row['slot_date'])[:10];old_t=row['start_time'];dest=target.get('reservation_date',old_d);n=target.get('party_size',row['party_size'])
-    if 'reservation_date' in target and 'reservation_time' not in target:return _offer(s,_slots(s['business'],dest,n),channel,parsed.get('meal'))
+    if 'reservation_date' in target and 'reservation_time' not in target:
+        return _offer(s,_slots(s['business'],dest,n),channel,parsed.get('meal'))
     dest_t=target.get('reservation_time',old_t)
-    if (dest,dest_t,n)==(old_d,old_t,row['party_size']):return _reply(s,'Eso coincide con tu reserva actual. ¿Qué querés cambiar?')
+    if (dest,dest_t,n)==(old_d,old_t,row['party_size']):
+        return _reply(s,'Eso coincide con tu reserva actual. ¿Qué querés cambiar?',True)
     if (dest,dest_t)!=(old_d,old_t) or n>row['party_size']:
         if not availability(s['business'],dest,dest_t,n).get('available'):
-            target.pop('reservation_time',None);return _reply(s,'Ese horario no tiene lugar; tu reserva original sigue igual. ¿Probamos otro?',True)
+            target.pop('reservation_time',None)
+            return _reply(s,'Ese horario no está disponible. Tu reserva original sigue igual. ¿Probamos otra hora?',True)
     s['pending']={'operation':'modify','code':row['code'],'old_date':old_d,'old_time':old_t,'changes':{'reservation_date':dest,'reservation_time':dest_t,'party_size':n}}
     s['phase']='awaiting'
     return _reply(s,f'Tu reserva actual es {label(old_d,old_t)}. La cambiaría a {label(dest,dest_t)} para {n} personas. ¿Confirmás?',True)
+
 def _availability_only(s,text,parsed,channel,tz):
-    """A read-only question never collects contact data or prepares a booking."""
     u=parsed.get('updates') or {};d,conflict=_date(text,u,tz,s)
     if conflict:return _reply(s,conflict)
     if d:s['values']['reservation_date']=d
@@ -248,21 +256,22 @@ def _availability_only(s,text,parsed,channel,tz):
     if not s['values'].get('reservation_date'):
         s['expected']='reservation_date';return _reply(s,'¿Qué día querés consultar?')
     if not s['values'].get('party_size'):
-        s['expected']='party_size';return _reply(s,'¿Para cuántas personas consulto? No voy a registrar otra reserva.')
+        s['expected']='party_size';return _reply(s,'¿Para cuántas personas consulto?')
     rows=_slots(s['business'],s['values']['reservation_date'],s['values']['party_size'])
     s['phase']='inquiry';s['expected']=None
     if not rows:return _reply(s,'No veo mesas disponibles ese día. No hice ninguna reserva.')
     s['offered']=rows[:3 if channel=='Voice' else 8]
     times=(' o '.join('a las '+_spoken_time(x['time']) for x in s['offered']) if channel=='Voice' else ', '.join(x['time'] for x in s['offered']))
-    return _reply(s,f'Para {s["values"]["party_size"]} personas veo mesas {label(s["values"]["reservation_date"])} {times if channel=="Voice" else "a las "+times}. Solo estoy consultando; ¿querés reservar alguna?')
+    return _reply(s,f'Para {s["values"]["party_size"]} personas, tengo disponibilidad {label(s["values"]["reservation_date"])} {times if channel=="Voice" else "a las "+times}.',True)
+
 def _process_internal(b,state,history,text,channel,external_id,customer):
     s=dict(state or {});s['values']=dict(s.get('values') or {});s['business']=b
     if b.get('sector')!='restaurante' or not b.get('allow_reservations'):return 'No tengo reservas habilitadas para este negocio.',s
     if _goodbye(text):
-        if s.get('phase')=='sync_pending':return 'La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.',s
+        if s.get('phase')=='sync_pending':return 'La operación sigue pendiente de verificación. Si querés, seguimos con recepción. Hasta luego.',s
         if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{}}
         return '¡Gracias a vos! Hasta luego.',{'phase':'closed','intent':None,'values':{}}
-    if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. No la repitas; contactá con recepción.')
+    if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. Si querés, te sigo ayudando con recepción.')
     if s.get('phase')=='stalled':
         s['phase']='collecting';s['stalls']=0
     if s.get('phase')=='awaiting' and s.get('pending'):
@@ -274,9 +283,10 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, no hice otra reserva. ¿Necesitás algo más?',True)
     try:parsed=interpret(b,{k:v for k,v in s.items() if k!='business'},history,text)
     except Exception:
-        log.exception('Interpretation unavailable');return _reply(s,'No pude entender bien tu pedido. No hice cambios; ¿me lo repetís?')
+        log.exception('Interpretation unavailable')
+        return _reply(s,'No entendí bien ese mensaje. No hice cambios; ¿me lo repetís de otra forma?')
     u=parsed.get('updates') or {};intent=parsed.get('intent');q=norm(text)
-    switch='cancel' if re.search(r'\b(?:cancelar|anular|cancela)\b',q) else 'modify' if re.search(r'\b(?:modificar|cambiar)\b.{0,30}\breserva\b|\breserva\b.{0,30}\b(?:modificar|cambiar)\b',q) else 'create' if re.search(r'\b(?:quiero|hacer|nueva|otra)\b.{0,40}\b(?:reservar|reserva|mesa)\b',q) else None
+    switch='cancel' if re.search(r'\b(?:cancelar|anular|cancela)\b',q) else 'modify' if re.search(r'\b(?:modificar|cambiar)\b.{0,30}\breserva\b|\breserva\b.{0,30}\b(?:modificar|cambiar)\b',q) else None
     if switch and switch!=s.get('intent'):
         s=fresh(switch);s['business']=b
     elif not s.get('intent') or s.get('phase') in ('done','closed'):
@@ -288,12 +298,12 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     if s.get('phase')=='awaiting':
         if no(text):s.pop('pending',None);s['phase']='collecting';return _reply(s,'De acuerdo, no hice cambios. ¿Querés otra cosa?',True)
         if yes(text) and s.get('pending'):return _confirm(s,customer,channel)
-        if any(u.get(k) is not None for k in ('reservation_date','reservation_time','party_size','customer_name','customer_email','customer_phone')) or parsed.get('meal') or re.search(r'\b(?:otra|otro|prefiero|mejor|cambiar)\b',q):
+        if any(u.get(k) is not None for k in ('reservation_date','reservation_time','party_size','customer_name','customer_email','customer_phone')) or parsed.get('meal') or re.search(r'\b(?:otra|otro|diferente)\b',q):
             s.pop('pending',None);s['phase']='collecting'
             if s['intent']=='create' and (u.get('reservation_date') or u.get('reservation_time') or parsed.get('meal')):s['values'].pop('reservation_time',None)
             elif s['intent']=='modify' and (u.get('reservation_date') or u.get('reservation_time') or parsed.get('meal')):s.setdefault('target',{}).pop('reservation_time',None)
         else:return _reply(s,(str(parsed.get('reply') or 'Te escucho.')[:160]+' ¿Confirmás la operación que te resumí?'),True)
-    if intent in ('social','question') and not u and not parsed.get('time_expression') and not parsed.get('meal') and not parsed.get('selection') and not re.search(r'\b(?:sabado|domingo|hoy|manana|hora|noche|tarde|comer|cenar)\b',q) and not (s.get('expected')=='customer_phone' and len(re.sub(r'\D','',text))>=9) and not (s.get('expected')=='customer_name' and len(q.split())<=5):
+    if intent in ('social','question') and not u and not parsed.get('time_expression') and not parsed.get('meal') and not parsed.get('selection') and not re.search(r'\b(?:sabado|domingo|hoy|manan|lunes|martes|miercoles|jueves|viernes)\b',q):
         return _reply(s,str(parsed.get('reply') or 'Te escucho.')[:220],True)
     try:
         if s['intent'] in ('cancel','modify'):answer,new=_manage(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid',customer)
@@ -301,7 +311,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         new.pop('business',None);return answer,new
     except BookingError as exc:
         log.warning('Booking dialogue error: %s',exc)
-        s.pop('business',None);return _reply(s,'No pude comprobar disponibilidad ahora. No hice cambios; intentemos otro momento.',True)
+        s.pop('business',None);return _reply(s,'No pude comprobar disponibilidad ahora. No hice cambios; si querés, probamos otra opción.',True)
 
 def process(b,state,history,text,channel,external_id,customer):
     token=_CHANNEL.set(channel)
