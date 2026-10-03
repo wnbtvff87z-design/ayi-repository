@@ -1,4 +1,5 @@
 """Regression coverage for availability selection and reservation handoff."""
+import importlib.util
 import re
 import sys
 import types
@@ -6,8 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "web"))
+web = Path(__file__).resolve().parents[1] / "web"
+sys.path.insert(0, str(web))
 
+previous_modules = {name: sys.modules.get(name) for name in ("booking", "booking_safe", "interpret")}
 booking = types.ModuleType("booking")
 
 
@@ -29,7 +32,14 @@ interpret = types.ModuleType("interpret")
 interpret.interpret = lambda *args, **kwargs: None
 sys.modules["interpret"] = interpret
 
-import restaurant_dialog as dialog
+spec = importlib.util.spec_from_file_location("availability_dialog_under_test", web / "restaurant_dialog.py")
+dialog = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dialog)
+for name, module in previous_modules.items():
+    if module is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = module
 
 
 BUSINESS = {
@@ -88,7 +98,7 @@ def parse(business, state, history, text):
     }
 
 
-def test_two_date_availability_selection_completes_confirmed_booking():
+def _two_date_availability_selection_completes_confirmed_booking():
     state = {}
     created = []
 
@@ -128,14 +138,14 @@ def test_two_date_availability_selection_completes_confirmed_booking():
     assert created[0]["_confirmed"] is True
 
 
-def test_date_selection_moves_to_create_and_keeps_party_size():
+def _date_selection_moves_to_create_and_keeps_party_size():
     state = {
         "intent": "availability",
         "phase": "inquiry",
         "values": {"party_size": 2, "requested_dates": [SATURDAY, SUNDAY]},
         "offered": SLOTS,
     }
-    parsed = {"intent": "availability", "updates": {}, "selection": None}
+    parsed = {"intent": "question", "updates": {}, "selection": None}
     with patch.object(dialog, "interpret", return_value=parsed), patch.object(dialog, "options", return_value=SLOTS):
         reply, updated = dialog.process(
             BUSINESS, state, [], "el 6 de noviembre de 2030", "WhatsApp", "date", "+34612345678"
@@ -146,7 +156,7 @@ def test_date_selection_moves_to_create_and_keeps_party_size():
     assert "20:00" in reply
 
 
-def test_repeated_operational_reply_does_not_change_intent_or_phase():
+def _repeated_operational_reply_does_not_change_intent_or_phase():
     state = {
         "intent": "availability",
         "phase": "inquiry",
@@ -162,10 +172,10 @@ def test_repeated_operational_reply_does_not_change_intent_or_phase():
 
 class AvailabilityReservationRegression(unittest.TestCase):
     def test_two_date_availability_selection_completes_confirmed_booking(self):
-        test_two_date_availability_selection_completes_confirmed_booking()
+        _two_date_availability_selection_completes_confirmed_booking()
 
     def test_date_selection_moves_to_create_and_keeps_party_size(self):
-        test_date_selection_moves_to_create_and_keeps_party_size()
+        _date_selection_moves_to_create_and_keeps_party_size()
 
     def test_repeated_operational_reply_does_not_change_intent_or_phase(self):
-        test_repeated_operational_reply_does_not_change_intent_or_phase()
+        _repeated_operational_reply_does_not_change_intent_or_phase()

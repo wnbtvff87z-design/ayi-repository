@@ -315,7 +315,9 @@ def _manage(s,text,parsed,channel,tz,customer):
 
 def _availability_only(s,text,parsed,channel,tz):
     """A read-only question never collects contact data or prepares a booking."""
-    u=parsed.get('updates') or {};dates=_requested_dates(text,u,tz)
+    u=parsed.get('updates') or {};dates=_requested_dates(text,{},tz)
+    if not dates and s['values'].get('requested_dates'):dates=s['values']['requested_dates']
+    elif not dates:dates=_requested_dates(text,u,tz)
     if dates:
         s['values']['requested_dates']=dates
         if len(dates)==1:s['values']['reservation_date']=dates[0]
@@ -365,9 +367,13 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. Si querés, te sigo ayudando con recepción.')
     if s.get('phase')=='stalled':
         s['phase']='collecting';s['stalls']=0
-    if intent=='other' and not has_data:
+    availability_followup=s.get('intent')=='availability' and s.get('phase')=='inquiry' and (
+        parsed.get('selection') is not None or explicit_time(text) or _requested_dates(text,{},tz)
+        or re.search(r'\b(?:reservar|reserva|apartar|hacer una mesa)\b',q)
+    )
+    if intent=='other' and not has_data and not availability_followup:
         return _side_reply(s,'Eso no te lo puedo ayudar a resolver: solo puedo ayudarte con reservas e información del restaurante (menú, horarios, dirección).')
-    if intent=='question' and not has_data and not manage:
+    if intent=='question' and not has_data and not manage and not availability_followup:
         info=_business_info(b,q)
         return _side_reply(s,info or str(parsed.get('reply') or 'Te escucho.')[:220])
     if s.get('intent')=='availability' and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',q):
@@ -375,7 +381,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     if s.get('intent')=='availability' and s.get('phase')=='inquiry':
         offered=s.get('offered') or []
         offered_dates=sorted({x['date'] for x in offered})
-        mentioned_dates=[d for d in _requested_dates(text,u,tz) if d in offered_dates]
+        mentioned_dates=[d for d in _requested_dates(text,{},tz) if d in offered_dates]
         selected_date=mentioned_dates[0] if len(mentioned_dates)==1 else None
         candidates=[x for x in offered if not selected_date or x['date']==selected_date]
         chosen=_choose(candidates,text,parsed,selected_date)
