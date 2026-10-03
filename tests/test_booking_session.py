@@ -20,7 +20,7 @@ import restaurant_dialog as dialog
 # Extract pure session helpers without importing Flask/Twilio in this offline test.
 source=Path(__file__).resolve().parents[1]/'web'/'main.py'
 tree=ast.parse(source.read_text())
-functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ('session_ttl','session_expired')]
+functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ('session_ttl','session_expired','recent_history')]
 namespace={'os':os,'datetime':datetime,'timezone':timezone,'timedelta':timedelta}
 exec(compile(ast.Module(body=functions,type_ignores=[]),str(source),'exec'),namespace)
 main=types.SimpleNamespace(**{name:namespace[name] for name in ('session_ttl','session_expired')})
@@ -110,6 +110,7 @@ def test_goodbye_after_booking_closes_dialogue():
             reply,new=dialog.process(B,state,[],message,channel,'bye','+34600000000')
             assert 'Hasta luego' in reply
             assert new['phase']=='closed'
+            assert new['_end_call_reason']=='goodbye'
 
 def test_goodbye_before_confirmation_does_not_book():
     values={'party_size':3,'reservation_date':'2030-10-01','reservation_time':'15:00'}
@@ -118,4 +119,19 @@ def test_goodbye_before_confirmation_does_not_book():
     with patch.object(dialog,'create') as create:
         reply,new=dialog.process(B,state,[],'chau','Voice','bye','+34600000000')
     assert 'no registré' in reply and new['phase']=='closed'
+    assert new['_end_call_reason']=='cancelled'
     create.assert_not_called()
+
+def test_voice_history_is_scoped_to_call_sid_only():
+    class Cursor:
+        def execute(self,query,params):
+            self.query,self.params=query,params
+            return self
+        def fetchall(self):return []
+    cursor=Cursor()
+    main.recent_history(cursor,'REST-001','Voice','+34600000000','CA123:turn:2')
+    assert 'external_id LIKE %s' in cursor.query
+    assert cursor.params==('REST-001','Voice','+34600000000','CA123:%')
+    main.recent_history(cursor,'REST-001','WhatsApp','+34600000000','SM123')
+    assert 'external_id LIKE' not in cursor.query
+    assert cursor.params==('REST-001','WhatsApp','+34600000000')

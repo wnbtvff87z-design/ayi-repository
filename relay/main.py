@@ -128,6 +128,7 @@ async def websocket(ws:WebSocket):
     # Mark only after core accepts the turn; failed requests may be retried.
     if len(state['processed_ids'])>200:
      state['processed_ids']={external_id}
+    end_reason=None
     try:
      out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':external_id,'text':text})
      reply=out.get('reply')
