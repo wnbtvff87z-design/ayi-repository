@@ -67,10 +67,10 @@ def _business_info(b,q):
 
 def _closure(s):
     if s.get('phase')=='sync_pending':return 'La operación sigue pendiente de verificación. Si querés, seguimos con recepción. Hasta luego.',s
-    if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{}}
+    if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'cancelled'}
     if _in_progress(s) and s.get('values'):
         s['last_reply']='¡Gracias! Cuando quieras retomamos tu reserva, no perdí lo que me dijiste.';return s['last_reply'],s
-    return '¡Gracias a vos! Hasta luego.',{'phase':'closed','intent':None,'values':{}}
+    return '¡Gracias a vos! Hasta luego.',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'goodbye'}
 
 def label(d,t=None):
     x=date.fromisoformat(str(d)[:10]);day=f'el {DAYS[x.weekday()]} {_words(x.day)} de {MONTHS[x.month-1]}' if _CHANNEL.get()=='Voice' else f'el {DAYS[x.weekday()]} {x.day}/{x.month}';return day+(f' a las {_spoken_time(t)}' if t and _CHANNEL.get()=='Voice' else f' a las {t}' if t else '')
@@ -344,6 +344,7 @@ def _availability_only(s,text,parsed,channel,tz):
 
 def _process_internal(b,state,history,text,channel,external_id,customer):
     s=dict(state or {});s['values']=dict(s.get('values') or {});s['business']=b
+    s.pop('_end_call_reason',None)
     q=norm(text);tz=b.get('timezone') or 'Europe/Madrid'
     if b.get('sector')!='restaurante' or not b.get('allow_reservations'):return 'No tengo reservas habilitadas para este negocio.',s
     if _UNSAFE.search(q):
