@@ -7,6 +7,7 @@ from booking import BookingError,availability,options,create
 from booking_safe import reservations_for_caller,unique_reservation,cancel_for_caller,modify_for_caller
 from temporal import explicit_date,relative_day,explicit_time,weekend_days
 from utils import norm,yes,no,valid_date,valid_time
+from reservation_rules import format_slots,is_availability_question,is_explicit_restart,is_opening_hours_question,meal_filter as _meal_filter,parse_party,sort_slots
 log=logging.getLogger(__name__)
 DAYS=('lunes','martes','miércoles','jueves','viernes','sábado','domingo')
 MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
@@ -42,6 +43,7 @@ def _side_reply(s,text):
 def _business_info(b,q):
     """Answer only from trusted business data; None when the topic is not covered."""
     for key,pattern,prefix in _BUSINESS_INFO:
+        if key=='hours' and not is_opening_hours_question(q):continue  # opening hours are never availability
         if pattern.search(q):
             value={'menu':b.get('menu'),'hours':b.get('hours'),'address':b.get('address')}[key]
             if value:return prefix+str(value)[:400]
@@ -67,6 +69,8 @@ def candidate_name(text,proposed,expected):
     return q.title() if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,4}',q) and not any(x in q.split() for x in ('quiero','reserva','cancelar','modificar','hola','bien')) else None
 
 def _party(text,proposed,expected):
+    stated=parse_party(text,expected=='party_size')
+    if stated:return stated
     if type(proposed) is int and 1<=proposed<=20:return proposed
     q=norm(text);m=re.search(r'\b(20|1[0-9]|[1-9])\s+(?:personas|comensales|pax)\b',q)
     if not m and expected=='party_size' and not re.search(r'\b(?:hora|horas|las|telefono)\b',q):
@@ -106,16 +110,6 @@ def _requested_dates(text,updates,tz):
 def _slots(b,d,n):
     return [{'date':x['date'],'time':x['time']} for x in options(b,d,n,limit=None) if x['date']==d]
 
-def _meal_filter(rows,meal):
-    if not meal:return rows
-    hours=sorted({int(x['time'][:2])*60+int(x['time'][3:]) for x in rows})
-    if len(hours)<2:return rows
-    gaps=[(hours[i+1]-hours[i],i) for i in range(len(hours)-1)]
-    gap,i=max(gaps)
-    if gap<120:return rows
-    pivot=(hours[i]+hours[i+1])/2
-    return [x for x in rows if (int(x['time'][:2])*60+int(x['time'][3:])<pivot)==(meal=='lunch')]
-
 def _choose(rows,text,parsed,d=None):
     if not rows:return None
     selection=parsed.get('selection')
@@ -150,13 +144,13 @@ def _reply(s,text,changed=False):
     s['last_base_reply']=base
     return text,s
 
-def _offer(s,rows,channel,meal=None):
-    selected=_meal_filter(rows,meal)
-    if meal and not selected:return _reply(s,'No veo lugar para ese servicio. ¿Querés probar otro horario o día?',True)
-    if not selected:return _reply(s,'No veo mesas disponibles ese día. ¿Probamos otro día?',True)
-    s['offered']=selected[:3 if channel=='Voice' else 8];s['expected']='reservation_time'
-    times=(' o '.join('a las '+_spoken_time(x['time']) for x in s['offered']) if channel=='Voice' else ', '.join(x['time'] for x in s['offered']))
-    return _reply(s,f'Tengo disponibilidad {label(s["offered"][0]["date"])} {times if channel=="Voice" else "a las "+times}. ¿Cuál te viene mejor?',True)
+def _offer(s,rows,channel,meal=None,party=None,day=None,requested=None):
+    """Present REAL slots (itemised); the list is exactly what booking.options() returned."""
+    selected=sort_slots(_meal_filter(rows,meal))
+    s['offered']=selected;s['expected']='reservation_time' if selected else None
+    party=party or s['values'].get('party_size') or 1
+    day=day or (selected[0]['date'] if selected else s['values'].get('reservation_date'))
+    return _reply(s,format_slots(selected,party,_CHANNEL.get(),day,label,_spoken_time,meal,requested),True)
 
 def _confirm(s,customer,channel):
     p=s['pending'];op=p['operation']
@@ -165,7 +159,7 @@ def _confirm(s,customer,channel):
             v=p['values']
             if not availability(s['business'],v['reservation_date'],v['reservation_time'],v['party_size']).get('available'):
                 s.pop('pending',None);s['phase']='collecting';s['values'].pop('reservation_time',None)
-                return _offer(s,_slots(s['business'],v['reservation_date'],v['party_size']),channel)
+                return _offer(s,_slots(s['business'],v['reservation_date'],v['party_size']),channel,party=v['party_size'],day=v['reservation_date'],requested=v['reservation_time'])
             result=create({**v,'_confirmed':True,'request_id':p['request_id'],'channel':channel},s['business'])
         else:
             row=unique_reservation(s['business'],s['values']['customer_name'],customer,p['old_date'],p['old_time'],p['code'])
@@ -220,13 +214,11 @@ def _create(s,text,parsed,channel,tz,customer):
         if not v.get('reservation_time'):
             if s.get('offered') and not meal and not d and not chosen:
                 s['expected']='reservation_time';return _reply(s,'¿Cuál de las horas que te dije preferís? También podés pedirme otra.',v!=old)
-            return _offer(s,rows,channel,s.get('meal'))
+            return _offer(s,rows,channel,s.get('meal'),v['party_size'],v['reservation_date'])
     check=availability(s['business'],v['reservation_date'],v['reservation_time'],v['party_size'])
     if not check.get('available'):
         old_time=v.pop('reservation_time');rows=_slots(s['business'],v['reservation_date'],v['party_size'])
-        if rows:
-            reply,state=_offer(s,rows,channel,s.get('meal'));return _reply(s,f'A las {old_time} no hay disponibilidad. '+reply,True)
-        return _reply(s,'A esa hora no hay disponibilidad. ¿Querés probar otro día?',True)
+        return _offer(s,rows,channel,s.get('meal'),v['party_size'],v['reservation_date'],old_time)
     name=candidate_name(text,u.get('customer_name'),s.get('expected'))
     if name:v['customer_name']=name
     email=re.search(r'[a-z0-9._+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+',norm(text))
@@ -283,7 +275,7 @@ def _manage(s,text,parsed,channel,tz,customer):
 
     old_d=str(row['slot_date'])[:10];old_t=row['start_time'];dest=target.get('reservation_date',old_d);n=target.get('party_size',row['party_size'])
     if 'reservation_date' in target and 'reservation_time' not in target:
-        return _offer(s,_slots(s['business'],dest,n),channel,parsed.get('meal'))
+        return _offer(s,_slots(s['business'],dest,n),channel,parsed.get('meal'),n,dest)
     dest_t=target.get('reservation_time',old_t)
     if (dest,dest_t,n)==(old_d,old_t,row['party_size']):
         return _reply(s,'Eso coincide con tu reserva actual. ¿Qué querés cambiar?',True)
@@ -318,7 +310,9 @@ def _availability_only(s,text,parsed,channel,tz):
     for d in dates:rows.extend(_slots(s['business'],d,s['values']['party_size']))
     rows=sorted(rows,key=lambda x:(x['date'],x['time']))
     s['phase']='inquiry';s['expected']=None
-    if not rows:return _reply(s,'No veo mesas disponibles ese día. No hice ninguna reserva.')
+    if len(dates)==1:
+        return _offer(s,rows,channel,parsed.get('meal'),s['values']['party_size'],dates[0])
+    if not rows:return _reply(s,'No veo mesas disponibles esos días. No hice ninguna reserva.')
     per_date=3 if channel=='Voice' else 4
     s['offered']=[x for d in dates for x in [r for r in rows if r['date']==d][:per_date]]
     choices='; '.join(label(x['date'],x['time']) for x in s['offered'])
@@ -341,6 +335,11 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         log.exception('Interpretation unavailable')
         return _reply(s,'No pude interpretar ese mensaje ahora. No hice cambios; ¿me lo repetís de otra forma?')
     u=parsed.get('updates') or {};intent=parsed.get('intent')
+    if intent=='question' and is_availability_question(text):intent='availability'  # asking for times is never an opening-hours answer
+    if is_explicit_restart(text):
+        # Only an explicit request replaces the open booking; detours and tangents never do
+        intent=intent if intent in ('cancel','modify') else 'create'
+        s=fresh(intent);s['business']=b
     manage=intent in ('cancel','modify')
     has_data=bool(u) or bool(parsed.get('time_expression') or parsed.get('meal') or parsed.get('selection') or parsed.get('clear_fields'))
     cleared=set(parsed.get('clear_fields') or [])

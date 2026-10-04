@@ -79,7 +79,7 @@ class MixedIntentTests(FlowBase):
         reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text,
                                  {'intent': 'availability', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
         self.assertEqual(st.get('phase'), 'inquiry')
-        self.assertIn('tengo disponibilidad', reply.lower())
+        self.assertIn('1. 13:30', reply); self.assertIn('2. 21:00', reply)
         self.assertNoSideEffects()
 
     def test_interpreter_failure_does_not_guess_availability_from_phrases(self):
@@ -94,7 +94,7 @@ class MixedIntentTests(FlowBase):
                                   {'intent': 'create', 'updates': {'reservation_date': '2030-10-07', 'party_size': 4}})
         self.assertEqual(st2['values'], {'reservation_date': '2030-10-07', 'party_size': 4})
         self.assertEqual(st2['intent'], 'create')
-        self.assertIn('Tengo disponibilidad', reply); self.assertNotIn('Volviendo a tu reserva', reply)
+        self.assertIn('tengo estas opciones', reply); self.assertNotIn('Volviendo a tu reserva', reply)
         self.assertNoSideEffects()
 
     def test_independent_availability_intent_is_a_detour(self):
@@ -114,7 +114,7 @@ class MixedIntentTests(FlowBase):
         self.assertIn('¿Para cuántas personas?', reply)
         self.assertNotIn('Volviendo a tu reserva', reply)
         reply, st = self.env.say(st, '2 personas', {'intent': 'create', 'updates': {'party_size': 2}})
-        self.assertIn('Tengo disponibilidad', reply)
+        self.assertIn('tengo estas opciones', reply)
         self.assertIn('2030-10-07', st['values']['reservation_date'])
         self.assertEqual(st['intent'], 'create')
         self.assertNoSideEffects()

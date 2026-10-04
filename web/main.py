@@ -180,7 +180,7 @@ def converse(b,channel,customer,text,external_id,include_end_reason=False):
 @app.get('/')
 def home():return jsonify(name='AI Reservas Core',status='running',version='integracion-piloto+twilio-diag1')
 @app.get('/health')
-def health():return jsonify(status='OK',tenant_mode=MODE,relay_enabled=bool(os.getenv('RELAY_VOICE_URL')),booking_test_mode=os.getenv('BOOKING_TEST_MODE','false').lower()=='true')
+def health():return jsonify(status='OK',tenant_mode=MODE,relay_enabled=bool(os.getenv('RELAY_VOICE_URL')),booking_test_mode=os.getenv('BOOKING_TEST_MODE','false').lower()=='true',restaurant_agent_enabled=os.getenv('RESTAURANT_AGENT','false').strip().lower()=='true')
 @app.get('/booking-health')
 def booking_health():
   if not authorized():return jsonify(status='Unauthorized'),401

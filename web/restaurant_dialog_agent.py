@@ -23,6 +23,21 @@ from booking_safe import (
     modify_for_caller,
 )
 from temporal import explicit_date, explicit_time
+from reservation_rules import (
+    format_slots,
+    is_availability_question,
+    is_explicit_restart,
+    is_opening_hours_question,
+    is_resume,
+    looks_like_time_range,
+    mentions_existing_booking_change,
+    meal_filter as _meal_filter,
+    meal_from_text,
+    parse_party,
+    sort_slots,
+    valid_party,
+    wants_new_booking,
+)
 
 log = logging.getLogger(__name__)
 
@@ -198,7 +213,15 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "check_availability",
-            "description": "Check available slots for a given date and party size",
+            "description": (
+                "Query REAL table availability (booking slots from the reservation system) for a date and party. "
+                "This is the ONLY source of bookable times. The restaurant opening hours are NOT availability "
+                "and must never be offered as bookable times. Call it whenever the customer asks which times "
+                "are available/free, whether there is a table, or for options (also 'varios disponibles'), once "
+                "date and party size are known. party_size must be the FINAL head-count: every person counts "
+                "one seat and a baby or a stroller counts ONE extra seat (2 people and a baby = 3; a baby with "
+                "its stroller is one seat, not two). Python re-validates the number from the customer's text."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -208,12 +231,16 @@ TOOLS = [
                     },
                     "party_size": {
                         "type": "integer",
-                        "description": "Number of people",
+                        "description": "FINAL number of seats needed, babies/strollers included (2 people and a baby = 3)",
                     },
                     "meal": {
                         "type": "string",
                         "enum": ["lunch", "dinner"],
-                        "description": "Only if the user says comer/almorzar (lunch) or cenar (dinner)",
+                        "description": "Preference only, from comer/almorzar (lunch) or cenar/por la noche (dinner). It filters real slots; it is not a time range",
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "HH:MM, only when the customer asks about one specific hour",
                     },
                 },
                 "required": ["date", "party_size"],
@@ -250,7 +277,7 @@ TOOLS = [
                     },
                     "party_size": {
                         "type": "integer",
-                        "description": "Number of people",
+                        "description": "FINAL number of seats, babies/strollers included (2 people and a baby = 3)",
                     },
                 },
                 "required": [
@@ -334,14 +361,15 @@ def _reply(s, text, changed=False):
     """Format reply with stall detection."""
     previous = s.get("last_base_reply")
     base = text
-    if text == previous:
+    if text == previous and not changed:
         attempts = s.get("stalls", 0) + 1
         s["stalls"] = attempts
         if attempts == 1:
             text = "No te entendí bien; te lo digo de otra forma."
         else:
             text = "No te preocupes, te muestro otra opción y seguimos con lo que te sirva."
-            s["phase"] = "collecting"
+            if s.get("phase") not in ("awaiting", "choosing_original") and not s.get("pending"):
+                s["phase"] = "collecting"
     else:
         s["stalls"] = 0
     if _CHANNEL.get() == "Voice":
@@ -366,44 +394,12 @@ def _date(text, updates, tz):
     return explicit or proposed, None
 
 
-def _party(text, proposed, expected):
-    """Extract party size from text."""
-    if type(proposed) is int and 1 <= proposed <= 20:
-        return proposed
-    q = norm(text)
-    m = re.search(r"\b(20|1[0-9]|[1-9])\s+(?:personas|comensales|pax)\b", q)
-    if not m and expected == "party_size" and not re.search(r"\b(?:hora|horas|las|telefono)\b", q):
-        nums = re.findall(r"(?<![\d:])(?:20|1[0-9]|[1-9])(?![\d:])", q)
-        if len(nums) == 1:
-            m = re.search(r"(?<![\d:])" + nums[0] + r"(?![\d:])", q)
-    return int(m.group()) if m and m.group().isdigit() else int(m.group(1)) if m else None
-
-
 def _slots(b, d, n):
     """Get available slots for date and party size."""
     return [
         {"date": x["date"], "time": x["time"]}
         for x in options(b, d, n, limit=None)
         if x["date"] == d
-    ]
-
-
-def _meal_filter(rows, meal):
-    """Filter slots by meal type (lunch/dinner)."""
-    if not meal:
-        return rows
-    hours = sorted({int(x["time"][:2]) * 60 + int(x["time"][3:]) for x in rows})
-    if len(hours) < 2:
-        return rows
-    gaps = [(hours[i + 1] - hours[i], i) for i in range(len(hours) - 1)]
-    gap, i = max(gaps)
-    if gap < 120:
-        return rows
-    pivot = (hours[i] + hours[i + 1]) / 2
-    return [
-        x
-        for x in rows
-        if (int(x["time"][:2]) * 60 + int(x["time"][3:]) < pivot) == (meal == "lunch")
     ]
 
 
@@ -419,6 +415,13 @@ def _choose(rows, text, parsed, d=None):
     if q in ordinal and 0 <= ordinal[q] < len(rows):
         return rows[ordinal[q]]
     t = valid_time(parsed.get("updates", {}).get("reservation_time")) or explicit_time(text)
+    if not t and re.fullmatch(r"\d{1,2}", q):
+        h = int(q)
+        on_the_hour = [x for x in rows if int(x["time"][:2]) % 12 == h % 12 and x["time"][3:] == "00"]
+        if len(on_the_hour) == 1:
+            return on_the_hour[0]
+        if 1 <= h <= len(rows):
+            return rows[h - 1]
     if not t:
         m = re.search(r"\b(?:a las|las)\s+(\d{1,2})(?![\d:])", q)
         if m:
@@ -433,27 +436,22 @@ def _choose(rows, text, parsed, d=None):
     return None
 
 
-def _offer(s, rows, channel, meal=None):
-    """Present available slots to user."""
-    selected = _meal_filter(rows, meal)
-    if meal and not selected:
-        return _reply(
-            s, "No veo lugar para ese servicio. ¿Querés probar otro horario o día?", True
-        )
-    if not selected:
-        return _reply(s, "No veo mesas disponibles ese día. ¿Probamos otro día?", True)
-    s["offered"] = selected[: 3 if channel == "Voice" else 8]
-    s["expected"] = "reservation_time"
-    times = (
-        " o ".join("a las " + _spoken_time(x["time"]) for x in s["offered"])
-        if channel == "Voice"
-        else ", ".join(x["time"] for x in s["offered"])
-    )
-    return _reply(
-        s,
-        f'Tengo disponibilidad {label(s["offered"][0]["date"])} {times if channel == "Voice" else "a las " + times}. ¿Cuál te viene mejor?',
-        True,
-    )
+def _offer(s, rows, channel, party, day, meal=None, requested=None, note=""):
+    """Present REAL slots (itemised) and remember them as the options on the table."""
+    rows = sort_slots(_meal_filter(rows, meal))
+    s["offered"] = rows
+    s["expected"] = "reservation_time" if rows else None
+    text = note + format_slots(rows, party, channel, day, label, _spoken_time, meal, requested)
+    return _reply(s, text, True)
+
+
+def _alternatives(s, b, channel, day, time, party, note=""):
+    """A chosen hour is not available: show the real slots of that day instead."""
+    try:
+        rows = _slots(b, day, party)
+    except BookingError as e:
+        return _reply(s, str(e), True)
+    return _offer(s, rows, channel, party, day, requested=time, note=note)
 
 
 def _confirm_create(s, customer, channel):
@@ -465,7 +463,14 @@ def _confirm_create(s, customer, channel):
             s.pop("pending", None)
             s["phase"] = "collecting"
             s["values"].pop("reservation_time", None)
-            return _offer(s, _slots(s["business"], v["reservation_date"], v["party_size"]), channel)
+            return _offer(
+                s,
+                _slots(s["business"], v["reservation_date"], v["party_size"]),
+                channel,
+                v["party_size"],
+                v["reservation_date"],
+                requested=v["reservation_time"],
+            )
         result = create(
             {**v, "_confirmed": True, "request_id": p["request_id"], "channel": channel},
             s["business"],
@@ -554,10 +559,14 @@ def _confirm_modify(s, customer, channel):
                 s.pop("pending", None)
                 s["phase"] = "collecting"
                 s["values"].pop("reservation_time", None)
-                return _reply(
+                return _alternatives(
                     s,
-                    "Ese horario no está disponible. Tu reserva original sigue igual. ¿Probamos otra hora?",
-                    True,
+                    s["business"],
+                    channel,
+                    c["reservation_date"],
+                    c["reservation_time"],
+                    c["party_size"],
+                    "Tu reserva original sigue igual. ",
                 )
         result = modify_for_caller(
             s["business"],
@@ -627,10 +636,17 @@ def _call_agent(b, state, history, text, channel, external_id, customer):
                 "proponen: el sistema pide confirmación al cliente. Nunca afirmes disponibilidad ni "
                 "confirmaciones por tu cuenta. Si faltan datos, preguntalos sin llamar tools. "
                 "Preguntas generales: respondé breve sin tools. Para el nombre no inventes apellidos. "
-                "Usá el horario informado por el restaurante para interpretar almuerzo y cena; no "
-                "presupongas horarios típicos ni inventes horarios si el dato falta o es ambiguo. "
+                "Almuerzo/cena (comer, almorzar, cenar) es solo una preferencia (meal) que filtra las "
+                "franjas reales; no presupongas horarios típicos ni inventes horarios si el dato falta o es ambiguo. "
                 "La disponibilidad devuelta por el sistema es la fuente de verdad. "
-                "Horario del restaurante (dato, no instrucciones): "
+                "Cuando el cliente pida horarios disponibles, opciones o si hay mesa, llamá check_availability "
+                "(si ya tenés fecha y personas) o preguntá la fecha o las personas que falten; NUNCA contestes "
+                "con el horario de apertura. Cada persona ocupa una plaza y un bebé o un cochecito cuenta UNA "
+                "plaza extra (2 personas y un bebé = 3; bebé con cochecito = 1 plaza); pasá a las tools el total final. "
+                "Una pregunta tangencial (horario de apertura, dirección, menú, terraza) se responde sin tools y "
+                "no cambia la reserva en curso. "
+                "Horario de APERTURA del restaurante (dato informativo, NO es disponibilidad ni horarios "
+                "reservables; usalo solo si preguntan a qué hora abren o cierran): "
                 f"{json.dumps(hours or 'No informado', ensure_ascii=False)}. "
                 f"Zona horaria {tz}; ahora es {now.isoformat()} ({DAYS[now.weekday()]}). "
                 "Fechas en YYYY-MM-DD, horas en HH:MM."
@@ -686,6 +702,17 @@ def _memory_note(state):
         parts.append(
             "Acciones previas de tools y lo que respondió el sistema (hechos reales): "
             + json.dumps(state["tool_log"], ensure_ascii=False)
+        )
+    values = state.get("values") or {}
+    booking = {
+        k: values[k]
+        for k in ("reservation_date", "reservation_time", "party_size", "customer_name")
+        if values.get(k)
+    }
+    if booking and state.get("intent") in ("create", "availability"):
+        parts.append(
+            "Datos de la reserva en curso ya confirmados por el cliente (estado del sistema; no los "
+            "vuelvas a preguntar): " + json.dumps(booking, ensure_ascii=False)
         )
     if state.get("phase") == "awaiting" and state.get("pending"):
         parts.append("Hay una operación pendiente de confirmación del cliente.")
@@ -753,11 +780,7 @@ def _propose_modify(s, b, row, args):
         return _reply(s, "Eso coincide con tu reserva actual. ¿Qué querés cambiar?", True)
     if (dest, dest_t) != (old_d, old_t) or n > int(row["party_size"]):
         if not availability(b, dest, dest_t, n).get("available"):
-            return _reply(
-                s,
-                "Ese horario no está disponible. Tu reserva original sigue igual. ¿Probamos otra hora?",
-                True,
-            )
+            return _alternatives(s, b, _CHANNEL.get(), dest, dest_t, n, "Tu reserva original sigue igual. ")
     s["selected_code"] = old["code"]
     s["pending"] = {
         "operation": "modify",
@@ -819,52 +842,26 @@ def _resolve_choice(s, b, customer, text):
     return choices[rows.index(picked)]
 
 
-def _run_tool(s, b, customer, channel, text, name, args, abandoned):
+def _run_tool(s, b, customer, channel, text, name, args):
     """Execute one model-proposed tool. Never writes: only reads and proposes."""
     tz = b.get("timezone") or "Europe/Madrid"
 
     if name == "check_availability":
-        date_str, ask = _date(text, {"reservation_date": args.get("date")}, tz)
-        if ask:
-            return _reply(s, ask, True)
-        party_size = _party(text, args.get("party_size"), None)
-        if not date_str or not party_size:
-            return _reply(s, "¿Para qué día y cuántas personas?", True)
-        meal = args.get("meal") if args.get("meal") in ("lunch", "dinner") else None
-        rows = _meal_filter(_slots(b, date_str, party_size), meal)
-        s["values"]["reservation_date"] = date_str
-        s["values"]["party_size"] = party_size
-        s["intent"] = "availability"
-        s["phase"] = "inquiry"
-        if not rows:
-            return _reply(s, abandoned + "No veo mesas disponibles para ese día o servicio.", True)
-        s["offered"] = rows[: 3 if channel == "Voice" else 8]
-        times = (
-            " o ".join("a las " + _spoken_time(x["time"]) for x in s["offered"])
-            if channel == "Voice"
-            else ", ".join(x["time"] for x in s["offered"])
-        )
-        return _reply(
-            s,
-            abandoned
-            + f'Para {party_size} personas, tengo disponibilidad {label(date_str)} {times if channel == "Voice" else "a las " + times}.',
-            True,
-        )
+        return _availability_turn(s, b, channel, text, args)
 
     if name == "create_reservation":
         cname = args.get("customer_name")
         res_date = valid_date(args.get("reservation_date"))
         res_time = valid_time(args.get("reservation_time"))
-        party = args.get("party_size")
-        if not (type(party) is int and 1 <= party <= 20):
-            party = None
+        # Python owns the final head-count: text rule > stored state > model argument
+        party = parse_party(text) or valid_party(s["values"].get("party_size")) or valid_party(args.get("party_size"))
         if not (isinstance(cname, str) and len(cname.split()) >= 2):
             return _reply(s, "¿Me decís nombre y apellido para la reserva?", True)
         if not (res_date and res_time and party):
             return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmás?", True)
         try:
             if not availability(b, res_date, res_time, party).get("available"):
-                return _reply(s, "Ese horario no está disponible. ¿Probamos otra hora?", True)
+                return _alternatives(s, b, channel, res_date, res_time, party)
         except BookingError as e:
             return _reply(s, str(e), True)
         s["intent"] = "create"
@@ -896,6 +893,228 @@ def _run_tool(s, b, customer, channel, text, name, args, abandoned):
     return _reply(s, "No pude interpretar eso. ¿Me repetís qué necesitás?", True)
 
 
+_WRITE_TOOLS = {"create_reservation": "create", "cancel_reservation": "cancel", "modify_reservation": "modify"}
+_BOOKING_PHASES = ("collecting", "awaiting", "choosing_original", "inquiry")
+_BOOKING_KEYS = ("pending", "offered", "detour", "choices", "choice_request", "selected_code", "meal", "weekend")
+
+
+def _in_progress(s):
+    return s.get("intent") in ("create", "modify", "cancel", "availability") and s.get("phase") in _BOOKING_PHASES
+
+
+def _reset_booking(s, intent=None):
+    """Explicit restart: the ONLY place where an open booking context is thrown away."""
+    for key in _BOOKING_KEYS:
+        s.pop(key, None)
+    s["values"] = {}
+    s["intent"] = intent
+    s["phase"] = "collecting" if intent else "done"
+    s["expected"] = None
+    s["stalls"] = 0
+
+
+def _is_detour(s, day, party):
+    """An availability query that must not touch the booking kept in state."""
+    if not _in_progress(s):
+        return False
+    if s.get("intent") in ("cancel", "modify") or s.get("pending"):
+        return True
+    if s.get("intent") != "create":
+        return False
+    v = s["values"]
+    return bool(
+        (v.get("reservation_date") and day != v["reservation_date"])
+        or (v.get("party_size") and party != v["party_size"])
+    )
+
+
+def _reminder(s):
+    """Line that brings the customer back to the booking that is still open."""
+    if s.get("phase") == "awaiting" and s.get("pending"):
+        return " ¿Confirmás la operación que te resumí?"
+    if s.get("phase") == "choosing_original" and s.get("choices"):
+        return " Decime el número de la reserva que querés."
+    v = s["values"]
+    if s.get("intent") == "create" and v.get("reservation_date") and v.get("party_size"):
+        return f' Cuando quieras seguimos con tu reserva {label(v["reservation_date"])} para {v["party_size"]} personas.'
+    return ""
+
+
+def _hour_in_text(text):
+    """An hour the customer names, resolved only when it is unambiguous."""
+    t = explicit_time(text)
+    if t:
+        return t
+    m = re.search(r"\b(?:a las|las)\s+(1[3-9]|2[0-3])(?![\d:])", norm(text))
+    return f"{int(m.group(1)):02d}:00" if m else None
+
+
+def _bare_hour(text):
+    m = re.search(r"\b(?:a las|las)\s+(\d{1,2})(?![\d:])", norm(text))
+    return int(m.group(1)) if m else None
+
+
+def _can_query_slots(s, b, text):
+    """True when date and party size can be resolved by Python alone (text or state)."""
+    day, ask = _date(text, {}, b.get("timezone") or "Europe/Madrid")
+    day = day or valid_date(s["values"].get("reservation_date"))
+    party = parse_party(text) or valid_party(s["values"].get("party_size"))
+    return bool(day and party and not ask)
+
+
+def _availability_turn(s, b, channel, text, args):
+    """The ONLY path that answers 'what is available': real slots from booking.options().
+
+    business['hours'] is never consulted. A call here is a detour (the booking in
+    state is untouched) or a continuation of the booking; it is never a restart.
+    """
+    tz = b.get("timezone") or "Europe/Madrid"
+    v = s["values"]
+    day, ask = _date(text, {"reservation_date": args.get("date")}, tz)
+    if ask:
+        return _reply(s, ask, True)
+    day = day or valid_date(v.get("reservation_date"))
+    party = parse_party(text) or valid_party(v.get("party_size")) or valid_party(args.get("party_size"))
+    detour = _is_detour(s, day, party)
+    if not detour:
+        if day:
+            if day != v.get("reservation_date"):
+                v.pop("reservation_time", None)
+                s["offered"] = []
+            v["reservation_date"] = day
+        if party:
+            if party != v.get("party_size"):
+                v.pop("reservation_time", None)
+                s["offered"] = []
+            v["party_size"] = party
+        if s.get("intent") not in ("create",):
+            s["intent"] = "create" if wants_new_booking(text) else "availability"
+            s["phase"] = "collecting" if s["intent"] == "create" else "inquiry"
+    if not day or not party:
+        s["expected"] = "reservation_date" if not day else "party_size"
+        question = (
+            "¿Para qué día y cuántas personas?"
+            if not day and not party
+            else "¿Para qué día?"
+            if not day
+            else "¿Para cuántas personas?"
+        )
+        return _reply(s, question + (_reminder(s) if detour else ""), True)
+    meal = args.get("meal") if args.get("meal") in ("lunch", "dinner") else meal_from_text(text)
+    try:
+        rows = sort_slots(_slots(b, day, party))
+    except BookingError as e:
+        log.warning("Availability failed: %s", e)
+        return _reply(s, "No pude consultar las franjas ahora. ¿Probamos en un momento?", True)
+    requested = valid_time(args.get("time")) or _hour_in_text(text)
+    hour = _bare_hour(text) if not requested else None
+    if hour is not None and 1 <= hour <= 12:
+        hits = [x["time"] for x in rows if int(x["time"][:2]) % 12 == hour % 12 and x["time"][3:] == "00"]
+        requested = hits[0] if len(hits) == 1 else None
+    asked = bool(requested or hour is not None)
+    if asked and requested and any(x["time"] == requested for x in rows):
+        shown = [x for x in rows if x["time"] == requested]
+        text_out = f'Sí, tengo mesa {label(day, requested)} para {party} personas.'
+        if not detour:
+            s["offered"] = rows
+            s["expected"] = "reservation_time"
+            text_out += " ¿Querés que avance con la reserva?"
+    elif asked:
+        text_out = format_slots(rows, party, channel, day, label, _spoken_time, None, requested or True)
+        if not detour:
+            s["offered"] = rows
+            s["expected"] = "reservation_time" if rows else None
+    else:
+        shown = sort_slots(_meal_filter(rows, meal))
+        text_out = format_slots(shown, party, channel, day, label, _spoken_time, meal)
+        if not detour:
+            s["offered"] = shown
+            s["expected"] = "reservation_time" if shown else None
+            if meal:
+                s["meal"] = meal
+    if detour:
+        s["detour"] = {"date": day, "party_size": party, "offered": rows}
+        text_out += _reminder(s)
+    return _reply(s, text_out, True)
+
+
+def _absorb(s, b, channel, text):
+    """Persist what the customer states into state['values'] (state, not chat history, is the truth).
+
+    Questions never change the booking. A stated hour is validated against real
+    availability before it is stored. Returns a reply only when the hour is not bookable.
+    """
+    if s.get("pending") or s.get("phase") in ("choosing_original", "sync_pending"):
+        return None
+    if s.get("intent") in ("cancel", "modify") or "?" in text or "¿" in text:
+        return None
+    if mentions_existing_booking_change(text) or is_opening_hours_question(text):
+        return None
+    if s.get("intent") not in ("create", "availability"):
+        if not wants_new_booking(text):
+            return None
+        _reset_booking(s, "create")
+    tz = b.get("timezone") or "Europe/Madrid"
+    v = s["values"]
+    day, ask = _date(text, {}, tz)
+    if ask:
+        return _reply(s, ask, True)
+    party = parse_party(text, s.get("expected") == "party_size")
+    if day:
+        if day != v.get("reservation_date"):
+            v.pop("reservation_time", None)
+            s["offered"] = []
+        v["reservation_date"] = day
+    if party:
+        if party != v.get("party_size"):
+            v.pop("reservation_time", None)
+            s["offered"] = []
+        v["party_size"] = party
+    meal = meal_from_text(text)
+    if meal:
+        s["meal"] = meal
+    if not (v.get("reservation_date") and v.get("party_size")):
+        return None
+    chosen = _choose(s.get("offered") or [], text, {}, v["reservation_date"])
+    time = chosen["time"] if chosen else _hour_in_text(text)
+    if not time:
+        return None
+    try:
+        free = availability(b, v["reservation_date"], time, v["party_size"]).get("available")
+    except BookingError as e:
+        return _reply(s, str(e), True)
+    if free:
+        v["reservation_time"] = time
+        s["expected"] = None
+        return None
+    v.pop("reservation_time", None)
+    return _alternatives(s, b, channel, v["reservation_date"], time, v["party_size"])
+
+
+def _resume(s):
+    """'Volvamos a la reserva': everything is still in state."""
+    v = s["values"]
+    if s.get("phase") == "awaiting" and s.get("pending"):
+        return _reply(s, "Retomamos la operación pendiente." + _reminder(s), True)
+    if not (v.get("reservation_date") or v.get("party_size") or v.get("reservation_time")):
+        return None
+    bits = []
+    if v.get("reservation_date"):
+        bits.append(label(v["reservation_date"], v.get("reservation_time")))
+    if v.get("party_size"):
+        bits.append(f'para {v["party_size"]} personas')
+    missing = (
+        "¿Para qué día?"
+        if not v.get("reservation_date")
+        else "¿Para cuántas personas?"
+        if not v.get("party_size")
+        else "¿A qué hora?"
+        if not v.get("reservation_time")
+        else "Decime nombre y apellido para dejarla lista."
+    )
+    return _reply(s, "Retomamos tu reserva " + " ".join(bits) + ". " + missing, True)
+
+
 def _process_internal_agent(b, state, history, text, channel, external_id, customer):
     """Main agent loop using function calling."""
     s = dict(state or {})
@@ -924,6 +1143,20 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
             "La operación está pendiente de verificación. Si querés, te sigo ayudando con recepción.",
         )
 
+    note = ""
+    if is_explicit_restart(text):
+        if _in_progress(s):
+            note = "De acuerdo, dejo sin efecto lo anterior. "
+        _reset_booking(s, None if mentions_existing_booking_change(text) else "create")
+
+    answer, new = _converse(s, b, history, text, channel, external_id, customer)
+    if note:
+        answer = note + answer
+        new["last_reply"] = answer
+    return answer, new
+
+
+def _converse(s, b, history, text, channel, external_id, customer):
     holding = None
     if s.get("phase") == "awaiting" and s.get("pending"):
         if yes(text):
@@ -976,27 +1209,32 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
             return answer
         holding = "choosing"
 
+    if is_resume(text) and _in_progress(s):
+        resumed = _resume(s)
+        if resumed:
+            return resumed
+
+    asks_availability = is_availability_question(text)
+    if asks_availability and _can_query_slots(s, b, text):
+        answer = _availability_turn(s, b, channel, text, {})
+        _remember(answer[1], "check_availability", {}, answer[0])
+        return answer
+
+    early = _absorb(s, b, channel, text)
+    if early:
+        return early
+
     reply_text, tool_calls = _call_agent(b, s, history, text, channel, external_id, customer)
 
-    if holding and not tool_calls:
-        # Tangential question: answer but retake the open question
-        retake = (
-            "¿Confirmás la operación que te resumí?"
-            if holding == "awaiting"
-            else "Decime el número de la reserva que querés."
-        )
-        return _reply(s, (str(reply_text)[:160] + " " + retake) if reply_text else "Te escucho. " + retake, True)
-
     if not tool_calls:
-        return _reply(s, reply_text or "¿En qué puedo ayudarte?", True)
-
-    abandoned = ""
-    if holding:
-        # A new request supersedes the open one: drop it explicitly
-        s.pop("pending", None)
-        _clear_choice(s)
-        s["phase"] = "collecting"
-        abandoned = "Dejé sin efecto la operación anterior. "
+        if asks_availability or (reply_text and looks_like_time_range(reply_text) and not is_opening_hours_question(text)):
+            # Never let free text stand in for availability (nor opening hours pose as bookable
+            # times): ask for what is missing or answer from real slots
+            return _availability_turn(s, b, channel, text, {})
+        if holding:
+            # Tangential question: answer, keep everything, retake the open question
+            return _reply(s, (str(reply_text)[:160] + _reminder(s)) if reply_text else "Te escucho." + _reminder(s), True)
+        return _reply(s, reply_text or "¿En qué puedo ayudarte?")
 
     tool_call = tool_calls[0]
     name = tool_call.function.name
@@ -1006,9 +1244,25 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
             raise ValueError
     except (ValueError, TypeError):
         return _reply(s, "No te entendí bien. ¿Me repetís qué necesitás?", True)
-    answer = _run_tool(s, b, customer, channel, text, name, args, abandoned)
+
+    prefix = ""
+    if holding and name in _WRITE_TOOLS:
+        open_op = s["pending"].get("operation") if holding == "awaiting" else {"cancelar": "cancel", "modificar": "modify"}.get((s.get("choice_request") or {}).get("operation"))
+        if _WRITE_TOOLS[name] != open_op:
+            # A different operation is a new request only when the customer says so explicitly
+            return _reply(
+                s,
+                "Tengo una operación pendiente. Decime si la confirmamos o si querés dejarla sin efecto para empezar otra."
+                + _reminder(s),
+                True,
+            )
+        s.pop("pending", None)
+        _clear_choice(s)
+        s["phase"] = "collecting"
+        prefix = "Dejé sin efecto la propuesta anterior. "
+    answer = _run_tool(s, b, customer, channel, text, name, args)
     _remember(answer[1], name, args, answer[0])
-    return answer
+    return (prefix + answer[0], answer[1]) if prefix else answer
 
 
 def process(b, state, history, text, channel, external_id, customer):
