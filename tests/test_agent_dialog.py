@@ -81,11 +81,25 @@ def test_meal_filter_lunch_dinner():
     assert [r['time'] for r in mod._meal_filter(rows,'lunch')]==['13:00','13:30','14:00']
     assert [r['time'] for r in mod._meal_filter(rows,'dinner')]==['21:00','21:30']
 
+def test_date_ignores_stale_weekend_state():
+    mod,_=load()
+    expected=mod.explicit_date('sábado','Europe/Madrid')
+    assert mod._date('sábado',{},'Europe/Madrid')==(expected,None)
+
 def test_availability_applies_meal_filter():
     rows=[{'date':'2030-05-01','time':t} for t in ('13:00','14:00','21:00','22:00')]
     mod,calls=load([tc('check_availability',{'date':'2030-05-01','party_size':2,'meal':'dinner'})],rows=rows)
     reply,st=run(mod,calls,BIZ,{},[],'cena el 1','WhatsApp','s1','+34600')
     assert [x['time'] for x in st['offered']]==['21:00','22:00']
+
+def test_call_agent_uses_business_hours_for_meal_context():
+    mod,calls=load(content='hola')
+    business={**BIZ,'hours':'Lun-Dom 12:00-15:00 y 19:00-23:00'}
+    run(mod,calls,business,{},[],'¿hay lugar para comer?','WhatsApp','s1','+34600')
+    system=calls[0]['messages'][0]['content']
+    assert business['hours'] in system
+    assert 'no presupongas horarios típicos' in system
+    assert 'La disponibilidad devuelta por el sistema es la fuente de verdad' in system
 
 def test_history_keys_are_used():
     mod,calls=load(content='hola')

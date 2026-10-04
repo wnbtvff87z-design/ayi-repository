@@ -66,9 +66,19 @@ class InterpreterTests(unittest.TestCase):
 
     def test_valid_json_is_normalised(self):
         out = self._run(json.dumps({'intent': 'availability', 'updates': {'customer_name': None, 'party_size': 2},
+                                    'clear_fields': ['reservation_date', 'unknown'],
                                     'requested_times': [], 'meal': None, 'time_expression': None, 'selection': None,
                                     'reply': '', 'needs_clarification': False}))
         self.assertEqual(out['intent'], 'availability'); self.assertEqual(out['updates'], {'party_size': 2})
+        self.assertEqual(out['clear_fields'], ['reservation_date'])
+
+    def test_prompt_uses_context_for_greetings_corrections_and_booking_continuity(self):
+        self._run(json.dumps({'intent': 'greeting', 'updates': {}, 'clear_fields': []}))
+        system = self.env.openai_client.chat.completions.create.call_args.kwargs['messages'][0]['content']
+        self.assertIn("usa greeting para iniciar o retomar amablemente", system)
+        self.assertIn("conserva intent=create", system)
+        self.assertIn("incluye el campo en clear_fields", system)
+        self.assertIn("No uses frases gatillo ni reglas literales", system)
 
     def test_malformed_json_raises(self):
         with self.assertRaises(ValueError):
@@ -76,8 +86,10 @@ class InterpreterTests(unittest.TestCase):
 
     def test_validate_rejects_untrusted_values(self):
         v = self.m.validate_parsed({'intent': 'drop_tables', 'updates': {'party_size': 999, 'customer_name': 5, 'evil': 'x',
-                                    'reservation_date': ' 2030-10-06 '}, 'meal': 'brunch', 'selection': True, 'reply': 7})
+                                    'reservation_date': ' 2030-10-06 '}, 'clear_fields': ['password', 'reservation_time'],
+                                    'meal': 'brunch', 'selection': True, 'reply': 7})
         self.assertEqual(v['intent'], 'other'); self.assertEqual(v['updates'], {'reservation_date': '2030-10-06'})
+        self.assertEqual(v['clear_fields'], ['reservation_time'])
         self.assertIsNone(v['meal']); self.assertIsNone(v['selection']); self.assertEqual(v['reply'], '')
         with self.assertRaises(ValueError):
             self.m.validate_parsed(['not', 'a', 'dict'])

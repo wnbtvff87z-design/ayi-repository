@@ -38,9 +38,21 @@ class SocialClosureTests(FlowBase):
         reply, st = self.env.say(self.done_state(), 'ahí quedó todo clarísimo, un abrazo grande', {'intent': 'social'})
         self.assertEqual(st['phase'], 'closed'); self.assertEqual(self.env.interpreted, ['ahí quedó todo clarísimo, un abrazo grande'])
 
-    def test_offline_fallback_still_closes_plain_farewell(self):
+    def test_interpreter_failure_does_not_guess_a_farewell(self):
         reply, st = self.env.say(self.done_state(), 'gracias, chau', None)
-        self.assertEqual(st['phase'], 'closed')
+        self.assertIn('No pude interpretar', reply)
+        self.assertNotEqual(st.get('phase'), 'closed')
+
+    def test_greetings_are_classified_and_do_not_close_the_conversation(self):
+        state = {'intent': 'create', 'phase': 'collecting', 'values': dict(CREATE_STATE_VALUES)}
+        reply, st = self.env.say(state, 'Hola, buenas',
+                                 {'intent': 'greeting', 'reply': '¡Hola! ¿En qué puedo ayudarte?'})
+        self.assertIn('¿En qué puedo ayudarte?', reply)
+        self.assertNotEqual(st.get('phase'), 'closed')
+        self.assertEqual(st['values'], CREATE_STATE_VALUES)
+        reply, st = self.env.say({}, 'Hola, buenas', None)
+        self.assertIn('No pude interpretar', reply)
+        self.assertNotEqual(st.get('phase'), 'closed')
 
     def test_farewell_midbooking_keeps_collected_data(self):
         _, st = self.start_booking()
@@ -62,22 +74,62 @@ class MixedIntentTests(FlowBase):
         self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('13:30', reply); self.assertIn('21:00', reply)
         self.assertEqual(st['phase'], 'inquiry'); self.assertNoSideEffects()
 
-    def test_mixed_turn_not_closed_even_if_model_says_social(self):
+    def test_interpreter_classifies_mixed_turn_as_operational(self):
         text = 'gracias, chau, pero antes decime si tenías horarios para el domingo'
-        reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text, {'intent': 'social'})
-        self.assertNotEqual(st.get('phase'), 'closed')
+        reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text,
+                                 {'intent': 'availability', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
+        self.assertEqual(st.get('phase'), 'inquiry')
+        self.assertIn('tengo disponibilidad', reply.lower())
+        self.assertNoSideEffects()
 
-    def test_mixed_turn_with_interpreter_down_still_answers_availability(self):
+    def test_interpreter_failure_does_not_guess_availability_from_phrases(self):
         reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}},
                                  'gracias, chau, pero antes decime si tenías horarios para el domingo', None)
-        self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('cuántas personas', reply); self.assertEqual(st['intent'], 'availability'); self.assertNoSideEffects()
+        self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('No pude interpretar', reply)
+        self.assertNotEqual(st.get('intent'), 'availability'); self.assertNoSideEffects()
 
-    def test_availability_question_during_booking_keeps_state_and_resumes(self):
+    def test_agent_classifies_booking_followup_and_keeps_reservation_context(self):
         _, st = self.start_booking()
-        reply, st2 = self.env.say(st, 'che, ¿y tenés horarios libres para el lunes?',
-                                  {'intent': 'availability', 'updates': {'reservation_date': '2030-10-07', 'party_size': 4}})
-        self.assertEqual(st2['values'], CREATE_STATE_VALUES); self.assertEqual(st2['intent'], 'create')
-        self.assertIn('Volviendo a tu reserva', reply); self.assertNoSideEffects()
+        reply, st2 = self.env.say(st, '¿Y para el 7 de octubre de 2030 qué horarios hay?',
+                                  {'intent': 'create', 'updates': {'reservation_date': '2030-10-07', 'party_size': 4}})
+        self.assertEqual(st2['values'], {'reservation_date': '2030-10-07', 'party_size': 4})
+        self.assertEqual(st2['intent'], 'create')
+        self.assertIn('Tengo disponibilidad', reply); self.assertNotIn('Volviendo a tu reserva', reply)
+        self.assertNoSideEffects()
+
+    def test_independent_availability_intent_is_a_detour(self):
+        _, state = self.start_booking()
+        reply, updated = self.env.say(state, '¿Hay una consulta independiente para otra fecha?',
+                                      {'intent': 'availability', 'updates': {'reservation_date': '2030-10-07',
+                                                                            'party_size': 2}})
+        self.assertIn('Volviendo a tu reserva', reply)
+        self.assertEqual(updated['intent'], 'create')
+        self.assertEqual(updated['values'], CREATE_STATE_VALUES)
+        self.assertNoSideEffects()
+
+    def test_availability_during_new_booking_stays_in_same_booking_flow(self):
+        _, st = self.env.say({}, 'Quería reservar', {'intent': 'create'})
+        reply, st = self.env.say(st, 'Para el 7 de octubre de 2030, tenés algo?',
+                                 {'intent': 'create', 'updates': {'reservation_date': '2030-10-07'}})
+        self.assertIn('¿Para cuántas personas?', reply)
+        self.assertNotIn('Volviendo a tu reserva', reply)
+        reply, st = self.env.say(st, '2 personas', {'intent': 'create', 'updates': {'party_size': 2}})
+        self.assertIn('Tengo disponibilidad', reply)
+        self.assertIn('2030-10-07', st['values']['reservation_date'])
+        self.assertEqual(st['intent'], 'create')
+        self.assertNoSideEffects()
+
+    def test_interpreter_clear_fields_retracts_stale_date_and_time(self):
+        state = {'intent': 'create', 'phase': 'collecting',
+                 'values': {'reservation_date': '2030-10-06', 'party_size': 2,
+                            'reservation_time': '21:00'},
+                 'offered': [{'date': '2030-10-06', 'time': '21:00'}]}
+        reply, st = self.env.say(state, 'Eso no era lo que quise decir.',
+                                 {'intent': 'create', 'clear_fields': ['reservation_date']})
+        self.assertIn('¿Para qué día querés la mesa?', reply)
+        self.assertNotIn('reservation_date', st['values'])
+        self.assertNotIn('reservation_time', st['values'])
+        self.assertEqual(st['expected'], 'reservation_date')
 
 
 class DetourTests(FlowBase):
@@ -211,7 +263,7 @@ class ConfirmationSafetyTests(FlowBase):
 
     def test_interpreter_failure_never_writes(self):
         reply, st = self.env.say({}, 'quiero reservar', None)
-        self.assertIn('No entendí', reply); self.assertNoSideEffects()
+        self.assertIn('No pude interpretar', reply); self.assertNoSideEffects()
 
     def test_disabled_business_never_touches_tools(self):
         self.env.business['allow_reservations'] = False
