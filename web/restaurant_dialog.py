@@ -31,6 +31,9 @@ def _goodbye(text):
     words=re.sub(r'[^a-z\s]',' ',norm(text)).split()
     return bool(words) and len(words)<=8 and all(w in _FAREWELL_WORDS for w in words) and any(w in ('gracias','chau','chao','adios','luego','pronto','vemos','saludos') for w in words)
 
+def _greeting(text):
+    return bool(re.fullmatch(r'(?:hola(?:\s+buenas?)?|buenas(?:\s+(?:dias|tardes|noches))?|buenos\s+dias)',norm(text).strip(' .,!¡?¿')))
+
 def availability_request(text):
     q=norm(text)
     if re.search(r'\b(?:disponib|horario|horas?|dias?|días?|dia|día).*\b(?:libre|disponible|tenes|tene[s]|ocupado)?\b',q):
@@ -359,12 +362,20 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     except Exception:
         log.exception('Interpretation unavailable')
         if _goodbye(text):parsed={'intent':'social','updates':{},'reply':'','meal':None,'time_expression':None,'selection':None}
+        elif _greeting(text):parsed={'intent':'social','updates':{},'reply':'','meal':None,'time_expression':None,'selection':None}
         elif availability_request(q) and not manage:parsed={'intent':'availability','updates':{},'reply':'','meal':None,'time_expression':None,'selection':None}
         else:return _reply(s,'No entendí bien ese mensaje. No hice cambios; ¿me lo repetís de otra forma?')
     u=parsed.get('updates') or {};intent=parsed.get('intent')
     has_data=bool(u) or bool(parsed.get('time_expression') or parsed.get('meal') or parsed.get('selection'))
+    if not has_data and _greeting(text):
+        return _reply(s,'¡Hola! ¿En qué puedo ayudarte?',True)
     if intent=='social' and not has_data and not _OPERATIONAL.search(q) and not explicit_date(text,tz) and not explicit_time(text):
         return _closure(s)
+    if s.get('intent')=='create' and _in_progress(s) and re.search(r'\bno\s+(?:te\s+)?dije\s+(?:el\s+)?dia\b',q) and not explicit_date(text,tz):
+        for key in ('reservation_date','requested_dates','reservation_time'):s['values'].pop(key,None)
+        s['offered']=[]
+        s['expected']='reservation_date'
+        return _reply(s,'Perdón, ¿para qué día querés la mesa?',True)
     if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. Si querés, te sigo ayudando con recepción.')
     if s.get('phase')=='stalled':
         s['phase']='collecting';s['stalls']=0
@@ -412,7 +423,10 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
                 suffix=(' para ese horario' if valid_time(u.get('reservation_time')) or explicit_time(text) else '')
                 return _reply(booking,'¿Cuál de esos días preferís'+suffix+' para la reserva?',True)
             return _create(booking,text,parsed,channel,tz,customer)
-    if intent=='availability' and not manage:
+    if intent=='availability' and not manage and s.get('intent')=='create' and _in_progress(s):
+        intent='create'
+        parsed['intent']='create'
+    elif intent=='availability' and not manage:
         if _in_progress(s) and re.search(r'\b(?:disponib\w*|horarios?|libres?|tenes|tenias|tienen|tienes|hay)\b',q):
             detour=fresh('availability');detour['business']=b
             answer,_=_availability_only(detour,text,parsed,channel,tz)
