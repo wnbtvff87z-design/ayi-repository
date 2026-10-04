@@ -68,12 +68,13 @@ def test_awaiting_tangent_single_call_and_keeps_pending():
     reply,st=run(mod,calls,BIZ,state,[],'¿a qué hora abren?','WhatsApp','s1','+34600')
     assert len(calls)==1 and 'pending' in st and '¿Confirmás' in reply
 
-def test_awaiting_new_tool_drops_pending_and_says_so():
+def test_awaiting_independent_availability_keeps_pending():
     rows=[{'date':'2030-05-01','time':'21:00'}]
     mod,calls=load([tc('check_availability',{'date':'2030-05-01','party_size':2})],rows=rows)
-    state={'phase':'awaiting','pending':{'operation':'create','values':{}}}
+    pending={'operation':'create','values':{}}
+    state={'phase':'awaiting','intent':'create','pending':pending}
     reply,st=run(mod,calls,BIZ,state,[],'¿y el miércoles?','WhatsApp','s1','+34600')
-    assert len(calls)==1 and 'pending' not in st and 'sin efecto' in reply
+    assert len(calls)==1 and st['pending']==pending and st['phase']=='awaiting' and '¿Confirmás' in reply
 
 def test_meal_filter_lunch_dinner():
     mod,_=load()
@@ -95,7 +96,7 @@ def test_availability_applies_meal_filter():
 def test_call_agent_uses_business_hours_for_meal_context():
     mod,calls=load(content='hola')
     business={**BIZ,'hours':'Lun-Dom 12:00-15:00 y 19:00-23:00'}
-    run(mod,calls,business,{},[],'¿hay lugar para comer?','WhatsApp','s1','+34600')
+    run(mod,calls,business,{},[],'¿tenéis terraza?','WhatsApp','s1','+34600')
     system=calls[0]['messages'][0]['content']
     assert business['hours'] in system
     assert 'no presupongas horarios típicos' in system
