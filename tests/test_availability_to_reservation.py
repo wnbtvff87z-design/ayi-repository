@@ -89,7 +89,7 @@ def parse(business, state, history, text):
     if re.fullmatch(r"\d{9}", text):
         updates["customer_phone"] = text
     return {
-        "intent": "create" if updates.get("reservation_date") or updates.get("reservation_time") else "availability",
+        "intent": "create" if state.get("intent") == "create" or updates.get("reservation_date") or updates.get("reservation_time") else "availability",
         "updates": updates,
         "reply": "",
         "meal": None,
