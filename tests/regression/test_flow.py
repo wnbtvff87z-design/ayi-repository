@@ -308,3 +308,14 @@ class SuperAgentTests(FlowBase):
                                  {'intent': 'create', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
         self.assertIn('Paella', reply); self.assertEqual(st['intent'], 'create'); self.assertEqual(st['values'], CREATE_STATE_VALUES)
         self.assertNoSideEffects()
+
+    def test_mixed_unknown_question_gets_polite_reply_and_keeps_booking(self):
+        reply, st = self.env.say({}, '¿Tenéis parking? Quería reservar para 2 el 6 de octubre de 2030',
+                                 {'intent': 'create', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'},
+                                  'reply': 'Ahora mismo no tengo ese dato a mano; puedes confirmarlo con el restaurante.'})
+        self.assertIn('no tengo ese dato', reply); self.assertEqual(st['values'], CREATE_STATE_VALUES)
+        self.assertNoSideEffects()
+
+    def test_prompt_does_not_announce_country(self):
+        mod = self.env.interpret_mod
+        self.assertNotIn('en España', mod.PRINCIPLES + mod.FEW_SHOT)

@@ -436,6 +436,8 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         if s['intent'] in ('cancel','modify'):answer,new=_manage(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid',customer)
         else:answer,new=_create(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid',customer)
         side=_business_info(b,q) if intent=='create' and u and s['intent']=='create' else None
+        if not side and intent=='create' and u and s['intent']=='create' and re.search(r'[?¿]',text):
+            side=str(parsed.get('reply') or '').strip()[:220] or None  # model reply is limited to business info or a polite "no data"
         if side:  # mixed turn: answer the trusted business question without losing the booking
             answer=side+' '+answer
             if _CHANNEL.get()=='Voice':answer=_voice_text(answer)

@@ -27,26 +27,26 @@ PRINCIPLES=(
     "y normaliza al esquema. Si un dato sigue siendo dudoso, no lo inventes: déjalo en null y usa needs_clarification o time_expression. "
     "Lo que no entra en el esquema (cochecito, trona, alergias) no se pierde: menciónalo en reply como aclaración a confirmar, sin afirmar que está resuelto. "
     "3) Multi-intención: si el cliente mezcla una consulta operativa con datos de reserva, captura los datos en updates y la intención de reserva en intent, "
-    "y pon la respuesta a la duda solo en reply (solo con datos del negocio; si no los tenés, di que lo consultás, sin inventar). "
+    "y pon la respuesta a la duda solo en reply (solo con datos del negocio). Si el dato que preguntan (parking, terraza, etc.) no figura en los datos del negocio, no lo inventes ni lo niegues: di con amabilidad que no tienes ese dato a mano y que pueden confirmarlo con el restaurante, y sigue con la reserva. Nunca menciones el país ni la ubicación salvo que te lo pregunten. "
     "Una duda nunca reinicia ni borra la reserva en curso, y no uses clear_fields por una pregunta. "
-    "4) Habla informal: el restaurante está en España, así que interpreta primero el español peninsular y tolera variantes latinoamericanas. "
+    "4) Habla informal: interpreta primero el español peninsular (el del cliente) y tolera variantes latinoamericanas. "
     "'¿Tenéis un hueco?', 'hay sitio', '¿os queda mesa?', '¿tenéis mesa libre?', 'echar un bocado', 'reservar una mesita' expresan consulta de disponibilidad o reserva; "
     "'a la hora de cenar', 'por la noche', 'a la noche' implican meal=dinner y 'a mediodía', 'a la hora de comer', 'a la hora del almuerzo' implican meal=lunch: "
     "deja reservation_time en null y la frase en time_expression, porque la hora exacta la define el restaurante según su horario. "
-    "Horas en España: 'sobre las nueve', 'las nueve y media', 'las nueve menos cuarto', 'las veintiuna' son horas normales; 'a las 9/10' para cenar equivale a 21:00/22:00 y 'a las 2' para comer a 14:00 si el contexto lo indica. "
+    "Horas habituales: 'sobre las nueve', 'las nueve y media', 'las nueve menos cuarto', 'las veintiuna' son horas normales; 'a las 9/10' para cenar equivale a 21:00/22:00 y 'a las 2' para comer a 14:00 si el contexto lo indica. "
     "'Somos unos cuantos', 'somos un montón', 'vamos en grupo', 'somos una cuadrilla' no son una cantidad: party_size=null, needs_clarification=true y pide la cantidad exacta en reply, conservando fecha y hora ya dadas. "
     "Interpreta estos modismos por significado, no por coincidencia literal. "
     "Antes de responder, razona internamente el orden cronológico del mensaje y devuelve solo el JSON final. "
 )
 
 FEW_SHOT=(
-    "EJEMPLOS (las fechas son ilustrativas; calculá las reales con 'ahora'). "
+    "EJEMPLOS (las fechas son ilustrativas; calcula las reales con 'ahora'). "
     "Ejemplo A, autocorrección en el mismo turno:\n"+_ex('Mesa para 4, no perdón, seremos 3 a las 8... o mejor a las 9 de la noche',
         {'intent':'create','updates':{**_NULLS,'party_size':3,'reservation_time':'21:00'},'clear_fields':[],'requested_times':[],'meal':'dinner','time_expression':None,'selection':None,'reply':'','needs_clarification':False})+"\n"
     "Ejemplo B, voz ruidosa con modismos (canal Voz, sin puntuación):\n"+_ex('hola queria un hueco para el sabado somos dos grandes y un carrito a las nuevas',
         {'intent':'create','updates':{**_NULLS,'reservation_date':'2030-10-12','reservation_time':'21:00','party_size':2},'clear_fields':[],'requested_times':[],'meal':'dinner','time_expression':'a las nuevas','selection':None,'reply':'Anoto 2 adultos y un cochecito; lo confirmo con el restaurante.','needs_clarification':False})+"\n"
     "Ejemplo C, pregunta de menú/alergias en medio de una confirmación (estado con fecha, hora, personas y nombre ya cargados):\n"+_ex('espera, ¿el menú tiene opciones sin gluten? soy celíaca',
-        {'intent':'question','updates':dict(_NULLS),'clear_fields':[],'requested_times':[],'meal':None,'time_expression':None,'selection':None,'reply':'Puedo informarte lo que figura en el menú del restaurante; para alergias confirmalo con el local.','needs_clarification':False})+"\n"
+        {'intent':'question','updates':dict(_NULLS),'clear_fields':[],'requested_times':[],'meal':None,'time_expression':None,'selection':None,'reply':'Puedo informarte lo que figura en el menú del restaurante; para alergias confírmalo con el local.','needs_clarification':False})+"\n"
     "(nada se borra: la reserva sigue pendiente de confirmación).\n"
 )
 
@@ -79,7 +79,7 @@ def interpret(business,state,history,text):
     if not key:raise RuntimeError('OPENAI_API_KEY no configurada')
     tz=business.get('timezone') or 'Europe/Madrid'
     instructions=(
-        "Eres el intérprete de un recepcionista de un restaurante en España (español peninsular, tuteo, hora de Madrid por defecto). Extrae la intención principal del turno actual y los datos expresados en ese mensaje. "
+        "Eres el intérprete de un recepcionista de restaurante (español peninsular, tuteo). Extrae la intención principal del turno actual y los datos expresados en ese mensaje. "
         "No uses listas cerradas de palabras ni reglas fijas. Interpreta por contexto y semántica. "
         "Intent es la acción principal; usa greeting para iniciar o retomar amablemente la conversación, social para despedidas, "
         "y no confundas un saludo con un cierre. "
