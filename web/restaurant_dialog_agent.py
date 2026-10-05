@@ -25,6 +25,7 @@ from booking_safe import (
 from temporal import explicit_date, explicit_time
 from reservation_rules import (
     format_slots,
+    spoken_time as _spoken_time,
     is_availability_question,
     is_explicit_restart,
     is_opening_hours_question,
@@ -116,12 +117,6 @@ def _words(n):
     )
 
 
-def _spoken_time(value):
-    """Format time as spoken Spanish."""
-    h, m = map(int, value.split(":"))
-    return _words(h) + ((" y " + _words(m)) if m else "")
-
-
 def _voice_text(text):
     """Convert text for voice output."""
     text = re.sub(
@@ -134,9 +129,10 @@ def _voice_text(text):
         text,
     )
     text = re.sub(
-        r"(?<!\d)([01]\d|2[0-3]):([0-5]\d)(?!\d)",
-        lambda m: _spoken_time(m.group(0)),
+        r"(?<!\d)(?:(a|de|desde|hasta|sobre)\s+(?:las?\s+)?)?([01]\d|2[0-3]):([0-5]\d)(?!\d)",
+        lambda m: (m.group(1) + " " if m.group(1) else "") + _spoken_time(m.group(2) + ":" + m.group(3)),
         text,
+        flags=re.I,
     )
     return text.replace(", ", ". ")
 
@@ -160,7 +156,7 @@ def label(d, t=None):
         else f"el {DAYS[x.weekday()]} {x.day}/{x.month}"
     )
     return (
-        day + (f" a las {_spoken_time(t)}" if _CHANNEL.get() == "Voice" and t else "")
+        day + (f" a {_spoken_time(t)}" if _CHANNEL.get() == "Voice" and t else "")
         if t and _CHANNEL.get() == "Voice"
         else (day + (f" a las {t}" if t else ""))
     )
@@ -388,7 +384,7 @@ def _date(text, updates, tz):
     """Extract date from user input."""
     q = norm(text)
     if re.search(r"\bsabado\b", q) and re.search(r"\bdomingo\b", q):
-        return None, "¿Preferís sábado o domingo?"
+        return None, "¿Prefieres sábado o domingo?"
     explicit = explicit_date(text, tz)
     proposed = valid_date(updates.get("reservation_date"))
     return explicit or proposed, None
@@ -479,7 +475,7 @@ def _confirm_create(s, customer, channel):
             s["phase"] = "sync_pending"
             return _reply(
                 s,
-                "La operación requiere verificación, pero no la repitas. Si querés, te sigo ayudando paso a paso.",
+                "La operación requiere verificación, pero no la repitas. Si quieres, te sigo ayudando paso a paso.",
                 True,
             )
         msg = "Listo, la reserva quedó registrada."
@@ -489,7 +485,7 @@ def _confirm_create(s, customer, channel):
         s["phase"] = "sync_pending"
         return _reply(
             s,
-            "No pude confirmar el resultado todavía. No hicimos cambios; si querés, te ayudo a intentar otra alternativa.",
+            "No pude confirmar el resultado todavía. No hicimos cambios; si quieres, te ayudo a intentar otra alternativa.",
             True,
         )
 
@@ -518,7 +514,7 @@ def _confirm_cancel(s, customer, channel):
             s["phase"] = "sync_pending"
             return _reply(
                 s,
-                "La operación requiere verificación, pero no la repitas. Si querés, te sigo ayudando paso a paso.",
+                "La operación requiere verificación, pero no la repitas. Si quieres, te sigo ayudando paso a paso.",
                 True,
             )
         msg = "Listo, cancelé esa reserva."
@@ -528,7 +524,7 @@ def _confirm_cancel(s, customer, channel):
         s["phase"] = "sync_pending"
         return _reply(
             s,
-            "No pude confirmar el resultado todavía. No hicimos cambios; si querés, te ayudo a intentar otra alternativa.",
+            "No pude confirmar el resultado todavía. No hicimos cambios; si quieres, te ayudo a intentar otra alternativa.",
             True,
         )
 
@@ -581,7 +577,7 @@ def _confirm_modify(s, customer, channel):
             s["phase"] = "sync_pending"
             return _reply(
                 s,
-                "La operación requiere verificación, pero no la repitas. Si querés, te sigo ayudando paso a paso.",
+                "La operación requiere verificación, pero no la repitas. Si quieres, te sigo ayudando paso a paso.",
                 True,
             )
         msg = "Listo, cambié esa reserva."
@@ -591,7 +587,7 @@ def _confirm_modify(s, customer, channel):
         s["phase"] = "sync_pending"
         return _reply(
             s,
-            "No pude confirmar el resultado todavía. No hicimos cambios; si querés, te ayudo a intentar otra alternativa.",
+            "No pude confirmar el resultado todavía. No hicimos cambios; si quieres, te ayudo a intentar otra alternativa.",
             True,
         )
 
@@ -630,23 +626,23 @@ def _call_agent(b, state, history, text, channel, external_id, customer):
         {
             "role": "system",
             "content": (
-                "Eres el asistente de reservas de un restaurante. Ayudás a consultar disponibilidad "
+                "Eres el asistente de reservas de un restaurante. Ayudas a consultar disponibilidad "
                 "(check_availability), crear (create_reservation), cancelar (cancel_reservation) y "
                 "modificar (modify_reservation) reservas. Las tools de crear/cancelar/modificar solo "
                 "proponen: el sistema pide confirmación al cliente. Nunca afirmes disponibilidad ni "
-                "confirmaciones por tu cuenta. Si faltan datos, preguntalos sin llamar tools. "
-                "Preguntas generales: respondé breve sin tools. Para el nombre no inventes apellidos. "
+                "confirmaciones por tu cuenta. Si faltan datos, pregúntalos sin llamar tools. "
+                "Preguntas generales: responde breve sin tools. Para el nombre no inventes apellidos. "
                 "Almuerzo/cena (comer, almorzar, cenar) es solo una preferencia (meal) que filtra las "
                 "franjas reales; no presupongas horarios típicos ni inventes horarios si el dato falta o es ambiguo. "
                 "La disponibilidad devuelta por el sistema es la fuente de verdad. "
-                "Cuando el cliente pida horarios disponibles, opciones o si hay mesa, llamá check_availability "
-                "(si ya tenés fecha y personas) o preguntá la fecha o las personas que falten; NUNCA contestes "
+                "Cuando el cliente pida horarios disponibles, opciones o si hay mesa, llama check_availability "
+                "(si ya tienes fecha y personas) o pregunta la fecha o las personas que falten; NUNCA contestes "
                 "con el horario de apertura. Cada persona ocupa una plaza y un bebé o un cochecito cuenta UNA "
-                "plaza extra (2 personas y un bebé = 3; bebé con cochecito = 1 plaza); pasá a las tools el total final. "
+                "plaza extra (2 personas y un bebé = 3; bebé con cochecito = 1 plaza); pasa a las tools el total final. "
                 "Una pregunta tangencial (horario de apertura, dirección, menú, terraza) se responde sin tools y "
                 "no cambia la reserva en curso. "
                 "Horario de APERTURA del restaurante (dato informativo, NO es disponibilidad ni horarios "
-                "reservables; usalo solo si preguntan a qué hora abren o cierran): "
+                "reservables; úsalo solo si preguntan a qué hora abren o cierran): "
                 f"{json.dumps(hours or 'No informado', ensure_ascii=False)}. "
                 f"Zona horaria {tz}; ahora es {now.isoformat()} ({DAYS[now.weekday()]}). "
                 "Fechas en YYYY-MM-DD, horas en HH:MM."
@@ -706,7 +702,7 @@ def _memory_note(state):
     values = state.get("values") or {}
     booking = {
         k: values[k]
-        for k in ("reservation_date", "reservation_time", "party_size", "customer_name")
+        for k in ("reservation_date", "reservation_time", "party_size", "customer_name", "customer_email")
         if values.get(k)
     }
     if booking and state.get("intent") in ("create", "availability"):
@@ -741,7 +737,7 @@ def _ask_which(s, rows, verb, args):
         + ", ".join(
             f'{i}. {label(c["date"], c["time"])}' for i, c in enumerate(s["choices"], 1)
         )
-        + f". ¿Cuál querés {verb}?",
+        + f". ¿Cuál quieres {verb}?",
         True,
     )
 
@@ -764,7 +760,7 @@ def _propose_cancel(s, row):
     s["expected"] = None
     return _reply(
         s,
-        f'Voy a cancelar la reserva {label(old["date"], old["time"])}. ¿Confirmás?',
+        f'Voy a cancelar la reserva {label(old["date"], old["time"])}. ¿Confirmas?',
         True,
     )
 
@@ -777,7 +773,7 @@ def _propose_modify(s, b, row, args):
     new_party = args.get("new_party_size")
     n = new_party if type(new_party) is int and 1 <= new_party <= 20 else int(row["party_size"])
     if (dest, dest_t, n) == (old_d, old_t, int(row["party_size"])):
-        return _reply(s, "Eso coincide con tu reserva actual. ¿Qué querés cambiar?", True)
+        return _reply(s, "Eso coincide con tu reserva actual. ¿Qué quieres cambiar?", True)
     if (dest, dest_t) != (old_d, old_t) or n > int(row["party_size"]):
         if not availability(b, dest, dest_t, n).get("available"):
             return _alternatives(s, b, _CHANNEL.get(), dest, dest_t, n, "Tu reserva original sigue igual. ")
@@ -793,7 +789,7 @@ def _propose_modify(s, b, row, args):
     s["expected"] = None
     return _reply(
         s,
-        f'Tu reserva actual es {label(old_d, old_t)}. La cambiaría a {label(dest, dest_t)} para {n} personas. ¿Confirmás?',
+        f'Tu reserva actual es {label(old_d, old_t)}. La cambiaría a {label(dest, dest_t)} para {n} personas. ¿Confirmas?',
         True,
     )
 
@@ -855,10 +851,25 @@ def _run_tool(s, b, customer, channel, text, name, args):
         res_time = valid_time(args.get("reservation_time"))
         # Python owns the final head-count: text rule > stored state > model argument
         party = parse_party(text) or valid_party(s["values"].get("party_size")) or valid_party(args.get("party_size"))
+        email = str(args.get("customer_email") or "").strip().lower()
+        email = email if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) else ""
+        # Keep what the customer already gave (never overwrite it with an empty value) so it is not asked twice
+        known = s.setdefault("values", {})
+        if isinstance(cname, str) and cname.strip():
+            known["customer_name"] = cname.strip()
+        if email:
+            known["customer_email"] = email
+        email = email or str(known.get("customer_email") or "")
+        cname = cname if isinstance(cname, str) and len(cname.split()) >= 2 else known.get("customer_name")
         if not (isinstance(cname, str) and len(cname.split()) >= 2):
-            return _reply(s, "¿Me decís nombre y apellido para la reserva?", True)
+            first = (cname or "").split()[0] if isinstance(cname, str) and cname.strip() else ""
+            return _reply(s, f"Gracias, {first}. ¿Y tu apellido?" if first else "¿Me dices nombre y apellido para la reserva?", True)
         if not (res_date and res_time and party):
-            return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmás?", True)
+            return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmas?", True)
+        if not email:
+            return _reply(s, "Perfecto. ¿Qué correo dejamos para la reserva?", True)
+        if len(re.sub(r"\D", "", str(customer or ""))) < 9:
+            return _reply(s, "¿Qué teléfono dejamos para la reserva?", True)
         try:
             if not availability(b, res_date, res_time, party).get("available"):
                 return _alternatives(s, b, channel, res_date, res_time, party)
@@ -868,7 +879,7 @@ def _run_tool(s, b, customer, channel, text, name, args):
         s["values"] = {
             "customer_name": cname,
             "customer_phone": customer,  # identity comes from the caller, never from the model
-            "customer_email": args.get("customer_email", ""),
+            "customer_email": email,
             "reservation_date": res_date,
             "reservation_time": res_time,
             "party_size": party,
@@ -890,7 +901,7 @@ def _run_tool(s, b, customer, channel, text, name, args):
         verb = "cancel" if name == "cancel_reservation" else "modify"
         return _propose_existing(s, b, customer, verb, args, args.get("customer_name"))
 
-    return _reply(s, "No pude interpretar eso. ¿Me repetís qué necesitás?", True)
+    return _reply(s, "No pude interpretar eso. ¿Me repites qué necesitas?", True)
 
 
 _WRITE_TOOLS = {"create_reservation": "create", "cancel_reservation": "cancel", "modify_reservation": "modify"}
@@ -931,9 +942,9 @@ def _is_detour(s, day, party):
 def _reminder(s):
     """Line that brings the customer back to the booking that is still open."""
     if s.get("phase") == "awaiting" and s.get("pending"):
-        return " ¿Confirmás la operación que te resumí?"
+        return " ¿Confirmas la operación que te resumí?"
     if s.get("phase") == "choosing_original" and s.get("choices"):
-        return " Decime el número de la reserva que querés."
+        return " Dime el número de la reserva que quieres."
     v = s["values"]
     if s.get("intent") == "create" and v.get("reservation_date") and v.get("party_size"):
         return f' Cuando quieras seguimos con tu reserva {label(v["reservation_date"])} para {v["party_size"]} personas.'
@@ -1018,7 +1029,7 @@ def _availability_turn(s, b, channel, text, args):
         if not detour:
             s["offered"] = rows
             s["expected"] = "reservation_time"
-            text_out += " ¿Querés que avance con la reserva?"
+            text_out += " ¿Quieres que avance con la reserva?"
     elif asked:
         text_out = format_slots(rows, party, channel, day, label, _spoken_time, None, requested or True)
         if not detour:
@@ -1110,7 +1121,7 @@ def _resume(s):
         if not v.get("party_size")
         else "¿A qué hora?"
         if not v.get("reservation_time")
-        else "Decime nombre y apellido para dejarla lista."
+        else "Dime nombre y apellido para dejarla lista."
     )
     return _reply(s, "Retomamos tu reserva " + " ".join(bits) + ". " + missing, True)
 
@@ -1127,7 +1138,7 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
     if _goodbye(text):
         if s.get("phase") == "sync_pending":
             return (
-                "La operación sigue pendiente de verificación. Si querés, seguimos con recepción. Hasta luego.",
+                "La operación sigue pendiente de verificación. Si quieres, seguimos con recepción. Hasta luego.",
                 s,
             )
         if s.get("phase") == "awaiting":
@@ -1135,12 +1146,12 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
                 "De acuerdo, no hice cambios. ¡Hasta luego!",
                 {"phase": "closed", "intent": None, "values": {}},
             )
-        return "¡Gracias a vos! Hasta luego.", {"phase": "closed", "intent": None, "values": {}}
+        return "¡Gracias a ti! Hasta luego.", {"phase": "closed", "intent": None, "values": {}}
 
     if s.get("phase") == "sync_pending":
         return _reply(
             s,
-            "La operación está pendiente de verificación. Si querés, te sigo ayudando con recepción.",
+            "La operación está pendiente de verificación. Si quieres, te sigo ayudando con recepción.",
         )
 
     note = ""
@@ -1171,14 +1182,14 @@ def _converse(s, b, history, text, channel, external_id, customer):
             s.pop("pending", None)
             s["phase"] = "done"
             s["intent"] = None
-            return _reply(s, "De acuerdo, no hice cambios. ¿Necesitás algo más?", True)
+            return _reply(s, "De acuerdo, no hice cambios. ¿Necesitas algo más?", True)
         holding = "awaiting"
     elif s.get("phase") == "choosing_original" and s.get("choices"):
         if no(text):
             _clear_choice(s)
             s["phase"] = "done"
             s["intent"] = None
-            return _reply(s, "De acuerdo, no hice cambios. ¿Necesitás algo más?", True)
+            return _reply(s, "De acuerdo, no hice cambios. ¿Necesitas algo más?", True)
         choice = _resolve_choice(s, b, customer, text)
         if choice:
             request = s.get("choice_request") or {}
@@ -1243,7 +1254,7 @@ def _converse(s, b, history, text, channel, external_id, customer):
         if not isinstance(args, dict):
             raise ValueError
     except (ValueError, TypeError):
-        return _reply(s, "No te entendí bien. ¿Me repetís qué necesitás?", True)
+        return _reply(s, "No te entendí bien. ¿Me repites qué necesitas?", True)
 
     prefix = ""
     if holding and name in _WRITE_TOOLS:
@@ -1252,7 +1263,7 @@ def _converse(s, b, history, text, channel, external_id, customer):
             # A different operation is a new request only when the customer says so explicitly
             return _reply(
                 s,
-                "Tengo una operación pendiente. Decime si la confirmamos o si querés dejarla sin efecto para empezar otra."
+                "Tengo una operación pendiente. Dime si la confirmamos o si quieres dejarla sin efecto para empezar otra."
                 + _reminder(s),
                 True,
             )

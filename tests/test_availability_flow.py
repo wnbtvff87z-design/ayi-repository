@@ -140,7 +140,7 @@ def test_reserve_without_date_asks_the_day_and_does_not_leak_hours():
     assert h.state['values']['party_size'] == 2 and h.state['intent'] == 'create'
 
 
-@pytest.mark.parametrize('question', ['¿Qué horarios tenéis disponibles?', '¿A qué hora puedo reservar?', 'Decime los disponibles',
+@pytest.mark.parametrize('question', ['¿Qué horarios tenéis disponibles?', '¿A qué hora puedo reservar?', 'Dime los disponibles',
                                       '¿Qué horarios hay para cenar?'])
 def test_availability_question_without_date_asks_instead_of_answering_with_hours(question):
     h = Harness(['21:00'], [f'Abrimos {HOURS}. Podés reservar entre 20:00 y 23:00'])
@@ -197,7 +197,7 @@ def test_requested_hour_available_is_confirmed_from_slots():
 def test_varios_disponibles_de_noche_filters_real_slots_only():
     h = Harness(['13:00', '13:30', '20:30', '21:00', '21:30', '22:00'])
     h.state = booking_state(h)
-    reply = h.say('Decime vos los varios disponibles de noche.')
+    reply = h.say('Dime vos los varios disponibles de noche.')
     assert '1. 20:30\n2. 21:00\n3. 21:30\n4. 22:00' in reply and '13:00' not in reply
     assert not h.llm_calls
 
@@ -240,7 +240,7 @@ def test_awaiting_tangent_keeps_pending(question):
     h.state = awaiting_state(h)
     pending = dict(h.state['pending'])
     reply = h.say(question)
-    assert h.state['pending'] == pending and h.state['phase'] == 'awaiting' and '¿Confirmás' in reply
+    assert h.state['pending'] == pending and h.state['phase'] == 'awaiting' and '¿Confirmas' in reply
 
 
 def test_many_consecutive_tangents_lose_nothing():
@@ -270,7 +270,7 @@ def test_awaiting_independent_availability_keeps_pending_and_yes_confirms_origin
     h.state = awaiting_state(h)
     pending = dict(h.state['pending'])
     reply = h.say('¿Y el miércoles hay disponibilidad para 4?')
-    assert h.state['pending'] == pending and h.state['phase'] == 'awaiting' and '¿Confirmás' in reply
+    assert h.state['pending'] == pending and h.state['phase'] == 'awaiting' and '¿Confirmas' in reply
     assert not h.writes
     reply = h.say('sí')
     assert len(h.writes) == 1 and h.writes[0]['reservation_time'] == '21:00' and h.writes[0]['party_size'] == 3

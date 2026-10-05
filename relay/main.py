@@ -90,9 +90,9 @@ async def relay_ended(req:Request):
  if not isinstance(payload,dict):payload={}
  reason=payload.get('reason','')
  if reason=='goodbye':
-  message='¡Gracias a vos! Hasta luego.'
+  message='¡Gracias a ti! Hasta luego.'
  elif reason=='verification':
-  message='La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.'
+  message='La operación sigue pendiente de verificación. No la repitas; consulta con recepción. Hasta luego.'
  elif reason=='cancelled':
   message='De acuerdo, no hice cambios. ¡Hasta luego!'
  else:
@@ -135,9 +135,9 @@ async def websocket(ws:WebSocket):
      end_reason=out.get('end_reason') if out.get('end_call') is True else None
      state['processed_ids'].add(external_id)
      if not reply:continue
-    except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contactá con recepción.'
+    except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contacta con recepción.'
     if end_reason not in ('goodbye','cancelled','verification'):
-     end_reason={'¡Gracias a vos! Hasta luego.':'goodbye','De acuerdo, no hice cambios. ¡Hasta luego!':'cancelled','La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.':'verification'}.get(reply)
+     end_reason={'¡Gracias a ti! Hasta luego.':'goodbye','De acuerdo, no hice cambios. ¡Hasta luego!':'cancelled','La operación sigue pendiente de verificación. No la repitas; consulta con recepción. Hasta luego.':'verification'}.get(reply)
     # Do not synthesize the goodbye over WebSocket and then end immediately:
     # Twilio's signed <Connect action> callback speaks it once, then hangs up.
     if end_reason:

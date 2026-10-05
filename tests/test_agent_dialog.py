@@ -51,11 +51,21 @@ def test_no_legacy_openai_api():
     assert 'ChatCompletion' not in (WEB/'restaurant_dialog_agent.py').read_text()
 
 def test_create_only_proposes_and_uses_caller_phone():
-    mod,calls=load([tc('create_reservation',{'customer_name':'Ana Pérez','customer_phone':'+999','customer_email':'','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
-    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600')
+    mod,calls=load([tc('create_reservation',{'customer_name':'Ana Pérez','customer_phone':'+999','customer_email':'ana@x.es','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
+    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600123456')
     assert st['phase']=='awaiting' and st['pending']['operation']=='create'
-    assert st['values']['customer_phone']=='+34600'
+    assert st['values']['customer_phone']=='+34600123456' and st['values']['customer_email']=='ana@x.es'
     assert '¿La confirmo?' in reply
+
+def test_create_without_valid_email_asks_for_it_and_keeps_name():
+    mod,calls=load([tc('create_reservation',{'customer_name':'Ana Pérez','customer_phone':'','customer_email':'no-es-correo','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
+    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600123456')
+    assert 'pending' not in st and 'correo' in reply and st['values']['customer_name']=='Ana Pérez'
+
+def test_create_with_single_name_asks_surname_and_remembers_first_name():
+    mod,calls=load([tc('create_reservation',{'customer_name':'Ana','customer_phone':'','customer_email':'a@x.es','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
+    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600123456')
+    assert 'pending' not in st and 'apellido' in reply and st['values']['customer_name']=='Ana'
 
 def test_create_rejects_incomplete_data():
     mod,calls=load([tc('create_reservation',{'customer_name':'Ana','reservation_date':'mañana','reservation_time':'x','party_size':2})])
@@ -66,7 +76,7 @@ def test_awaiting_tangent_single_call_and_keeps_pending():
     mod,calls=load(content='Abrimos a las 20.')
     state={'phase':'awaiting','pending':{'operation':'create','values':{}}}
     reply,st=run(mod,calls,BIZ,state,[],'¿a qué hora abren?','WhatsApp','s1','+34600')
-    assert len(calls)==1 and 'pending' in st and '¿Confirmás' in reply
+    assert len(calls)==1 and 'pending' in st and '¿Confirmas' in reply
 
 def test_awaiting_independent_availability_keeps_pending():
     rows=[{'date':'2030-05-01','time':'21:00'}]
@@ -74,7 +84,7 @@ def test_awaiting_independent_availability_keeps_pending():
     pending={'operation':'create','values':{}}
     state={'phase':'awaiting','intent':'create','pending':pending}
     reply,st=run(mod,calls,BIZ,state,[],'¿y el miércoles?','WhatsApp','s1','+34600')
-    assert len(calls)==1 and st['pending']==pending and st['phase']=='awaiting' and '¿Confirmás' in reply
+    assert len(calls)==1 and st['pending']==pending and st['phase']=='awaiting' and '¿Confirmas' in reply
 
 def test_meal_filter_lunch_dinner():
     mod,_=load()
@@ -120,7 +130,7 @@ def test_multiple_reservations_ask_then_pick_then_confirm_cancel():
     writes=[]
     mod,calls=load([tc('cancel_reservation',{'customer_name':'Ana Pérez'})],reservations=RES,writes=writes)
     reply,st=run(mod,calls,BIZ,{},[],'cancelá mi reserva','WhatsApp','s1','+34600')
-    assert st['phase']=='choosing_original' and len(st['choices'])==2 and '¿Cuál querés cancelar?' in reply
+    assert st['phase']=='choosing_original' and len(st['choices'])==2 and '¿Cuál quieres cancelar?' in reply
     n=len(calls)
     reply,st=run(mod,calls,BIZ,st,[],'la segunda','WhatsApp','s1','+34600')
     assert len(calls)==n  # resolved in Python, no model call

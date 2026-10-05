@@ -60,11 +60,10 @@ def parse_party(text, expected=False):
     for a, b in sorted(baby_spans + stroller_spans + child_spans, reverse=True):
         rest = rest[:a] + ' ' + rest[b:]
     base = None
-    for pattern in _BASE_PATTERNS:
-        m = pattern.search(rest)
-        if m:
-            base = _to_int(m.group(1))
-            break
+    # Temporal prevalence: when the caller self-corrects, the last stated head-count wins.
+    mentions = [m for pattern in _BASE_PATTERNS for m in pattern.finditer(rest)]
+    if mentions:
+        base = _to_int(max(mentions, key=lambda m: m.start()).group(1))
     if base is None and expected:
         m = re.fullmatch(r'(?:somos\s+|seremos\s+|para\s+)?(' + _NUM_BASE + r')', rest.strip(' .,!?¿¡'))
         if m:
@@ -130,6 +129,37 @@ def _people(n):
     return f'{n} persona' + ('' if n == 1 else 's')
 
 
+_SPOKEN=('cero','uno','dos','tres','cuatro','cinco','seis','siete','ocho','nueve','diez','once','doce','trece','catorce','quince',
+         'dieciséis','diecisiete','dieciocho','diecinueve','veinte','veintiuno','veintidós','veintitrés','veinticuatro','veinticinco',
+         'veintiséis','veintisiete','veintiocho','veintinueve')
+
+
+def _spoken_number(n):
+    return _SPOKEN[n] if n < 30 else ('treinta', 'cuarenta', 'cincuenta')[n // 10 - 3] + (' y ' + _SPOKEN[n % 10] if n % 10 else '')
+
+
+def _day_part(h):
+    if h == 12:
+        return 'del mediodía'
+    if h < 6 or h >= 21:
+        return 'de la noche' if h >= 21 or h == 0 else 'de la madrugada'
+    return 'de la mañana' if h < 12 else 'de la tarde'
+
+
+def spoken_time(value):
+    """Spanish (Spain) spoken clock time with its article: '21:30' -> 'las nueve y media de la noche'."""
+    h, m = map(int, str(value).split(':'))
+    if m == 45:
+        h, m = (h + 1) % 24, -15
+    hour = h % 12 or 12
+    article = 'la' if hour == 1 else 'las'
+    words = 'una' if hour == 1 else _spoken_number(hour)
+    tail = {0: '', 15: ' y cuarto', 30: ' y media', -15: ' menos cuarto'}.get(m)
+    if tail is None:
+        tail = ' y ' + _spoken_number(m)
+    return f'{article} {words}{tail} {_day_part(h)}'
+
+
 def format_slots(rows, party, channel, day, label, spoken_time, meal=None, requested=None):
     """Customer-facing text built ONLY from real slots of ``day``.
 
@@ -140,17 +170,21 @@ def format_slots(rows, party, channel, day, label, spoken_time, meal=None, reque
     voice = channel == 'Voice'
     miss = ''
     if requested:
-        miss = (f'Las {spoken_time(requested) if voice else requested} no están disponibles. '
-                if requested is not True else 'Esa hora no está disponible. ')
+        if requested is True:
+            miss = 'Esa hora no está disponible. '
+        elif voice:
+            miss = f'No tengo mesa a {spoken_time(requested)}. '
+        else:
+            miss = f'Las {requested} no están disponibles. '
     if not rows:
         if miss:
-            return miss + f'No tengo otra disponibilidad para {_people(party)} {label(day)}. ¿Querés que busque otro día?'
-        return f'No tengo disponibilidad para {_people(party)} {label(day)}{_meal_phrase(meal)}. ¿Querés que busque otro día?'
+            return miss + f'No tengo otra disponibilidad para {_people(party)} {label(day)}. ¿Quieres que busque otro día?'
+        return f'No tengo disponibilidad para {_people(party)} {label(day)}{_meal_phrase(meal)}. ¿Quieres que busque otro día?'
     if len(rows) == 1:
         when = label(day, rows[0]['time'])
         return miss + f'Tengo disponibilidad {when} para {_people(party)}.' if miss else f'Para {_people(party)} tengo disponibilidad {when}.'
     if voice:
-        times = ['a las ' + spoken_time(x['time']) for x in rows[:MAX_LISTED_VOICE]]
+        times = ['a ' + spoken_time(x['time']) for x in rows[:MAX_LISTED_VOICE]]
         lead = miss + 'Tengo' if miss else f'Para {_people(party)} tengo'
         return f'{lead} disponibilidad {label(day)} ' + ', '.join(times[:-1]) + ' y ' + times[-1] + '. ¿Cuál te viene mejor?'
     lead = miss + f'Tengo estas alternativas para {label(day)}:' if miss else f'Para {_people(party)} tengo estas opciones para {label(day)}:'
@@ -200,7 +234,8 @@ def is_resume(text):
 
 
 def mentions_existing_booking_change(text):
-    return bool(_CHANGE_EXISTING.search(norm(text)))
+    # a restart phrase ('cancelá lo anterior y hagamos una nueva') discards the draft; it is not a change to a stored booking
+    return bool(_CHANGE_EXISTING.search(_RESTART.sub(' ', norm(text))))
 
 
 def wants_new_booking(text):
