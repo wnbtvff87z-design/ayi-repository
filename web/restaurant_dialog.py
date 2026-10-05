@@ -74,10 +74,10 @@ def candidate_name(text,proposed,expected):
     if isinstance(proposed,str) and len(norm(proposed).split())>=2 and norm(proposed).strip(' .,!?¿¡') in q:return proposed.strip(' .,!?¿¡')
     if expected!='customer_name':return None
     q=re.sub(r'^(?:soy|me llamo|a nombre de)\s+','',q)
-    return q.title() if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,4}',q) and not any(x in q.split() for x in ('quiero','reserva','cancelar','modificar','hola','bien')) else None
+    return q.title() if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,4}',q) and not any(x in q.split() for x in ('quiero','reserva','cancelar','modificar','hola','bien','no','se','ehh','eh','mmm','nose')) else None
 
 _EMAIL=re.compile(r'[a-z0-9._+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+')
-_NOT_NAME=('quiero','reserva','reservar','cancelar','modificar','hola','bien','gracias','si','no','vale','dale','mesa','correo','telefono','email','arroba','punto')
+_NOT_NAME=('quiero','reserva','reservar','cancelar','modificar','hola','bien','gracias','si','no','vale','dale','mesa','correo','telefono','email','arroba','punto','ehh','eh','mmm','nose','no se')
 
 _EMAIL_FILLER=re.compile(r'^(?:(?:y|e|mi|el|su|correo|mail|email|e-mail|electronico|direccion|de|es|seria|son|tambien|telefono|numero|movil|nombre|apellido)\s+)+')
 
@@ -102,6 +102,36 @@ def _ask(s,field,first,again,changed):
     repeated=s.get('last_ask')==field and not changed
     s['last_ask']=field;s['expected']=field
     return _reply(s,again if repeated else first,True)
+
+_CONTACT_Q={'customer_name':'nombre y apellido','customer_email':'correo electrónico','customer_phone':'teléfono'}
+
+def _contact_ack(v,got):
+    """Echo what was understood so a wrong capture is noticed and corrected."""
+    parts=[]
+    for f in got:
+        if f=='customer_name':parts.append('a nombre de '+v[f])
+        elif f=='customer_email':parts.append('el correo '+v[f].replace('@',' arroba ').replace('.',' punto ') if _CHANNEL.get()=='Voice' else 'el correo '+v[f])
+        elif f=='customer_phone' and _CHANNEL.get()!='Voice':parts.append('el teléfono '+v[f])
+        elif f=='customer_phone':parts.append('el teléfono '+' '.join(re.sub(r'\D','',v[f])))
+    return 'Anoté '+', '.join(parts)+'. ' if parts else ''
+
+def _ask_contact(s,missing,got,v,changed):
+    """One question covering every missing contact field; a partial answer is acknowledged and only the rest is asked again."""
+    if len(missing)==1 and missing[0]=='customer_name' and s.get('first_name'):
+        return _ask(s,'customer_name',_contact_ack(v,got)+'Gracias, '+s['first_name']+'. ¿Y tu apellido?','Necesito también tu apellido para la reserva. ¿Me lo dices?',changed)
+    ack=_contact_ack(v,got)
+    names=[_CONTACT_Q[f] for f in missing]
+    what=names[0] if len(names)==1 else ', '.join(names[:-1])+' y '+names[-1]
+    if missing==['customer_name']:first='¿A qué nombre y apellido la dejo?'
+    elif missing==['customer_email']:first='¿Qué correo dejamos?'
+    elif missing==['customer_phone']:first='¿Qué teléfono dejamos?'
+    elif 'customer_name' in missing:first='¿A qué nombre y apellido la dejo y qué '+' y '.join(_CONTACT_Q[f] for f in missing[1:])+' dejamos?'
+    else:first='Me falta tu '+what+'. ¿Me los dices?'
+    hint=', por ejemplo nombre@dominio.com' if missing==['customer_email'] else ', dígito a dígito' if missing==['customer_phone'] else ''
+    again='Todavía me falta '+what+'. ¿Me '+('lo' if len(missing)==1 else 'los')+' dices'+hint+'?'
+    key=','.join(missing);repeated=s.get('last_contact_ask')==key and not changed
+    s['last_contact_ask']=key;s['expected']=missing[0];s['last_ask']=missing[0]
+    return _reply(s,ack+(again if repeated else first),True)
 
 def _capture_contact(s,text,u,customer):
     """Contact data is kept whenever it is said, not only when the dialogue happens to be asking for it."""
@@ -273,15 +303,13 @@ def _create(s,text,parsed,channel,tz,customer):
     if not check.get('available'):
         old_time=v.pop('reservation_time');rows=_slots(s['business'],v['reservation_date'],v['party_size'])
         return _offer(s,rows,channel,s.get('meal'),v['party_size'],v['reservation_date'],old_time)
-    if not v.get('customer_name'):
-        if s.get('first_name'):return _ask(s,'customer_name','Gracias, '+s['first_name']+'. ¿Y tu apellido?','Necesito también tu apellido para la reserva. ¿Me lo dices?',v!=old)
-        return _ask(s,'customer_name','¿A qué nombre y apellido la dejo?','No he captado bien el nombre. ¿Me dices nombre y apellido?',v!=old)
-    if not v.get('customer_email'):
-        return _ask(s,'customer_email','Perfecto. ¿Qué correo dejamos?','No he podido entender el correo. ¿Me lo dices o escribes completo, por ejemplo nombre@dominio.com?',v!=old)
     if not v.get('customer_phone'):
         mine=re.sub(r'\D','',str(customer or ''))
         if 9<=len(mine)<=15:v['customer_phone']=('+' if str(customer).strip().startswith('+') else '')+mine
-        else:return _ask(s,'customer_phone','¿Qué teléfono dejamos?','No he captado el teléfono. ¿Me lo dices dígito a dígito?',v!=old)
+    missing=[f for f in ('customer_name','customer_email','customer_phone') if not v.get(f)]
+    if missing:
+        got=[f for f in ('customer_name','customer_email','customer_phone') if v.get(f) and v.get(f)!=old.get(f)]
+        return _ask_contact(s,missing,got,v,v!=old)
     s['pending']={'operation':'create','values':dict(v),'request_id':secrets.token_hex(16)}
     s['phase']='awaiting';s['expected']=None
     return _reply(s,f'Mesa {label(v["reservation_date"],v["reservation_time"])} para {v["party_size"]} personas a nombre de {v["customer_name"]}{"" if _CHANNEL.get()=="Voice" else ", teléfono "+v["customer_phone"]}. ¿La confirmo?',True)

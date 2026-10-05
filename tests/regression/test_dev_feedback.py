@@ -55,3 +55,46 @@ class DevFeedback(unittest.TestCase):
         self.assertEqual(ns['field']({'Menú': 'Paella'}, 'Menu', 'Menú'), 'Paella')
         self.assertEqual(ns['field']({'menu': 'x'}, 'Menu'), 'x')
         self.assertEqual(ns['field']({}, 'Menu'), '')
+
+
+class ContactAndScenarios(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.base = {'intent': 'create', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06', 'reservation_time': '21:00'}}
+
+    def start(self):
+        env = self.env
+        env.dialog._CHANNEL.set('WhatsApp') if hasattr(env.dialog, '_CHANNEL') else None
+        return env.say({}, 'Reserva para 2 el 6 de octubre de 2030 a las 21:00', self.base)
+
+    def test_asks_all_missing_contact_in_one_question(self):
+        self.env.dialog.process  # sanity
+        reply, st = self.start()
+        self.assertIn('nombre y apellido', reply)
+
+    def test_partial_answer_acknowledged_and_only_rest_asked(self):
+        _, st = self.start()
+        reply, st = self.env.say(st, 'mi mail es ana@hotmail.com', {'intent': 'create'})
+        self.assertIn('Anoté el correo ana@hotmail.com', reply)
+        self.assertIn('nombre y apellido', reply)
+        self.assertNotIn('qué correo', reply.lower())
+        self.assertEqual(st['values']['customer_email'], 'ana@hotmail.com')
+
+    def test_unanswered_question_is_rephrased(self):
+        _, st = self.start()
+        r1, st = self.env.say(st, 'ehh', {'intent': 'create'})
+        r2, st = self.env.say(st, 'no sé', {'intent': 'create'})
+        self.assertNotEqual(r1, r2)
+        self.assertIn('Todavía me falta', r2)
+
+    def test_full_answer_in_one_message_goes_to_confirmation(self):
+        _, st = self.start()
+        reply, st = self.env.say(st, 'Ana Pérez, 687378433, ana@hotmail.com',
+                                 {'intent': 'create', 'updates': {'customer_name': 'Ana Pérez'}})
+        self.assertEqual(st['phase'], 'awaiting')
+        self.assertEqual(self.env.writes, [])
+
+    def test_voice_lists_up_to_20(self):
+        from reservation_rules import MAX_LISTED_VOICE
+        self.assertEqual(MAX_LISTED_VOICE, 20)
