@@ -82,11 +82,12 @@ class ContactAndScenarios(unittest.TestCase):
         self.assertEqual(st['values']['customer_email'], 'ana@hotmail.com')
 
     def test_unanswered_question_is_rephrased(self):
-        _, st = self.start()
+        r0, st = self.start()
         r1, st = self.env.say(st, 'ehh', {'intent': 'create'})
         r2, st = self.env.say(st, 'no sé', {'intent': 'create'})
-        self.assertNotEqual(r1, r2)
+        self.assertNotEqual(r0, r1)
         self.assertIn('Todavía me falta', r2)
+        self.assertNotIn('customer_name', st['values'])
 
     def test_full_answer_in_one_message_goes_to_confirmation(self):
         _, st = self.start()

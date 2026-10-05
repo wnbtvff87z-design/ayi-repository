@@ -76,7 +76,7 @@ def candidate_name(text,proposed,expected):
     q=re.sub(r'^(?:soy|me llamo|a nombre de)\s+','',q)
     return q.title() if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,4}',q) and not any(x in q.split() for x in ('quiero','reserva','cancelar','modificar','hola','bien','no','se','ehh','eh','mmm','nose')) else None
 
-_EMAIL=re.compile(r'[a-z0-9._+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+')
+_EMAIL=re.compile(r'[a-z0-9._+\-]{1,64}@[a-z0-9\-]{1,63}(?:\.[a-z0-9\-]{1,63}){1,4}')
 _NOT_NAME=('quiero','reserva','reservar','cancelar','modificar','hola','bien','gracias','si','no','vale','dale','mesa','correo','telefono','email','arroba','punto','ehh','eh','mmm','nose','no se')
 
 _EMAIL_FILLER=re.compile(r'^(?:(?:y|e|mi|el|su|correo|mail|email|e-mail|electronico|direccion|de|es|seria|son|tambien|telefono|numero|movil|nombre|apellido)\s+)+')
@@ -138,7 +138,7 @@ def _capture_contact(s,text,u,customer):
     v=s['values'];q=norm(text)
     email=_spoken_email(text) or (u.get('customer_email').strip().lower() if isinstance(u.get('customer_email'),str) and _EMAIL.fullmatch(u['customer_email'].strip().lower()) else None)
     if email:v['customer_email']=email
-    digits=re.sub(r'\D','',_EMAIL.sub(' ',text.casefold()))
+    digits=re.sub(r'\D','',_EMAIL.sub(' ',text.casefold()[:500]))
     proposed=re.sub(r'\D','',str(u.get('customer_phone') or ''))
     if 9<=len(proposed)<=15:v['customer_phone']=('+' if str(u['customer_phone']).strip().startswith('+') else '')+proposed
     elif 9<=len(digits)<=15 and (s.get('expected')=='customer_phone' or 'telefono' in q or 'movil' in q or 'numero' in q):v['customer_phone']=('+' if text.strip().startswith('+') else '')+digits
