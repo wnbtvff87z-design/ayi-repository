@@ -199,7 +199,8 @@ def is_resume(text):
 
 
 def mentions_existing_booking_change(text):
-    return bool(_CHANGE_EXISTING.search(norm(text)))
+    # a restart phrase ('cancelá lo anterior y hagamos una nueva') discards the draft; it is not a change to a stored booking
+    return bool(_CHANGE_EXISTING.search(_RESTART.sub(' ', norm(text))))
 
 
 def wants_new_booking(text):
