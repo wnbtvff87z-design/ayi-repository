@@ -92,21 +92,40 @@ def _party(text,proposed,expected):
         if len(nums)==1:m=re.search(r'(?<![\d:])'+nums[0]+r'(?![\d:])',q)
     return int(m.group()) if m and m.group().isdigit() else int(m.group(1)) if m else None
 
-def _date(text,updates,tz,s):
+def _date(text,updates,tz,s,now=None):
     q=norm(text)
     if re.search(r'\bsabado\b',q) and re.search(r'\bdomingo\b',q):return None,'¿Preferís sábado o domingo?'
-    explicit=explicit_date(text,tz)
+    explicit=explicit_date(text,tz,now) if now else explicit_date(text,tz)
+    date_phrase=re.search(r'\b(?:el\s+)?([0-3]?\d)\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)(?:\s+de\s+(20\d\d))?\b',q)
+    weekday=re.search(r'\b(lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b',q)
+    if explicit and date_phrase and weekday:
+        actual=date.fromisoformat(explicit)
+        stated=('lunes','martes','miercoles','jueves','viernes','sabado','domingo').index(weekday.group(1))
+        if actual.weekday()!=stated:
+            return None,f'El {actual.day} de {MONTHS[actual.month-1]} de {actual.year} cae {DAYS[actual.weekday()]}, no {DAYS[stated]}. ¿Querés ese día u otro {DAYS[stated]}?'
     proposed=valid_date(updates.get('reservation_date'))
     if explicit and proposed and explicit!=proposed and not s.get('weekend'):
         proposed=explicit
     d=explicit or proposed
+    if d and date.fromisoformat(d)<(now or datetime.now(ZoneInfo(tz))).date():return None,'Esa fecha ya pasó. ¿Qué día futuro te sirve?'
     if s.get('weekend'):
         if re.search(r'\bsabado\b',q):d=s['weekend'][0]
         elif re.search(r'\bdomingo\b',q):d=s['weekend'][1]
     return d,None
 
-def _slots(b,d,n):
-    return [{'date':x['date'],'time':x['time']} for x in options(b,d,n,limit=None) if x['date']==d]
+def _past_slot(d,t,tz,now=None):
+    try:target=datetime.fromisoformat(str(d)[:10]+'T'+str(t)).replace(tzinfo=ZoneInfo(tz))
+    except (TypeError,ValueError):return False
+    return target<=(now or datetime.now(ZoneInfo(tz)))
+
+def _slots(b,d,n,now=None):
+    tz=b.get('timezone') or 'Europe/Madrid'
+    return [{'date':x['date'],'time':x['time']} for x in options(b,d,n,limit=None) if x['date']==d and not _past_slot(x['date'],x['time'],tz,now)]
+
+def _interpreted_reply(s,parsed,fallback,limit):
+    reply=str(parsed.get('reply') or fallback)[:limit]
+    name=(s.get('values') or {}).get('customer_name')
+    return re.sub(r'\bcliente\b',name or 'vos',reply,flags=re.IGNORECASE)
 
 def _meal_filter(rows,meal):
     if not meal:return rows
@@ -196,6 +215,9 @@ def _create(s,text,parsed,channel,tz,customer):
     if d:
         if d!=v.get('reservation_date'):v.pop('reservation_time',None);s['offered']=[]
         v['reservation_date']=d;s.pop('weekend',None)
+    if v.get('reservation_date') and date.fromisoformat(v['reservation_date'])<datetime.now(ZoneInfo(tz)).date():
+        v.pop('reservation_date',None);v.pop('reservation_time',None)
+        return _reply(s,'Esa fecha ya pasó. ¿Qué día futuro te sirve?',True)
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:
         if n!=v.get('party_size'):v.pop('reservation_time',None);s['offered']=[]
@@ -224,6 +246,9 @@ def _create(s,text,parsed,channel,tz,customer):
             if s.get('offered') and not meal and not d and not chosen:
                 s['expected']='reservation_time';return _reply(s,'¿Cuál de las horas que te dije preferís? También podés pedirme otra.',v!=old)
             return _offer(s,rows,channel,s.get('meal'))
+    if _past_slot(v['reservation_date'],v['reservation_time'],tz):
+        v.pop('reservation_time',None);s['expected']='reservation_time'
+        return _reply(s,'Esa hora ya pasó. ¿Qué otro horario te sirve?',True)
     check=availability(s['business'],v['reservation_date'],v['reservation_time'],v['party_size'])
     if not check.get('available'):
         old_time=v.pop('reservation_time');rows=_slots(s['business'],v['reservation_date'],v['party_size'])
@@ -290,6 +315,9 @@ def _manage(s,text,parsed,channel,tz,customer):
     dest_t=target.get('reservation_time',old_t)
     if (dest,dest_t,n)==(old_d,old_t,row['party_size']):
         return _reply(s,'Eso coincide con tu reserva actual. ¿Qué querés cambiar?',True)
+    if _past_slot(dest,dest_t,tz):
+        target.pop('reservation_time',None)
+        return _reply(s,'Esa hora ya pasó. Tu reserva original sigue igual. ¿Qué otro horario te sirve?',True)
     if (dest,dest_t)!=(old_d,old_t) or n>row['party_size']:
         if not availability(s['business'],dest,dest_t,n).get('available'):
             target.pop('reservation_time',None)
@@ -303,6 +331,9 @@ def _availability_only(s,text,parsed,channel,tz):
     u=parsed.get('updates') or {};d,conflict=_date(text,u,tz,s)
     if conflict:return _reply(s,conflict)
     if d:s['values']['reservation_date']=d
+    if s['values'].get('reservation_date') and date.fromisoformat(s['values']['reservation_date'])<datetime.now(ZoneInfo(tz)).date():
+        s['values'].pop('reservation_date',None);s['expected']='reservation_date'
+        return _reply(s,'Esa fecha ya pasó. ¿Qué día futuro te sirve?',True)
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:s['values']['party_size']=n
     if not s['values'].get('reservation_date'):
@@ -345,7 +376,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         return _side_reply(s,'Eso no te lo puedo ayudar a resolver: solo puedo ayudarte con reservas e información del restaurante (menú, horarios, dirección).')
     if intent=='question' and not has_data and not manage:
         info=_business_info(b,q)
-        return _side_reply(s,info or str(parsed.get('reply') or 'Te escucho.')[:220])
+        return _side_reply(s,info or _interpreted_reply(s,parsed,'Te escucho.',220))
     if s.get('intent')=='availability' and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',q):
         return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, no hice otra reserva. ¿Necesitás algo más?',True)
     if intent=='availability' and not manage:
@@ -362,7 +393,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         s=fresh(switch);s['business']=b
     elif not s.get('intent') or s.get('phase') in ('done','closed'):
         if intent not in ('create','cancel','modify','availability'):
-            return _reply(s,str(parsed.get('reply') or '¿En qué puedo ayudarte?')[:220],True)
+            return _reply(s,_interpreted_reply(s,parsed,'¿En qué puedo ayudarte?',220),True)
         s=fresh(intent);s['business']=b
     if s.get('intent')=='availability':
         return _availability_only(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid')
@@ -373,9 +404,9 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
             s.pop('pending',None);s['phase']='collecting'
             if s['intent']=='create' and (u.get('reservation_date') or u.get('reservation_time') or parsed.get('meal')):s['values'].pop('reservation_time',None)
             elif s['intent']=='modify' and (u.get('reservation_date') or u.get('reservation_time') or parsed.get('meal')):s.setdefault('target',{}).pop('reservation_time',None)
-        else:return _reply(s,(str(parsed.get('reply') or 'Te escucho.')[:160]+' ¿Confirmás la operación que te resumí?'),True)
+        else:return _reply(s,'No entendí tu respuesta. La reserva sigue pendiente; decime sí para confirmarla o no para cancelarla.',True)
     if intent in ('social','question') and not u and not parsed.get('time_expression') and not parsed.get('meal') and not parsed.get('selection') and not re.search(r'\b(?:sabado|domingo|hoy|manan|lunes|martes|miercoles|jueves|viernes)\b',q):
-        return _side_reply(s,str(parsed.get('reply') or 'Te escucho.')[:220])
+        return _side_reply(s,_interpreted_reply(s,parsed,'Te escucho.',220))
     try:
         if s['intent'] in ('cancel','modify'):answer,new=_manage(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid',customer)
         else:answer,new=_create(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid',customer)
