@@ -191,9 +191,8 @@ class ConfirmationSafetyTests(FlowBase):
         _, st = self.start_booking()
         for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Juan García', {'customer_name': 'Juan García'}),
                           ('juan@example.com', {'customer_email': 'juan@example.com'})):
-            _, st = self.env.say(st, text, {'intent': 'create', 'updates': upd})
-        reply, st = self.env.say(st, 'telefono 600123456', {'intent': 'create'})
-        return reply, st
+            reply, st = self.env.say(st, text, {'intent': 'create', 'updates': upd})
+        return reply, st  # the caller's own number is used, so no phone question is needed
 
     def test_create_requires_explicit_confirmation(self):
         reply, st = self.full_create()
@@ -342,3 +341,74 @@ class SpanishVoiceTests(FlowBase):
         for rel in ('relay/main.py', 'web/restaurant_dialog.py', 'web/restaurant_dialog_agent.py'):
             src = (root / rel).read_text()
             self.assertNotIn('a vos', src); self.assertIn('Gracias a ti', src)
+
+
+class RealCustomerScenarioTests(FlowBase):
+    """Situations seen with real callers: data given early, spoken e-mails, single names, unclear answers."""
+
+    def create(self, **upd):
+        return {'intent': 'create', 'updates': upd}
+
+    def test_contact_data_given_before_it_is_asked_is_remembered(self):
+        _, st = self.env.say({}, 'Soy Juan Pérez, mesa para 2 el 6 de octubre de 2030, mi correo es juan@x.com',
+                             self.create(customer_name='Juan Pérez', customer_email='juan@x.com', party_size=2, reservation_date='2030-10-06'))
+        reply, st = self.env.say(st, 'a las 21', self.create(reservation_time='21:00'))
+        self.assertEqual(st['phase'], 'awaiting'); self.assertIn('Juan Pérez', reply)
+        self.assertEqual(st['pending']['values']['customer_email'], 'juan@x.com')
+        self.assertNoSideEffects()
+
+    def test_caller_number_is_used_instead_of_asking_again(self):
+        _, st = self.start_booking()
+        for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Ana Ruiz', {'customer_name': 'Ana Ruiz'}),
+                          ('ana@x.es', {'customer_email': 'ana@x.es'})):
+            reply, st = self.env.say(st, text, self.create(**upd))
+        self.assertEqual(st['phase'], 'awaiting'); self.assertEqual(st['pending']['values']['customer_phone'], '+34600000000')
+        self.assertNotIn('teléfono dejamos', reply)
+
+    def test_explicit_phone_overrides_caller_number_while_awaiting(self):
+        _, st = self.start_booking()
+        for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Ana Ruiz', {'customer_name': 'Ana Ruiz'}),
+                          ('ana@x.es', {'customer_email': 'ana@x.es'})):
+            _, st = self.env.say(st, text, self.create(**upd))
+        reply, st = self.env.say(st, 'mejor mi móvil 611 222 333', self.create(customer_phone='611222333'))
+        self.assertEqual(st['phase'], 'awaiting'); self.assertEqual(st['pending']['values']['customer_phone'], '611222333')
+
+    def test_first_name_then_surname_is_assembled_without_repeating_question(self):
+        _, st = self.start_booking()
+        _, st = self.env.say(st, '21:00', self.create(reservation_time='21:00'))
+        r1, st = self.env.say(st, 'Juan', self.create())
+        self.assertIn('apellido', r1)
+        r2, st = self.env.say(st, 'Pérez', self.create())
+        self.assertEqual(st['values']['customer_name'], 'Juan Pérez'); self.assertIn('correo', r2)
+
+    def test_spoken_email_from_voice_transcription_is_rebuilt(self):
+        _, st = self.start_booking()
+        for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Juan Pérez', {'customer_name': 'Juan Pérez'})):
+            _, st = self.env.say(st, text, self.create(**upd))
+        reply, st = self.env.say(st, 'juan punto perez arroba gmail punto com', self.create())
+        self.assertEqual(st['values']['customer_email'], 'juan.perez@gmail.com')
+        self.assertEqual(st['values']['customer_name'], 'Juan Pérez')
+
+    def test_unanswered_question_is_rephrased_not_repeated_verbatim(self):
+        _, st = self.env.say({}, 'quiero reservar', self.create())
+        r1, st = self.env.say(st, 'no sé', self.create())
+        r2, st = self.env.say(st, 'ni idea', self.create())
+        self.assertIn('No he entendido', r2)
+        _, st = self.env.say(st, 'el 6 de octubre de 2030', self.create(reservation_date='2030-10-06'))
+        self.assertEqual(st['values']['reservation_date'], '2030-10-06')
+
+    def test_unexpected_internal_error_gets_friendly_reply_and_no_write(self):
+        _, st = self.start_booking()
+        def boom(*a, **k):
+            raise ValueError('unexpected')
+        self.env.dialog.availability = boom
+        reply, st2 = self.env.say(st, 'a las 21', self.create(reservation_time='21:00'))
+        self.assertIn('No he hecho cambios', reply); self.assertNotIn('pending', st2); self.assertEqual(self.env.writes, [])
+
+    def test_voice_channel_reads_times_in_spanish(self):
+        env = self.env
+        env.dialog._CHANNEL.set('Voice')
+        try:
+            self.assertEqual(env.dialog._voice_text('A las 21:30'), 'A las nueve y media de la noche')
+        finally:
+            env.dialog._CHANNEL.set('WhatsApp')

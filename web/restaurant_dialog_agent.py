@@ -132,6 +132,7 @@ def _voice_text(text):
         r"(?<!\d)(?:(a|de|desde|hasta|sobre)\s+(?:las?\s+)?)?([01]\d|2[0-3]):([0-5]\d)(?!\d)",
         lambda m: (m.group(1) + " " if m.group(1) else "") + _spoken_time(m.group(2) + ":" + m.group(3)),
         text,
+        flags=re.I,
     )
     return text.replace(", ", ". ")
 
@@ -701,7 +702,7 @@ def _memory_note(state):
     values = state.get("values") or {}
     booking = {
         k: values[k]
-        for k in ("reservation_date", "reservation_time", "party_size", "customer_name")
+        for k in ("reservation_date", "reservation_time", "party_size", "customer_name", "customer_email")
         if values.get(k)
     }
     if booking and state.get("intent") in ("create", "availability"):
@@ -850,10 +851,25 @@ def _run_tool(s, b, customer, channel, text, name, args):
         res_time = valid_time(args.get("reservation_time"))
         # Python owns the final head-count: text rule > stored state > model argument
         party = parse_party(text) or valid_party(s["values"].get("party_size")) or valid_party(args.get("party_size"))
+        email = str(args.get("customer_email") or "").strip().lower()
+        email = email if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) else ""
+        # Keep what the customer already gave (never overwrite it with an empty value) so it is not asked twice
+        known = s.setdefault("values", {})
+        if isinstance(cname, str) and cname.strip():
+            known["customer_name"] = cname.strip()
+        if email:
+            known["customer_email"] = email
+        email = email or str(known.get("customer_email") or "")
+        cname = cname if isinstance(cname, str) and len(cname.split()) >= 2 else known.get("customer_name")
         if not (isinstance(cname, str) and len(cname.split()) >= 2):
-            return _reply(s, "¿Me dices nombre y apellido para la reserva?", True)
+            first = (cname or "").split()[0] if isinstance(cname, str) and cname.strip() else ""
+            return _reply(s, f"Gracias, {first}. ¿Y tu apellido?" if first else "¿Me dices nombre y apellido para la reserva?", True)
         if not (res_date and res_time and party):
             return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmas?", True)
+        if not email:
+            return _reply(s, "Perfecto. ¿Qué correo dejamos para la reserva?", True)
+        if len(re.sub(r"\D", "", str(customer or ""))) < 9:
+            return _reply(s, "¿Qué teléfono dejamos para la reserva?", True)
         try:
             if not availability(b, res_date, res_time, party).get("available"):
                 return _alternatives(s, b, channel, res_date, res_time, party)
@@ -863,7 +879,7 @@ def _run_tool(s, b, customer, channel, text, name, args):
         s["values"] = {
             "customer_name": cname,
             "customer_phone": customer,  # identity comes from the caller, never from the model
-            "customer_email": args.get("customer_email", ""),
+            "customer_email": email,
             "reservation_date": res_date,
             "reservation_time": res_time,
             "party_size": party,

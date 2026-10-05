@@ -51,11 +51,21 @@ def test_no_legacy_openai_api():
     assert 'ChatCompletion' not in (WEB/'restaurant_dialog_agent.py').read_text()
 
 def test_create_only_proposes_and_uses_caller_phone():
-    mod,calls=load([tc('create_reservation',{'customer_name':'Ana Pérez','customer_phone':'+999','customer_email':'','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
-    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600')
+    mod,calls=load([tc('create_reservation',{'customer_name':'Ana Pérez','customer_phone':'+999','customer_email':'ana@x.es','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
+    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600123456')
     assert st['phase']=='awaiting' and st['pending']['operation']=='create'
-    assert st['values']['customer_phone']=='+34600'
+    assert st['values']['customer_phone']=='+34600123456' and st['values']['customer_email']=='ana@x.es'
     assert '¿La confirmo?' in reply
+
+def test_create_without_valid_email_asks_for_it_and_keeps_name():
+    mod,calls=load([tc('create_reservation',{'customer_name':'Ana Pérez','customer_phone':'','customer_email':'no-es-correo','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
+    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600123456')
+    assert 'pending' not in st and 'correo' in reply and st['values']['customer_name']=='Ana Pérez'
+
+def test_create_with_single_name_asks_surname_and_remembers_first_name():
+    mod,calls=load([tc('create_reservation',{'customer_name':'Ana','customer_phone':'','customer_email':'a@x.es','reservation_date':'2030-05-01','reservation_time':'21:00','party_size':2})])
+    reply,st=run(mod,calls,BIZ,{},[],'reservá','WhatsApp','s1','+34600123456')
+    assert 'pending' not in st and 'apellido' in reply and st['values']['customer_name']=='Ana'
 
 def test_create_rejects_incomplete_data():
     mod,calls=load([tc('create_reservation',{'customer_name':'Ana','reservation_date':'mañana','reservation_time':'x','party_size':2})])
