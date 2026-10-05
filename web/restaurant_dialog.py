@@ -7,7 +7,7 @@ from booking import BookingError,availability,options,create
 from booking_safe import reservations_for_caller,unique_reservation,cancel_for_caller,modify_for_caller
 from temporal import explicit_date,relative_day,explicit_time,weekend_days
 from utils import norm,yes,no,valid_date,valid_time
-from reservation_rules import format_slots,is_availability_question,is_explicit_restart,is_opening_hours_question,meal_filter as _meal_filter,parse_party,sort_slots,spoken_time as _spoken_time
+from reservation_rules import explicit_choice,format_slots,format_reservation_page,is_next_page_request,is_numeric_choice,is_availability_question,is_explicit_restart,is_opening_hours_question,listed_slots,meal_filter as _meal_filter,parse_party,resolve_meal,sort_slots,spoken_time as _spoken_time
 log=logging.getLogger(__name__)
 DAYS=('lunes','martes','miércoles','jueves','viernes','sábado','domingo')
 MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
@@ -230,12 +230,24 @@ def _requested_dates(text,updates,tz):
 
 def _choose(rows,text,parsed,d=None):
     if not rows:return None
+    t=explicit_time(text)
+    if t:
+        hits=[x for x in rows if x['time']==t and (not d or x['date']==d)]
+        if len(hits)==1:return hits[0]
+    choice=explicit_choice(text,len(rows))
+    if choice:return rows[choice-1]
+    if is_numeric_choice(text):
+        number=int(re.search(r'\d{1,2}',norm(text)).group())
+        if 1<=number<=23:
+            hits=[x for x in rows if int(x['time'][:2])%12==number%12 and x['time'][3:]=='00']
+            if len(hits)==1:return hits[0]
+        return None
     selection=parsed.get('selection')
     if type(selection) is int and 1<=selection<=len(rows):return rows[selection-1]
     q=norm(text).strip(' .,!?¿¡')
     ordinal={'la primera':0,'la segunda':1,'la tercera':2,'la ultima':len(rows)-1}
     if q in ordinal and 0<=ordinal[q]<len(rows):return rows[ordinal[q]]
-    t=valid_time(parsed.get('updates',{}).get('reservation_time')) or explicit_time(text)
+    t=valid_time(parsed.get('updates',{}).get('reservation_time'))
     if not t:
         m=re.search(r'\b(?:a las|las)\s+(\d{1,2})(?![\d:])',q)
         if m:
@@ -266,10 +278,23 @@ def _reply(s,text,changed=False):
 def _offer(s,rows,channel,meal=None,party=None,day=None,requested=None):
     """Present REAL slots (itemised); the list is exactly what booking.options() returned."""
     selected=sort_slots(_meal_filter(rows,meal))
-    s['offered']=selected;s['expected']='reservation_time' if selected else None
+    page,next_offset=listed_slots(selected,_CHANNEL.get())
+    s['availability_slots']=selected;s['slot_offset']=0
+    s['slot_listing']={'party':party,'day':day,'meal':meal,'requested':requested}
+    s['offered']=page;s['expected']='reservation_time' if selected else None
     party=party or s['values'].get('party_size') or 1
     day=day or (selected[0]['date'] if selected else s['values'].get('reservation_date'))
-    return _reply(s,format_slots(selected,party,_CHANNEL.get(),day,label,_spoken_time,meal,requested),True)
+    return _reply(s,format_slots(page,party,_CHANNEL.get(),day,label,_spoken_time,meal,requested,next_offset is not None),True)
+
+def _next_slot_page(s,channel):
+    rows=s.get('availability_slots') or []
+    offset=int(s.get('slot_offset') or 0)+len(s.get('offered') or [])
+    page,next_offset=listed_slots(rows,channel,offset)
+    if not page:return _reply(s,'Ya te mostré todos los horarios disponibles. ¿Cuál te viene mejor?',True)
+    listing=s.get('slot_listing') or {}
+    s['slot_offset']=offset;s['offered']=page
+    text=format_slots(page,listing.get('party') or s['values'].get('party_size') or 1,channel,listing.get('day') or s['values'].get('reservation_date'),label,_spoken_time,listing.get('meal'),listing.get('requested'),next_offset is not None)
+    return _reply(s,text,True)
 
 def _confirm(s,customer,channel):
     p=s['pending'];op=p['operation']
@@ -300,8 +325,9 @@ def _confirm(s,customer,channel):
 def _create(s,text,parsed,channel,tz,customer):
     v=s['values'];u=parsed.get('updates') or {};old=dict(v)
     _capture_contact(s,text,u,customer)
-    d,conflict=_date(text,u,tz,s)
+    d,conflict=_date(text,{},tz,s)
     if conflict:return _reply(s,conflict)
+    d=d or v.get('reservation_date') or valid_date(u.get('reservation_date'))
     if re.search(r'\b(?:finde|fin de semana)\b',norm(text)) and not d:
         s['weekend']=list(weekend_days(tz));v.pop('reservation_date',None)
     if d:
@@ -314,14 +340,14 @@ def _create(s,text,parsed,channel,tz,customer):
     if n:
         if n!=v.get('party_size'):v.pop('reservation_time',None);s['offered']=[]
         v['party_size']=n
-    meal=parsed.get('meal')
-    if meal in ('lunch','dinner'):s['meal']=meal
+    meal=resolve_meal(text,s.get('meal'),parsed.get('meal'))
+    if meal:s['meal']=meal
     if re.search(r'\b(?:otra|otro|diferente)\s+(?:hora|horario|opcion)\b',norm(text)):
         v.pop('reservation_time',None);s['offered']=[]
     chosen=_choose(s.get('offered') or [],text,parsed,v.get('reservation_date'))
     if chosen:v['reservation_date']=chosen['date'];v['reservation_time']=chosen['time']
-    elif valid_time(u.get('reservation_time')):v['reservation_time']=u['reservation_time']
     elif explicit_time(text):v['reservation_time']=explicit_time(text)
+    elif valid_time(u.get('reservation_time')):v['reservation_time']=u['reservation_time']
     if s.get('weekend') and not v.get('reservation_date'):
         s['expected']='reservation_date';a,b=s['weekend'];return _reply(s,f'¿Prefieres {label(a)} o {label(b)}?',v!=old)
     if not v.get('reservation_date'):return _ask(s,'reservation_date','¿Para qué día quieres la mesa?','No he entendido el día. ¿Me lo dices, por ejemplo "el sábado" o "el 12 de octubre"?',v!=old)
@@ -341,6 +367,10 @@ def _create(s,text,parsed,channel,tz,customer):
     if _past_slot(v['reservation_date'],v['reservation_time'],tz):
         v.pop('reservation_time',None);s['expected']='reservation_time'
         return _reply(s,'Esa hora ya pasó. ¿Qué otro horario te sirve?',True)
+    if meal and not _meal_filter([{'date':v['reservation_date'],'time':v['reservation_time']}],meal):
+        rows=_slots(s['business'],v['reservation_date'],v['party_size'])
+        v.pop('reservation_time',None)
+        return _offer(s,rows,channel,meal,v['party_size'],v['reservation_date'])
     check=availability(s['business'],v['reservation_date'],v['reservation_time'],v['party_size'])
     if not check.get('available'):
         old_time=v.pop('reservation_time');rows=_slots(s['business'],v['reservation_date'],v['party_size'])
@@ -378,26 +408,53 @@ def _manage(s,text,parsed,channel,tz,customer):
     rows=reservations_for_caller(s['business'],v['customer_name'],customer)
     if not rows:return _reply(s,'No encontré una reserva activa con ese nombre y teléfono. No hice cambios.',True)
     row=next((x for x in rows if x['code']==s.get('selected_code')),None)
+    if not row and s.get('phase')=='choosing_original' and s.get('choices'):
+        all_choices=s.get('choice_rows') or s['choices']
+        if is_next_page_request(text):
+            offset=int(s.get('choice_offset') or 0)+len(s['choices'])
+            page,_,message=format_reservation_page(all_choices,offset,'cancelar' if s['intent']=='cancel' else 'modificar',label)
+            if page:
+                s['choices']=page;s['choice_offset']=offset
+                return _reply(s,message,True)
+            return _reply(s,'Ya te mostré todas las reservas. Dime el número de la que quieres elegir.',True)
+        page_rows=[{'date':x['date'],'time':x['time']} for x in s['choices']]
+        number=explicit_choice(text,len(s['choices']))
+        if not number and is_numeric_choice(text):
+            return _reply(s,'Ese número no aparece entre las reservas mostradas. Dime uno de los números o di “siguiente”.',True)
+        choice=page_rows[number-1] if number else _choose(page_rows,text,parsed)
+        if choice:
+            matching=[x for x in s['choices'] if x['date']==choice['date'] and x['time']==choice['time']]
+            selected=s['choices'][number-1] if number else matching[0] if len(matching)==1 else None
+            row=next((x for x in rows if selected and x['code']==selected['code']),None)
+        if row:
+            s.pop('choices',None);s.pop('choice_rows',None);s.pop('choice_offset',None)
+            s['selected_code']=row['code'];s['phase']='collecting';s['expected']=None;s['target']={}
+            text='';u={};parsed={}
+        else:
+            return _reply(s,'Dime el número de una de las reservas mostradas, o di “siguiente” para ver más.',True)
     if not row:
-        d,_=_date(text,u,tz,s);t=valid_time(u.get('reservation_time')) or explicit_time(text)
-        i=parsed.get('selection')
-        if type(i) is int and 1<=i<=len(rows):row=rows[i-1]
+        d,_=_date(text,{},tz,s);d=d or valid_date(u.get('reservation_date'))
+        t=explicit_time(text) or valid_time(u.get('reservation_time'))
         if not row:
             hits=[x for x in rows if (not d or str(x['slot_date'])[:10]==d) and (not t or x['start_time']==t)] if d or t else []
             if len(hits)==1:row=hits[0]
         if not row and len(rows)==1:row=rows[0]
         if not row:
+            all_choices=[{'code':x['code'],'date':str(x['slot_date'])[:10],'time':x['start_time']} for x in rows]
+            page,_,message=format_reservation_page(all_choices,0,'cancelar' if s['intent']=='cancel' else 'modificar',label)
+            s['choice_rows']=all_choices;s['choice_offset']=0;s['choices']=page
             s['phase']='choosing_original';s['expected']='original'
-            return _reply(s,'Encontré '+', '.join(f'{i}. {label(x["slot_date"],x["start_time"])}' for i,x in enumerate(rows[:5],1))+'. ¿Cuál es?',True)
+            return _reply(s,message,True)
         s['selected_code']=row['code'];s['phase']='collecting';s['expected']=None;s['target']={}
         text='';u={};parsed={}
     if s['intent']=='cancel':
         s['pending']={'operation':'cancel','code':row['code'],'old_date':str(row['slot_date'])[:10],'old_time':row['start_time']};s['phase']='awaiting'
         return _reply(s,f'Voy a cancelar la reserva {label(row["slot_date"],row["start_time"])}. ¿Confirmas?',True)
-    target=s.setdefault('target',{});d,_=_date(text,u,tz,s)
+    target=s.setdefault('target',{});d,_=_date(text,{},tz,s)
+    d=d or target.get('reservation_date') or valid_date(u.get('reservation_date'))
     chosen=_choose(s.get('offered') or [],text,parsed)
     if chosen:d=chosen['date'];t=chosen['time']
-    else:t=valid_time(u.get('reservation_time')) or explicit_time(text)
+    else:t=explicit_time(text) or valid_time(u.get('reservation_time'))
     if d:
         if d!=target.get('reservation_date'):target.pop('reservation_time',None)
         target['reservation_date']=d
@@ -408,9 +465,14 @@ def _manage(s,text,parsed,channel,tz,customer):
         return _reply(s,'¿Qué día, hora o cantidad quieres cambiar?')
 
     old_d=str(row['slot_date'])[:10];old_t=row['start_time'];dest=target.get('reservation_date',old_d);n=target.get('party_size',row['party_size'])
+    meal=resolve_meal(text,s.get('meal'),parsed.get('meal'))
+    if meal:s['meal']=meal
     if 'reservation_date' in target and 'reservation_time' not in target:
-        return _offer(s,_slots(s['business'],dest,n),channel,parsed.get('meal'),n,dest)
+        return _offer(s,_slots(s['business'],dest,n),channel,meal,n,dest)
     dest_t=target.get('reservation_time',old_t)
+    if meal and not _meal_filter([{'date':dest,'time':dest_t}],meal):
+        target.pop('reservation_time',None)
+        return _offer(s,_slots(s['business'],dest,n),channel,meal,n,dest,dest_t)
     if (dest,dest_t,n)==(old_d,old_t,row['party_size']):
         return _reply(s,'Eso coincide con tu reserva actual. ¿Qué quieres cambiar?',True)
     if _past_slot(dest,dest_t,tz):
@@ -428,6 +490,8 @@ def _availability_only(s,text,parsed,channel,tz):
     """A read-only question never collects contact data or prepares a booking."""
     u=parsed.get('updates') or {}
     q=norm(text)
+    meal=resolve_meal(text,s.get('meal'),parsed.get('meal'))
+    if meal:s['meal']=meal
     if re.search(r'\b(?:el\s+)?[0-3]?\d\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b',q) and re.search(r'\b(?:lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b',q):
         _,conflict=_date(text,u,tz,s)
         if conflict:return _reply(s,conflict)
@@ -466,20 +530,21 @@ def _availability_only(s,text,parsed,channel,tz):
         s['expected']='party_size';return _reply(s,'¿Para cuántas personas quieres consultar?')
     rows=[]
     for d in dates:rows.extend(_slots(s['business'],d,s['values']['party_size']))
-    rows=sorted(rows,key=lambda x:(x['date'],x['time']))
+    rows=sort_slots(_meal_filter(sorted(rows,key=lambda x:(x['date'],x['time'])),meal))
     s['phase']='inquiry';s['expected']=None
     if len(dates)==1:
-        asked=valid_time(u.get('reservation_time')) or explicit_time(text)
+        asked=explicit_time(text) or valid_time(s['values'].get('reservation_time')) or valid_time(u.get('reservation_time'))
         if asked and not any(x['time']==asked for x in rows):
-            return _offer(s,rows,channel,parsed.get('meal'),s['values']['party_size'],dates[0],asked)
-        answer,s=_offer(s,rows,channel,parsed.get('meal'),s['values']['party_size'],dates[0])
+            return _offer(s,rows,channel,meal,s['values']['party_size'],dates[0],asked)
+        answer,s=_offer(s,rows,channel,meal,s['values']['party_size'],dates[0])
         if asked:
             answer=('Sí, '+('tengo mesa a '+_spoken_time(asked) if _CHANNEL.get()=='Voice' else f'a las {asked} tengo mesa')+'. ')+answer;s['last_reply']=answer
         return answer,s
     if not rows:return _reply(s,'No veo mesas disponibles esos días. No hice ninguna reserva.')
     per_date=3 if channel=='Voice' else 4
     s['offered']=[x for d in dates for x in [r for r in rows if r['date']==d][:per_date]]
-    choices='; '.join(label(x['date'],x['time']) for x in s['offered'])
+    s['availability_slots']=rows
+    choices='; '.join(f'{i}. {label(x["date"],x["time"])}' for i,x in enumerate(s['offered'],1))
     return _reply(s,f'Para {s["values"]["party_size"]} personas, tengo disponibilidad: {choices}. ¿Cuál te viene mejor?',True)
 
 def _process_internal(b,state,history,text,channel,external_id,customer):
@@ -487,6 +552,16 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     s.pop('_end_call_reason',None)
     q=norm(text);tz=b.get('timezone') or 'Europe/Madrid'
     if b.get('sector')!='restaurante' or not b.get('allow_reservations'):return 'No tengo reservas habilitadas para este negocio.',s
+    if is_next_page_request(text) and s.get('phase')=='choosing_original' and s.get('choices'):
+        all_choices=s.get('choice_rows') or s['choices']
+        offset=int(s.get('choice_offset') or 0)+len(s['choices'])
+        page,_,message=format_reservation_page(all_choices,offset,'cancelar' if s.get('intent')=='cancel' else 'modificar',label)
+        if page:
+            s['choices']=page;s['choice_offset']=offset
+            return _reply(s,message,True)
+        return _reply(s,'Ya te mostré todas las reservas. Dime el número de la que quieres elegir.',True)
+    if is_next_page_request(text) and s.get('expected')=='reservation_time' and s.get('availability_slots'):
+        return _next_slot_page(s,channel)
     if _UNSAFE.search(q):
         return _side_reply(s,'Eso no te lo puedo ayudar a resolver: solo puedo ayudarte con reservas e información del restaurante (menú, horarios, dirección).')
     if s.get('phase')=='awaiting' and s.get('pending'):

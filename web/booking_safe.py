@@ -1,6 +1,7 @@
 """Caller-bound reservation selection. Never authorize by name alone."""
 import re, unicodedata
 from booking import BookingError, db, cancel, modify, day
+from reservation_rules import sort_reservations
 
 def _name(v):
     return ' '.join(''.join(c for c in unicodedata.normalize('NFKD',str(v or '').casefold()) if not unicodedata.combining(c)).split())
@@ -13,7 +14,7 @@ def reservations_for_caller(b,name,incoming):
     if not phone:raise BookingError('No puedo identificar esta llamada. No hice cambios.')
     with db() as conn:
         rows=conn.execute("SELECT r.code,r.email,r.name,r.phone,r.party_size,s.slot_date,s.start_time FROM booking_reservations r JOIN booking_slots s ON s.business_id=r.business_id AND s.slot_id=r.slot_id WHERE r.business_id=%s AND r.status='Confirmada'",(b['business_id'],)).fetchall()
-    return sorted((r for r in rows if _name(r['name'])==_name(name) and _phone(r['phone'],b)==phone),key=lambda r:(str(r['slot_date']),r['start_time'],r['code']))
+    return sort_reservations(r for r in rows if _name(r['name'])==_name(name) and _phone(r['phone'],b)==phone)
 def unique_reservation(b,name,incoming,reservation_date=None,reservation_time=None,expected_code=None):
     rows=reservations_for_caller(b,name,incoming)
     if reservation_date:rows=[r for r in rows if day(r['slot_date'])==day(reservation_date)]

@@ -2,6 +2,8 @@ import importlib,os,sys,types
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 WEB=Path(__file__).resolve().parents[1]/'web'
 BIZ={'sector':'restaurante','allow_reservations':True,'timezone':'Europe/Madrid','business_id':'R1'}
 
@@ -171,6 +173,54 @@ def test_multiple_reservations_pick_by_number_for_modify():
     reply,st=run(mod,calls,BIZ,st,[],'1','WhatsApp','s1','+34600')
     assert st['pending']['operation']=='modify' and st['pending']['code']=='A1'
     assert st['pending']['changes']['reservation_time']=='22:00'
+
+
+def _many_reservations(count):
+    return [
+        {'code': f'R{i:02d}', 'name': 'Ana Pérez', 'slot_date': f'2030-05-{i:02d}',
+         'start_time': f'{12 + i % 10:02d}:00', 'party_size': 2}
+        for i in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize('count', [1, 5, 6, 20, 25])
+def test_existing_reservation_list_sizes_are_bounded_and_exactly_selectable(count):
+    reservations = _many_reservations(count)
+    mod, calls = load([tc('cancel_reservation', {'customer_name': 'Ana Pérez'})], reservations=reservations)
+    reply, state = run(mod, calls, BIZ, {}, [], 'cancela mi reserva', 'WhatsApp', 's1', '+34600')
+    if count == 1:
+        assert state['pending']['code'] == 'R01'
+        return
+    assert len(state['choices']) == min(count, 20)
+    assert len(state['choice_rows']) == count
+    for index, choice in enumerate(state['choices'], 1):
+        assert f'{index}. ' in reply
+    assert (count > 20) == ('siguiente' in reply)
+    reply, state = run(mod, calls, BIZ, state, [], str(min(count, 20)), 'WhatsApp', 's1', '+34600')
+    assert state['pending']['code'] == f'R{min(count, 20):02d}'
+
+
+def test_existing_reservation_list_next_page_restarts_indices_at_one():
+    reservations = _many_reservations(25)
+    mod, calls = load([tc('cancel_reservation', {'customer_name': 'Ana Pérez'})], reservations=reservations)
+    _, state = run(mod, calls, BIZ, {}, [], 'cancela mi reserva', 'WhatsApp', 's1', '+34600')
+    reply, state = run(mod, calls, BIZ, state, [], '21', 'WhatsApp', 's1', '+34600')
+    assert state['phase'] == 'choosing_original' and 'no aparece' in reply
+    reply, state = run(mod, calls, BIZ, state, [], 'siguiente', 'WhatsApp', 's1', '+34600')
+    assert [choice['code'] for choice in state['choices']] == [f'R{i:02d}' for i in range(21, 26)]
+    assert '1. ' in reply and '5. ' in reply and '6. ' not in reply
+    _, state = run(mod, calls, BIZ, state, [], '5', 'WhatsApp', 's1', '+34600')
+    assert state['pending']['code'] == 'R25'
+
+
+def test_voice_reservation_list_accepts_spoken_number_on_the_visible_page():
+    reservations = _many_reservations(25)
+    mod, calls = load([tc('cancel_reservation', {'customer_name': 'Ana Pérez'})], reservations=reservations)
+    reply, state = run(mod, calls, BIZ, {}, [], 'cancela mi reserva', 'Voice', 's1', '+34600')
+    assert len(state['choices']) == 20 and 'siguiente' in reply
+    _, state = run(mod, calls, BIZ, state, [], 'veinte', 'Voice', 's1', '+34600')
+    assert state['pending']['code'] == 'R20'
+
 
 def test_choice_unclear_answers_and_keeps_choices():
     mod,calls=load(content='Abrimos a las 20.',reservations=RES)

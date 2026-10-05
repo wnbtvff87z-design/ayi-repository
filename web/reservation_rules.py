@@ -11,6 +11,7 @@ import unicodedata
 MAX_PARTY = 20
 MAX_LISTED_TEXT = 30
 MAX_LISTED_VOICE = 20
+MAX_LISTED_RESERVATIONS = 20
 
 _WORDS = {'un': 1, 'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5, 'seis': 6, 'siete': 7,
           'ocho': 8, 'nueve': 9, 'diez': 10, 'once': 11, 'doce': 12, 'trece': 13, 'catorce': 14, 'quince': 15,
@@ -93,23 +94,22 @@ def sort_slots(rows):
     return out
 
 
-def meal_filter(rows, meal):
-    """Keep lunch or dinner slots using only the slots really offered.
+def listed_slots(rows, channel, offset=0):
+    """Return one presentation page without discarding the underlying availability."""
+    limit = MAX_LISTED_VOICE if channel == 'Voice' else MAX_LISTED_TEXT
+    start = max(0, int(offset or 0))
+    rows = list(rows or [])
+    page = rows[start:start + limit]
+    next_offset = start + len(page) if start + len(page) < len(rows) else None
+    return page, next_offset
 
-    The split is the largest gap (>= 2h) between real slots; no fixed lunch/dinner
-    window is assumed. With too little data to separate services, rows are returned
-    unfiltered rather than guessing.
-    """
+
+def meal_filter(rows, meal):
+    """Keep real slots inside the restaurant's defined lunch or dinner window."""
     if meal not in ('lunch', 'dinner'):
         return rows
-    minutes = sorted({_minutes(x) for x in rows})
-    if len(minutes) < 2:
-        return rows
-    gap, i = max((minutes[k + 1] - minutes[k], k) for k in range(len(minutes) - 1))
-    if gap < 120:
-        return rows
-    pivot = (minutes[i] + minutes[i + 1]) / 2
-    return [x for x in rows if (_minutes(x) < pivot) == (meal == 'lunch')]
+    start, end = (750, 930) if meal == 'lunch' else (1140, 1380)
+    return [x for x in rows if start <= _minutes(x) < end]
 
 
 def meal_from_text(text):
@@ -119,6 +119,78 @@ def meal_from_text(text):
     if re.search(r'\b(?:almorzar|almuerzo|almorzamos|comer|comemos|comida|mediodia)\b', q):
         return 'lunch'
     return None
+
+
+def resolve_meal(text, confirmed=None, proposed=None):
+    """Explicit customer wording outranks confirmed state, which outranks a model proposal."""
+    explicit = meal_from_text(text)
+    if explicit:
+        return explicit
+    if confirmed in ('lunch', 'dinner'):
+        return confirmed
+    return proposed if proposed in ('lunch', 'dinner') else None
+
+
+def reservation_page(rows, offset=0):
+    """Return a page and its next offset; numbers restart at one on each page."""
+    start = max(0, int(offset or 0))
+    rows = list(rows or [])
+    page = rows[start:start + MAX_LISTED_RESERVATIONS]
+    next_offset = start + len(page) if start + len(page) < len(rows) else None
+    return page, next_offset
+
+
+def sort_reservations(rows):
+    """Most recent scheduled reservation first, with code as a stable tie-breaker."""
+    return sorted(
+        rows or [],
+        key=lambda row: (
+            str(row.get('slot_date', row.get('date', ''))),
+            str(row.get('start_time', row.get('time', ''))),
+            str(row.get('code', '')),
+        ),
+        reverse=True,
+    )
+
+
+def format_reservation_page(rows, offset, verb, label):
+    page, next_offset = reservation_page(rows, offset)
+    listed = ', '.join(
+        f'{i}. {label(row["date"], row["time"])}'
+        for i, row in enumerate(page, 1)
+    )
+    more = " Hay más reservas; di 'siguiente' para verlas." if next_offset is not None else ''
+    return page, next_offset, f'Encontré {listed}.{more} ¿Cuál quieres {verb}?'
+
+
+def is_next_page_request(text):
+    return bool(re.fullmatch(r'\s*(?:(?:y|las?)\s+)?(?:siguiente|siguientes|ver\s+mas|mostrar\s+mas|mas)\s*[.!?¿¡]*\s*', norm(text)))
+
+
+def explicit_choice(text, count):
+    q = norm(text).strip(' .,!?¿¡')
+    number_words = {word: value for word, value in _WORDS.items()}
+    m = re.fullmatch(r'(?:(?:la|el)\s+)?(?:(?:opcion|numero|reserva)\s+)?(\d{1,2})', q)
+    if m:
+        number = int(m.group(1))
+        return number if 1 <= number <= count else None
+    m = re.fullmatch(r'(?:(?:la|el)\s+)?(?:(?:opcion|numero|reserva)\s+)?([a-z]+)', q)
+    if m and m.group(1) in number_words:
+        number = number_words[m.group(1)]
+        return number if 1 <= number <= count else None
+    ordinals = {'primera': 1, 'segunda': 2, 'tercera': 3, 'cuarta': 4, 'quinta': 5,
+                'sexta': 6, 'septima': 7, 'octava': 8, 'novena': 9, 'decima': 10,
+                'ultima': count}
+    m = re.fullmatch(r'(?:(?:la|el)\s+)?(' + '|'.join(ordinals) + r')', q)
+    number = ordinals[m.group(1)] if m else None
+    return number if number is not None and 1 <= number <= count else None
+
+
+def is_numeric_choice(text):
+    return bool(re.fullmatch(
+        r'(?:(?:la|el)\s+)?(?:(?:opcion|numero|reserva)\s+)?\d{1,2}',
+        norm(text).strip(' .,!?¿¡'),
+    ))
 
 
 def _meal_phrase(meal):
@@ -160,7 +232,7 @@ def spoken_time(value):
     return f'{article} {words}{tail} {_day_part(h)}'
 
 
-def format_slots(rows, party, channel, day, label, spoken_time, meal=None, requested=None):
+def format_slots(rows, party, channel, day, label, spoken_time, meal=None, requested=None, has_more=False):
     """Customer-facing text built ONLY from real slots of ``day``.
 
     ``requested`` is the hour the customer asked for and that is NOT available
@@ -182,14 +254,17 @@ def format_slots(rows, party, channel, day, label, spoken_time, meal=None, reque
         return f'No tengo disponibilidad para {_people(party)} {label(day)}{_meal_phrase(meal)}. ¿Quieres que busque otro día?'
     if len(rows) == 1:
         when = label(day, rows[0]['time'])
-        return miss + f'Tengo disponibilidad {when} para {_people(party)}.' if miss else f'Para {_people(party)} tengo disponibilidad {when}.'
+        result = miss + f'Tengo disponibilidad {when} para {_people(party)}.' if miss else f'Para {_people(party)} tengo disponibilidad {when}.'
+        return result + (" Hay más horarios; di 'siguiente' para verlos." if has_more else '')
     if voice:
         times = ['a ' + spoken_time(x['time']) for x in rows[:MAX_LISTED_VOICE]]
         lead = miss + 'Tengo' if miss else f'Para {_people(party)} tengo'
-        return f'{lead} disponibilidad {label(day)} ' + ', '.join(times[:-1]) + ' y ' + times[-1] + '. ¿Cuál te viene mejor?'
+        more = " Hay más horarios; di 'siguiente' para verlos." if has_more else ''
+        return f'{lead} disponibilidad {label(day)} ' + ', '.join(times[:-1]) + ' y ' + times[-1] + '.' + more + ' ¿Cuál te viene mejor?'
     lead = miss + f'Tengo estas alternativas para {label(day)}:' if miss else f'Para {_people(party)} tengo estas opciones para {label(day)}:'
     listing = '\n'.join(f'{i}. {x["time"]}' for i, x in enumerate(rows[:MAX_LISTED_TEXT], 1))
-    return f'{lead}\n\n{listing}\n\n¿Cuál te viene mejor?'
+    more = "\n\nHay más horarios; di 'siguiente' para verlos." if has_more else ''
+    return f'{lead}\n\n{listing}{more}\n\n¿Cuál te viene mejor?'
 
 
 # --- intent helpers ---------------------------------------------------------
