@@ -28,7 +28,7 @@ class SocialClosureTests(FlowBase):
                      'muchas gracias por todo, nos vemos'):
             with self.subTest(text=text):
                 reply, st = self.env.say(self.done_state(), text, {'intent': 'social', 'reply': 'x'})
-                self.assertEqual(st, {'phase': 'closed', 'intent': None, 'values': {}})
+                self.assertEqual(st, {'phase': 'closed', 'intent': None, 'values': {}, '_end_call_reason': 'goodbye'})
                 self.assertIn('Hasta luego', reply)
                 self.assertNotIn('?', reply)  # never asks for booking details again
         self.assertNoSideEffects(); self.assertNotIn('availability', self.env.calls)
@@ -38,9 +38,21 @@ class SocialClosureTests(FlowBase):
         reply, st = self.env.say(self.done_state(), 'ahí quedó todo clarísimo, un abrazo grande', {'intent': 'social'})
         self.assertEqual(st['phase'], 'closed'); self.assertEqual(self.env.interpreted, ['ahí quedó todo clarísimo, un abrazo grande'])
 
-    def test_offline_fallback_still_closes_plain_farewell(self):
+    def test_interpreter_failure_does_not_guess_a_farewell(self):
         reply, st = self.env.say(self.done_state(), 'gracias, chau', None)
-        self.assertEqual(st['phase'], 'closed')
+        self.assertIn('No pude interpretar', reply)
+        self.assertNotEqual(st.get('phase'), 'closed')
+
+    def test_greetings_are_classified_and_do_not_close_the_conversation(self):
+        state = {'intent': 'create', 'phase': 'collecting', 'values': dict(CREATE_STATE_VALUES)}
+        reply, st = self.env.say(state, 'Hola, buenas',
+                                 {'intent': 'greeting', 'reply': '¡Hola! ¿En qué puedo ayudarte?'})
+        self.assertIn('¿En qué puedo ayudarte?', reply)
+        self.assertNotEqual(st.get('phase'), 'closed')
+        self.assertEqual(st['values'], CREATE_STATE_VALUES)
+        reply, st = self.env.say({}, 'Hola, buenas', None)
+        self.assertIn('No pude interpretar', reply)
+        self.assertNotEqual(st.get('phase'), 'closed')
 
     def test_farewell_midbooking_keeps_collected_data(self):
         _, st = self.start_booking()
@@ -56,28 +68,68 @@ class SocialClosureTests(FlowBase):
 
 class MixedIntentTests(FlowBase):
     def test_farewell_plus_availability_is_processed(self):
-        text = 'gracias, chau, pero antes decime si tenías horarios para el domingo'
+        text = 'gracias, chau, pero antes dime si tenías horarios para el domingo'
         reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text,
                                  {'intent': 'availability', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
         self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('13:30', reply); self.assertIn('21:00', reply)
         self.assertEqual(st['phase'], 'inquiry'); self.assertNoSideEffects()
 
-    def test_mixed_turn_not_closed_even_if_model_says_social(self):
-        text = 'gracias, chau, pero antes decime si tenías horarios para el domingo'
-        reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text, {'intent': 'social'})
-        self.assertNotEqual(st.get('phase'), 'closed')
+    def test_interpreter_classifies_mixed_turn_as_operational(self):
+        text = 'gracias, chau, pero antes dime si tenías horarios para el domingo'
+        reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text,
+                                 {'intent': 'availability', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
+        self.assertEqual(st.get('phase'), 'inquiry')
+        self.assertIn('1. 13:30', reply); self.assertIn('2. 21:00', reply)
+        self.assertNoSideEffects()
 
-    def test_mixed_turn_with_interpreter_down_still_answers_availability(self):
+    def test_interpreter_failure_does_not_guess_availability_from_phrases(self):
         reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}},
-                                 'gracias, chau, pero antes decime si tenías horarios para el domingo', None)
-        self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('cuántas personas', reply); self.assertEqual(st['intent'], 'availability'); self.assertNoSideEffects()
+                                 'gracias, chau, pero antes dime si tenías horarios para el domingo', None)
+        self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('No pude interpretar', reply)
+        self.assertNotEqual(st.get('intent'), 'availability'); self.assertNoSideEffects()
 
-    def test_availability_question_during_booking_keeps_state_and_resumes(self):
+    def test_agent_classifies_booking_followup_and_keeps_reservation_context(self):
         _, st = self.start_booking()
-        reply, st2 = self.env.say(st, 'che, ¿y tenés horarios libres para el lunes?',
-                                  {'intent': 'availability', 'updates': {'reservation_date': '2030-10-07', 'party_size': 4}})
-        self.assertEqual(st2['values'], CREATE_STATE_VALUES); self.assertEqual(st2['intent'], 'create')
-        self.assertIn('Volviendo a tu reserva', reply); self.assertNoSideEffects()
+        reply, st2 = self.env.say(st, '¿Y para el 7 de octubre de 2030 qué horarios hay?',
+                                  {'intent': 'create', 'updates': {'reservation_date': '2030-10-07', 'party_size': 4}})
+        self.assertEqual(st2['values'], {'reservation_date': '2030-10-07', 'party_size': 4})
+        self.assertEqual(st2['intent'], 'create')
+        self.assertIn('tengo estas opciones', reply); self.assertNotIn('Volviendo a tu reserva', reply)
+        self.assertNoSideEffects()
+
+    def test_independent_availability_intent_is_a_detour(self):
+        _, state = self.start_booking()
+        reply, updated = self.env.say(state, '¿Hay una consulta independiente para otra fecha?',
+                                      {'intent': 'availability', 'updates': {'reservation_date': '2030-10-07',
+                                                                            'party_size': 2}})
+        self.assertIn('Volviendo a tu reserva', reply)
+        self.assertEqual(updated['intent'], 'create')
+        self.assertEqual(updated['values'], CREATE_STATE_VALUES)
+        self.assertNoSideEffects()
+
+    def test_availability_during_new_booking_stays_in_same_booking_flow(self):
+        _, st = self.env.say({}, 'Quería reservar', {'intent': 'create'})
+        reply, st = self.env.say(st, 'Para el 7 de octubre de 2030, tienes algo?',
+                                 {'intent': 'create', 'updates': {'reservation_date': '2030-10-07'}})
+        self.assertIn('¿Para cuántas personas?', reply)
+        self.assertNotIn('Volviendo a tu reserva', reply)
+        reply, st = self.env.say(st, '2 personas', {'intent': 'create', 'updates': {'party_size': 2}})
+        self.assertIn('tengo estas opciones', reply)
+        self.assertIn('2030-10-07', st['values']['reservation_date'])
+        self.assertEqual(st['intent'], 'create')
+        self.assertNoSideEffects()
+
+    def test_interpreter_clear_fields_retracts_stale_date_and_time(self):
+        state = {'intent': 'create', 'phase': 'collecting',
+                 'values': {'reservation_date': '2030-10-06', 'party_size': 2,
+                            'reservation_time': '21:00'},
+                 'offered': [{'date': '2030-10-06', 'time': '21:00'}]}
+        reply, st = self.env.say(state, 'Eso no era lo que quise decir.',
+                                 {'intent': 'create', 'clear_fields': ['reservation_date']})
+        self.assertIn('¿Para qué día quieres la mesa?', reply)
+        self.assertNotIn('reservation_date', st['values'])
+        self.assertNotIn('reservation_time', st['values'])
+        self.assertEqual(st['expected'], 'reservation_date')
 
 
 class DetourTests(FlowBase):
@@ -139,9 +191,8 @@ class ConfirmationSafetyTests(FlowBase):
         _, st = self.start_booking()
         for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Juan García', {'customer_name': 'Juan García'}),
                           ('juan@example.com', {'customer_email': 'juan@example.com'})):
-            _, st = self.env.say(st, text, {'intent': 'create', 'updates': upd})
-        reply, st = self.env.say(st, 'telefono 600123456', {'intent': 'create'})
-        return reply, st
+            reply, st = self.env.say(st, text, {'intent': 'create', 'updates': upd})
+        return reply, st  # the caller's own number is used, so no phone question is needed
 
     def test_create_requires_explicit_confirmation(self):
         reply, st = self.full_create()
@@ -183,7 +234,7 @@ class ConfirmationSafetyTests(FlowBase):
         self.env.rows = [self.ROW]
         reply, st = self.env.say({}, 'quiero cancelar mi reserva a nombre de Juan García',
                                  {'intent': 'cancel', 'updates': {'customer_name': 'Juan García'}})
-        self.assertEqual(st['phase'], 'awaiting'); self.assertIn('¿Confirmás?', reply); self.assertNoSideEffects()
+        self.assertEqual(st['phase'], 'awaiting'); self.assertIn('¿Confirmas?', reply); self.assertNoSideEffects()
         self.assertIn('reservations_for_caller', self.env.calls)
         reply, st = self.env.say(st, 'sí', {'intent': 'cancel'})
         self.assertEqual(self.env.writes, ['cancel']); self.assertIn('cancelé', reply)
@@ -211,12 +262,152 @@ class ConfirmationSafetyTests(FlowBase):
 
     def test_interpreter_failure_never_writes(self):
         reply, st = self.env.say({}, 'quiero reservar', None)
-        self.assertIn('No entendí', reply); self.assertNoSideEffects()
+        self.assertIn('No pude interpretar', reply); self.assertNoSideEffects()
 
     def test_disabled_business_never_touches_tools(self):
         self.env.business['allow_reservations'] = False
         reply, st = self.env.say({}, 'quiero reservar', {'intent': 'create'})
         self.assertIn('No tengo reservas', reply); self.assertEqual(self.env.calls, [])
+
+
+class SuperAgentTests(FlowBase):
+    def test_null_updates_never_overwrite_accumulated_state(self):
+        _, st = self.start_booking()
+        nulls = {k: None for k in ('customer_name', 'reservation_date', 'reservation_time', 'party_size', 'customer_phone', 'customer_email')}
+        _, st2 = self.env.say(st, 'ehh no sé, somos un montón', {'intent': 'create', 'updates': nulls, 'needs_clarification': True})
+        self.assertEqual(st2['values'], CREATE_STATE_VALUES)
+
+    def test_last_correction_wins_and_is_validated(self):
+        _, st = self.env.say({}, 'Mesa para 4, no perdón, seremos 3 a las 8... o mejor a las 9',
+                             {'intent': 'create', 'updates': {'party_size': 3, 'reservation_time': '21:00', 'reservation_date': '2030-10-06'}})
+        self.assertEqual(st['values'].get('party_size'), 3)
+        self.assertNotEqual(st['values'].get('party_size'), 4)
+
+    def test_invalid_model_values_are_dropped_by_validation(self):
+        mod = self.env.interpret_mod
+        out = mod.validate_parsed({'intent': 'create', 'updates': {'party_size': 99, 'reservation_time': ' 21:00 ', 'customer_name': None}})
+        self.assertEqual(out['updates'], {'reservation_time': '21:00'})
+
+    def test_prompt_contains_principles_and_valid_few_shot_json(self):
+        import json
+        mod = self.env.interpret_mod
+        for token in ('Prevalencia temporal', 'STT', 'Multi-intención', 'hora de cenar', 'Ejemplo A', 'Ejemplo B', 'Ejemplo C'):
+            self.assertIn(token, mod.PRINCIPLES + mod.FEW_SHOT)
+        outs = [l[len('Salida: '):] for l in mod.FEW_SHOT.splitlines() if l.startswith('Salida: ')]
+        self.assertEqual(len(outs), 3)
+        for o in outs:
+            self.assertEqual(mod.validate_parsed(json.loads(o))['intent'], json.loads(o)['intent'])
+
+    def test_mixed_menu_question_is_answered_and_booking_kept(self):
+        reply, st = self.env.say({}, '¿Qué tienen en la carta? Quería reservar para 2 el 6 de octubre de 2030',
+                                 {'intent': 'create', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
+        self.assertIn('Paella', reply); self.assertEqual(st['intent'], 'create'); self.assertEqual(st['values'], CREATE_STATE_VALUES)
+        self.assertNoSideEffects()
+
+    def test_mixed_unknown_question_gets_polite_reply_and_keeps_booking(self):
+        reply, st = self.env.say({}, '¿Tenéis parking? Quería reservar para 2 el 6 de octubre de 2030',
+                                 {'intent': 'create', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'},
+                                  'reply': 'Ahora mismo no tengo ese dato a mano; puedes confirmarlo con el restaurante.'})
+        self.assertIn('no tengo ese dato', reply); self.assertEqual(st['values'], CREATE_STATE_VALUES)
+        self.assertNoSideEffects()
+
+    def test_prompt_does_not_announce_country(self):
+        mod = self.env.interpret_mod
+        self.assertNotIn('en España', mod.PRINCIPLES + mod.FEW_SHOT)
+
+
+class SpanishVoiceTests(FlowBase):
+    def test_spoken_time_is_natural_peninsular_spanish(self):
+        t = self.env.dialog._spoken_time
+        self.assertEqual(t('21:00'), 'las nueve de la noche')
+        self.assertEqual(t('21:30'), 'las nueve y media de la noche')
+        self.assertEqual(t('13:30'), 'la una y media de la tarde')
+        self.assertEqual(t('20:45'), 'las nueve menos cuarto de la noche')
+        self.assertEqual(t('12:00'), 'las doce del mediodía')
+
+    def test_voice_text_rewrites_clock_times_without_double_article(self):
+        v = self.env.dialog._voice_text
+        self.assertEqual(v('Tengo mesa a las 21:00.'), 'Tengo mesa a las nueve de la noche.')
+        self.assertEqual(v('Tengo mesa a las 13:00.'), 'Tengo mesa a la una de la tarde.')
+        self.assertNotIn(':', v('Tengo 13:30 y 21:00'))
+
+    def test_relay_and_core_goodbye_match_and_use_tuteo(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[2]
+        for rel in ('relay/main.py', 'web/restaurant_dialog.py', 'web/restaurant_dialog_agent.py'):
+            src = (root / rel).read_text()
+            self.assertNotIn('a vos', src); self.assertIn('Gracias a ti', src)
+
+
+class RealCustomerScenarioTests(FlowBase):
+    """Situations seen with real callers: data given early, spoken e-mails, single names, unclear answers."""
+
+    def create(self, **upd):
+        return {'intent': 'create', 'updates': upd}
+
+    def test_contact_data_given_before_it_is_asked_is_remembered(self):
+        _, st = self.env.say({}, 'Soy Juan Pérez, mesa para 2 el 6 de octubre de 2030, mi correo es juan@x.com',
+                             self.create(customer_name='Juan Pérez', customer_email='juan@x.com', party_size=2, reservation_date='2030-10-06'))
+        reply, st = self.env.say(st, 'a las 21', self.create(reservation_time='21:00'))
+        self.assertEqual(st['phase'], 'awaiting'); self.assertIn('Juan Pérez', reply)
+        self.assertEqual(st['pending']['values']['customer_email'], 'juan@x.com')
+        self.assertNoSideEffects()
+
+    def test_caller_number_is_used_instead_of_asking_again(self):
+        _, st = self.start_booking()
+        for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Ana Ruiz', {'customer_name': 'Ana Ruiz'}),
+                          ('ana@x.es', {'customer_email': 'ana@x.es'})):
+            reply, st = self.env.say(st, text, self.create(**upd))
+        self.assertEqual(st['phase'], 'awaiting'); self.assertEqual(st['pending']['values']['customer_phone'], '+34600000000')
+        self.assertNotIn('teléfono dejamos', reply)
+
+    def test_explicit_phone_overrides_caller_number_while_awaiting(self):
+        _, st = self.start_booking()
+        for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Ana Ruiz', {'customer_name': 'Ana Ruiz'}),
+                          ('ana@x.es', {'customer_email': 'ana@x.es'})):
+            _, st = self.env.say(st, text, self.create(**upd))
+        reply, st = self.env.say(st, 'mejor mi móvil 611 222 333', self.create(customer_phone='611222333'))
+        self.assertEqual(st['phase'], 'awaiting'); self.assertEqual(st['pending']['values']['customer_phone'], '611222333')
+
+    def test_first_name_then_surname_is_assembled_without_repeating_question(self):
+        _, st = self.start_booking()
+        _, st = self.env.say(st, '21:00', self.create(reservation_time='21:00'))
+        r1, st = self.env.say(st, 'Juan', self.create())
+        self.assertIn('apellido', r1)
+        r2, st = self.env.say(st, 'Pérez', self.create())
+        self.assertEqual(st['values']['customer_name'], 'Juan Pérez'); self.assertIn('correo', r2)
+
+    def test_spoken_email_from_voice_transcription_is_rebuilt(self):
+        _, st = self.start_booking()
+        for text, upd in (('21:00', {'reservation_time': '21:00'}), ('Juan Pérez', {'customer_name': 'Juan Pérez'})):
+            _, st = self.env.say(st, text, self.create(**upd))
+        reply, st = self.env.say(st, 'juan punto perez arroba gmail punto com', self.create())
+        self.assertEqual(st['values']['customer_email'], 'juan.perez@gmail.com')
+        self.assertEqual(st['values']['customer_name'], 'Juan Pérez')
+
+    def test_unanswered_question_is_rephrased_not_repeated_verbatim(self):
+        _, st = self.env.say({}, 'quiero reservar', self.create())
+        r1, st = self.env.say(st, 'no sé', self.create())
+        r2, st = self.env.say(st, 'ni idea', self.create())
+        self.assertIn('No he entendido', r2)
+        _, st = self.env.say(st, 'el 6 de octubre de 2030', self.create(reservation_date='2030-10-06'))
+        self.assertEqual(st['values']['reservation_date'], '2030-10-06')
+
+    def test_unexpected_internal_error_gets_friendly_reply_and_no_write(self):
+        _, st = self.start_booking()
+        def boom(*a, **k):
+            raise ValueError('unexpected')
+        self.env.dialog.availability = boom
+        reply, st2 = self.env.say(st, 'a las 21', self.create(reservation_time='21:00'))
+        self.assertIn('No he hecho cambios', reply); self.assertNotIn('pending', st2); self.assertEqual(self.env.writes, [])
+
+    def test_voice_channel_reads_times_in_spanish(self):
+        env = self.env
+        env.dialog._CHANNEL.set('Voice')
+        try:
+            self.assertEqual(env.dialog._voice_text('A las 21:30'), 'A las nueve y media de la noche')
+        finally:
+            env.dialog._CHANNEL.set('WhatsApp')
 
 
 if __name__ == '__main__':
