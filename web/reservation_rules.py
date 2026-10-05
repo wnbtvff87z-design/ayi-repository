@@ -143,8 +143,8 @@ def format_slots(rows, party, channel, day, label, spoken_time, meal=None, reque
                 if requested is not True else 'Esa hora no está disponible. ')
     if not rows:
         if miss:
-            return miss + f'No tengo otra disponibilidad para {_people(party)} {label(day)}. ¿Querés que busque otro día?'
-        return f'No tengo disponibilidad para {_people(party)} {label(day)}{_meal_phrase(meal)}. ¿Querés que busque otro día?'
+            return miss + f'No tengo otra disponibilidad para {_people(party)} {label(day)}. ¿Quieres que busque otro día?'
+        return f'No tengo disponibilidad para {_people(party)} {label(day)}{_meal_phrase(meal)}. ¿Quieres que busque otro día?'
     if len(rows) == 1:
         when = label(day, rows[0]['time'])
         return miss + f'Tengo disponibilidad {when} para {_people(party)}.' if miss else f'Para {_people(party)} tengo disponibilidad {when}.'

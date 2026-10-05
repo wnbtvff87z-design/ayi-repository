@@ -66,7 +66,7 @@ def test_awaiting_tangent_single_call_and_keeps_pending():
     mod,calls=load(content='Abrimos a las 20.')
     state={'phase':'awaiting','pending':{'operation':'create','values':{}}}
     reply,st=run(mod,calls,BIZ,state,[],'¿a qué hora abren?','WhatsApp','s1','+34600')
-    assert len(calls)==1 and 'pending' in st and '¿Confirmás' in reply
+    assert len(calls)==1 and 'pending' in st and '¿Confirmas' in reply
 
 def test_awaiting_independent_availability_keeps_pending():
     rows=[{'date':'2030-05-01','time':'21:00'}]
@@ -74,7 +74,7 @@ def test_awaiting_independent_availability_keeps_pending():
     pending={'operation':'create','values':{}}
     state={'phase':'awaiting','intent':'create','pending':pending}
     reply,st=run(mod,calls,BIZ,state,[],'¿y el miércoles?','WhatsApp','s1','+34600')
-    assert len(calls)==1 and st['pending']==pending and st['phase']=='awaiting' and '¿Confirmás' in reply
+    assert len(calls)==1 and st['pending']==pending and st['phase']=='awaiting' and '¿Confirmas' in reply
 
 def test_meal_filter_lunch_dinner():
     mod,_=load()
@@ -120,7 +120,7 @@ def test_multiple_reservations_ask_then_pick_then_confirm_cancel():
     writes=[]
     mod,calls=load([tc('cancel_reservation',{'customer_name':'Ana Pérez'})],reservations=RES,writes=writes)
     reply,st=run(mod,calls,BIZ,{},[],'cancelá mi reserva','WhatsApp','s1','+34600')
-    assert st['phase']=='choosing_original' and len(st['choices'])==2 and '¿Cuál querés cancelar?' in reply
+    assert st['phase']=='choosing_original' and len(st['choices'])==2 and '¿Cuál quieres cancelar?' in reply
     n=len(calls)
     reply,st=run(mod,calls,BIZ,st,[],'la segunda','WhatsApp','s1','+34600')
     assert len(calls)==n  # resolved in Python, no model call

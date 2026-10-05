@@ -68,14 +68,14 @@ class SocialClosureTests(FlowBase):
 
 class MixedIntentTests(FlowBase):
     def test_farewell_plus_availability_is_processed(self):
-        text = 'gracias, chau, pero antes decime si tenías horarios para el domingo'
+        text = 'gracias, chau, pero antes dime si tenías horarios para el domingo'
         reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text,
                                  {'intent': 'availability', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
         self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('13:30', reply); self.assertIn('21:00', reply)
         self.assertEqual(st['phase'], 'inquiry'); self.assertNoSideEffects()
 
     def test_interpreter_classifies_mixed_turn_as_operational(self):
-        text = 'gracias, chau, pero antes decime si tenías horarios para el domingo'
+        text = 'gracias, chau, pero antes dime si tenías horarios para el domingo'
         reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}}, text,
                                  {'intent': 'availability', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
         self.assertEqual(st.get('phase'), 'inquiry')
@@ -84,7 +84,7 @@ class MixedIntentTests(FlowBase):
 
     def test_interpreter_failure_does_not_guess_availability_from_phrases(self):
         reply, st = self.env.say({'phase': 'done', 'intent': None, 'values': {}},
-                                 'gracias, chau, pero antes decime si tenías horarios para el domingo', None)
+                                 'gracias, chau, pero antes dime si tenías horarios para el domingo', None)
         self.assertNotEqual(st.get('phase'), 'closed'); self.assertIn('No pude interpretar', reply)
         self.assertNotEqual(st.get('intent'), 'availability'); self.assertNoSideEffects()
 
@@ -109,7 +109,7 @@ class MixedIntentTests(FlowBase):
 
     def test_availability_during_new_booking_stays_in_same_booking_flow(self):
         _, st = self.env.say({}, 'Quería reservar', {'intent': 'create'})
-        reply, st = self.env.say(st, 'Para el 7 de octubre de 2030, tenés algo?',
+        reply, st = self.env.say(st, 'Para el 7 de octubre de 2030, tienes algo?',
                                  {'intent': 'create', 'updates': {'reservation_date': '2030-10-07'}})
         self.assertIn('¿Para cuántas personas?', reply)
         self.assertNotIn('Volviendo a tu reserva', reply)
@@ -126,7 +126,7 @@ class MixedIntentTests(FlowBase):
                  'offered': [{'date': '2030-10-06', 'time': '21:00'}]}
         reply, st = self.env.say(state, 'Eso no era lo que quise decir.',
                                  {'intent': 'create', 'clear_fields': ['reservation_date']})
-        self.assertIn('¿Para qué día querés la mesa?', reply)
+        self.assertIn('¿Para qué día quieres la mesa?', reply)
         self.assertNotIn('reservation_date', st['values'])
         self.assertNotIn('reservation_time', st['values'])
         self.assertEqual(st['expected'], 'reservation_date')
@@ -235,7 +235,7 @@ class ConfirmationSafetyTests(FlowBase):
         self.env.rows = [self.ROW]
         reply, st = self.env.say({}, 'quiero cancelar mi reserva a nombre de Juan García',
                                  {'intent': 'cancel', 'updates': {'customer_name': 'Juan García'}})
-        self.assertEqual(st['phase'], 'awaiting'); self.assertIn('¿Confirmás?', reply); self.assertNoSideEffects()
+        self.assertEqual(st['phase'], 'awaiting'); self.assertIn('¿Confirmas?', reply); self.assertNoSideEffects()
         self.assertIn('reservations_for_caller', self.env.calls)
         reply, st = self.env.say(st, 'sí', {'intent': 'cancel'})
         self.assertEqual(self.env.writes, ['cancel']); self.assertIn('cancelé', reply)

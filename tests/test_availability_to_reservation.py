@@ -160,7 +160,7 @@ def _repeated_operational_reply_does_not_change_intent_or_phase():
     state = {
         "intent": "availability",
         "phase": "inquiry",
-        "last_base_reply": "¿Cuál de las horas que te dije preferís?",
+        "last_base_reply": "¿Cuál de las horas que te dije prefieres?",
         "stalls": 1,
     }
     reply, updated = dialog._reply(state, state["last_base_reply"])
