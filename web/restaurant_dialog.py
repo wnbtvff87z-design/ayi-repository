@@ -51,7 +51,9 @@ def _greeting_reply(reply,channel,history):
     return (text or '¡Hola! ¿En qué puedo ayudarte?')[:220]
 
 def _closure(s,hangup=False):
-    if s.get('phase')=='sync_pending':return 'La operación sigue pendiente de verificación. Si quieres, seguimos con recepción. Hasta luego.',s
+    if s.get('phase')=='sync_pending':
+        s['_end_call_reason']='verification'
+        return 'La operación sigue pendiente de verificación. No la repitas; consulta con recepción.',s
     if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'cancelled'}
     if _in_progress(s) and s.get('values') and not hangup:
         s['last_reply']='¡Gracias! Cuando quieras retomamos tu reserva, no perdí lo que me dijiste.';return s['last_reply'],s
@@ -90,9 +92,9 @@ def _spoken_digits(value):
 
 def _spoken_address(email):
     """'juan8@gmail.com' -> 'juan, ocho, arroba, gmail, punto, com': symbols and digits as words, with pauses."""
-    words={'@':'arroba','.':'punto','_':'guion bajo','-':'guion'}
+    words={'@':'arroba','.':'punto','_':'guion bajo','-':'guion','hotmail':'jotmail'}
     parts=re.findall(r'\d|[@._-]|[^\d@._-]+',str(email))
-    return ', '.join(_DIGIT_NAMES[int(p)] if p.isdigit() else words.get(p,p) for p in parts)
+    return ', '.join(_DIGIT_NAMES[int(p)] if p.isdigit() else words.get(p.casefold(),p) for p in parts)
 
 def _spoken_email(text):
     """Deterministic fallback only (the interpreter is the primary reader of spoken addresses). STT writes addresses as words ('juan arroba gmail punto com'); rebuild them. Returns None when absent."""
@@ -346,10 +348,24 @@ def _create(s,text,parsed,channel,tz,customer):
     if not v.get('customer_phone'):
         mine=re.sub(r'\D','',str(customer or ''))
         if 9<=len(mine)<=15:v['customer_phone']=('+' if str(customer).strip().startswith('+') else '')+mine
+    declined=set(s.get('declined_fields') or ())|set(parsed.get('declined_fields') or ())
+    declined={field for field in declined if field in _CONTACT_Q and not v.get(field)}
+    s['declined_fields']=sorted(declined)
+    if not declined:s.pop('contact_decline_notified',None)
     missing=[f for f in ('customer_name','customer_email','customer_phone') if not v.get(f)]
     if missing:
         got=[f for f in ('customer_name','customer_email','customer_phone') if v.get(f) and v.get(f)!=old.get(f)]
-        return _ask_contact(s,missing,got,v,v!=old)
+        still_needed=[field for field in missing if field not in declined]
+        if still_needed:
+            return _ask_contact(s,still_needed,got,v,v!=old)
+        s['expected']=sorted(declined)[0]
+        if s.get('contact_decline_notified'):
+            message='De acuerdo. No he confirmado la reserva.'
+        else:
+            labels=' y '.join(_CONTACT_Q[field] for field in sorted(declined))
+            message=f'Entiendo; no te lo volveré a pedir. Sin {labels} no puedo registrar la reserva, así que no la he confirmado.'
+            s['contact_decline_notified']=True
+        return _reply(s,message,True)
     s['pending']={'operation':'create','values':dict(v),'request_id':secrets.token_hex(16)}
     s['phase']='awaiting';s['expected']=None
     return _reply(s,f'Mesa {label(v["reservation_date"],v["reservation_time"])} para {v["party_size"]} personas a nombre de {v["customer_name"]}{"" if _CHANNEL.get()=="Voice" else ", teléfono "+v["customer_phone"]}. ¿La confirmo?',True)
@@ -490,8 +506,10 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         s=fresh(intent);s['business']=b
     contact=bool(u.get('customer_email') or u.get('customer_phone')) and s.get('intent')=='create' and _in_progress(s) and not is_explicit_restart(text)
     if contact and intent in ('other','question','social','greeting'):intent='create'
+    declined_contact=bool(parsed.get('declined_fields')) and s.get('intent')=='create' and _in_progress(s)
+    if declined_contact and intent in ('other','question','social','greeting'):intent='create'
     manage=intent in ('cancel','modify')
-    has_data=bool(u) or bool(parsed.get('time_expression') or parsed.get('meal') or parsed.get('selection') or parsed.get('clear_fields') or contact)
+    has_data=bool(u) or bool(parsed.get('time_expression') or parsed.get('meal') or parsed.get('selection') or parsed.get('clear_fields') or parsed.get('declined_fields') or contact)
     cleared=set(parsed.get('clear_fields') or [])
     if cleared:
         for field in cleared:
@@ -504,6 +522,12 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
             s['offered']=[]
     if parsed.get('end_call') and not has_data and intent in ('social','other','question','greeting'):
         return _closure(s,True)
+    if s.get('phase')=='awaiting' and s.get('pending') and not has_data:
+        if parsed.get('confirmation')=='yes':
+            return _confirm(s,customer,channel)
+        if parsed.get('confirmation')=='no':
+            s.pop('pending',None);s['phase']='done';s['intent']=None
+            return _reply(s,'De acuerdo, no hice cambios. ¿Necesitas algo más?',True)
     if intent=='greeting':
         return _reply(s,_interpreted_reply(s,{'reply':_greeting_reply(parsed.get('reply'),channel,history)},'Te escucho.',220),True)
     if intent=='social' and not has_data:

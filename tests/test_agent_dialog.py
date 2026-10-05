@@ -78,6 +78,33 @@ def test_awaiting_tangent_single_call_and_keeps_pending():
     reply,st=run(mod,calls,BIZ,state,[],'¿a qué hora abren?','WhatsApp','s1','+34600')
     assert len(calls)==1 and 'pending' in st and '¿Confirmas' in reply
 
+
+def test_llm_confirmation_tool_confirms_pending_operation_once():
+    writes=[]
+    mod,calls=load([tc('confirm_pending',{})],reservations=RES,writes=writes)
+    state={'phase':'awaiting','intent':'cancel','values':{'customer_name':'Ana Pérez'},
+           'pending':{'operation':'cancel','code':'A1','old_date':'2030-05-01','old_time':'20:00'}}
+    reply,st=run(mod,calls,BIZ,state,[],'me parece estupendo','WhatsApp','s1','+34600')
+    assert writes==['cancel']
+    assert st['phase']=='done'
+
+
+def test_llm_decides_natural_goodbye_and_returns_hangup_reason():
+    mod,calls=load([tc('end_call',{})])
+    reply,st=run(mod,calls,BIZ,{},[],'ahí quedó todo clarísimo, un abrazo','WhatsApp','s1','+34600')
+    assert st['_end_call_reason']=='goodbye'
+    assert any(tool['function']['name']=='end_call' for tool in calls[0]['tools'])
+
+
+def test_awaiting_write_tool_does_not_repeat_the_pending_proposal():
+    mod,calls=load([tc('create_reservation',{'customer_name':'Ana Pérez'})])
+    pending={'operation':'create','values':{},'request_id':'x'}
+    state={'phase':'awaiting','intent':'create','pending':pending}
+    reply,st=run(mod,calls,BIZ,state,[],'no estoy segura','WhatsApp','s1','+34600')
+    assert st['pending']==pending
+    assert 'no la he repetido' in reply
+
+
 def test_awaiting_independent_availability_keeps_pending():
     rows=[{'date':'2030-05-01','time':'21:00'}]
     mod,calls=load([tc('check_availability',{'date':'2030-05-01','party_size':2})],rows=rows)

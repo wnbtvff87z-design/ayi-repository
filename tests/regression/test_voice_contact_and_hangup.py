@@ -54,6 +54,39 @@ class ContactTests(FlowBase):
         self.env.say(st, 'sí', {'intent': 'other'})
         self.assertEqual(self.env.calls.count('create'), 1)
 
+    def test_model_classifies_a_natural_confirmation_once(self):
+        _, st = self.env.say(self.state(), 'x', {'intent': 'create', 'updates': {'customer_email': 'a@hotmail.com'}})
+        _, done = self.env.say(st, 'me parece bien, sigamos', {'intent': 'social', 'confirmation': 'yes'})
+        self.assertEqual(self.env.calls.count('create'), 1)
+        self.assertEqual(done['phase'], 'done')
+        self.env.say(done, 'me parece bien, sigamos', {'intent': 'social', 'confirmation': 'yes'})
+        self.assertEqual(self.env.calls.count('create'), 1)
+
+    def test_declined_phone_is_not_reasked_or_drops_saved_email(self):
+        state = self.state()
+        state['values']['customer_email'] = 'pepito@manola.example'
+        state['values'].pop('customer_phone')
+        state['expected'] = 'customer_phone'
+        reply, updated = self.env.say(
+            state,
+            'no hace falta el teléfono',
+            {'intent': 'other', 'declined_fields': ['customer_phone']},
+            customer='',
+        )
+        self.assertEqual(updated['values']['customer_email'], state['values']['customer_email'])
+        self.assertIn('teléfono', reply)
+        self.assertNotIn('correo', reply)
+        self.assertNotIn('?', reply)
+        self.assertEqual(self.env.writes, [])
+
+    def test_booking_name_is_independent_of_email_local_part(self):
+        state = self.state()
+        state['values']['customer_name'] = 'Pepito Pérez'
+        state['values']['customer_email'] = 'manola@hotmail.com'
+        _, updated = self.env.say(state, 'x', {'intent': 'create'})
+        self.assertEqual(updated['pending']['values']['customer_name'], 'Pepito Pérez')
+        self.assertEqual(updated['pending']['values']['customer_email'], 'manola@hotmail.com')
+
     def test_no_email_given_does_not_invent_one(self):
         _, st = self.env.say(self.state(), 'mmm', {'intent': 'other'})
         self.assertNotIn('customer_email', st['values'])
@@ -65,6 +98,7 @@ class ContactTests(FlowBase):
         finally:
             d._CHANNEL.reset(token)
         self.assertNotIn('8', ack); self.assertNotIn('@', ack); self.assertIn('arroba', ack); self.assertIn('ocho', ack)
+        self.assertIn('jotmail', d._spoken_address('manola@hotmail.com'))
 
 
 class HangupTests(FlowBase):
@@ -110,6 +144,14 @@ class HangupTests(FlowBase):
     def test_interpreter_down_never_hangs_up(self):
         reply, st = self.env.say(self.done(), 'adiós', None)
         self.assertIsNone(st.get('_end_call_reason'))
+
+    def test_goodbye_ends_even_when_operation_is_awaiting_verification(self):
+        _, st = self.env.say(
+            {'phase': 'sync_pending', 'intent': 'create', 'values': {}},
+            'hasta luego',
+            {'intent': 'social', 'end_call': True},
+        )
+        self.assertEqual(st.get('_end_call_reason'), 'verification')
 
 
 if __name__ == '__main__':

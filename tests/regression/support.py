@@ -60,10 +60,10 @@ class Env:
     def writes(self):
         return [c for c in self.calls if c in ('create', 'cancel', 'modify')]
 
-    def say(self, state, text, parsed=None):
+    def say(self, state, text, parsed=None, customer='+34600000000'):
         """Run one turn. `parsed` stands in for the (mocked) LLM classification of that turn."""
         base = {'intent': 'other', 'updates': {}, 'requested_times': [], 'meal': None, 'time_expression': None,
-                'selection': None, 'reply': '', 'needs_clarification': False}
+                'selection': None, 'reply': '', 'needs_clarification': False, 'declined_fields': [], 'confirmation': 'unclear'}
         if parsed is None:
             def fail(*a, **k):
                 raise RuntimeError('interpreter unavailable')
@@ -73,7 +73,7 @@ class Env:
                 self.interpreted.append(t)
                 return self.interpret_mod.validate_parsed({**base, **parsed})
             self.dialog.interpret = fake
-        return self.dialog.process(self.business, state, [], text, 'WhatsApp', 'ext', '+34600000000')
+        return self.dialog.process(self.business, state, [], text, 'WhatsApp', 'ext', customer)
 
     def close(self):
         for m in _MANAGED:

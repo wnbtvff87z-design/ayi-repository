@@ -137,14 +137,17 @@ def _voice_text(text):
     return text.replace(", ", ". ")
 
 
-def _goodbye(text):
-    """Detect farewell messages."""
-    return bool(
-        re.fullmatch(
-            r"(?:chau|chao|adios|hasta luego|hasta pronto|nos vemos|gracias|muchas gracias)(?:[.! ]*)",
-            norm(text).strip(),
-        )
-    )
+def _closure(s):
+    if s.get("phase") == "sync_pending":
+        s["_end_call_reason"] = "verification"
+        return "La operación sigue pendiente de verificación. No la repitas; consulta con recepción.", s
+    if s.get("phase") == "awaiting":
+        return "De acuerdo, no hice cambios. ¡Hasta luego!", {
+            "phase": "closed", "intent": None, "values": {}, "_end_call_reason": "cancelled"
+        }
+    return "¡Gracias a ti! Hasta luego.", {
+        "phase": "closed", "intent": None, "values": {}, "_end_call_reason": "goodbye"
+    }
 
 
 def label(d, t=None):
@@ -205,6 +208,22 @@ def valid_time(v):
 # ============================================================================
 
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_pending",
+            "description": "Confirm the already-pending operation only when the caller clearly accepts it. Never propose or execute a second operation.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "end_call",
+            "description": "End the conversation when the caller naturally says they are done and makes no new request or correction, regardless of wording or booking phase.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -613,7 +632,7 @@ def _call_agent(b, state, history, text, channel, external_id, customer):
     """Ask the model for a reply or tool calls (OpenAI SDK >= 1.0).
 
     Returns (reply_text, tool_calls). On any failure returns (None, []).
-    The model only proposes; writes happen in Python after an explicit yes().
+    The model only proposes; Python performs writes only after clear caller acceptance.
     """
     key = os.getenv("OPENAI_API_KEY", "")
     if not key:
@@ -631,7 +650,12 @@ def _call_agent(b, state, history, text, channel, external_id, customer):
                 "modificar (modify_reservation) reservas. Las tools de crear/cancelar/modificar solo "
                 "proponen: el sistema pide confirmación al cliente. Nunca afirmes disponibilidad ni "
                 "confirmaciones por tu cuenta. Si faltan datos, pregúntalos sin llamar tools. "
+                "Pide una única confirmación final. Si una operación ya está pendiente, usa confirm_pending solo ante una aceptación inequívoca; "
+                "no vuelvas a llamar la herramienta de escritura para repetir la propuesta. Una despedida natural sin petición nueva debe llamar end_call, "
+                "aunque la reserva esté incompleta; decide por el contexto, no por palabras o listas de frases. "
                 "Preguntas generales: responde breve sin tools. Para el nombre no inventes apellidos. "
+                "El nombre de la reserva y el que aparece en el correo son independientes; nunca los compares ni cambies uno por el otro. "
+                "Conserva los datos de contacto ya facilitados y no vuelvas a pedirlos salvo que el cliente los corrija. "
                 "Almuerzo/cena (comer, almorzar, cenar) es solo una preferencia (meal) que filtra las "
                 "franjas reales; no presupongas horarios típicos ni inventes horarios si el dato falta o es ambiguo. "
                 "La disponibilidad devuelta por el sistema es la fuente de verdad. "
@@ -712,6 +736,8 @@ def _memory_note(state):
         )
     if state.get("phase") == "awaiting" and state.get("pending"):
         parts.append("Hay una operación pendiente de confirmación del cliente.")
+    if state.get("phase") == "sync_pending":
+        parts.append("La operación no debe repetirse: está pendiente de verificación; ante una despedida natural, termina la llamada.")
     if state.get("phase") == "choosing_original":
         parts.append("Se le pidió al cliente elegir una de varias reservas.")
     return " ".join(parts)
@@ -1135,24 +1161,13 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
     if b.get("sector") != "restaurante" or not b.get("allow_reservations"):
         return "No tengo reservas habilitadas para este negocio.", s
 
-    if _goodbye(text):
-        if s.get("phase") == "sync_pending":
-            return (
-                "La operación sigue pendiente de verificación. Si quieres, seguimos con recepción. Hasta luego.",
-                s,
-            )
-        if s.get("phase") == "awaiting":
-            return (
-                "De acuerdo, no hice cambios. ¡Hasta luego!",
-                {"phase": "closed", "intent": None, "values": {}},
-            )
-        return "¡Gracias a ti! Hasta luego.", {"phase": "closed", "intent": None, "values": {}}
-
     if s.get("phase") == "sync_pending":
-        return _reply(
-            s,
-            "La operación está pendiente de verificación. Si quieres, te sigo ayudando con recepción.",
-        )
+        reply_text, tool_calls = _call_agent(b, s, history, text, channel, external_id, customer)
+        if tool_calls:
+            call = tool_calls[0]
+            if call.function.name == "end_call":
+                return _closure(s)
+        return _reply(s, "La operación sigue pendiente de verificación. No la repitas; consulta con recepción.")
 
     note = ""
     if is_explicit_restart(text):
@@ -1256,9 +1271,24 @@ def _converse(s, b, history, text, channel, external_id, customer):
     except (ValueError, TypeError):
         return _reply(s, "No te entendí bien. ¿Me repites qué necesitas?", True)
 
+    if name == "end_call":
+        return _closure(s)
+    if name == "confirm_pending":
+        if holding == "awaiting" and s.get("pending"):
+            operation = s["pending"].get("operation")
+            answer, new = _confirm(s, customer, channel)
+            new.pop("business", None)
+            carried = dict(s)
+            _remember(carried, "confirm_" + str(operation), {}, answer)
+            new["tool_log"] = carried["tool_log"]
+            return answer, new
+        return _reply(s, "No hay ninguna operación pendiente de confirmar.", True)
+
     prefix = ""
     if holding and name in _WRITE_TOOLS:
         open_op = s["pending"].get("operation") if holding == "awaiting" else {"cancelar": "cancel", "modificar": "modify"}.get((s.get("choice_request") or {}).get("operation"))
+        if holding == "awaiting" and _WRITE_TOOLS[name] == open_op:
+            return _reply(s, "La propuesta sigue pendiente; no la he repetido. Dime si la confirmas o quieres dejarla sin efecto.", True)
         if _WRITE_TOOLS[name] != open_op:
             # A different operation is a new request only when the customer says so explicitly
             return _reply(
