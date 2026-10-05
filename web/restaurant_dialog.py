@@ -330,7 +330,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         if no(text):
             s.pop('pending',None);s['phase']='done';s['intent']=None
             return _reply(s,'De acuerdo, no hice cambios. ¿Necesitás algo más?',True)
-    try:parsed=interpret(b,{k:v for k,v in s.items() if k!='business'},history,text)
+    try:parsed=interpret(b,{**{k:v for k,v in s.items() if k!='business'},'channel':channel},history,text)
     except Exception:
         log.exception('Interpretation unavailable')
         return _reply(s,'No pude interpretar ese mensaje ahora. No hice cambios; ¿me lo repetís de otra forma?')
@@ -435,6 +435,11 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     try:
         if s['intent'] in ('cancel','modify'):answer,new=_manage(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid',customer)
         else:answer,new=_create(s,text,parsed,channel,b.get('timezone') or 'Europe/Madrid',customer)
+        side=_business_info(b,q) if intent=='create' and u and s['intent']=='create' else None
+        if side:  # mixed turn: answer the trusted business question without losing the booking
+            answer=side+' '+answer
+            if _CHANNEL.get()=='Voice':answer=_voice_text(answer)
+            new['last_reply']=answer
         new.pop('business',None);return answer,new
     except BookingError as exc:
         log.warning('Booking dialogue error: %s',exc)

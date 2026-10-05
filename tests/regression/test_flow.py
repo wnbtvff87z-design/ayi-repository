@@ -273,3 +273,38 @@ class ConfirmationSafetyTests(FlowBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SuperAgentTests(FlowBase):
+    def test_null_updates_never_overwrite_accumulated_state(self):
+        _, st = self.start_booking()
+        nulls = {k: None for k in ('customer_name', 'reservation_date', 'reservation_time', 'party_size', 'customer_phone', 'customer_email')}
+        _, st2 = self.env.say(st, 'ehh no sé, somos un montón', {'intent': 'create', 'updates': nulls, 'needs_clarification': True})
+        self.assertEqual(st2['values'], CREATE_STATE_VALUES)
+
+    def test_last_correction_wins_and_is_validated(self):
+        _, st = self.env.say({}, 'Mesa para 4, no perdón, seremos 3 a las 8... o mejor a las 9',
+                             {'intent': 'create', 'updates': {'party_size': 3, 'reservation_time': '21:00', 'reservation_date': '2030-10-06'}})
+        self.assertEqual(st['values'].get('party_size'), 3)
+        self.assertNotEqual(st['values'].get('party_size'), 4)
+
+    def test_invalid_model_values_are_dropped_by_validation(self):
+        mod = self.env.interpret_mod
+        out = mod.validate_parsed({'intent': 'create', 'updates': {'party_size': 99, 'reservation_time': ' 21:00 ', 'customer_name': None}})
+        self.assertEqual(out['updates'], {'reservation_time': '21:00'})
+
+    def test_prompt_contains_principles_and_valid_few_shot_json(self):
+        import json
+        mod = self.env.interpret_mod
+        for token in ('Prevalencia temporal', 'STT', 'Multi-intención', 'nochecita', 'Ejemplo A', 'Ejemplo B', 'Ejemplo C'):
+            self.assertIn(token, mod.PRINCIPLES + mod.FEW_SHOT)
+        outs = [l[len('Salida: '):] for l in mod.FEW_SHOT.splitlines() if l.startswith('Salida: ')]
+        self.assertEqual(len(outs), 3)
+        for o in outs:
+            self.assertEqual(mod.validate_parsed(json.loads(o))['intent'], json.loads(o)['intent'])
+
+    def test_mixed_menu_question_is_answered_and_booking_kept(self):
+        reply, st = self.env.say({}, '¿Qué tienen en la carta? Quería reservar para 2 el 6 de octubre de 2030',
+                                 {'intent': 'create', 'updates': {'party_size': 2, 'reservation_date': '2030-10-06'}})
+        self.assertIn('Paella', reply); self.assertEqual(st['intent'], 'create'); self.assertEqual(st['values'], CREATE_STATE_VALUES)
+        self.assertNoSideEffects()

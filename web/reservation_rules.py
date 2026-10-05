@@ -60,11 +60,10 @@ def parse_party(text, expected=False):
     for a, b in sorted(baby_spans + stroller_spans + child_spans, reverse=True):
         rest = rest[:a] + ' ' + rest[b:]
     base = None
-    for pattern in _BASE_PATTERNS:
-        m = pattern.search(rest)
-        if m:
-            base = _to_int(m.group(1))
-            break
+    # Temporal prevalence: when the caller self-corrects, the last stated head-count wins.
+    mentions = [m for pattern in _BASE_PATTERNS for m in pattern.finditer(rest)]
+    if mentions:
+        base = _to_int(max(mentions, key=lambda m: m.start()).group(1))
     if base is None and expected:
         m = re.fullmatch(r'(?:somos\s+|seremos\s+|para\s+)?(' + _NUM_BASE + r')', rest.strip(' .,!?¿¡'))
         if m:
