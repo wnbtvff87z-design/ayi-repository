@@ -25,6 +25,8 @@ def dialogue_namespace():
         'DAYS':('lunes','martes','miércoles','jueves','viernes','sábado','domingo'),
         'MONTHS':('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'),
     }
+    utils=load_functions(ROOT/'web'/'utils.py',('norm','yes'),{'re':re,'unicodedata':unicodedata,'date':date})
+    namespace['yes']=utils['yes']
     return load_functions(ROOT/'web'/'restaurant_dialog.py',('_date','_past_slot','_slots','_interpreted_reply'),namespace)
 
 def test_weekday_and_explicit_date_are_checked_in_the_current_year():
@@ -50,3 +52,8 @@ def test_past_dates_and_times_are_never_returned_as_available():
 def test_interpreted_reply_uses_the_known_customer_name():
     ns=dialogue_namespace()
     assert ns['_interpreted_reply']({'values':{'customer_name':'Ana Pérez'}},{'reply':'Un momento, cliente.'},'',220)=='Un momento, Ana Pérez.'
+
+def test_repeated_yes_is_a_single_unambiguous_affirmative():
+    ns=dialogue_namespace()
+    assert ns['yes']('sí, sí, sí, confirmo')
+    assert not ns['yes']('sí, no')

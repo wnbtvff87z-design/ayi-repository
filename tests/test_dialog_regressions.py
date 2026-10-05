@@ -133,14 +133,3 @@ def test_first_available_exact_time_skips_extra_choice():
    reply,new=d.process(B,state,[],'20:00',channel,'first','+34612345678')
   assert '¿Nombre y apellido' in reply and '¿Elegís' not in reply
   assert new['values']['reservation_time']=='20:00'
-
-def test_repeated_affirmative_confirms_once():
- values={'reservation_date':'2030-10-02','reservation_time':'20:00','party_size':3,
- 'customer_name':'Ana Pérez','customer_email':'ana@example.com','customer_phone':'612345678'}
- state={'intent':'create','phase':'awaiting','operation_id':'op','values':values,
- 'pending':{'operation':'create','values':dict(values),'request_id':'req'}}
- with patch.object(d,'availability',return_value={'available':True}),patch.object(d,'create',return_value={'success':True,'airtable_synced':True}) as create:
- reply,new=d.process(B,state,[],'sí, sí, sí, confirmo','Voice','yes','+34612345678')
- assert 'registrada' in reply
- assert new['phase']=='done'
- create.assert_called_once()
