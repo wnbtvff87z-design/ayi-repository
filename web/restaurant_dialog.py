@@ -210,7 +210,7 @@ def _create(s,text,parsed,channel,tz,customer):
             if m:
                 h=int(m.group(1));hits=[x for x in _meal_filter(rows,s.get('meal')) if int(x['time'][:2])%12==h%12]
                 if len(hits)==1:v['reservation_time']=hits[0]['time']
-                elif len(hits)>1:return _reply(s,'¿Te referís a '+ ' o '.join(x['time'] for x in hits[:2])+'?',True)
+                elif len(hits)>1:return _reply(s,'¿Te refieres a '+ ' o '.join(x['time'] for x in hits[:2])+'?',True)
         if not v.get('reservation_time'):
             if s.get('offered') and not meal and not d and not chosen:
                 s['expected']='reservation_time';return _reply(s,'¿Cuál de las horas que te dije prefieres? También puedes pedirme otra.',v!=old)

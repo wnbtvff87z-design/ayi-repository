@@ -173,7 +173,7 @@ def converse(b,channel,customer,text,external_id,include_end_reason=False):
    state['_sector']=str(b.get('sector') or '').strip().casefold()
    if channel=='Voice':
     state['_voice_call_id']=str(external_id).split(':',1)[0]
-   reply=str(reply or 'No pude responder con seguridad. ¿Podés repetirlo?')
+   reply=str(reply or 'No pude responder con seguridad. ¿Puedes repetirlo?')
    c.execute('UPDATE customer_sessions SET state=%s::jsonb,updated_at=now() WHERE business_id=%s AND channel=%s AND customer_phone=%s',(json.dumps(state,ensure_ascii=False),bid,channel,customer))
    c.execute('INSERT INTO conversation_turns(business_id,channel,customer_phone,external_id,user_text,assistant_text) VALUES(%s,%s,%s,%s,%s,%s)',(bid,channel,customer,external_id,text[:4000],reply[:4000]))
    return (reply,state.get('_end_call_reason')) if include_end_reason else reply
@@ -197,7 +197,7 @@ def whatsapp():
   try:
    b=lookup(request.form.get('To') or PHONE,'WhatsApp');text=request.form.get('Body','').strip()
    if not b:answer='No puedo identificar el negocio asociado a este número.'
-   elif not text:answer='No recibí ningún texto. ¿Me lo repetís?'
+   elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
    else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''))
    if b and text and answer:
     try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
