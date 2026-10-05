@@ -270,10 +270,6 @@ class ConfirmationSafetyTests(FlowBase):
         self.assertIn('No tengo reservas', reply); self.assertEqual(self.env.calls, [])
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class SuperAgentTests(FlowBase):
     def test_null_updates_never_overwrite_accumulated_state(self):
         _, st = self.start_booking()
@@ -412,3 +408,7 @@ class RealCustomerScenarioTests(FlowBase):
             self.assertEqual(env.dialog._voice_text('A las 21:30'), 'A las nueve y media de la noche')
         finally:
             env.dialog._CHANNEL.set('WhatsApp')
+
+
+if __name__ == '__main__':
+    unittest.main()

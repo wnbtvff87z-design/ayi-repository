@@ -23,17 +23,20 @@ def relative_day(text,tz,now=None):
     return (now.date()+timedelta(days=days)).isoformat()
 
 def explicit_date(text,tz,now=None):
-    s=normalized(text);now=now or datetime.now(ZoneInfo(tz));rel=relative_day(s,tz,now)
-    if rel:return rel
+    s=normalized(text);now=now or datetime.now(ZoneInfo(tz))
     months={'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,'julio':7,'agosto':8,'septiembre':9,'octubre':10,'noviembre':11,'diciembre':12}
     m=re.search(r'\b(?:el\s+)?([0-3]?\d)\s+de\s+('+'|'.join(months)+r')(?:\s+de\s+(20\d\d))?\b',s)
-    if not m:return None
-    year=int(m.group(3) or now.year)
-    try:
-        parsed=date(year,months[m.group(2)],int(m.group(1)))
-        if not m.group(3) and parsed<now.date():parsed=parsed.replace(year=parsed.year+1)
+    if m:
+        year=int(m.group(3) or now.year)
+        try:parsed=date(year,months[m.group(2)],int(m.group(1)))
+        except ValueError:return None
+        if not m.group(3):
+            while parsed<now.date():
+                year+=1
+                try:parsed=date(year,months[m.group(2)],int(m.group(1)))
+                except ValueError:continue
         return parsed.isoformat()
-    except ValueError:return None
+    return relative_day(s,tz,now)
 
 def explicit_time(text):
     """A clock must have an introducer, a period, or an HH:MM / HHh form."""

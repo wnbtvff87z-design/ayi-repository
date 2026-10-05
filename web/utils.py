@@ -37,7 +37,9 @@ def valid_party(v):
 def yes(text):
     """Detect affirmative response: si, ok, vale, etc."""
     q = ' '.join(re.sub(r'[.,!?¿¡]+', ' ', norm(text)).split())
-    return q in ('si', 'si por favor', 'si porfavor', 'si confirma', 'si confirmo', 'confirmo', 'dale', 'ok', 'vale', 'adelante', 'de acuerdo')
+    if q in ('si', 'si por favor', 'si porfavor', 'si confirma', 'si confirmo', 'confirmo', 'dale', 'ok', 'vale', 'adelante', 'de acuerdo'):
+        return True
+    return bool(q) and all(word in {'si','confirmo','confirmar','dale','ok','okay','vale','adelante','correcto','claro','perfecto','por','favor','supuesto','de','acuerdo'} for word in q.split())
 
 def no(text):
     """Detect negative response: no, no gracias, espera, etc."""
