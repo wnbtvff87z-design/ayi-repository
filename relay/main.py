@@ -89,14 +89,9 @@ async def relay_ended(req:Request):
  except (ValueError,TypeError,AttributeError):pass
  if not isinstance(payload,dict):payload={}
  reason=payload.get('reason','')
- if reason=='goodbye':
-  message='¡Gracias a ti! Hasta luego.'
- elif reason=='verification':
-  message='La operación sigue pendiente de verificación. No la repitas; consulta con recepción. Hasta luego.'
- elif reason=='cancelled':
-  message='De acuerdo, no hice cambios. ¡Hasta luego!'
- else:
-  message=''
+ # The caller already said goodbye: hang up silently, never add a farewell phrase.
+ # Only the unresolved-operation notice is spoken, because the caller must not retry it.
+ message='La operación sigue pendiente de verificación. No la repitas; consulta con recepción.' if reason=='verification' else ''
  say=''
  if message:
   voice_id=str(payload.get('voice_id') or '').strip()
