@@ -274,6 +274,7 @@ def internal_turn():
    channel=d.get('channel','Voice');b=lookup(d.get('business_phone'),channel)
    if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
    reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),include_end_reason=True)
+   end_reason=end_reason if end_reason in ('goodbye','cancelled','verification') else None
    return jsonify(success=True,reply=reply,end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
   except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
 @app.post('/internal/reconcile-pending')
