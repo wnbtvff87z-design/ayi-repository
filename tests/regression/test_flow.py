@@ -291,10 +291,10 @@ class SuperAgentTests(FlowBase):
     def test_prompt_contains_principles_and_valid_few_shot_json(self):
         import json
         mod = self.env.interpret_mod
-        for token in ('Prevalencia temporal', 'STT', 'Multi-intención', 'hora de cenar', 'Ejemplo A', 'Ejemplo B', 'Ejemplo C'):
+        for token in ('Prevalencia temporal', 'STT', 'Multi-intención', 'hora de cenar', 'Ejemplo A', 'Ejemplo B', 'Ejemplo C', 'Ejemplo D', 'Ejemplo E'):
             self.assertIn(token, mod.PRINCIPLES + mod.FEW_SHOT)
         outs = [l[len('Salida: '):] for l in mod.FEW_SHOT.splitlines() if l.startswith('Salida: ')]
-        self.assertEqual(len(outs), 3)
+        self.assertEqual(len(outs), 5)
         for o in outs:
             self.assertEqual(mod.validate_parsed(json.loads(o))['intent'], json.loads(o)['intent'])
 
