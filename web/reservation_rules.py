@@ -9,8 +9,8 @@ import re
 import unicodedata
 
 MAX_PARTY = 20
-MAX_LISTED_TEXT = 10
-MAX_LISTED_VOICE = 4
+MAX_LISTED_TEXT = 30
+MAX_LISTED_VOICE = 20
 
 _WORDS = {'un': 1, 'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5, 'seis': 6, 'siete': 7,
           'ocho': 8, 'nueve': 9, 'diez': 10, 'once': 11, 'doce': 12, 'trece': 13, 'catorce': 14, 'quince': 15,

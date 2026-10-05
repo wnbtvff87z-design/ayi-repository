@@ -46,6 +46,17 @@ def _business_info(b,q):
             if value:return prefix+str(value)[:400]
     return None
 
+_GREETING_LEAD=re.compile(r'^\s*[¡!]*\s*(?:hola|buen(?:os|as)\s+(?:dias|tardes|noches)|buenas|hey|saludos)\b[\s,.!¡]*(?:de nuevo|otra vez)?[\s,.!¡]*',re.I)
+
+def _greeting_reply(reply,channel,history):
+    """The call already opened with the business welcome and a chat is already under way: never greet twice."""
+    text=str(reply or '').strip()
+    if channel=='Voice' or history:
+        text=_GREETING_LEAD.sub('',text).strip()
+        text=(text[:1].upper()+text[1:]) if text else ''
+        return (text or '¿En qué puedo ayudarte?')[:220]
+    return (text or '¡Hola! ¿En qué puedo ayudarte?')[:220]
+
 def _closure(s):
     if s.get('phase')=='sync_pending':return 'La operación sigue pendiente de verificación. Si quieres, seguimos con recepción. Hasta luego.',s
     if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'cancelled'}
@@ -63,10 +74,12 @@ def candidate_name(text,proposed,expected):
     if isinstance(proposed,str) and len(norm(proposed).split())>=2 and norm(proposed).strip(' .,!?¿¡') in q:return proposed.strip(' .,!?¿¡')
     if expected!='customer_name':return None
     q=re.sub(r'^(?:soy|me llamo|a nombre de)\s+','',q)
-    return q.title() if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,4}',q) and not any(x in q.split() for x in ('quiero','reserva','cancelar','modificar','hola','bien')) else None
+    return q.title() if re.fullmatch(r'[a-z]+(?:[ -][a-z]+){1,4}',q) and not any(x in q.split() for x in ('quiero','reserva','cancelar','modificar','hola','bien','no','se','ehh','eh','mmm','nose')) else None
 
-_EMAIL=re.compile(r'[a-z0-9._+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+')
-_NOT_NAME=('quiero','reserva','reservar','cancelar','modificar','hola','bien','gracias','si','no','vale','dale','mesa','correo','telefono','email','arroba','punto')
+_EMAIL=re.compile(r'[a-z0-9._+\-]{1,64}@[a-z0-9\-]{1,63}(?:\.[a-z0-9\-]{1,63}){1,4}')
+_NOT_NAME=('quiero','reserva','reservar','cancelar','modificar','hola','bien','gracias','si','no','vale','dale','mesa','correo','telefono','email','arroba','punto','ehh','eh','mmm','nose','no se')
+
+_EMAIL_FILLER=re.compile(r'^(?:(?:y|e|mi|el|su|correo|mail|email|e-mail|electronico|direccion|de|es|seria|son|tambien|telefono|numero|movil|nombre|apellido)\s+)+')
 
 def _spoken_email(text):
     """STT writes addresses as words ('juan arroba gmail punto com'); rebuild them. Returns None when absent."""
@@ -74,7 +87,13 @@ def _spoken_email(text):
     if re.search(r'\barroba\b',q):
         q=re.sub(r'\s*\barroba\b\s*','@',q);q=re.sub(r'\s*\bpunto\b\s*','.',q);q=re.sub(r'\s*\bguion bajo\b\s*','_',q);q=re.sub(r'\s*\bguion\b\s*','-',q)
         q=re.sub(r'(?<=[@.])\s+|\s+(?=[@.])','',q)
-        q=re.sub(r'^.*?\s(?=\S*@)','',q)
+        # the local part is whatever words sit between the last non-email chunk and the @; keep them all, joined
+        head,_,tail=q.partition('@')
+        words=head.split()
+        while words and re.fullmatch(r'[\d+]{6,}',words[-1].replace(' ','')):words.pop()  # a phone number is not part of the address
+        local=_EMAIL_FILLER.sub('',' '.join(words)+' ') .strip()
+        local=re.sub(r'.*?\b(?:correo|mail|email|e-mail)\s+(?:es\s+)?','',local).replace(' ','')
+        q=local+'@'+tail
     m=_EMAIL.search(q)
     return m.group(0) if m else None
 
@@ -84,15 +103,45 @@ def _ask(s,field,first,again,changed):
     s['last_ask']=field;s['expected']=field
     return _reply(s,again if repeated else first,True)
 
+_CONTACT_Q={'customer_name':'nombre y apellido','customer_email':'correo electrónico','customer_phone':'teléfono'}
+
+def _contact_ack(v,got):
+    """Echo what was understood so a wrong capture is noticed and corrected."""
+    parts=[]
+    for f in got:
+        if f=='customer_name':parts.append('a nombre de '+v[f])
+        elif f=='customer_email':parts.append('el correo '+v[f].replace('@',' arroba ').replace('.',' punto ') if _CHANNEL.get()=='Voice' else 'el correo '+v[f])
+        elif f=='customer_phone' and _CHANNEL.get()!='Voice':parts.append('el teléfono '+v[f])
+        elif f=='customer_phone':parts.append('el teléfono '+' '.join(re.sub(r'\D','',v[f])))
+    return 'Anoté '+', '.join(parts)+'. ' if parts else ''
+
+def _ask_contact(s,missing,got,v,changed):
+    """One question covering every missing contact field; a partial answer is acknowledged and only the rest is asked again."""
+    if len(missing)==1 and missing[0]=='customer_name' and s.get('first_name'):
+        return _ask(s,'customer_name',_contact_ack(v,got)+'Gracias, '+s['first_name']+'. ¿Y tu apellido?','Necesito también tu apellido para la reserva. ¿Me lo dices?',changed)
+    ack=_contact_ack(v,got)
+    names=[_CONTACT_Q[f] for f in missing]
+    what=names[0] if len(names)==1 else ', '.join(names[:-1])+' y '+names[-1]
+    if missing==['customer_name']:first='¿A qué nombre y apellido la dejo?'
+    elif missing==['customer_email']:first='¿Qué correo dejamos?'
+    elif missing==['customer_phone']:first='¿Qué teléfono dejamos?'
+    elif 'customer_name' in missing:first='¿A qué nombre y apellido la dejo y qué '+' y '.join(_CONTACT_Q[f] for f in missing[1:])+' dejamos?'
+    else:first='Me falta tu '+what+'. ¿Me los dices?'
+    hint=', por ejemplo nombre@dominio.com' if missing==['customer_email'] else ', dígito a dígito' if missing==['customer_phone'] else ''
+    again='Todavía me falta '+what+'. ¿Me '+('lo' if len(missing)==1 else 'los')+' dices'+hint+'?'
+    key=','.join(missing);repeated=s.get('last_contact_ask')==key and not changed
+    s['last_contact_ask']=key;s['expected']=missing[0];s['last_ask']=missing[0]
+    return _reply(s,ack+(again if repeated else first),True)
+
 def _capture_contact(s,text,u,customer):
     """Contact data is kept whenever it is said, not only when the dialogue happens to be asking for it."""
     v=s['values'];q=norm(text)
     email=_spoken_email(text) or (u.get('customer_email').strip().lower() if isinstance(u.get('customer_email'),str) and _EMAIL.fullmatch(u['customer_email'].strip().lower()) else None)
     if email:v['customer_email']=email
-    digits=re.sub(r'\D','',text)
+    digits=re.sub(r'\D','',_EMAIL.sub(' ',text.casefold()[:500]))
     proposed=re.sub(r'\D','',str(u.get('customer_phone') or ''))
     if 9<=len(proposed)<=15:v['customer_phone']=('+' if str(u['customer_phone']).strip().startswith('+') else '')+proposed
-    elif not email and 9<=len(digits)<=15 and (s.get('expected')=='customer_phone' or 'telefono' in q or 'movil' in q or 'numero' in q):v['customer_phone']=('+' if text.strip().startswith('+') else '')+digits
+    elif 9<=len(digits)<=15 and (s.get('expected')=='customer_phone' or 'telefono' in q or 'movil' in q or 'numero' in q):v['customer_phone']=('+' if text.strip().startswith('+') else '')+digits
     name=candidate_name(text,u.get('customer_name'),s.get('expected'))
     if name:v['customer_name']=name;s.pop('first_name',None);return
     if email or s.get('expected')!='customer_name' or v.get('customer_name'):return
@@ -254,15 +303,13 @@ def _create(s,text,parsed,channel,tz,customer):
     if not check.get('available'):
         old_time=v.pop('reservation_time');rows=_slots(s['business'],v['reservation_date'],v['party_size'])
         return _offer(s,rows,channel,s.get('meal'),v['party_size'],v['reservation_date'],old_time)
-    if not v.get('customer_name'):
-        if s.get('first_name'):return _ask(s,'customer_name','Gracias, '+s['first_name']+'. ¿Y tu apellido?','Necesito también tu apellido para la reserva. ¿Me lo dices?',v!=old)
-        return _ask(s,'customer_name','¿A qué nombre y apellido la dejo?','No he captado bien el nombre. ¿Me dices nombre y apellido?',v!=old)
-    if not v.get('customer_email'):
-        return _ask(s,'customer_email','Perfecto. ¿Qué correo dejamos?','No he podido entender el correo. ¿Me lo dices o escribes completo, por ejemplo nombre@dominio.com?',v!=old)
     if not v.get('customer_phone'):
         mine=re.sub(r'\D','',str(customer or ''))
         if 9<=len(mine)<=15:v['customer_phone']=('+' if str(customer).strip().startswith('+') else '')+mine
-        else:return _ask(s,'customer_phone','¿Qué teléfono dejamos?','No he captado el teléfono. ¿Me lo dices dígito a dígito?',v!=old)
+    missing=[f for f in ('customer_name','customer_email','customer_phone') if not v.get(f)]
+    if missing:
+        got=[f for f in ('customer_name','customer_email','customer_phone') if v.get(f) and v.get(f)!=old.get(f)]
+        return _ask_contact(s,missing,got,v,v!=old)
     s['pending']={'operation':'create','values':dict(v),'request_id':secrets.token_hex(16)}
     s['phase']='awaiting';s['expected']=None
     return _reply(s,f'Mesa {label(v["reservation_date"],v["reservation_time"])} para {v["party_size"]} personas a nombre de {v["customer_name"]}{"" if _CHANNEL.get()=="Voice" else ", teléfono "+v["customer_phone"]}. ¿La confirmo?',True)
@@ -342,7 +389,13 @@ def _availability_only(s,text,parsed,channel,tz):
     rows=sorted(rows,key=lambda x:(x['date'],x['time']))
     s['phase']='inquiry';s['expected']=None
     if len(dates)==1:
-        return _offer(s,rows,channel,parsed.get('meal'),s['values']['party_size'],dates[0])
+        asked=valid_time(u.get('reservation_time')) or explicit_time(text)
+        if asked and not any(x['time']==asked for x in rows):
+            return _offer(s,rows,channel,parsed.get('meal'),s['values']['party_size'],dates[0],asked)
+        answer,s=_offer(s,rows,channel,parsed.get('meal'),s['values']['party_size'],dates[0])
+        if asked:
+            answer=('Sí, '+('tengo mesa a '+_spoken_time(asked) if _CHANNEL.get()=='Voice' else f'a las {asked} tengo mesa')+'. ')+answer;s['last_reply']=answer
+        return answer,s
     if not rows:return _reply(s,'No veo mesas disponibles esos días. No hice ninguna reserva.')
     per_date=3 if channel=='Voice' else 4
     s['offered']=[x for d in dates for x in [r for r in rows if r['date']==d][:per_date]]
@@ -384,7 +437,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
             s.setdefault('target',{}).pop('reservation_time',None)
             s['offered']=[]
     if intent=='greeting':
-        return _reply(s,str(parsed.get('reply') or '¡Hola! ¿En qué puedo ayudarte?')[:220],True)
+        return _reply(s,_greeting_reply(parsed.get('reply'),channel,history),True)
     if intent=='social' and not has_data:
         return _closure(s)
     if s.get('phase')=='sync_pending':return _reply(s,'La operación está pendiente de verificación. Si quieres, te sigo ayudando con recepción.')
@@ -398,7 +451,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     if intent=='question' and not has_data and not manage and not availability_followup:
         info=_business_info(b,q)
         return _side_reply(s,info or str(parsed.get('reply') or 'Te escucho.')[:220])
-    if s.get('intent')=='availability' and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',q):
+    if s.get('intent')=='availability' and re.search(r'\b(?:no|nono|me quedo con|con la del)\b',q) and not explicit_time(text) and not re.search(r'[?¿]',text) and not is_availability_question(text):
         return _reply({'phase':'done','intent':None,'values':{}},'Perfecto, no hice otra reserva. ¿Necesitas algo más?',True)
     if s.get('intent')=='availability' and s.get('phase')=='inquiry':
         offered=s.get('offered') or []
@@ -408,6 +461,15 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         candidates=[x for x in offered if not selected_date or x['date']==selected_date]
         chosen=_choose(candidates,text,parsed,selected_date)
         wants_booking=intent=='create'
+        asked_time=valid_time(u.get('reservation_time')) or explicit_time(text)
+        ask_day=selected_date or (offered_dates[0] if len(offered_dates)==1 else s['values'].get('reservation_date') if not offered_dates else None)
+        party=s['values'].get('party_size')
+        if not chosen and asked_time and ask_day and party:
+            # never confirm or deny an hour without asking the real availability
+            try:free=availability(b,ask_day,asked_time,party).get('available')
+            except BookingError:free=False
+            if free:chosen={'date':ask_day,'time':asked_time}
+            else:return _offer(s,_slots(b,ask_day,party),channel,None,party,ask_day,asked_time)
         if not chosen and not selected_date:
             requested_time=valid_time(u.get('reservation_time')) or explicit_time(text)
             matching=[x for x in offered if x['time']==requested_time] if requested_time else []
