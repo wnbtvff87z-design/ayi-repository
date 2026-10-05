@@ -7,7 +7,7 @@ from booking import BookingError,availability,options,create
 from booking_safe import reservations_for_caller,unique_reservation,cancel_for_caller,modify_for_caller
 from temporal import explicit_date,relative_day,explicit_time,weekend_days
 from utils import norm,yes,no,valid_date,valid_time
-from reservation_rules import format_slots,is_availability_question,is_explicit_restart,is_opening_hours_question,meal_filter as _meal_filter,parse_party,sort_slots
+from reservation_rules import format_slots,is_availability_question,is_explicit_restart,is_opening_hours_question,meal_filter as _meal_filter,parse_party,sort_slots,spoken_time as _spoken_time
 log=logging.getLogger(__name__)
 DAYS=('lunes','martes','miércoles','jueves','viernes','sábado','domingo')
 MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
@@ -17,12 +17,9 @@ _NUMBERS=('cero','uno','dos','tres','cuatro','cinco','seis','siete','ocho','nuev
 def _words(n):
     return _NUMBERS[n] if n<30 else ('treinta','cuarenta','cincuenta')[n//10-3]+(' y '+_NUMBERS[n%10] if n%10 else '')
 
-def _spoken_time(value):
-    h,m=map(int,value.split(':'));return _words(h)+(' y '+_words(m) if m else '')
-
 def _voice_text(text):
     text=re.sub(r'(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)',lambda m:_words(int(m.group(1)))+' de '+MONTHS[int(m.group(2))-1] if 1<=int(m.group(1))<=31 and 1<=int(m.group(2))<=12 else m.group(0),text)
-    text=re.sub(r'(?<!\d)([01]\d|2[0-3]):([0-5]\d)(?!\d)',lambda m:_spoken_time(m.group(0)),text)
+    text=re.sub(r'(?<!\d)(?:(a|de|desde|hasta|sobre)\s+(?:las?\s+)?)?([01]\d|2[0-3]):([0-5]\d)(?!\d)',lambda m:(m.group(1)+' ' if m.group(1) else '')+_spoken_time(m.group(2)+':'+m.group(3)),text)
     return text.replace(', ','. ')
 
 _UNSAFE=re.compile(r"\b(?:select\b.+\bfrom|insert\s+into|drop\s+table|delete\s+from|update\s+\w+\s+set|union\s+select)\b|\bsql\b|system\s+prompt|prompt\s+del\s+sistema|instrucciones\s+(?:internas|del\s+sistema|anteriores)|ignor\w*\s+(?:todas\s+)?(?:las\s+)?(?:previous\s+|instrucciones|instructions)|api[\s_-]?key|contrasen|password|airtable|postgres|base\s+de\s+datos|\b(?:datos|reservas?|telefonos?|correos?|emails?|tarjetas?)\s+(?:de|del)\s+(?:otros?|otras?|los\s+demas)\b")
@@ -54,10 +51,10 @@ def _closure(s):
     if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'cancelled'}
     if _in_progress(s) and s.get('values'):
         s['last_reply']='¡Gracias! Cuando quieras retomamos tu reserva, no perdí lo que me dijiste.';return s['last_reply'],s
-    return '¡Gracias a vos! Hasta luego.',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'goodbye'}
+    return '¡Gracias a ti! Hasta luego.',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'goodbye'}
 
 def label(d,t=None):
-    x=date.fromisoformat(str(d)[:10]);day=f'el {DAYS[x.weekday()]} {_words(x.day)} de {MONTHS[x.month-1]}' if _CHANNEL.get()=='Voice' else f'el {DAYS[x.weekday()]} {x.day}/{x.month}';return day+(f' a las {_spoken_time(t)}' if t and _CHANNEL.get()=='Voice' else f' a las {t}' if t else '')
+    x=date.fromisoformat(str(d)[:10]);day=f'el {DAYS[x.weekday()]} {_words(x.day)} de {MONTHS[x.month-1]}' if _CHANNEL.get()=='Voice' else f'el {DAYS[x.weekday()]} {x.day}/{x.month}';return day+(f' a {_spoken_time(t)}' if t and _CHANNEL.get()=='Voice' else f' a las {t}' if t else '')
 
 def fresh(intent):return {'intent':intent,'phase':'collecting','values':{},'offered':[],'operation_id':secrets.token_hex(12)}
 

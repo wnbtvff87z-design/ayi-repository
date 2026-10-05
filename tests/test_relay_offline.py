@@ -22,7 +22,7 @@ class WS:
  async def send_text(self,text):self.sent.append(json.loads(text))
 class Relay(unittest.TestCase):
  def test_end_reasons_hang_up_without_duplicate_tts(self):
-  for reply,reason in [('¡Gracias a vos! Hasta luego.','goodbye'),('De acuerdo, no hice cambios. ¡Hasta luego!','cancelled'),('La operación sigue pendiente de verificación. No la repitas; consultá con recepción. Hasta luego.','verification')]:
+  for reply,reason in [('¡Gracias a ti! Hasta luego.','goodbye'),('De acuerdo, no hice cambios. ¡Hasta luego!','cancelled'),('La operación sigue pendiente de verificación. No la repitas; consulta con recepción. Hasta luego.','verification')]:
    async def core(path,data):return {'business':{'business_id':'test','voice':'bN1bDXgDIGX5lw0rtY2B'}} if path=='/internal/business' else {'reply':reply}
    ns['core']=core;ns['event_external_id']=lambda event,sid,text,seq:'CA1:1'
    ws=WS();asyncio.run(ns['websocket'](ws));self.assertEqual(len(ws.sent),1);self.assertEqual(ws.sent[0]['type'],'end')

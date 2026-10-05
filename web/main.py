@@ -203,7 +203,7 @@ def whatsapp():
     try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
-  except Exception:log.exception('WhatsApp error');tw.message('No puedo verificar el resultado ahora. No repitas la operación; consultá con recepción.')
+  except Exception:log.exception('WhatsApp error');tw.message('No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
   return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
 def voice():

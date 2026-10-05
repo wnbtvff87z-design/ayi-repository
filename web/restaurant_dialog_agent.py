@@ -25,6 +25,7 @@ from booking_safe import (
 from temporal import explicit_date, explicit_time
 from reservation_rules import (
     format_slots,
+    spoken_time as _spoken_time,
     is_availability_question,
     is_explicit_restart,
     is_opening_hours_question,
@@ -116,12 +117,6 @@ def _words(n):
     )
 
 
-def _spoken_time(value):
-    """Format time as spoken Spanish."""
-    h, m = map(int, value.split(":"))
-    return _words(h) + ((" y " + _words(m)) if m else "")
-
-
 def _voice_text(text):
     """Convert text for voice output."""
     text = re.sub(
@@ -134,8 +129,8 @@ def _voice_text(text):
         text,
     )
     text = re.sub(
-        r"(?<!\d)([01]\d|2[0-3]):([0-5]\d)(?!\d)",
-        lambda m: _spoken_time(m.group(0)),
+        r"(?<!\d)(?:(a|de|desde|hasta|sobre)\s+(?:las?\s+)?)?([01]\d|2[0-3]):([0-5]\d)(?!\d)",
+        lambda m: (m.group(1) + " " if m.group(1) else "") + _spoken_time(m.group(2) + ":" + m.group(3)),
         text,
     )
     return text.replace(", ", ". ")
@@ -160,7 +155,7 @@ def label(d, t=None):
         else f"el {DAYS[x.weekday()]} {x.day}/{x.month}"
     )
     return (
-        day + (f" a las {_spoken_time(t)}" if _CHANNEL.get() == "Voice" and t else "")
+        day + (f" a {_spoken_time(t)}" if _CHANNEL.get() == "Voice" and t else "")
         if t and _CHANNEL.get() == "Voice"
         else (day + (f" a las {t}" if t else ""))
     )
@@ -1135,7 +1130,7 @@ def _process_internal_agent(b, state, history, text, channel, external_id, custo
                 "De acuerdo, no hice cambios. ¡Hasta luego!",
                 {"phase": "closed", "intent": None, "values": {}},
             )
-        return "¡Gracias a vos! Hasta luego.", {"phase": "closed", "intent": None, "values": {}}
+        return "¡Gracias a ti! Hasta luego.", {"phase": "closed", "intent": None, "values": {}}
 
     if s.get("phase") == "sync_pending":
         return _reply(

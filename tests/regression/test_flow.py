@@ -319,3 +319,26 @@ class SuperAgentTests(FlowBase):
     def test_prompt_does_not_announce_country(self):
         mod = self.env.interpret_mod
         self.assertNotIn('en España', mod.PRINCIPLES + mod.FEW_SHOT)
+
+
+class SpanishVoiceTests(FlowBase):
+    def test_spoken_time_is_natural_peninsular_spanish(self):
+        t = self.env.dialog._spoken_time
+        self.assertEqual(t('21:00'), 'las nueve de la noche')
+        self.assertEqual(t('21:30'), 'las nueve y media de la noche')
+        self.assertEqual(t('13:30'), 'la una y media de la tarde')
+        self.assertEqual(t('20:45'), 'las nueve menos cuarto de la noche')
+        self.assertEqual(t('12:00'), 'las doce del mediodía')
+
+    def test_voice_text_rewrites_clock_times_without_double_article(self):
+        v = self.env.dialog._voice_text
+        self.assertEqual(v('Tengo mesa a las 21:00.'), 'Tengo mesa a las nueve de la noche.')
+        self.assertEqual(v('Tengo mesa a las 13:00.'), 'Tengo mesa a la una de la tarde.')
+        self.assertNotIn(':', v('Tengo 13:30 y 21:00'))
+
+    def test_relay_and_core_goodbye_match_and_use_tuteo(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[2]
+        for rel in ('relay/main.py', 'web/restaurant_dialog.py', 'web/restaurant_dialog_agent.py'):
+            src = (root / rel).read_text()
+            self.assertNotIn('a vos', src); self.assertIn('Gracias a ti', src)
