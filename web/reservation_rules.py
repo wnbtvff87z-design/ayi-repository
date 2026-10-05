@@ -18,14 +18,16 @@ _WORDS = {'un': 1, 'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco'
           'dieciseis': 16, 'diecisiete': 17, 'dieciocho': 18, 'diecinueve': 19, 'veinte': 20}
 _NUM = r'(?:20|1\d|[1-9]|' + '|'.join(sorted(_WORDS, key=len, reverse=True)) + r')'
 _NUM_BASE = r'(?:20|1\d|[1-9]|' + '|'.join(sorted((w for w in _WORDS if w not in ('un', 'una')), key=len, reverse=True)) + r')'
+_NUM_BASE_ANY = r'(?:\d+|' + '|'.join(sorted((w for w in _WORDS if w not in ('un', 'una')), key=len, reverse=True)) + r')'
+_NUM_ANY = r'(?:\d+|' + '|'.join(sorted(_WORDS, key=len, reverse=True)) + r')'
 _NOT_DATE_OR_TIME = r'(?!\s*(?:de\s|/|:|h\b|hs\b|horas\b))(?![/:\d])'
 
 _BABY = re.compile(r'(?:(' + _NUM + r')\s+)?\b(bebes?|bebitos?|bebitas?|recien\s+nacidos?)\b')
 _STROLLER = re.compile(r'(?:(' + _NUM + r')\s+)?\b(cochecitos?|carritos?|carros?\s+de\s+bebe|sillitas?(?:\s+de\s+paseo)?)\b')
 _CHILD = re.compile(r'(?:(' + _NUM + r')\s+)?\b(ninos?|ninas?|peques?|menores)\b')
 _BASE_PATTERNS = (
-    re.compile(r'\b(?:somos|seremos|vamos|iremos|venimos|vendremos|eramos|para|mesa\s+para|grupo\s+de)\s+(?:unos\s+)?(' + _NUM_BASE + r')\b' + _NOT_DATE_OR_TIME),
-    re.compile(r'(?<![\d:/])\b(' + _NUM + r')\s+(?:personas?|adultos?|comensales|pax|amigos|invitados|gente)\b'),
+    re.compile(r'\b(?:somos|seremos|vamos|iremos|venimos|vendremos|eramos|para|mesa\s+para|grupo\s+de)\s+(?:unos\s+)?(' + _NUM_BASE_ANY + r')\b' + _NOT_DATE_OR_TIME),
+    re.compile(r'(?<![\d:/])\b(' + _NUM_ANY + r')\s+(?:personas?|adultos?|comensales|pax|amigos|invitados|gente)\b'),
 )
 
 
@@ -46,8 +48,18 @@ def _count(pattern, text):
     return total, spans
 
 
-def parse_party(text, expected=False):
-    """Final party size from free text, or None when no head-count is stated.
+PARTY_NOT_MENTIONED = 'not_mentioned'
+PARTY_VALID = 'valid'
+PARTY_INVALID = 'invalid'
+PARTY_TOO_LARGE_REPLY = f'Lo siento, el máximo es de {MAX_PARTY} personas por reserva. ¿Para cuántas personas sería?'
+
+
+def parse_party_result(text, expected=False):
+    """Classify the head-count in free text as (status, party).
+
+    PARTY_NOT_MENTIONED: no head-count stated (party is None).
+    PARTY_VALID: a final seat total within 1..MAX_PARTY (party is that total).
+    PARTY_INVALID: a head-count was stated but the base or the final total is out of range (party is None).
 
     Every person occupies one seat. A baby or a stroller takes ONE extra seat and
     a baby with its stroller is still ONE seat (the stroller belongs to the baby).
@@ -66,13 +78,23 @@ def parse_party(text, expected=False):
     if mentions:
         base = _to_int(max(mentions, key=lambda m: m.start()).group(1))
     if base is None and expected:
-        m = re.fullmatch(r'(?:somos\s+|seremos\s+|para\s+)?(' + _NUM_BASE + r')', rest.strip(' .,!?¿¡'))
+        m = re.fullmatch(r'(?:somos\s+|seremos\s+|para\s+)?(' + _NUM_BASE_ANY + r')', rest.strip(' .,!?¿¡'))
         if m:
             base = _to_int(m.group(1))
-    if base is None or not 1 <= base <= MAX_PARTY:
-        return None
+    if base is None:
+        return PARTY_NOT_MENTIONED, None
+    if not 1 <= base <= MAX_PARTY:
+        return PARTY_INVALID, None
     total = base + extras
-    return total if total <= MAX_PARTY else None
+    return (PARTY_VALID, total) if total <= MAX_PARTY else (PARTY_INVALID, None)
+
+
+def parse_party(text, expected=False):
+    """Final party size from free text, or None when no VALID head-count is stated.
+
+    None does not say whether the count was absent or invalid: use parse_party_result for that.
+    """
+    return parse_party_result(text, expected)[1]
 
 
 def valid_party(value):

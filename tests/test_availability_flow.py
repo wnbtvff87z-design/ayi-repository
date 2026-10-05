@@ -415,3 +415,65 @@ def test_chosen_hour_that_vanished_shows_fresh_real_alternatives():
     reply = h.say('Entonces a las 21:00.')
     assert 'Las 21:00 no están disponibles' in reply and '1. 20:30' in reply and '2. 21:00' in reply
     assert 'reservation_time' not in h.state['values']
+
+
+# ---------------------------------------------------------------- explicit invalid party never falls back to state
+def _rules():
+    sys.path.insert(0, str(WEB))
+    try:
+        import reservation_rules
+    finally:
+        sys.path.remove(str(WEB))
+    return reservation_rules
+
+
+@pytest.mark.parametrize('text,status,party', [
+    ('¿Qué horarios tienen?', 'not_mentioned', None),
+    ('Somos 4', 'valid', 4),
+    ('Somos 2 y un bebé', 'valid', 3),
+    ('Somos 2 y un bebé con cochecito', 'valid', 3),
+    ('Somos 20', 'valid', 20),
+    ('Somos 21', 'invalid', None),
+    ('Somos 30', 'invalid', None),
+    ('Somos 20 personas y además viene un bebé', 'invalid', None),
+    ('Somos 20 y un cochecito', 'invalid', None),
+])
+def test_parse_party_result_distinguishes_not_mentioned_valid_invalid(text, status, party):
+    assert _rules().parse_party_result(text) == (status, party)
+
+
+def test_message_without_party_keeps_previous_party():
+    h = Harness(['21:00'], [('check_availability', {})])
+    h.say('Domingo, ¿qué horarios hay?', state=booking_state(h))
+    assert h.option_calls == [(h.sunday, 2)]
+
+
+def test_valid_party_overrides_previous_party():
+    h = Harness(['21:00'], [('check_availability', {})])
+    h.say('Domingo para 4, ¿qué horarios hay?', state=booking_state(h))
+    assert h.option_calls[-1][1] == 4
+
+
+@pytest.mark.parametrize('text', ['Al final somos 21. ¿Qué horarios hay?', 'Somos 20 personas y viene un bebé. ¿Horarios?'])
+def test_invalid_party_is_rejected_and_previous_party_is_not_used(text):
+    h = Harness(['21:00'], [('check_availability', {})])
+    reply = h.say(text, state=booking_state(h))
+    assert 'máximo' in reply and '20' in reply
+    assert h.option_calls == []
+    assert h.state['values']['party_size'] == 2
+
+
+def test_invalid_party_in_create_tool_does_not_fall_back_to_args_or_state():
+    h = Harness(['21:00'], [('create_reservation', {'customer_name': 'Ana Pérez', 'party_size': 2})])
+    reply = h.say('A nombre de Ana Pérez, a@b.co. Somos 21', state=booking_state(h))
+    assert 'máximo' in reply and not h.writes and not h.availability_calls
+
+
+def test_valid_party_after_valid_and_after_invalid_continues_normally():
+    h = Harness(['21:00'], [('check_availability', {}), ('check_availability', {}), ('check_availability', {})])
+    h.say('Domingo para 3, ¿qué horarios hay?', state=booking_state(h))
+    assert h.option_calls[-1][1] == 3
+    assert 'máximo' in h.say('Somos 21, ¿qué horarios hay?')
+    assert len(h.option_calls) == 1
+    h.say('Perdón, somos 5. ¿Qué horarios hay?')
+    assert h.option_calls[-1][1] == 5

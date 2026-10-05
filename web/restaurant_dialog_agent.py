@@ -39,7 +39,10 @@ from reservation_rules import (
     mentions_existing_booking_change,
     meal_filter as _meal_filter,
     meal_from_text,
+    PARTY_INVALID,
+    PARTY_TOO_LARGE_REPLY,
     parse_party,
+    parse_party_result,
     resolve_meal,
     reservation_page,
     sort_slots,
@@ -940,7 +943,11 @@ def _run_tool(s, b, customer, channel, text, name, args):
         res_date = explicit_day or valid_date(s["values"].get("reservation_date")) or valid_date(args.get("reservation_date"))
         res_time = explicit_time(text) or valid_time(s["values"].get("reservation_time")) or valid_time(args.get("reservation_time"))
         # Python owns the final head-count: text rule > stored state > model argument
-        party = parse_party(text) or valid_party(s["values"].get("party_size")) or valid_party(args.get("party_size"))
+        party_status, party = parse_party_result(text)
+        if party_status == PARTY_INVALID:
+            s["expected"] = "party_size"
+            return _reply(s, PARTY_TOO_LARGE_REPLY, True)
+        party = party or valid_party(s["values"].get("party_size")) or valid_party(args.get("party_size"))
         meal = resolve_meal(text, s.get("meal"))
         email = str(args.get("customer_email") or "").strip().lower()
         email = email if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) else ""
@@ -998,7 +1005,10 @@ def _run_tool(s, b, customer, channel, text, name, args):
             args["reservation_date" if verb == "cancel" else "new_date"] = explicit_day
         if verb == "modify":
             explicit_hour = explicit_time(text)
-            explicit_party = parse_party(text)
+            party_status, explicit_party = parse_party_result(text)
+            if party_status == PARTY_INVALID:
+                s["expected"] = "party_size"
+                return _reply(s, PARTY_TOO_LARGE_REPLY, True)
             if explicit_hour:
                 args["new_time"] = explicit_hour
             if explicit_party:
@@ -1074,7 +1084,10 @@ def _can_query_slots(s, b, text):
     """True when date and party size can be resolved by Python alone (text or state)."""
     day, ask = _date(text, {}, b.get("timezone") or "Europe/Madrid")
     day = day or valid_date(s["values"].get("reservation_date"))
-    party = parse_party(text) or valid_party(s["values"].get("party_size"))
+    status, party = parse_party_result(text)
+    if status == PARTY_INVALID:
+        return False
+    party = party or valid_party(s["values"].get("party_size"))
     return bool(day and party and not ask)
 
 
@@ -1090,7 +1103,12 @@ def _availability_turn(s, b, channel, text, args):
     if ask:
         return _reply(s, ask, True)
     day = day or valid_date(v.get("reservation_date")) or valid_date(args.get("date"))
-    party = parse_party(text) or valid_party(v.get("party_size")) or valid_party(args.get("party_size"))
+    party_status, party = parse_party_result(text)
+    if party_status == PARTY_INVALID:
+        # An explicit but invalid head-count never falls back to the previous one
+        s["expected"] = "party_size"
+        return _reply(s, PARTY_TOO_LARGE_REPLY, True)
+    party = party or valid_party(v.get("party_size")) or valid_party(args.get("party_size"))
     detour = _is_detour(s, day, party)
     if not detour:
         if day:
@@ -1183,7 +1201,10 @@ def _absorb(s, b, channel, text):
     day, ask = _date(text, {}, tz)
     if ask:
         return _reply(s, ask, True)
-    party = parse_party(text, s.get("expected") == "party_size")
+    party_status, party = parse_party_result(text, s.get("expected") == "party_size")
+    if party_status == PARTY_INVALID:
+        s["expected"] = "party_size"
+        return _reply(s, PARTY_TOO_LARGE_REPLY, True)
     if day:
         if day != v.get("reservation_date"):
             v.pop("reservation_time", None)

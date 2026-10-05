@@ -7,7 +7,7 @@ from booking import BookingError,availability,options,create
 from booking_safe import reservations_for_caller,unique_reservation,cancel_for_caller,modify_for_caller
 from temporal import explicit_date,relative_day,explicit_time,weekend_days
 from utils import norm,yes,no,valid_date,valid_time
-from reservation_rules import explicit_choice,format_slots,format_reservation_page,is_next_page_request,is_numeric_choice,is_availability_question,is_explicit_restart,is_opening_hours_question,listed_slots,meal_filter as _meal_filter,parse_party,resolve_meal,sort_slots,spoken_time as _spoken_time
+from reservation_rules import explicit_choice,format_slots,format_reservation_page,is_next_page_request,is_numeric_choice,is_availability_question,is_explicit_restart,is_opening_hours_question,listed_slots,meal_filter as _meal_filter,parse_party,parse_party_result,PARTY_INVALID,PARTY_TOO_LARGE_REPLY,resolve_meal,sort_slots,spoken_time as _spoken_time
 log=logging.getLogger(__name__)
 DAYS=('lunes','martes','miércoles','jueves','viernes','sábado','domingo')
 MONTHS=('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')
@@ -336,6 +336,8 @@ def _create(s,text,parsed,channel,tz,customer):
     if v.get('reservation_date') and date.fromisoformat(v['reservation_date'])<datetime.now(ZoneInfo(tz)).date():
         v.pop('reservation_date',None);v.pop('reservation_time',None)
         return _reply(s,'Esa fecha ya pasó. ¿Qué día futuro te sirve?',True)
+    if parse_party_result(text,s.get('expected')=='party_size')[0]==PARTY_INVALID:
+        s['expected']='party_size';return _reply(s,PARTY_TOO_LARGE_REPLY,True)
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:
         if n!=v.get('party_size'):v.pop('reservation_time',None);s['offered']=[]
@@ -459,6 +461,8 @@ def _manage(s,text,parsed,channel,tz,customer):
         if d!=target.get('reservation_date'):target.pop('reservation_time',None)
         target['reservation_date']=d
     if t:target['reservation_time']=t
+    if parse_party_result(text,s.get('expected')=='party_size')[0]==PARTY_INVALID:
+        s['expected']='party_size';return _reply(s,PARTY_TOO_LARGE_REPLY,True)
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:target['party_size']=n
     if not target:
@@ -522,6 +526,8 @@ def _availability_only(s,text,parsed,channel,tz):
     if dates:
         s['values']['requested_dates']=dates
         if len(dates)==1:s['values']['reservation_date']=dates[0]
+    if parse_party_result(text,s.get('expected')=='party_size')[0]==PARTY_INVALID:
+        s['expected']='party_size';return _reply(s,PARTY_TOO_LARGE_REPLY,True)
     n=_party(text,u.get('party_size'),s.get('expected'))
     if n:s['values']['party_size']=n
     if not dates:
