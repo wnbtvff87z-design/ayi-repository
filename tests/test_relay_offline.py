@@ -28,7 +28,10 @@ class Relay(unittest.TestCase):
    ws=WS();asyncio.run(ns['websocket'](ws));self.assertEqual(len(ws.sent),1);self.assertEqual(ws.sent[0]['type'],'end')
    payload=json.loads(ws.sent[0]['handoffData']);self.assertEqual(payload['reason'],reason)
    result=asyncio.run(ns['relay_ended'](Req(payload)));xml=ET.fromstring(result.content)
-   self.assertIsNotNone(xml.find('Hangup'));self.assertIsNotNone(xml.find('Say'))
+   self.assertIsNotNone(xml.find('Hangup'))
+   say=xml.find('Say')
+   if reason=='verification':self.assertNotIn('Hasta luego',say.text or '')
+   else:self.assertIsNone(say)
  def test_structured_goodbye_ends_call_even_with_different_reply(self):
   async def core(path,data):
    if path=='/internal/business':return {'business':{'business_id':'test','voice':'bN1bDXgDIGX5lw0rtY2B'}}

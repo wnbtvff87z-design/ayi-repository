@@ -50,10 +50,10 @@ def _greeting_reply(reply,channel,history):
         return (text or '¿En qué puedo ayudarte?')[:220]
     return (text or '¡Hola! ¿En qué puedo ayudarte?')[:220]
 
-def _closure(s):
+def _closure(s,hangup=False):
     if s.get('phase')=='sync_pending':return 'La operación sigue pendiente de verificación. Si quieres, seguimos con recepción. Hasta luego.',s
     if s.get('phase')=='awaiting':return 'De acuerdo, no hice cambios. ¡Hasta luego!',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'cancelled'}
-    if _in_progress(s) and s.get('values'):
+    if _in_progress(s) and s.get('values') and not hangup:
         s['last_reply']='¡Gracias! Cuando quieras retomamos tu reserva, no perdí lo que me dijiste.';return s['last_reply'],s
     return '¡Gracias a ti! Hasta luego.',{'phase':'closed','intent':None,'values':{},'_end_call_reason':'goodbye'}
 
@@ -82,8 +82,20 @@ _NOT_NAME=('quiero','reserva','reservar','cancelar','modificar','hola','bien','g
 
 _EMAIL_FILLER=re.compile(r'^(?:(?:y|e|mi|el|su|correo|mail|email|e-mail|electronico|direccion|de|es|seria|son|tambien|telefono|numero|movil|nombre|apellido)\s+)+')
 
+_DIGIT_NAMES=('cero','uno','dos','tres','cuatro','cinco','seis','siete','ocho','nueve')
+
+def _spoken_digits(value):
+    """Digits as Spanish words so the TTS never mangles '8'."""
+    return ', '.join(_DIGIT_NAMES[int(c)] for c in re.sub(r'\D','',str(value)))
+
+def _spoken_address(email):
+    """'juan8@gmail.com' -> 'juan, ocho, arroba, gmail, punto, com': symbols and digits as words, with pauses."""
+    words={'@':'arroba','.':'punto','_':'guion bajo','-':'guion'}
+    parts=re.findall(r'\d|[@._-]|[^\d@._-]+',str(email))
+    return ', '.join(_DIGIT_NAMES[int(p)] if p.isdigit() else words.get(p,p) for p in parts)
+
 def _spoken_email(text):
-    """STT writes addresses as words ('juan arroba gmail punto com'); rebuild them. Returns None when absent."""
+    """Deterministic fallback only (the interpreter is the primary reader of spoken addresses). STT writes addresses as words ('juan arroba gmail punto com'); rebuild them. Returns None when absent."""
     q=norm(text)
     if re.search(r'\barroba\b',q):
         q=re.sub(r'\s*\barroba\b\s*','@',q);q=re.sub(r'\s*\bpunto\b\s*','.',q);q=re.sub(r'\s*\bguion bajo\b\s*','_',q);q=re.sub(r'\s*\bguion\b\s*','-',q)
@@ -111,9 +123,9 @@ def _contact_ack(v,got):
     parts=[]
     for f in got:
         if f=='customer_name':parts.append('a nombre de '+v[f])
-        elif f=='customer_email':parts.append('el correo '+v[f].replace('@',' arroba ').replace('.',' punto ') if _CHANNEL.get()=='Voice' else 'el correo '+v[f])
+        elif f=='customer_email':parts.append('el correo '+(_spoken_address(v[f]) if _CHANNEL.get()=='Voice' else v[f]))
         elif f=='customer_phone' and _CHANNEL.get()!='Voice':parts.append('el teléfono '+v[f])
-        elif f=='customer_phone':parts.append('el teléfono '+' '.join(re.sub(r'\D','',v[f])))
+        elif f=='customer_phone':parts.append('el teléfono '+_spoken_digits(v[f]))
     return 'Anoté '+', '.join(parts)+'. ' if parts else ''
 
 def _ask_contact(s,missing,got,v,changed):
@@ -137,7 +149,8 @@ def _ask_contact(s,missing,got,v,changed):
 def _capture_contact(s,text,u,customer):
     """Contact data is kept whenever it is said, not only when the dialogue happens to be asking for it."""
     v=s['values'];q=norm(text)
-    email=_spoken_email(text) or (u.get('customer_email').strip().lower() if isinstance(u.get('customer_email'),str) and _EMAIL.fullmatch(u['customer_email'].strip().lower()) else None)
+    proposed_email=u.get('customer_email').strip().lower() if isinstance(u.get('customer_email'),str) else ''
+    email=proposed_email if _EMAIL.fullmatch(proposed_email) else _spoken_email(text)
     if email:v['customer_email']=email
     digits=re.sub(r'\D','',_EMAIL.sub(' ',text.casefold()[:500]))
     proposed=re.sub(r'\D','',str(u.get('customer_phone') or ''))
@@ -475,8 +488,10 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
         # Only an explicit request replaces the open booking; detours and tangents never do
         intent=intent if intent in ('cancel','modify') else 'create'
         s=fresh(intent);s['business']=b
+    contact=bool(u.get('customer_email') or u.get('customer_phone')) and s.get('intent')=='create' and _in_progress(s) and not is_explicit_restart(text)
+    if contact and intent in ('other','question','social','greeting'):intent='create'
     manage=intent in ('cancel','modify')
-    has_data=bool(u) or bool(parsed.get('time_expression') or parsed.get('meal') or parsed.get('selection') or parsed.get('clear_fields'))
+    has_data=bool(u) or bool(parsed.get('time_expression') or parsed.get('meal') or parsed.get('selection') or parsed.get('clear_fields') or contact)
     cleared=set(parsed.get('clear_fields') or [])
     if cleared:
         for field in cleared:
@@ -487,6 +502,8 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
             s['values'].pop('reservation_time',None)
             s.setdefault('target',{}).pop('reservation_time',None)
             s['offered']=[]
+    if parsed.get('end_call') and not has_data and intent in ('social','other','question','greeting'):
+        return _closure(s,True)
     if intent=='greeting':
         return _reply(s,_interpreted_reply(s,{'reply':_greeting_reply(parsed.get('reply'),channel,history)},'Te escucho.',220),True)
     if intent=='social' and not has_data:
@@ -497,7 +514,8 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     availability_followup=s.get('intent')=='availability' and s.get('phase')=='inquiry' and (
         intent=='create' or parsed.get('selection') is not None or explicit_time(text) or _requested_dates(text,{},tz)
     )
-    if intent=='other' and not has_data and not availability_followup:
+    asking_contact=s.get('intent')=='create' and _in_progress(s) and s.get('expected') in _CONTACT_Q
+    if intent=='other' and not has_data and not availability_followup and not asking_contact:
         return _side_reply(s,'Eso no te lo puedo ayudar a resolver: solo puedo ayudarte con reservas e información del restaurante (menú, horarios, dirección).')
     if intent=='question' and not has_data and not manage and not availability_followup:
         info=_business_info(b,q)
@@ -569,7 +587,7 @@ def _process_internal(b,state,history,text,channel,external_id,customer):
     if s.get('phase')=='awaiting':
         if no(text):s.pop('pending',None);s['phase']='collecting';return _reply(s,'De acuerdo, no hice cambios. ¿Quieres otra cosa?',True)
         if yes(text) and s.get('pending'):return _confirm(s,customer,channel)
-        if any(u.get(k) is not None for k in ('reservation_date','reservation_time','party_size','customer_name','customer_email','customer_phone')) or parsed.get('meal') or re.search(r'\b(?:otra|otro|diferente)\b',q):
+        if any(u.get(k) is not None for k in ('reservation_date','reservation_time','party_size','customer_name','customer_email','customer_phone')) or parsed.get('meal') or contact or re.search(r'\b(?:otra|otro|diferente)\b',q):
             s.pop('pending',None);s['phase']='collecting'
             if s['intent']=='create' and (u.get('reservation_date') or u.get('reservation_time') or parsed.get('meal')):s['values'].pop('reservation_time',None)
             elif s['intent']=='modify' and (u.get('reservation_date') or u.get('reservation_time') or parsed.get('meal')):s.setdefault('target',{}).pop('reservation_time',None)
