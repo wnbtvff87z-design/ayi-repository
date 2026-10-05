@@ -202,11 +202,80 @@ def test_varios_disponibles_de_noche_filters_real_slots_only():
     assert not h.llm_calls
 
 
-def test_meal_filter_never_invents_a_service_window():
+def test_meal_filter_uses_fixed_service_windows_even_without_gaps():
     h = Harness()
-    rows = [{'date': 'd', 'time': t} for t in ('20:30', '21:00')]
-    assert h.mod._meal_filter(rows, 'dinner') == rows      # no gap between real slots: do not guess
-    assert h.mod._meal_filter([{'date': 'd', 'time': '21:00'}], 'lunch') == [{'date': 'd', 'time': '21:00'}]
+    rows = [{'date': 'd', 'time': t} for t in ('13:00', '15:29', '15:30', '20:00', '20:30', '22:30')]
+    assert [r['time'] for r in h.mod._meal_filter(rows, 'lunch')] == ['13:00', '15:29']
+    assert [r['time'] for r in h.mod._meal_filter(rows, 'dinner')] == ['20:00', '20:30', '22:30']
+
+
+@pytest.mark.parametrize('text,model_meal,expected', [
+    ('Cena', 'lunch', ['20:00', '20:30', '22:30']),
+    ('Comida', 'dinner', ['13:00', '15:29']),
+])
+def test_explicit_meal_text_overrides_conflicting_availability_tool_argument(text, model_meal, expected):
+    h = Harness(['13:00', '15:29', '15:30', '20:00', '20:30', '22:30'])
+    h.state = booking_state(h)
+    reply, state = h.mod._availability_turn(
+        h.state,
+        BIZ,
+        'WhatsApp',
+        text,
+        {'date': h.sunday, 'party_size': 2, 'meal': model_meal},
+    )
+    assert [row['time'] for row in state['offered']] == expected
+    assert not any(time in reply for time in (('13:00', '15:29') if expected[0] == '20:00' else ('20:00', '20:30')))
+
+
+def test_confirmed_meal_state_overrides_conflicting_model_argument():
+    h = Harness(['13:00', '20:00'])
+    h.state = booking_state(h, meal='dinner')
+    _, state = h.mod._availability_turn(
+        h.state, BIZ, 'WhatsApp', 'consulta', {'date': h.sunday, 'party_size': 2, 'meal': 'lunch'}
+    )
+    assert [row['time'] for row in state['offered']] == ['20:00']
+
+
+def test_create_tool_cannot_override_explicit_date_time_or_party_with_model_values():
+    h = Harness(['20:00', '21:00'])
+    h.state = booking_state(h)
+    text = 'Ana Pérez, para 2 personas el 6 de octubre de 2030 a las 20:00'
+    args = {
+        'customer_name': 'Ana Pérez',
+        'customer_email': 'ana@example.org',
+        'reservation_date': '2030-10-07',
+        'reservation_time': '21:00',
+        'party_size': 4,
+    }
+    _, state = h.mod._run_tool(h.state, BIZ, PHONE, 'WhatsApp', text, 'create_reservation', args)
+    assert state['pending']['values']['reservation_date'] == '2030-10-06'
+    assert state['pending']['values']['reservation_time'] == '20:00'
+    assert state['pending']['values']['party_size'] == 2
+
+
+def test_slot_pages_keep_full_availability_and_only_offer_displayed_indices():
+    times = [f'{12 + minute // 60:02d}:{minute % 60:02d}' for minute in range(0, 510, 15)]
+    h = Harness(times)
+    h.state = booking_state(h)
+    reply = h.say('¿Qué horarios hay?')
+    assert len(h.state['offered']) == 30
+    assert len(h.state['availability_slots']) == len(times)
+    assert '30.' in reply and '31.' not in reply and 'di' in reply and 'siguiente' in reply
+    reply = h.say('siguiente')
+    assert h.state['offered'] == h.state['availability_slots'][30:]
+    assert reply.count('1.') == 1 and '31.' not in reply
+
+
+def test_voice_slot_page_limit_and_continuation_preserve_remaining_slots():
+    times = [f'{12 + minute // 60:02d}:{minute % 60:02d}' for minute in range(0, 330, 15)]
+    h = Harness(times)
+    h.state = booking_state(h)
+    reply = h.say('¿Qué horarios hay?', 'Voice')
+    assert len(h.state['offered']) == 20
+    assert len(h.state['availability_slots']) == len(times)
+    assert 'siguiente' in reply
+    h.say('siguiente', 'Voice')
+    assert h.state['offered'] == h.state['availability_slots'][20:]
 
 
 def test_voice_lists_real_slots_naturally():

@@ -170,6 +170,29 @@ def _repeated_operational_reply_does_not_change_intent_or_phase():
     assert updated["stalls"] == 0
 
 
+def _legacy_dialog_uses_shared_meal_windows_and_paged_reservation_choices():
+    rows = [{"date": "2030-05-01", "time": t} for t in ("12:30", "15:29", "15:30", "20:00", "22:59", "23:00")]
+    assert [row["time"] for row in dialog._meal_filter(rows, "lunch")] == ["12:30", "15:29"]
+    assert [row["time"] for row in dialog._meal_filter(rows, "dinner")] == ["20:00", "22:59"]
+
+    reservations = [
+        {"code": f"R{i:02d}", "name": "Lucía Pérez", "slot_date": f"2030-05-{i:02d}",
+         "start_time": "20:00", "party_size": 2}
+        for i in range(1, 26)
+    ]
+    state = {"intent": "cancel", "phase": "collecting", "values": {"customer_name": "Lucía Pérez"},
+             "business": BUSINESS}
+    parsed = {"updates": {}, "selection": None}
+    with patch.object(dialog, "reservations_for_caller", return_value=reservations):
+        reply, state = dialog._manage(state, "cancelar", parsed, "WhatsApp", "Europe/Madrid", "+34612345678")
+        assert len(state["choices"]) == 20 and "siguiente" in reply
+        reply, state = dialog._manage(state, "siguiente", parsed, "WhatsApp", "Europe/Madrid", "+34612345678")
+        assert [choice["code"] for choice in state["choices"]] == [f"R{i:02d}" for i in range(21, 26)]
+        assert "1. " in reply and "5. " in reply and "6. " not in reply
+        _, state = dialog._manage(state, "5", parsed, "WhatsApp", "Europe/Madrid", "+34612345678")
+    assert state["pending"]["code"] == "R25"
+
+
 class AvailabilityReservationRegression(unittest.TestCase):
     def test_two_date_availability_selection_completes_confirmed_booking(self):
         _two_date_availability_selection_completes_confirmed_booking()
@@ -179,3 +202,6 @@ class AvailabilityReservationRegression(unittest.TestCase):
 
     def test_repeated_operational_reply_does_not_change_intent_or_phase(self):
         _repeated_operational_reply_does_not_change_intent_or_phase()
+
+    def test_legacy_dialog_uses_shared_rules_and_paging(self):
+        _legacy_dialog_uses_shared_meal_windows_and_paged_reservation_choices()

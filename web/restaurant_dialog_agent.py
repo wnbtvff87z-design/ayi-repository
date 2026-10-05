@@ -24,7 +24,12 @@ from booking_safe import (
 )
 from temporal import explicit_date, explicit_time
 from reservation_rules import (
+    explicit_choice,
     format_slots,
+    format_reservation_page,
+    is_numeric_choice,
+    is_next_page_request,
+    listed_slots,
     spoken_time as _spoken_time,
     is_availability_question,
     is_explicit_restart,
@@ -35,6 +40,8 @@ from reservation_rules import (
     meal_filter as _meal_filter,
     meal_from_text,
     parse_party,
+    resolve_meal,
+    reservation_page,
     sort_slots,
     valid_party,
     wants_new_booking,
@@ -422,6 +429,21 @@ def _choose(rows, text, parsed, d=None):
     """Select a specific slot from offerings."""
     if not rows:
         return None
+    t = explicit_time(text)
+    if t:
+        hits = [x for x in rows if x["time"] == t and (not d or x["date"] == d)]
+        if len(hits) == 1:
+            return hits[0]
+    choice = explicit_choice(text, len(rows))
+    if choice:
+        return rows[choice - 1]
+    if is_numeric_choice(text):
+        number = int(re.search(r"\d{1,2}", norm(text)).group())
+        if 1 <= number <= 23:
+            hits = [x for x in rows if int(x["time"][:2]) % 12 == number % 12 and x["time"][3:] == "00"]
+            if len(hits) == 1:
+                return hits[0]
+        return None
     selection = parsed.get("selection")
     if type(selection) is int and 1 <= selection <= len(rows):
         return rows[selection - 1]
@@ -429,7 +451,7 @@ def _choose(rows, text, parsed, d=None):
     ordinal = {"la primera": 0, "la segunda": 1, "la tercera": 2, "la ultima": len(rows) - 1}
     if q in ordinal and 0 <= ordinal[q] < len(rows):
         return rows[ordinal[q]]
-    t = valid_time(parsed.get("updates", {}).get("reservation_time")) or explicit_time(text)
+    t = valid_time(parsed.get("updates", {}).get("reservation_time"))
     if not t and re.fullmatch(r"\d{1,2}", q):
         h = int(q)
         on_the_hour = [x for x in rows if int(x["time"][:2]) % 12 == h % 12 and x["time"][3:] == "00"]
@@ -454,19 +476,52 @@ def _choose(rows, text, parsed, d=None):
 def _offer(s, rows, channel, party, day, meal=None, requested=None, note=""):
     """Present REAL slots (itemised) and remember them as the options on the table."""
     rows = sort_slots(_meal_filter(rows, meal))
-    s["offered"] = rows
+    page, next_offset = listed_slots(rows, channel)
+    s["availability_slots"] = rows
+    s["slot_offset"] = 0
+    s["slot_listing"] = {
+        "party": party,
+        "day": day,
+        "meal": meal,
+        "requested": requested,
+        "note": note,
+    }
+    s["offered"] = page
     s["expected"] = "reservation_time" if rows else None
-    text = note + format_slots(rows, party, channel, day, label, _spoken_time, meal, requested)
+    text = note + format_slots(page, party, channel, day, label, _spoken_time, meal, requested, next_offset is not None)
     return _reply(s, text, True)
 
 
-def _alternatives(s, b, channel, day, time, party, note=""):
+def _next_slot_page(s, channel):
+    rows = s.get("availability_slots") or []
+    offset = int(s.get("slot_offset") or 0) + len(s.get("offered") or [])
+    page, next_offset = listed_slots(rows, channel, offset)
+    if not page:
+        return _reply(s, "Ya te mostré todos los horarios disponibles. ¿Cuál te viene mejor?", True)
+    listing = s.get("slot_listing") or {}
+    s["slot_offset"] = offset
+    s["offered"] = page
+    text = listing.get("note", "") + format_slots(
+        page,
+        listing.get("party") or s["values"].get("party_size") or 1,
+        channel,
+        listing.get("day") or s["values"].get("reservation_date"),
+        label,
+        _spoken_time,
+        listing.get("meal"),
+        listing.get("requested"),
+        next_offset is not None,
+    )
+    return _reply(s, text, True)
+
+
+def _alternatives(s, b, channel, day, time, party, note="", meal=None):
     """A chosen hour is not available: show the real slots of that day instead."""
     try:
         rows = _slots(b, day, party)
     except BookingError as e:
         return _reply(s, str(e), True)
-    return _offer(s, rows, channel, party, day, requested=time, note=note)
+    return _offer(s, rows, channel, party, day, meal=meal, requested=time, note=note)
 
 
 def _confirm_create(s, customer, channel):
@@ -753,23 +808,21 @@ def _brief(row):
 
 def _ask_which(s, rows, verb, args):
     """Several active reservations: remember them and ask which one."""
-    s["choices"] = [_brief(x) for x in rows[:5]]
+    all_choices = [_brief(x) for x in rows]
+    page, _, message = format_reservation_page(all_choices, 0, verb, label)
+    s["choice_rows"] = all_choices
+    s["choice_offset"] = 0
+    s["choices"] = page
     s["choice_request"] = {"operation": verb, "args": args}
     s["phase"] = "choosing_original"
     s["expected"] = "original"
-    return _reply(
-        s,
-        "Encontré "
-        + ", ".join(
-            f'{i}. {label(c["date"], c["time"])}' for i, c in enumerate(s["choices"], 1)
-        )
-        + f". ¿Cuál quieres {verb}?",
-        True,
-    )
+    return _reply(s, message, True)
 
 
 def _clear_choice(s):
     s.pop("choices", None)
+    s.pop("choice_rows", None)
+    s.pop("choice_offset", None)
     s.pop("choice_request", None)
 
 
@@ -796,10 +849,13 @@ def _propose_modify(s, b, row, args):
     old_d, old_t = old["date"], old["time"]
     dest = valid_date(args.get("new_date")) or old_d
     dest_t = valid_time(args.get("new_time")) or old_t
+    meal = args.get("_meal") if args.get("_meal") in ("lunch", "dinner") else None
     new_party = args.get("new_party_size")
     n = new_party if type(new_party) is int and 1 <= new_party <= 20 else int(row["party_size"])
     if (dest, dest_t, n) == (old_d, old_t, int(row["party_size"])):
         return _reply(s, "Eso coincide con tu reserva actual. ¿Qué quieres cambiar?", True)
+    if meal and not _meal_filter([{"date": dest, "time": dest_t}], meal):
+        return _alternatives(s, b, _CHANNEL.get(), dest, dest_t, n, meal=meal)
     if (dest, dest_t) != (old_d, old_t) or n > int(row["party_size"]):
         if not availability(b, dest, dest_t, n).get("available"):
             return _alternatives(s, b, _CHANNEL.get(), dest, dest_t, n, "Tu reserva original sigue igual. ")
@@ -857,11 +913,16 @@ def _resolve_choice(s, b, customer, text):
     """Pick one of the offered reservations from the caller's reply. None if unclear."""
     choices = s.get("choices") or []
     rows = [{"date": c["date"], "time": c["time"]} for c in choices]
-    m = re.fullmatch(r"\D*?(\d)\D*", norm(text))
-    picked = _choose(rows, text, {"selection": int(m.group(1)) if m else None})
+    number = explicit_choice(text, len(rows))
+    if number:
+        return choices[number - 1]
+    if is_numeric_choice(text):
+        return None
+    picked = _choose(rows, text, {})
     if picked is None:
         return None
-    return choices[rows.index(picked)]
+    hits = [choice for choice, row in zip(choices, rows) if row == picked]
+    return hits[0] if len(hits) == 1 else None
 
 
 def _run_tool(s, b, customer, channel, text, name, args):
@@ -873,10 +934,14 @@ def _run_tool(s, b, customer, channel, text, name, args):
 
     if name == "create_reservation":
         cname = args.get("customer_name")
-        res_date = valid_date(args.get("reservation_date"))
-        res_time = valid_time(args.get("reservation_time"))
+        explicit_day, date_question = _date(text, {}, tz)
+        if date_question:
+            return _reply(s, date_question, True)
+        res_date = explicit_day or valid_date(s["values"].get("reservation_date")) or valid_date(args.get("reservation_date"))
+        res_time = explicit_time(text) or valid_time(s["values"].get("reservation_time")) or valid_time(args.get("reservation_time"))
         # Python owns the final head-count: text rule > stored state > model argument
         party = parse_party(text) or valid_party(s["values"].get("party_size")) or valid_party(args.get("party_size"))
+        meal = resolve_meal(text, s.get("meal"))
         email = str(args.get("customer_email") or "").strip().lower()
         email = email if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) else ""
         # Keep what the customer already gave (never overwrite it with an empty value) so it is not asked twice
@@ -892,6 +957,8 @@ def _run_tool(s, b, customer, channel, text, name, args):
             return _reply(s, f"Gracias, {first}. ¿Y tu apellido?" if first else "¿Me dices nombre y apellido para la reserva?", True)
         if not (res_date and res_time and party):
             return _reply(s, "Me falta día, hora o cantidad de personas. ¿Me los confirmas?", True)
+        if meal and not _meal_filter([{"date": res_date, "time": res_time}], meal):
+            return _offer(s, _slots(b, res_date, party), channel, party, res_date, meal, res_time)
         if not email:
             return _reply(s, "Perfecto. ¿Qué correo dejamos para la reserva?", True)
         if len(re.sub(r"\D", "", str(customer or ""))) < 9:
@@ -925,6 +992,18 @@ def _run_tool(s, b, customer, channel, text, name, args):
 
     if name in ("cancel_reservation", "modify_reservation"):
         verb = "cancel" if name == "cancel_reservation" else "modify"
+        args = dict(args)
+        explicit_day, _ = _date(text, {}, tz)
+        if explicit_day:
+            args["reservation_date" if verb == "cancel" else "new_date"] = explicit_day
+        if verb == "modify":
+            explicit_hour = explicit_time(text)
+            explicit_party = parse_party(text)
+            if explicit_hour:
+                args["new_time"] = explicit_hour
+            if explicit_party:
+                args["new_party_size"] = explicit_party
+            args["_meal"] = resolve_meal(text, s.get("meal"))
         return _propose_existing(s, b, customer, verb, args, args.get("customer_name"))
 
     return _reply(s, "No pude interpretar eso. ¿Me repites qué necesitas?", True)
@@ -932,7 +1011,7 @@ def _run_tool(s, b, customer, channel, text, name, args):
 
 _WRITE_TOOLS = {"create_reservation": "create", "cancel_reservation": "cancel", "modify_reservation": "modify"}
 _BOOKING_PHASES = ("collecting", "awaiting", "choosing_original", "inquiry")
-_BOOKING_KEYS = ("pending", "offered", "detour", "choices", "choice_request", "selected_code", "meal", "weekend")
+_BOOKING_KEYS = ("pending", "offered", "availability_slots", "slot_offset", "slot_listing", "detour", "choices", "choice_rows", "choice_offset", "choice_request", "selected_code", "meal", "weekend")
 
 
 def _in_progress(s):
@@ -1007,10 +1086,10 @@ def _availability_turn(s, b, channel, text, args):
     """
     tz = b.get("timezone") or "Europe/Madrid"
     v = s["values"]
-    day, ask = _date(text, {"reservation_date": args.get("date")}, tz)
+    day, ask = _date(text, {}, tz)
     if ask:
         return _reply(s, ask, True)
-    day = day or valid_date(v.get("reservation_date"))
+    day = day or valid_date(v.get("reservation_date")) or valid_date(args.get("date"))
     party = parse_party(text) or valid_party(v.get("party_size")) or valid_party(args.get("party_size"))
     detour = _is_detour(s, day, party)
     if not detour:
@@ -1037,38 +1116,46 @@ def _availability_turn(s, b, channel, text, args):
             else "¿Para cuántas personas?"
         )
         return _reply(s, question + (_reminder(s) if detour else ""), True)
-    meal = args.get("meal") if args.get("meal") in ("lunch", "dinner") else meal_from_text(text)
+    meal = resolve_meal(text, s.get("meal"), args.get("meal"))
     try:
         rows = sort_slots(_slots(b, day, party))
     except BookingError as e:
         log.warning("Availability failed: %s", e)
         return _reply(s, "No pude consultar las franjas ahora. ¿Probamos en un momento?", True)
-    requested = valid_time(args.get("time")) or _hour_in_text(text)
+    requested = explicit_time(text) or valid_time(v.get("reservation_time")) or valid_time(args.get("time"))
     hour = _bare_hour(text) if not requested else None
     if hour is not None and 1 <= hour <= 12:
-        hits = [x["time"] for x in rows if int(x["time"][:2]) % 12 == hour % 12 and x["time"][3:] == "00"]
+        service_rows = _meal_filter(rows, meal)
+        hits = [x["time"] for x in service_rows if int(x["time"][:2]) % 12 == hour % 12 and x["time"][3:] == "00"]
         requested = hits[0] if len(hits) == 1 else None
+    else:
+        service_rows = _meal_filter(rows, meal)
     asked = bool(requested or hour is not None)
-    if asked and requested and any(x["time"] == requested for x in rows):
-        shown = [x for x in rows if x["time"] == requested]
+    if asked and requested and any(x["time"] == requested for x in service_rows):
+        shown = [x for x in service_rows if x["time"] == requested]
         text_out = f'Sí, tengo mesa {label(day, requested)} para {party} personas.'
         if not detour:
-            s["offered"] = rows
+            s["offered"] = shown
             s["expected"] = "reservation_time"
+            s["availability_slots"] = shown
+            s["slot_offset"] = 0
             text_out += " ¿Quieres que avance con la reserva?"
     elif asked:
-        text_out = format_slots(rows, party, channel, day, label, _spoken_time, None, requested or True)
-        if not detour:
-            s["offered"] = rows
-            s["expected"] = "reservation_time" if rows else None
+        if detour:
+            page, _ = listed_slots(service_rows, channel)
+            text_out = format_slots(page, party, channel, day, label, _spoken_time, meal, requested or True)
+        else:
+            text_out, s = _offer(s, service_rows, channel, party, day, meal, requested or True)
+            s["expected"] = "reservation_time" if service_rows else None
     else:
-        shown = sort_slots(_meal_filter(rows, meal))
-        text_out = format_slots(shown, party, channel, day, label, _spoken_time, meal)
-        if not detour:
-            s["offered"] = shown
-            s["expected"] = "reservation_time" if shown else None
-            if meal:
-                s["meal"] = meal
+        if detour:
+            page, _ = listed_slots(service_rows, channel)
+            text_out = format_slots(page, party, channel, day, label, _spoken_time, meal)
+        else:
+            text_out, s = _offer(s, service_rows, channel, party, day, meal)
+            s["expected"] = "reservation_time" if service_rows else None
+    if meal and not detour:
+        s["meal"] = meal
     if detour:
         s["detour"] = {"date": day, "party_size": party, "offered": rows}
         text_out += _reminder(s)
@@ -1205,6 +1292,21 @@ def _converse(s, b, history, text, channel, external_id, customer):
             s["phase"] = "done"
             s["intent"] = None
             return _reply(s, "De acuerdo, no hice cambios. ¿Necesitas algo más?", True)
+        if is_next_page_request(text):
+            all_choices = s.get("choice_rows") or s["choices"]
+            offset = int(s.get("choice_offset") or 0) + len(s["choices"])
+            page, _ = reservation_page(all_choices, offset)
+            if page:
+                s["choices"] = page
+                s["choice_offset"] = offset
+                request = s.get("choice_request") or {}
+                _, _, message = format_reservation_page(
+                    all_choices, offset, request.get("operation") or "cancelar", label
+                )
+                return _reply(s, message, True)
+            return _reply(s, "Ya te mostré todas las reservas. Dime el número de la que quieres elegir.", True)
+        if is_numeric_choice(text) and not explicit_choice(text, len(s["choices"])):
+            return _reply(s, "Ese número no aparece entre las reservas mostradas. Dime uno de los números o di “siguiente”.", True)
         choice = _resolve_choice(s, b, customer, text)
         if choice:
             request = s.get("choice_request") or {}
@@ -1234,6 +1336,9 @@ def _converse(s, b, history, text, channel, external_id, customer):
             _remember(s, "choose_reservation", {"choice": choice["code"]}, answer[0])
             return answer
         holding = "choosing"
+
+    if is_next_page_request(text) and s.get("expected") == "reservation_time" and s.get("availability_slots"):
+        return _next_slot_page(s, channel)
 
     if is_resume(text) and _in_progress(s):
         resumed = _resume(s)
