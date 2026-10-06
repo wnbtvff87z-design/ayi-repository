@@ -1,0 +1,1 @@
+"""Isolated insurance conversation domain."""

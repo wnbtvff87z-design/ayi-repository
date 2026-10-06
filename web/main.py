@@ -8,7 +8,7 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
-from dialog import process
+from dialog import BusinessSectorError, process, sector_of
 app=Flask(__name__);log=logging.getLogger(__name__)
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
@@ -50,16 +50,21 @@ def _tenant_lookup(number,channel):
   if len(links)!=1:raise BookingError('Número sin negocio único')
   r=requests.get(url(os.getenv('AIRTABLE_BUSINESSES_TABLE','Negocios'),links[0]),headers=headers(),timeout=10);r.raise_for_status();f=r.json()['fields']
   if f.get('Estado')!='Activo' or not f.get('Business_ID'):return None
-  return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or 'general').lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
+  return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or '').strip().lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 _lookup_cache={}
 _lookup_lock=threading.Lock()
 def lookup(number,channel):
+  if channel not in ('Voice','WhatsApp'):raise BookingError('Canal no reconocido')
   number=phone(number)
   if not number:return None
   key=(number,channel);now=time.monotonic();ttl=int(os.getenv('BUSINESS_CACHE_TTL_SECONDS','60'))
   with _lookup_lock:
    cached=_lookup_cache.get(key)
-   if cached and cached[0]>now:return cached[1]
+   if cached and cached[0]>now:
+    if cached[1]:
+     try:sector_of(cached[1])
+     except BusinessSectorError as exc:raise BookingError(str(exc)) from exc
+    return cached[1]
   if MODE=='new':b=_tenant_lookup(number,channel)
   else:
    if MODE not in ('legacy','shadow'):raise BookingError('TENANT_LOOKUP_MODE inválido')
@@ -69,9 +74,13 @@ def lookup(number,channel):
      other=_tenant_lookup(number,channel)
      if other and b and other['name'].casefold()!=b['name'].casefold():log.warning('Shadow lookup mismatch for %s',channel)
     except Exception:log.exception('Shadow lookup failed')
+  if b:
+   try:sector_of(b)
+   except BusinessSectorError as exc:raise BookingError(str(exc)) from exc
   with _lookup_lock:_lookup_cache[key]=(now+ttl,b)
   return b
 def save_conversation(b,customer,question,answer,status):
+  if sector_of(b)=='insurance':raise BookingError('Las conversaciones de seguros no se espejan en Airtable')
   table=os.getenv('AIRTABLE_CONVERSATIONS_TABLE','Conversaciones')
   f={'Twilio_Phone':phone(b['phone']),'Customer_Phone':phone(customer),'Question':str(question),'Answer':str(answer or ''),'Timestamp':datetime.now(timezone.utc).isoformat(),'Status':status}
   if MODE=='new':f['Business_ID']=b['business_id']
@@ -159,6 +168,9 @@ def recent_history(c,bid,channel,customer,external_id):
 
 def converse(b,channel,customer,text,external_id,include_end_reason=False):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
+  if sector_of(b)=='insurance':
+   reply,_=process(b,{},[],text,channel,external_id,customer)
+   return (reply,None) if include_end_reason else reply
   init_schema();bid=b['business_id']
   with db() as c:
    c.execute('INSERT INTO customer_sessions(business_id,channel,customer_phone) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING',(bid,channel,customer))
@@ -205,7 +217,7 @@ def whatsapp():
   if not twilio_valid():return Response('Forbidden',status=403)
   tw=MessagingResponse()
   try:
-   b=lookup(request.form.get('To') or PHONE,'WhatsApp');text=request.form.get('Body','').strip()
+   b=lookup(request.form.get('To'),'WhatsApp');text=request.form.get('Body','').strip()
    if not b:answer='No puedo identificar el negocio asociado a este número.'
    elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
    else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''))
@@ -219,7 +231,7 @@ def whatsapp():
 def voice():
   if not twilio_valid():return Response('Forbidden',status=403)
   r=VoiceResponse();relay=os.getenv('RELAY_VOICE_URL','')
-  try:b=lookup(request.form.get('To') or PHONE,'Voice')
+  try:b=lookup(request.form.get('To'),'Voice')
   except Exception:log.exception('Voice business lookup failed');b=None
   if b and open_now(b) and phone(b.get('reception')):
    dial=r.dial(action='/voice-dial-result',method='POST',timeout=20,answer_on_bridge=True);dial.number(phone(b['reception']))
