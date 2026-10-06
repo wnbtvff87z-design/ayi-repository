@@ -24,11 +24,13 @@ REASONS = {
     'identity_not_verified',
 }
 URGENCIES = {'normal', 'high', 'critical'}
+URGENCY_RANK = {'normal': 0, 'high': 1, 'critical': 2}
 CHANNELS = {'Voice', 'WhatsApp'}
 MAX_TEXT = 12000
 MAX_CONTEXT_BYTES = 32768
 MAX_EVIDENCE_BYTES = 32768
 MAX_OUTBOX_ATTEMPTS = 8
+EXPIRED_OUTBOX_SWEEP_LIMIT = 25
 AIRTABLE_FIELDS = {
     'case_id': 'Insurance_Case_ID',
     'customer_ref': 'Customer_Ref',
@@ -104,6 +106,50 @@ def _payload(case_id, customer_ref, product, urgency, reason, status, next_actio
         'next_action': 'Abrir el caso en el sistema seguro y seguir el protocolo aprobado.',
         'revision': revision,
     }
+
+
+def _record_case_revision(
+    conn,
+    *,
+    case_id,
+    customer_ref,
+    product,
+    current_urgency,
+    urgency,
+    reason,
+    policy_version_id,
+    next_action,
+    event_type,
+    channel,
+):
+    urgency_value = max((current_urgency, urgency), key=URGENCY_RANK.get)
+    conn.execute(
+        'UPDATE insurance_cases SET urgency=%s,latest_reason=%s,'
+        'policy_version_id=COALESCE(%s,policy_version_id),next_action=%s,updated_at=now() '
+        'WHERE case_id=%s',
+        (urgency_value, reason, policy_version_id, next_action, case_id),
+    )
+    updated = conn.execute(
+        'UPDATE insurance_cases SET revision=revision+1,updated_at=now() '
+        'WHERE case_id=%s RETURNING revision',
+        (case_id,),
+    ).fetchone()
+    payload = _payload(
+        case_id, customer_ref, product, urgency_value, reason, 'pending',
+        next_action, updated['revision'],
+    )
+    conn.execute(
+        'INSERT INTO insurance_case_events(case_id,event_type,actor,details) '
+        'VALUES(%s,%s,%s,%s::jsonb)',
+        (
+            case_id, event_type, 'customer',
+            json.dumps({'channel': channel, 'reason': reason}, separators=(',', ':')),
+        ),
+    )
+    conn.execute(
+        'INSERT INTO insurance_outbox(case_id,revision,payload) VALUES(%s,%s,%s::jsonb)',
+        (case_id, updated['revision'], json.dumps(payload, ensure_ascii=False)),
+    )
 
 
 def create_or_update_case(
@@ -209,37 +255,22 @@ def create_or_update_case(
                 ).fetchone()
                 if not row:
                     return str(case_id)
-                urgency_rank = {'normal': 0, 'high': 1, 'critical': 2}
-                urgency_value = max((row['urgency'], urgency), key=urgency_rank.get)
-                conn.execute(
-                    'UPDATE insurance_cases SET urgency=%s,latest_reason=%s,policy_version_id=COALESCE(%s,policy_version_id),'
-                    'next_action=%s,updated_at=now() WHERE case_id=%s',
-                    (urgency_value, reason, policy_version_id, next_action, case_id),
-                )
-                updated = conn.execute(
-                    'UPDATE insurance_cases SET revision=revision+1,updated_at=now() '
-                    'WHERE case_id=%s RETURNING revision',
-                    (case_id,),
-                ).fetchone()
-                payload = _payload(
-                    case_id, row['customer_ref'], row['product'], urgency_value, reason,
-                    'pending', next_action, updated['revision'],
-                )
-                conn.execute(
-                    'INSERT INTO insurance_case_events(case_id,event_type,actor,details) '
-                    "VALUES(%s,'question_updated','customer',%s::jsonb)",
-                    (
-                        case_id,
-                        json.dumps({'channel': channel, 'reason': reason}, separators=(',', ':')),
-                    ),
-                )
-                conn.execute(
-                    'INSERT INTO insurance_outbox(case_id,revision,payload) VALUES(%s,%s,%s::jsonb)',
-                    (case_id, updated['revision'], json.dumps(payload, ensure_ascii=False)),
+                _record_case_revision(
+                    conn,
+                    case_id=case_id,
+                    customer_ref=row['customer_ref'],
+                    product=row['product'],
+                    current_urgency=row['urgency'],
+                    urgency=urgency,
+                    reason=reason,
+                    policy_version_id=policy_version_id,
+                    next_action=next_action,
+                    event_type='question_updated',
+                    channel=channel,
                 )
                 return str(case_id)
             row = conn.execute(
-                "SELECT case_id,customer_ref,product,urgency,revision FROM insurance_cases "
+                "SELECT case_id,customer_ref,product,urgency FROM insurance_cases "
                 "WHERE business_id=%s AND customer_ref=%s AND thread_key=%s "
                 "AND status='pending' FOR UPDATE",
                 (business_id, customer_ref, thread_key),
@@ -247,24 +278,20 @@ def create_or_update_case(
             if row:
                 case_id = row['case_id']
                 product = row['product']
-                urgency_rank = {'normal': 0, 'high': 1, 'critical': 2}
-                urgency_value = max((row['urgency'], urgency), key=urgency_rank.get)
-                conn.execute(
-                    'UPDATE insurance_cases SET urgency=%s,latest_reason=%s,policy_version_id=COALESCE(%s,policy_version_id),'
-                    'next_action=%s,updated_at=now() WHERE case_id=%s',
-                    (urgency_value, reason, policy_version_id, next_action, case_id),
-                )
+                current_urgency = row['urgency']
+                case_customer_ref = row['customer_ref']
                 event_type = 'question_added'
             else:
                 case_id = uuid.uuid4()
-                urgency_value = urgency
+                current_urgency = urgency
+                case_customer_ref = customer_ref
                 conn.execute(
                     'INSERT INTO insurance_cases '
                     '(case_id,business_id,customer_ref,thread_key,product,policy_id,policy_version_id,status,latest_reason,urgency,next_action) '
                     "VALUES(%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s)",
                     (
                         case_id, business_id, customer_ref, thread_key, product,
-                        policy_id, policy_version_id, reason, urgency_value, next_action,
+                        policy_id, policy_version_id, reason, urgency, next_action,
                     ),
                 )
                 event_type = 'created'
@@ -278,26 +305,18 @@ def create_or_update_case(
                     evidence_json,
                 ),
             )
-            conn.execute(
-                'INSERT INTO insurance_case_events(case_id,event_type,actor,details) '
-                'VALUES(%s,%s,%s,%s::jsonb)',
-                (
-                    case_id, event_type, 'customer',
-                    json.dumps({'channel': channel, 'reason': reason}, separators=(',', ':')),
-                ),
-            )
-            updated = conn.execute(
-                'UPDATE insurance_cases SET revision=revision+1,updated_at=now() '
-                'WHERE case_id=%s RETURNING revision',
-                (case_id,),
-            ).fetchone()
-            payload = _payload(
-                case_id, customer_ref, product, urgency_value, reason, 'pending',
-                next_action, updated['revision'],
-            )
-            conn.execute(
-                'INSERT INTO insurance_outbox(case_id,revision,payload) VALUES(%s,%s,%s::jsonb)',
-                (case_id, updated['revision'], json.dumps(payload, ensure_ascii=False)),
+            _record_case_revision(
+                conn,
+                case_id=case_id,
+                customer_ref=case_customer_ref,
+                product=product,
+                current_urgency=current_urgency,
+                urgency=urgency,
+                reason=reason,
+                policy_version_id=policy_version_id,
+                next_action=next_action,
+                event_type=event_type,
+                channel=channel,
             )
         return str(case_id)
     except CasePersistenceError:
@@ -452,11 +471,23 @@ def _upsert_airtable(payload, existing_record):
 
 def _fail_expired_outbox_leases(conn):
     expired = conn.execute(
-        "UPDATE insurance_outbox SET status='failed',locked_until=NULL,"
-        "last_error_code='lease_expired_max_attempts' "
-        "WHERE status='processing' AND locked_until<now() AND attempts>=%s "
-        'RETURNING outbox_id,case_id,attempts,last_error_code',
-        (MAX_OUTBOX_ATTEMPTS,),
+        """
+        WITH expired AS (
+            SELECT outbox_id
+            FROM insurance_outbox
+            WHERE status='processing' AND locked_until<now() AND attempts>=%s
+            ORDER BY locked_until,outbox_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+        )
+        UPDATE insurance_outbox o
+        SET status='failed',locked_until=NULL,
+            last_error_code='lease_expired_max_attempts'
+        FROM expired
+        WHERE o.outbox_id=expired.outbox_id
+        RETURNING o.outbox_id,o.case_id,o.attempts,o.last_error_code
+        """,
+        (MAX_OUTBOX_ATTEMPTS, EXPIRED_OUTBOX_SWEEP_LIMIT),
     ).fetchall()
     for item in expired:
         _notify_outbox_failure(item, item['last_error_code'], True)

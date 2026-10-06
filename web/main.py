@@ -117,10 +117,12 @@ def authorized():
   return bool(key and got and hmac.compare_digest(key,got))
 def insurance_human_authorized():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
-  return bool(key and got and hmac.compare_digest(key,got))
+  audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','')
+  return bool(key and got and len(audit_key.encode())>=32 and hmac.compare_digest(key,got))
 def insurance_human_actor():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','').encode()
-  return 'shared-key:'+hmac.new(key,b'insurance-human-api-actor',hashlib.sha256).hexdigest()[:16]
+  audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','').encode()
+  return 'shared-key:'+hmac.new(audit_key,key,hashlib.sha256).hexdigest()[:16]
 def _twilio_candidates(base,path,query):
   host=request.headers.get('Host','');xh=request.headers.get('X-Forwarded-Host','').split(',')[0].strip();xp=request.headers.get('X-Forwarded-Proto','').split(',')[0].strip()
   rd=os.getenv('RAILWAY_PUBLIC_DOMAIN','').strip();c={}

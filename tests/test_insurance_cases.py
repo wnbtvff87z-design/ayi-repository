@@ -317,6 +317,40 @@ def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schem
     ]
 
 
+def test_expired_final_lease_sweep_is_bounded_per_batch(pg_schema, monkeypatch):
+    for index in range(cases.EXPIRED_OUTBOX_SWEEP_LIMIT + 1):
+        submit_question(
+            external_id=f'SM-expired-{index}',
+            policy_id=f'POLICY-EXPIRED-{index}',
+        )
+    with pg_schema() as conn:
+        conn.execute(
+            "UPDATE insurance_outbox SET status='processing',attempts=%s,"
+            "locked_until=now()-interval '1 second'",
+            (cases.MAX_OUTBOX_ATTEMPTS,),
+        )
+    notified = []
+    monkeypatch.setattr(
+        cases,
+        '_notify_outbox_failure',
+        lambda item, error_code, permanent: notified.append(item['outbox_id']),
+    )
+
+    assert cases.sync_outbox(limit=1) == []
+    assert len(notified) == cases.EXPIRED_OUTBOX_SWEEP_LIMIT
+    with pg_schema() as conn:
+        statuses = conn.execute(
+            "SELECT status,count(*) AS count FROM insurance_outbox GROUP BY status ORDER BY status"
+        ).fetchall()
+    assert statuses == [
+        {'status': 'failed', 'count': cases.EXPIRED_OUTBOX_SWEEP_LIMIT},
+        {'status': 'processing', 'count': 1},
+    ]
+
+    assert cases.sync_outbox(limit=1) == []
+    assert len(notified) == cases.EXPIRED_OUTBOX_SWEEP_LIMIT + 1
+
+
 def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema, monkeypatch):
     case_id = submit_question()
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
@@ -461,6 +495,8 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
 
     assert client.get(path).status_code == 401
     headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
+    assert client.get(path, headers=headers).status_code == 401
+    monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
     detail = client.get(path, headers=headers)
     assert detail.status_code == 200
     assert len(detail.json['questions']) == 2
@@ -470,7 +506,10 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
     resolved = client.post(
         path + '/resolve',
         headers=headers,
-        json={'resolved_by': 'human-agent-1', 'resolution': 'Consulta revisada.'},
+        json={
+            'resolved_by': 'FORGED-CLIENT-ACTOR-NEVER-TRUST',
+            'resolution': 'Consulta revisada.',
+        },
     )
     assert resolved.status_code == 200
     missing = client.post(
@@ -496,11 +535,13 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
         'resolution': 'Consulta revisada.',
         'resolved_by': main.insurance_human_actor(),
     }
+    assert state['resolved_by'] != 'FORGED-CLIENT-ACTOR-NEVER-TRUST'
     assert events == 1
 
 
 def test_human_resolution_does_not_echo_internal_validation_error(monkeypatch):
     monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
     monkeypatch.setattr(
         cases,
         'resolve_case',
@@ -564,6 +605,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
     monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
     monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
     monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceCases')
