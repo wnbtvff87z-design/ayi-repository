@@ -32,6 +32,9 @@ MAX_EVIDENCE_BYTES = 32768
 MAX_OUTBOX_ATTEMPTS = 8
 EXPIRED_OUTBOX_SWEEP_LIMIT = 25
 MIN_KEY_BYTES = 32
+OUTBOX_BACKOFF_BASE_SECONDS = 30
+OUTBOX_BACKOFF_MAX_EXPONENT = 10
+OUTBOX_BACKOFF_MAX_SECONDS = 3600
 AIRTABLE_FIELDS = {
     'case_id': 'Case ID',
     'customer_ref': 'Customer Reference',
@@ -421,7 +424,10 @@ def _airtable_config():
 
 def _case_filter_formula(case_id):
     canonical_case_id = str(uuid.UUID(str(case_id)))
-    return '{' + AIRTABLE_FIELDS['case_id'] + '}=' + json.dumps(canonical_case_id)
+    field_name = AIRTABLE_FIELDS['case_id']
+    if any(char in field_name for char in '{}'):
+        raise ValueError('Airtable case ID field name is invalid')
+    return '{' + field_name + '}=' + json.dumps(canonical_case_id)
 
 
 def _upsert_airtable(payload, existing_record):
@@ -580,7 +586,11 @@ def _retry_outbox(conn, item, error_code):
             (error_code, item['outbox_id']),
         )
     else:
-        delay = min(2 ** min(int(item['attempts']), 10) * 30, 3600)
+        exponent = min(int(item['attempts']), OUTBOX_BACKOFF_MAX_EXPONENT)
+        delay = min(
+            2 ** exponent * OUTBOX_BACKOFF_BASE_SECONDS,
+            OUTBOX_BACKOFF_MAX_SECONDS,
+        )
         conn.execute(
             "UPDATE insurance_outbox SET status='pending',locked_until=NULL,"
             "next_attempt_at=now()+(%s * interval '1 second'),last_error_code=%s "

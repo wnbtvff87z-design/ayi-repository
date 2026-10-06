@@ -262,6 +262,14 @@ def test_airtable_permission_or_contract_rejection_is_retried(
             (case_id,),
         ).fetchone()
     assert state == {'status': 'pending', 'attempts': 1, 'last_error_code': code}
+    if status == 422:
+        with pg_schema() as conn:
+            retry = conn.execute(
+                'SELECT EXTRACT(EPOCH FROM next_attempt_at-now())::integer AS delay '
+                'FROM insurance_outbox WHERE case_id=%s',
+                (case_id,),
+            ).fetchone()['delay']
+        assert 58 <= retry <= cases.OUTBOX_BACKOFF_MAX_SECONDS
 
 
 def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkeypatch):
@@ -313,6 +321,12 @@ def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkey
 def test_airtable_case_filter_requires_uuid():
     with pytest.raises(ValueError):
         cases._case_filter_formula('not-a-uuid')
+
+
+def test_airtable_case_filter_rejects_unescaped_field_name(monkeypatch):
+    monkeypatch.setitem(cases.AIRTABLE_FIELDS, 'case_id', 'Case } ID')
+    with pytest.raises(ValueError, match='field name'):
+        cases._case_filter_formula(str(uuid.uuid4()))
 
 
 def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schema, monkeypatch):

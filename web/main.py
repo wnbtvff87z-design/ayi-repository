@@ -124,8 +124,9 @@ def insurance_human_authorized():
   if len(audit_key.encode())<MIN_KEY_BYTES:
     return False
   return hmac.compare_digest(key_bytes,got_bytes)
-def insurance_human_actor():
-  key=os.getenv('INSURANCE_HUMAN_API_KEY','').encode()
+def insurance_human_actor(credential=None):
+  credential=os.getenv('INSURANCE_HUMAN_API_KEY','') if credential is None else credential
+  key=credential.encode()
   audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','').encode()
   return 'shared-key:v1:'+hmac.new(audit_key,key,hashlib.sha256).hexdigest()
 def _twilio_candidates(base,path,query):
@@ -341,7 +342,11 @@ def internal_resolve_insurance_case(case_id):
   data=request.get_json(silent=True) or {}
   try:
    from insurance.cases import resolve_case
-   resolved=resolve_case(case_id,insurance_human_actor(),data.get('resolution'))
+   resolved=resolve_case(
+       case_id,
+       insurance_human_actor(request.headers.get('X-Insurance-Human-Key','')),
+       data.get('resolution'),
+   )
    return jsonify(success=True,case_id=resolved)
   except ValueError:return jsonify(success=False,message='Invalid resolution request'),400
   except CaseWorkflowError:return jsonify(success=False,message='Pending insurance case not found'),404
