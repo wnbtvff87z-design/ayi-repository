@@ -66,7 +66,7 @@ Opción 1 puede servir para prototipo con datos ficticios únicamente, mientras 
 - `web/dialog.py`: reconocer sectores explícitos; seguros solo si `INSURANCE_ENABLED=true`; sector no reconocido falla en vez de caer en `general`. Sectores `restaurante`, `consultora` y `general` conservan sus respectivos diálogos.
 - `web/main.py`: valida canales y sectores, no infiere un destino ausente desde `TWILIO_PHONE`, evita caché positiva para seguros, omite el espejo Airtable general y añade endpoints internos de lectura/resolución humana con clave independiente.
 - `web/insurance/cases.py`, `web/insurance/migrations/001_cases_outbox.sql`, `web/insurance/migrate.py`: persisten casos, cada consulta no resuelta, evidencia/contexto, eventos y outbox en tablas aisladas; referencias de cliente seudonimizadas con HMAC.
-- `web/insurance_sync_outbox.py`: worker independiente para publicar tareas minimizadas desde el outbox PostgreSQL hacia un Airtable separado, con reintento exponencial e identificador de caso estable.
+- `web/insurance_sync_outbox.py`: worker independiente para publicar tareas minimizadas desde el outbox PostgreSQL hacia la tabla Airtable configurada, con reintento exponencial e identificador de caso estable. La separación real de base no está verificada.
 - `web/insurance/dialog.py`: no contesta cobertura; al escalar, confirma solo después de que termina el commit PostgreSQL. Si no puede persistir, dice expresamente que el caso no se creó.
 - `tests/test_insurance_cases.py`: suite de integración contra PostgreSQL real local y Airtable simulado, con motivos, idempotencia, preguntas múltiples, reintentos, fallo y resolución humana.
 - `INSURANCE_ENABLED` sigue desactivado por defecto y no se habilitó en el entorno. No hay acceso a pólizas ni documentos.
@@ -89,7 +89,7 @@ No hay campos existentes comprobados para titularidad, configuración de saludo/
 
 ## Pendientes y secuencia posterior
 
-**Bloqueantes para activación real:** confirmar el modo de resolución efectivo en Railway; provisionar `INSURANCE_DATABASE_URL` como rol de aplicación mínimo y `INSURANCE_MIGRATION_DATABASE_URL` separado; configurar `INSURANCE_CASE_HMAC_KEY`; crear base/tabla/campos Airtable y `AIRTABLE_INSURANCE_*`; desplegar y vigilar el worker; conectar alerta `INSURANCE_ALERT_WEBHOOK_URL` o un alert manager de logs; completar pruebas E2E contra proveedores reales. También siguen pendientes identidad y autorización por póliza, versiones/vigencias documentales, almacenamiento privado/borrado, responsables y protocolo de urgencias/contactos oficiales, aprobación de privacidad/proveedores, configuración de voz y pruebas manuales Voice/WhatsApp. El teléfono de origen no autentica al asegurado. No se afirma cumplimiento normativo.
+**Bloqueantes para activación real:** confirmar el modo de resolución efectivo en Railway; provisionar `INSURANCE_DATABASE_URL` como rol de aplicación mínimo y `INSURANCE_MIGRATION_DATABASE_URL` separado; configurar `INSURANCE_CASE_HMAC_KEY`; verificar base/tabla/campos Airtable y `AIRTABLE_INSURANCE_*` (el usuario informa que las tablas están en “AI reservas”, pero ese acceso/esquema no es visible desde este checkout); desplegar y vigilar el worker; conectar alerta `INSURANCE_ALERT_WEBHOOK_URL` o un alert manager de logs; completar pruebas E2E contra proveedores reales. También siguen pendientes identidad y autorización por póliza, versiones/vigencias documentales, almacenamiento privado/borrado, responsables y protocolo de urgencias/contactos oficiales, aprobación de privacidad/proveedores, configuración de voz y pruebas manuales Voice/WhatsApp. El teléfono de origen no autentica al asegurado. No se afirma cumplimiento normativo.
 
 Fases propuestas (PR #21 contiene ahora la base del caso/outbox; las fases restantes siguen pendientes):
 
@@ -171,3 +171,76 @@ Prueba local E2E PostgreSQL + API Airtable simulada: `INSURANCE_TEST_DATABASE_UR
 ### AI Reservas y separación de datos
 
 La aplicación de reservas usa `DATABASE_URL`; el esquema existente guarda nombre, teléfono, email y tamaño de grupo en `booking_reservations`, además de `customer_sessions` y `conversation_turns` (`web/booking.py`). El flujo nuevo usa otra variable (`INSURANCE_DATABASE_URL`) y tablas propias, pero eso por sí solo no prueba separación de base física, usuarios/roles, grants, backups, operadores ni políticas de acceso. **No es aceptable conectar seguros con el mismo usuario/base operacional de AI Reservas para almacenar consultas reales sensibles.** Recomendación: base e identidad de servicio separadas para seguros; mismo clúster PostgreSQL solo sería aceptable tras revisión de seguridad/privacidad y aislamiento verificable a nivel de base/schema/roles, red, backups y acceso humano. Preferir instancia separada si el riesgo o regulación lo requiere. Hasta documentar y verificar ese aislamiento, mantener solo fixtures ficticios y `INSURANCE_ENABLED=false`.
+
+## Revisión de contrato solicitada antes de aprobar
+
+Esta revisión parte del HEAD `5a60c0016ff7058f4691a6fc150241664265ad15` de PR #21; GitHub confirma base `develop` en `306116185259ceeee56384e35b77285f7ae5f9c9`. El cuerpo del PR en GitHub aún describe el alcance anterior como si no existieran casos/outbox; actualizar esa descripción antes de pedir aprobación.
+
+### Decisión de bandeja: una tabla por caso, opción 1
+
+La recomendación para el alcance actual es usar `Insurance Cases` como bandeja operativa, con **una fila/tarea de revisión por caso pendiente**. No es una decisión basada en que el código ya escriba una tabla: se basa en el modelo actual de PostgreSQL, que agrega todas las preguntas no resueltas del mismo hilo/póliza a un caso abierto y no tiene entidad ni ciclo de vida separados para tareas humanas. El humano recibe una unidad de trabajo por caso, ve estado/urgencia/producto/motivo y accede al detalle completo de todas sus preguntas solo mediante la API autenticada. La consulta original, el contexto y la evidencia no se copian a Airtable.
+
+| Criterio | Opción 1: una tabla caso/tarea | Opción 2: `Insurance Cases` + `Insurance Human Tasks` vinculadas |
+|---|---|---|
+| Preguntas no resueltas | Una fila representa el caso; el humano consulta todas las preguntas en PostgreSQL por la API. | La tarea enlaza al caso; el humano consulta el mismo detalle en PostgreSQL. |
+| Caso/tarea/urgencia/estado | La fila es el caso y su tarea única de revisión; contiene urgencia y estado del caso/tarea. | Caso agregado y tarea operativa son objetos distintos y pueden tener estados, prioridad y responsables propios. |
+| Varias tareas por caso | No se admiten en el modelo actual: una tarea abierta por caso. Todas las preguntas se acumulan en ella. | Sí, mediante varias tareas enlazadas; requiere que PostgreSQL modele esas tareas, su idempotencia y resolución independiente. |
+| Detalle sensible | API protegida; Airtable solo recibe una referencia HMAC y metadatos minimizados. | Igual; el enlace no debe incluir claves ni datos sensibles. |
+| Resolución | Solo la API escribe resolución/actor/evento en PostgreSQL y genera revisión de outbox. | La API tendría que identificar tarea y caso, validar permisos, actualizar ambos objetos PG y generar proyecciones de ambos registros. |
+| Campos/vínculos | ID estable del caso, referencia HMAC, producto, estado, urgencia, razón, resumen no sensible, siguiente acción y revisión. Sin vínculo de Airtable. | ID del caso más ID de tarea, vínculo Airtable `Case`, campos de estado/prioridad de ambos objetos y control de revisiones. |
+| Coste frente al HEAD | Adaptar el único adaptador a nombres y opciones acordadas; cambiar/validar una proyección. | Añadir entidad/migración PG de tareas, dos upserts ordenados y reintentables, vínculo idempotente, estados independientes y reconciliación parcial. |
+| Sustitución futura | El outbox puede proyectarse a otra bandeja mediante un adaptador, manteniendo PG como autoridad. | También sustituible mediante adaptador, pero contrato de dos objetos y vínculos debe reproducirse o transformarse. |
+
+Opción 2 sería preferible cuando existan asignaciones, SLA o tareas independientes por caso. No es el requisito/ciclo de vida implementado hoy: introducirla ya ampliaría esquema y operación sin una política acordada para crear, cerrar, asignar o deduplicar varias tareas. Si aparece esa necesidad, debe ser un incremento separado con `insurance_case_tasks` en PostgreSQL como autoridad. **No se borra ni modifica automáticamente `Insurance Human Tasks`: queda conservada sin sincronización.**
+
+### Matriz del contrato objetivo (propuesta, NO validada contra Airtable)
+
+No hay acceso autorizado a la base real ni a su API de metadatos desde este entorno. Los nombres enumerados por el usuario son evidencia de nombres visibles, no de tipos, opciones, obligatoriedad, permisos ni reglas de enlace. La tabla siguiente define el contrato mínimo que habría que acordar/configurar para opción 1; **no afirma que la tabla preparada lo satisfaga**.
+
+| Tabla | Campo exacto | Tipo Airtable requerido | Opciones/valores permitidos del contrato | Origen PostgreSQL | Dirección | Requerido | Ejemplo ficticio |
+|---|---|---|---|---|---|---|---|
+| Insurance Cases | `Case ID` | Texto de una línea | UUID estable; único | `insurance_cases.case_id` | PG → Airtable | Sí | `00000000-0000-4000-8000-000000000021` |
+| Insurance Cases | `Customer Reference` | Texto de una línea | HMAC hexadecimal; no teléfono | `insurance_cases.customer_ref` | PG → Airtable | Sí | `9f2a…c120` |
+| Insurance Cases | `Product Type` | Texto de una línea | Texto corto, nunca póliza/documento | `insurance_cases.product` | PG → Airtable | Sí | `hogar` |
+| Insurance Cases | `Status` | Selección única | Exactamente `pending`, `resolved`; el código actual emite esos valores literalmente, sin traducción | `insurance_cases.status` | PG → Airtable | Sí | `pending` |
+| Insurance Cases | `Urgency` | Selección única | Exactamente `normal`, `high`, `critical` | `insurance_cases.urgency` | PG → Airtable | Sí | `normal` |
+| Insurance Cases | `Reason Summary` | Texto de una línea | Códigos: `insufficient_evidence`, `missing_information`, `ambiguity`, `contradiction`, `unreadable_document`, `human_interpretation`, `identity_not_verified` | `insurance_cases.latest_reason` | PG → Airtable | Sí | `missing_information` |
+| Insurance Cases | `Task Summary` | Texto largo | Resumen genérico, sin pregunta ni evidencia | Payload outbox `summary` | PG → Airtable | Sí | `Consulta pendiente de revisión humana.` |
+| Insurance Cases | `Next Action` | Texto largo | Acción genérica sin hora prometida | `insurance_cases.next_action` (el payload actual lo reemplaza por una instrucción genérica) | PG → Airtable | Sí | `Verificar identidad y revisar la consulta.` |
+| Insurance Cases | `Revision` | Número entero | Entero positivo creciente por caso | `insurance_cases.revision` / `insurance_outbox.revision` | PG → Airtable | Sí | `1` |
+
+Los estados no se traducen: el contrato exige opciones Airtable literales `pending` y `resolved`. No se puede afirmar que `pending` sea equivalente a `Pendiente` ni escribir una etiqueta localizada sin confirmar/configurar una traducción explícita. El código actual **no cumple todavía esta matriz**: escribe los nombres `Insurance_Case_ID`, `Customer_Ref`, `Product`, `Escalation_Reason`, `Next_Action`, etc., y `Status` literal. Tampoco valida el esquema/opciones antes de intentar escribir. Los campos visibles `Next Action At`, `Task ID` y `Case` no son equivalentes al campo texto `Next Action` ni se usan por el modelo de una tabla; `Next Action At` es conceptualmente una fecha/hora y PostgreSQL no tiene una fecha límite para esa acción.
+
+Por esa discrepancia y la falta de metadatos, **no se cambia el adaptador a ciegas**. Antes de configurar credenciales/tabla se necesita export de esquema/API de metadatos autorizado con tipo, opciones, requeridos, campos calculados y permisos. Si los campos reales no coinciden, primero aprobar el contrato objetivo y luego adaptar código/tests y ejecutar una prueba de contrato con base Airtable de prueba. La tabla `Insurance Human Tasks` se conserva intacta y sin sincronización.
+
+### Outbox: ejecución, fallos y reconciliación actuales
+
+- Archivo consumidor: `web/insurance_sync_outbox.py`; función de proceso `run()` y consumidor `insurance.cases.sync_outbox()`.
+- Comando propuesto para un nuevo Railway Worker, tras aprobación y pruebas de entorno: Root Directory `web`, Start Command `python insurance_sync_outbox.py`. Es un bucle largo; no llama al Cron de reservas (`python sync_slots_job.py`). No hay manifiesto Railway ni evidencia de que ese worker exista/despliegue.
+- Variables por proceso: Web requiere `INSURANCE_ENABLED` (mantener `false`), `INSURANCE_DATABASE_URL`, `INSURANCE_CASE_HMAC_KEY`, `INSURANCE_HUMAN_API_KEY`; Worker requiere `INSURANCE_DATABASE_URL`, `AIRTABLE_INSURANCE_BASE_ID`, `AIRTABLE_INSURANCE_TOKEN`, `AIRTABLE_INSURANCE_CASES_TABLE`; `INSURANCE_ALERT_WEBHOOK_URL` es opcional y `INSURANCE_OUTBOX_POLL_SECONDS`/`INSURANCE_OUTBOX_BATCH_SIZE` tienen defaults. Una corrida manual de migración usa `INSURANCE_MIGRATION_DATABASE_URL`, no la credencial runtime.
+- Frecuencia: 15 segundos por defecto, configurable entre 2 y 300; batch 25 por defecto.
+- Reintentos: backoff exponencial desde 60 segundos (el primer intento fallido; `2 ** attempts * 30`) con máximo de una hora. No hay límite de intentos ni estado terminal/DLQ: una falla permanente queda pendiente y se reintenta indefinidamente.
+- Alerta: cada fallo produce log `CRITICAL`; un POST con ID opaco/intento/código se envía solo si `INSURANCE_ALERT_WEBHOOK_URL` existe. Si no se configura, no hay notificación fuera de logs; si ese POST falla, queda otro log crítico. No hay destinatario/responsable confirmado ni alarma verificada.
+- Evitar duplicados: PostgreSQL usa lease `FOR UPDATE SKIP LOCKED`, ordena revisiones por caso y el upsert consulta un ID estable antes de crear. No existe garantía transaccional distribuida; la recuperación tras respuesta perdida depende de buscar el ID estable en Airtable. La API actual sincroniza una única tabla.
+- Borrado manual: el siguiente upsert no encuentra el ID estable y crea de nuevo la fila; no hay reconciliador periódico ni alarma específica de borrado.
+- Edición manual: Airtable no escribe de vuelta a PostgreSQL. Cuando exista una nueva revisión del outbox, el código vuelve a localizar el ID y parchea campos del payload desde PG, por lo que puede sobrescribir ediciones conflictivas en esos campos. Hoy no detecta ni alerta sobre divergencias manuales. Campos fuera del payload no se parchean.
+- Base/tabla equivocada, campo ausente/tipo inválido/token sin permiso/opción no admitida: error HTTP cae en retry indefinido y log; la escritura a otra base seleccionada por configuración no se puede detectar. No hay comprobación de allowlist/base esperada.
+- El comando importa sin credenciales, pero `run()` no valida la configuración al iniciar: al faltar DSN/configuración, se mantiene vivo, registra excepción por ciclo y vuelve a intentar tras el intervalo. Esto conserva el fail-closed, pero no es un arranque sano/visible por health check.
+
+Instrucción futura, **no ejecutar ahora**: después de aprobar el PR, crear un Railway Worker privado separado (root `web`), cargar solo sus variables runtime/Airtable/alertas, desplegar primero en base PostgreSQL y Airtable de prueba con `INSURANCE_ENABLED=false`, probar contrato, permisos, alertas y recuperación, y revisar logs/estado del outbox antes de cualquier habilitación. No asociarlo al servicio Cron de reservas.
+
+### Acceso humano y resolución
+
+La fila de Airtable solo sería una bandeja/resumen; todas las preguntas y sus revisiones se consultan por `GET /internal/insurance/cases/<uuid>`, que lee el caso y **todas** las filas de `insurance_case_questions` más sus `updates`, contexto y evidencia de PostgreSQL. `POST /internal/insurance/cases/<uuid>/resolve` guarda la resolución libre, `resolved_by` y un evento `resolved`, y crea nueva revisión outbox. Una edición de Airtable no resuelve ni cambia PostgreSQL. El test local valida acceso con/sin clave y que la resolución queda auditada en PG.
+
+La autorización actual no constituye una consola/identidad humana completa: es una clave compartida `INSURANCE_HUMAN_API_KEY` en header `X-Insurance-Human-Key`; quien la posea puede leer/resolver cualquier UUID y el campo `resolved_by` es texto suministrado por quien llama. No hay identidad individual, roles, autorización por negocio, aprobación, auditoría de login ni prueba de respuesta fundamentada/protocolo. **Es una brecha funcional y bloquea el uso con datos reales.** No poner la clave en Airtable, fórmulas, enlaces, automatizaciones ni documentación. La resolución no comunica automáticamente una respuesta al cliente.
+
+### Cobertura real, brechas de pruebas y estado
+
+**Tests locales simulados:** `tests/test_insurance_cases.py` usa PostgreSQL local y API Airtable fake. Cubre motivos almacenados, varias preguntas en un caso, retry de creación con respuesta perdida, actualización de un mismo registro simulado, fallo HTTP 503, log/alerta opcional, acceso API y resolución. No prueba tipos/esquema real, labels de selección, falta de columnas, permisos reales, base equivocada, conflictos de edición, borrado, fallo permanente terminal (no existe), alertamiento real, ni dos tablas. Tampoco hay una sola prueba que recorra desde un webhook real simulado, incluya dos preguntas de la misma conversación y termine con resolución autenticada + sincronización posterior; las piezas están probadas en tests separados.
+
+**Contrato con Airtable real:** no ejecutado; no hay acceso autorizado, token ni base de prueba disponibles. No se afirma compatibilidad.
+
+**Pruebas pendientes en Railway/Airtable del propietario:** exportar y aprobar tipos/opciones; crear/validar base de prueba y token de mínimo privilegio; probar credenciales malas/403/404/campo faltante/opción inválida; crear, reintentar, editar y borrar registro; revisar alertas; consultar todas las preguntas desde el cliente humano; validar actor individual/alcance; comprobar que `Insurance Human Tasks` permanece intacta. Las pruebas no deben usar pólizas reales.
+
+**Bucket y pólizas:** EL BUCKET ESTÁ CREADO PERO NO ESTÁ INTEGRADO; NO SUBIR PÓLIZAS REALES TODAVÍA. No se encontró código de subida/recepción PDF, asociación a negocio/cliente/póliza/versión, extracción/OCR, indexación ni respuesta con página/cláusula. Proponer PR posterior dedicado a ingesta segura, retención, procedencia, OCR y recuperación con citas. Ese worker debe ser separado del outbox: carga y procesa documentos sensibles con perfil de acceso/recursos distinto; fallos/OCR lento no deben bloquear la bandeja operativa. Compartir proceso solo después de análisis de amenazas/aislamiento explícito, no como supuesto inicial.
