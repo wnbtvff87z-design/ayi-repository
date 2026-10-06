@@ -61,10 +61,11 @@ def lookup(number,channel):
   with _lookup_lock:
    cached=_lookup_cache.get(key)
    if cached and cached[0]>now:
+    cached_sector=None
     if cached[1]:
-     try:sector_of(cached[1])
+     try:cached_sector=sector_of(cached[1])
      except BusinessSectorError as exc:raise BookingError(str(exc)) from exc
-    return cached[1]
+    if cached_sector!='insurance':return cached[1]
   if MODE=='new':b=_tenant_lookup(number,channel)
   else:
    if MODE not in ('legacy','shadow'):raise BookingError('TENANT_LOOKUP_MODE inválido')
@@ -74,10 +75,13 @@ def lookup(number,channel):
      other=_tenant_lookup(number,channel)
      if other and b and other['name'].casefold()!=b['name'].casefold():log.warning('Shadow lookup mismatch for %s',channel)
     except Exception:log.exception('Shadow lookup failed')
+  sector=None
   if b:
-   try:sector_of(b)
+   try:sector=sector_of(b)
    except BusinessSectorError as exc:raise BookingError(str(exc)) from exc
-  with _lookup_lock:_lookup_cache[key]=(now+ttl,b)
+  with _lookup_lock:
+   if sector=='insurance':_lookup_cache.pop(key,None)
+   else:_lookup_cache[key]=(now+ttl,b)
   return b
 def save_conversation(b,customer,question,answer,status):
   if sector_of(b)=='insurance':raise BookingError('Las conversaciones de seguros no se espejan en Airtable')

@@ -34,9 +34,16 @@ def configure_registry(monkeypatch, number_records, businesses):
     def get(url, **kwargs):
         requests.append((url, kwargs))
         if url == 'Numbers':
-            channel = 'WhatsApp' if '{Canal}="WhatsApp"' in kwargs['params']['filterByFormula'] else 'Voice'
+            formula = kwargs['params']['filterByFormula']
+            channel = 'WhatsApp' if '{Canal}="WhatsApp"' in formula else 'Voice'
+            number = formula.split('{Numero_E164}=', 1)[1].split(',', 1)[0].strip('"')
             return AirtableResponse({
-                'records': [row for row in number_records if row['fields']['Canal'] == channel]
+                'records': [
+                    row for row in number_records
+                    if row['fields']['Canal'] == channel
+                    and row['fields']['Numero_E164'] == number
+                    and row['fields']['Estado'] == 'Activo'
+                ]
             })
         if url.startswith('Businesses/'):
             return AirtableResponse({'fields': businesses[url.split('/', 1)[1]]})
@@ -137,8 +144,8 @@ def test_lookup_rejects_unrecognized_channel_and_sector(monkeypatch):
 
 def test_number_and_channel_resolve_one_active_business(monkeypatch):
     records = [
-        {'fields': {'Canal': 'Voice', 'Negocio': ['voice-business']}},
-        {'fields': {'Canal': 'WhatsApp', 'Negocio': ['message-business']}},
+        {'fields': {'Numero_E164': '+34600111222', 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['voice-business']}},
+        {'fields': {'Numero_E164': '+34600111222', 'Canal': 'WhatsApp', 'Estado': 'Activo', 'Negocio': ['message-business']}},
     ]
     businesses = {
         'voice-business': {'Estado': 'Activo', 'Business_ID': 'VOICE-1', 'Sector': 'restaurante'},
@@ -159,8 +166,8 @@ def test_number_and_channel_resolve_one_active_business(monkeypatch):
 
 def test_number_registry_fails_closed_on_duplicate_or_non_unique_business(monkeypatch):
     duplicate = [
-        {'fields': {'Canal': 'Voice', 'Negocio': ['business-1']}},
-        {'fields': {'Canal': 'Voice', 'Negocio': ['business-2']}},
+        {'fields': {'Numero_E164': '+34600111222', 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['business-1']}},
+        {'fields': {'Numero_E164': '+34600111222', 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['business-2']}},
     ]
     configure_registry(monkeypatch, duplicate, {})
     with pytest.raises(BookingError, match='duplicado'):
@@ -169,7 +176,7 @@ def test_number_registry_fails_closed_on_duplicate_or_non_unique_business(monkey
     for links in ([], ['business-1', 'business-2']):
         configure_registry(
             monkeypatch,
-            [{'fields': {'Canal': 'Voice', 'Negocio': links}}],
+            [{'fields': {'Numero_E164': '+34600111222', 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': links}}],
             {},
         )
         with pytest.raises(BookingError, match='negocio único'):
@@ -182,7 +189,7 @@ def test_inactive_number_or_business_is_not_resolved(monkeypatch):
 
     configure_registry(
         monkeypatch,
-        [{'fields': {'Canal': 'Voice', 'Negocio': ['inactive']}}],
+        [{'fields': {'Numero_E164': '+34600111222', 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['inactive']}}],
         {'inactive': {'Estado': 'Inactivo', 'Business_ID': 'B1', 'Sector': 'seguros'}},
     )
     assert main.lookup('+34600111222', 'Voice') is None
@@ -192,12 +199,52 @@ def test_insurance_flag_is_checked_even_for_cached_business(monkeypatch):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setattr(main, 'MODE', 'new')
     main._lookup_cache.clear()
+    calls = []
+
+    def registry_lookup(number, channel):
+        calls.append((number, channel))
+        return {'business_id': 'B1', 'sector': 'seguros'}
+
     monkeypatch.setattr(main, '_tenant_lookup', lambda number, channel: {
         'business_id': 'B1', 'sector': 'seguros'
     })
     assert main.lookup('+34600111222', 'Voice')['sector'] == 'seguros'
     monkeypatch.setenv('INSURANCE_ENABLED', 'false')
     with pytest.raises(BookingError):
+        main.lookup('+34600111222', 'Voice')
+
+
+def test_insurance_number_is_rechecked_and_revocation_is_not_cached(monkeypatch):
+    monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setattr(main, 'MODE', 'new')
+    main._lookup_cache.clear()
+    answers = iter([
+        {'business_id': 'B1', 'sector': 'seguros'},
+        None,
+    ])
+    calls = []
+
+    def registry_lookup(number, channel):
+        calls.append((number, channel))
+        return next(answers)
+
+    monkeypatch.setattr(main, '_tenant_lookup', registry_lookup)
+    assert main.lookup('+34600111222', 'Voice')['business_id'] == 'B1'
+    assert ('+34600111222', 'Voice') not in main._lookup_cache
+    assert main.lookup('+34600111222', 'Voice') is None
+    assert calls == [('+34600111222', 'Voice'), ('+34600111222', 'Voice')]
+
+
+def test_insurance_registry_failure_does_not_fall_back_to_cached_assignment(monkeypatch):
+    monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setattr(main, 'MODE', 'new')
+    main._lookup_cache.clear()
+    monkeypatch.setattr(main, '_tenant_lookup', lambda number, channel: {
+        'business_id': 'B1', 'sector': 'seguros'
+    })
+    main.lookup('+34600111222', 'Voice')
+    monkeypatch.setattr(main, '_tenant_lookup', lambda number, channel: (_ for _ in ()).throw(RuntimeError('registry unavailable')))
+    with pytest.raises(RuntimeError, match='registry unavailable'):
         main.lookup('+34600111222', 'Voice')
 
 
@@ -237,3 +284,124 @@ def test_missing_destination_does_not_fall_back_to_default_phone(monkeypatch, pa
     assert main.phone(seen[0][0]) == ''
     assert seen[0][1] == channel
     assert response.status_code == 200
+
+
+def test_whatsapp_webhook_routes_valid_to_and_normalizes_whatsapp_prefix(monkeypatch):
+    number = '+34600111222'
+    configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'WhatsApp', 'Estado': 'Activo', 'Negocio': ['consulting']}}],
+        {'consulting': {'Estado': 'Activo', 'Business_ID': 'CONS-1', 'Sector': 'consultora'}},
+    )
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    turns, mirrors = [], []
+    monkeypatch.setattr(main, 'converse', lambda *args, **kwargs: turns.append(args) or 'respuesta consultora')
+    monkeypatch.setattr(main, 'save_conversation', lambda *args: mirrors.append(args))
+
+    response = main.app.test_client().post('/webhook-whatsapp', data={
+        'To': 'whatsapp:+34 600 111 222',
+        'From': 'whatsapp:+34600999888',
+        'Body': 'hola',
+        'MessageSid': 'SM-valid-to',
+    })
+
+    assert response.status_code == 200
+    assert 'respuesta consultora' in response.get_data(as_text=True)
+    assert len(turns) == len(mirrors) == 1
+    assert turns[0][0]['business_id'] == 'CONS-1'
+    assert turns[0][1:4] == ('WhatsApp', '+34600999888', 'hola')
+    assert mirrors[0][0]['business_id'] == 'CONS-1'
+
+
+@pytest.mark.parametrize('to_value', [None, 'not-a-phone'])
+def test_whatsapp_webhook_rejects_missing_or_invalid_to_without_default_phone(monkeypatch, to_value):
+    number = '+34600111222'
+    requests = configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'WhatsApp', 'Estado': 'Activo', 'Negocio': ['consulting']}}],
+        {'consulting': {'Estado': 'Activo', 'Business_ID': 'CONS-1', 'Sector': 'consultora'}},
+    )
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    monkeypatch.setattr(main, 'PHONE', number)
+    monkeypatch.setattr(main, 'converse', lambda *args, **kwargs: pytest.fail('unresolved destination entered dialogue'))
+    monkeypatch.setattr(main, 'save_conversation', lambda *args: pytest.fail('unresolved destination was mirrored'))
+    data = {'From': 'whatsapp:+34600999888', 'Body': 'hola', 'MessageSid': 'SM-invalid-to'}
+    if to_value is not None:
+        data['To'] = to_value
+
+    response = main.app.test_client().post('/webhook-whatsapp', data=data)
+
+    assert response.status_code == 200
+    assert 'No puedo identificar el negocio asociado a este número.' in response.get_data(as_text=True)
+    assert requests == []
+
+
+def test_existing_voice_webhook_routes_valid_restaurant_number_to_reception(monkeypatch):
+    number = '+34600111222'
+    configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['restaurant']}}],
+        {'restaurant': {
+            'Estado': 'Activo',
+            'Business_ID': 'REST-1',
+            'Sector': 'restaurante',
+            'Telefono_Recepcion': '+34911112222',
+        }},
+    )
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    monkeypatch.setattr(main, 'open_now', lambda business: True)
+    monkeypatch.setattr(main, 'PHONE', '+34999999999')
+
+    response = main.app.test_client().post('/webhook-voice', data={'To': number})
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert '<Dial' in body
+    assert '<Number>+34911112222</Number>' in body
+    assert 'No puedo identificar' not in body
+
+
+def test_disabled_insurance_whatsapp_responds_without_shared_storage_or_general_dialog(monkeypatch):
+    number = '+34600111222'
+    configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'WhatsApp', 'Estado': 'Activo', 'Negocio': ['insurance']}}],
+        {'insurance': {'Estado': 'Activo', 'Business_ID': 'INS-1', 'Sector': 'seguros'}},
+    )
+    monkeypatch.delenv('INSURANCE_ENABLED', raising=False)
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    for name in ('converse', 'save_conversation', 'init_schema', 'db'):
+        monkeypatch.setattr(main, name, lambda *args, _name=name, **kwargs: pytest.fail(f'{_name} should not be called'))
+
+    response = main.app.test_client().post('/webhook-whatsapp', data={
+        'To': 'whatsapp:' + number,
+        'From': 'whatsapp:+34600999888',
+        'Body': '¿qué cubre mi póliza?',
+        'MessageSid': 'SM-insurance-disabled',
+    })
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert 'No puedo verificar el resultado ahora.' in body
+    assert 'general' not in body.lower()
+
+
+def test_disabled_insurance_voice_does_not_enter_dialogue_or_storage(monkeypatch):
+    number = '+34600111222'
+    configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['insurance']}}],
+        {'insurance': {'Estado': 'Activo', 'Business_ID': 'INS-1', 'Sector': 'seguros'}},
+    )
+    monkeypatch.delenv('INSURANCE_ENABLED', raising=False)
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    monkeypatch.setattr(main, 'RELAY_VOICE_URL', '')
+    monkeypatch.setattr(main, 'converse', lambda *args, **kwargs: pytest.fail('insurance entered dialog'))
+    monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
+
+    response = main.app.test_client().post('/webhook-voice', data={'To': number})
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert 'La atención automática no está disponible.' in body
+    assert 'general' not in body.lower()
