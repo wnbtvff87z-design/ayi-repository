@@ -139,6 +139,11 @@ def _clean_email(raw):
         return ""
     raw = re.sub(r"\bhot\s+mail\b", "hotmail", raw)
     raw = re.sub(r"\ba\s+roba\b", "arroba", raw)
+    raw = re.sub(r"\b(?:underscore|barra\s+baja|gui[oó]n\s+bajo|raya\s+baja)\b", "guion bajo", raw)
+    raw = re.sub(r"\b(?:dot)\b", "punto", raw)
+    if "arroba" in raw:
+        digits = {w: str(i) for i, w in enumerate(("cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve"))}
+        raw = re.sub(r"\b(" + "|".join(digits) + r")\b", lambda m: digits[m.group(1)], raw)
     found = _spoken_email(raw)
     return found if found and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", found) else ""
 
