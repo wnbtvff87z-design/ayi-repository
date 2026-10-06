@@ -1,4 +1,5 @@
 import hmac,json,logging,os,re,time,threading,unicodedata
+import hashlib
 from datetime import timezone, datetime, timedelta
 from urllib.parse import quote,urlparse
 from zoneinfo import ZoneInfo
@@ -117,6 +118,9 @@ def authorized():
 def insurance_human_authorized():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
   return bool(key and got and hmac.compare_digest(key,got))
+def insurance_human_actor():
+  key=os.getenv('INSURANCE_HUMAN_API_KEY','').encode()
+  return 'shared-key:'+hmac.new(key,b'insurance-human-api-actor',hashlib.sha256).hexdigest()[:16]
 def _twilio_candidates(base,path,query):
   host=request.headers.get('Host','');xh=request.headers.get('X-Forwarded-Host','').split(',')[0].strip();xp=request.headers.get('X-Forwarded-Proto','').split(',')[0].strip()
   rd=os.getenv('RAILWAY_PUBLIC_DOMAIN','').strip();c={}
@@ -330,7 +334,7 @@ def internal_resolve_insurance_case(case_id):
   data=request.get_json(silent=True) or {}
   try:
    from insurance.cases import resolve_case
-   resolved=resolve_case(case_id,data.get('resolved_by'),data.get('resolution'))
+   resolved=resolve_case(case_id,insurance_human_actor(),data.get('resolution'))
    return jsonify(success=True,case_id=resolved)
   except ValueError:return jsonify(success=False,message='Invalid resolution request'),400
   except CaseWorkflowError:return jsonify(success=False,message='Pending insurance case not found'),404

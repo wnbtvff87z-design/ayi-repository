@@ -199,6 +199,8 @@ def create_or_update_case(
                         business_id, channel, external_id,
                     ),
                 ).fetchone()
+                if not changed:
+                    return str(existing['case_id'])
                 case_id = changed['case_id']
                 row = conn.execute(
                     'SELECT customer_ref,product,urgency FROM insurance_cases '
@@ -557,6 +559,7 @@ def sync_outbox(limit=25):
     results = []
     with db() as conn:
         conn.commit()
+        # Autocommit makes each lease claim durable before the Airtable HTTP call.
         conn.autocommit = True
         _fail_expired_outbox_leases(conn)
         for _ in range(max_items):

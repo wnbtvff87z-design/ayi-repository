@@ -39,5 +39,8 @@ def process(business,state,history,text,channel,external_id,customer,resolved_se
         return consulting_process(business,state,history,text,channel,external_id,customer)
     if sector=='insurance':
         from insurance.dialog import process as insurance_process
-        return insurance_process(business,state,history,text,channel,external_id,customer)
+        return insurance_process(
+            business,state,history,text,channel,external_id,customer,
+            resolved_sector=sector,
+        )
     return general_process(business,state,history,text,channel,external_id,customer)

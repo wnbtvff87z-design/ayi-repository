@@ -14,7 +14,7 @@ class ResultKind(str, Enum):
     URGENT = 'urgent'
 
 
-def process(business, state, history, text, channel, external_id, customer):
+def process(business, state, history, text, channel, external_id, customer, resolved_sector=None):
     details = (state or {}).get('insurance_escalation') or {}
     reason = details.get('reason', ResultKind.IDENTITY_NOT_VERIFIED.value)
     if reason not in REASONS:

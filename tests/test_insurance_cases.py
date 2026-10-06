@@ -494,7 +494,7 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
     assert state == {
         'status': 'resolved',
         'resolution': 'Consulta revisada.',
-        'resolved_by': 'human-agent-1',
+        'resolved_by': main.insurance_human_actor(),
     }
     assert events == 1
 
@@ -667,7 +667,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
             "WHERE case_id=%s AND status='done'",
             (case_id,),
         ).fetchone()['total']
-    assert state == {'status': 'resolved', 'resolved_by': 'fictional-agent'}
+    assert state == {'status': 'resolved', 'resolved_by': main.insurance_human_actor()}
     assert queue == 3
 
 
