@@ -22,6 +22,7 @@ from booking_safe import (
     cancel_for_caller,
     modify_for_caller,
 )
+from restaurant_dialog import _spoken_address, _spoken_digits, _spoken_email
 from temporal import explicit_date, explicit_time
 from reservation_rules import (
     explicit_choice,
@@ -127,8 +128,35 @@ def _words(n):
     )
 
 
+_ADDRESS = re.compile(r"[a-z0-9._+\-]{1,64}@[a-z0-9\-]{1,63}(?:\.[a-z0-9\-]{1,63}){1,4}", re.I)
+_LONG_NUMBER = re.compile(r"(?<![\d-])\+?\d(?: ?\d){6,14}(?![\d-])")
+
+
+def _clean_email(raw):
+    """Rebuild an address from model arguments or speech-to-text words; '' when it is not a valid address."""
+    raw = str(raw or "").strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"\bhot\s+mail\b", "hotmail", raw)
+    raw = re.sub(r"\ba\s+roba\b", "arroba", raw)
+    found = _spoken_email(raw)
+    return found if found and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", found) else ""
+
+
+def _arg_email(raw):
+    """Model argument: tolerate stray spaces inside an otherwise complete address."""
+    raw = str(raw or "").strip().lower()
+    if "@" in raw and "arroba" not in raw:
+        squashed = re.sub(r"\s+", "", raw)
+        return squashed if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", squashed) else ""
+    return _clean_email(raw)
+
+
 def _voice_text(text):
     """Convert text for voice output."""
+    text = text.replace("*", "")
+    text = _ADDRESS.sub(lambda m: _spoken_address(m.group(0)), text)
+    text = _LONG_NUMBER.sub(lambda m: _spoken_digits(m.group(0)), text)
     text = re.sub(
         r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)",
         lambda m: _words(int(m.group(1)))
@@ -711,6 +739,7 @@ def _call_agent(b, state, history, text, channel, external_id, customer):
                 "Pide una única confirmación final. Si una operación ya está pendiente, usa confirm_pending solo ante una aceptación inequívoca; "
                 "no vuelvas a llamar la herramienta de escritura para repetir la propuesta. Una despedida natural sin petición nueva debe llamar end_call, "
                 "aunque la reserva esté incompleta; decide por el contexto, no por palabras o listas de frases. "
+                "Nunca uses markdown ni negritas, ni repitas teléfono o correo del cliente: el teléfono es el de la llamada y el correo lo guarda el sistema; si hay un correo dicho por el cliente, llama create_reservation con él en customer_email sin espacios. "
                 "Preguntas generales: responde breve sin tools. Para el nombre no inventes apellidos. "
                 "El nombre de la reserva y el que aparece en el correo son independientes; nunca los compares ni cambies uno por el otro. "
                 "Conserva los datos de contacto ya facilitados y no vuelvas a pedirlos salvo que el cliente los corrija. "
@@ -949,8 +978,7 @@ def _run_tool(s, b, customer, channel, text, name, args):
             return _reply(s, PARTY_TOO_LARGE_REPLY, True)
         party = party or valid_party(s["values"].get("party_size")) or valid_party(args.get("party_size"))
         meal = resolve_meal(text, s.get("meal"))
-        email = str(args.get("customer_email") or "").strip().lower()
-        email = email if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) else ""
+        email = _clean_email(text) or _arg_email(args.get("customer_email"))
         # Keep what the customer already gave (never overwrite it with an empty value) so it is not asked twice
         known = s.setdefault("values", {})
         if isinstance(cname, str) and cname.strip():
@@ -1371,6 +1399,10 @@ def _converse(s, b, history, text, channel, external_id, customer):
         answer = _availability_turn(s, b, channel, text, {})
         _remember(answer[1], "check_availability", {}, answer[0])
         return answer
+
+    spoken_email = _clean_email(text) if not s.get("pending") else ""
+    if spoken_email and s.get("intent") in ("create", "availability"):
+        s["values"]["customer_email"] = spoken_email
 
     early = _absorb(s, b, channel, text)
     if early:
