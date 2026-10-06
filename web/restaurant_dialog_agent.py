@@ -161,7 +161,7 @@ def _voice_text(text):
     """Convert text for voice output."""
     text = text.replace("*", "")
     text = _ADDRESS.sub(lambda m: _spoken_address(m.group(0)), text)
-    text = _LONG_NUMBER.sub(lambda m: _spoken_digits(m.group(0)), text)
+    text = _LONG_NUMBER.sub(lambda m: ("más, " if m.group(0).startswith("+") else "") + _spoken_digits(m.group(0)), text)
     text = re.sub(
         r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)",
         lambda m: _words(int(m.group(1)))
