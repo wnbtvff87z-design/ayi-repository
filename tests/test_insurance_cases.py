@@ -15,7 +15,7 @@ sys.path.insert(0, str(WEB))
 import insurance.cases as cases
 import main
 
-MIGRATION = WEB / 'insurance' / 'migrations' / '001_cases_outbox.sql'
+MIGRATIONS = sorted((WEB / 'insurance' / 'migrations').glob('*.sql'))
 
 
 class FakeResponse:
@@ -50,9 +50,10 @@ def pg_schema(monkeypatch):
     monkeypatch.setattr(cases, 'db', connect)
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
     with connect() as conn:
-        for statement in MIGRATION.read_text(encoding='utf-8').split(';'):
-            if statement.strip():
-                conn.execute(statement)
+        for migration in MIGRATIONS:
+            for statement in migration.read_text(encoding='utf-8').split(';'):
+                if statement.strip():
+                    conn.execute(statement)
     try:
         yield connect
     finally:
@@ -152,14 +153,24 @@ def test_same_event_with_new_context_updates_without_duplicating_question(pg_sch
     case_id = submit_question(external_id='SM-retry')
     again = submit_question(
         external_id='SM-retry',
+        question='¿Y si el daño ocurrió antes de la vigencia?',
         context={'new_fact': 'fact from retried webhook'},
         evidence=[{'document': 'second-source', 'page': 21}],
+        reason='ambiguity',
+    )
+    same_update = submit_question(
+        external_id='SM-retry',
+        question='¿Y si el daño ocurrió antes de la vigencia?',
+        context={'new_fact': 'fact from retried webhook'},
+        evidence=[{'document': 'second-source', 'page': 21}],
+        reason='ambiguity',
     )
 
-    assert again == case_id
+    assert again == same_update == case_id
     with pg_schema() as conn:
         data = conn.execute(
-            'SELECT q.context,q.evidence,(SELECT count(*) FROM insurance_case_questions '
+            'SELECT q.question,q.updates,q.context,q.evidence,'
+            '(SELECT count(*) FROM insurance_case_questions '
             'WHERE case_id=%s) AS questions,(SELECT count(*) FROM insurance_outbox '
             'WHERE case_id=%s) AS outbox FROM insurance_case_questions q '
             'WHERE q.case_id=%s',
@@ -168,8 +179,28 @@ def test_same_event_with_new_context_updates_without_duplicating_question(pg_sch
 
     assert data['questions'] == 1
     assert data['outbox'] == 2
+    assert data['question'] == '¿Está cubierto el daño por agua?'
+    assert data['updates'][0]['question'] == '¿Y si el daño ocurrió antes de la vigencia?'
+    assert data['updates'][0]['reason'] == 'ambiguity'
+    assert data['updates'][0]['context']['new_fact'] == 'fact from retried webhook'
+    assert data['updates'][0]['evidence'][0]['document'] == 'second-source'
     assert data['context']['new_fact'] == 'fact from retried webhook'
     assert len(data['evidence']) == 2
+
+
+def test_unidentified_policies_from_different_products_use_separate_cases(pg_schema):
+    first = submit_question(
+        external_id='SM-life',
+        policy_id=None,
+        product='vida',
+    )
+    second = submit_question(
+        external_id='SM-auto',
+        policy_id=None,
+        product='automóvil',
+    )
+
+    assert first != second
 
 
 def test_outbox_retries_airtable_failure_and_alerts_without_losing_pg_case(pg_schema, monkeypatch, caplog):

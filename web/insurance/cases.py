@@ -79,8 +79,12 @@ def _customer_ref(business_id, customer):
     ).hexdigest()
 
 
-def _thread_key(policy_id):
-    value = str(policy_id or 'unidentified-policy').strip()
+def _thread_key(policy_id, product):
+    value = (
+        f'policy:{str(policy_id).strip()}'
+        if policy_id
+        else f'product:{str(product or "unknown").strip().casefold()}'
+    )
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
@@ -134,7 +138,24 @@ def create_or_update_case(
     context_json = _json_object(context or {}, 'context', MAX_CONTEXT_BYTES)
     evidence_json = _json_object(evidence or [], 'evidence', MAX_EVIDENCE_BYTES)
     customer_ref = _customer_ref(business_id, customer)
-    thread_key = _thread_key(policy_id)
+    thread_key = _thread_key(policy_id, product)
+    update_snapshot = json.dumps(
+        [
+            {
+                'question': question,
+                'product': product,
+                'policy_id': policy_id,
+                'policy_version_id': policy_version_id,
+                'reason': reason,
+                'channel': channel,
+                'urgency': urgency,
+                'next_action': next_action,
+                'context': json.loads(context_json),
+                'evidence': json.loads(evidence_json),
+            }
+        ],
+        ensure_ascii=False,
+    )
     try:
         with db() as conn:
             conn.execute(
@@ -148,24 +169,37 @@ def create_or_update_case(
             ).fetchone()
             if existing:
                 changed = conn.execute(
-                    'UPDATE insurance_case_questions SET question=%s,'
-                    'policy_id=COALESCE(%s,policy_id),policy_version_id=COALESCE(%s,policy_version_id),'
-                    'reason=%s,urgency=%s,next_action=%s,context=context || %s::jsonb,'
-                    'evidence=CASE WHEN evidence @> %s::jsonb THEN evidence '
-                    'ELSE evidence || %s::jsonb END '
-                    'WHERE business_id=%s AND channel=%s AND external_id=%s AND ('
+                    'UPDATE insurance_case_questions SET '
+                    'updates=CASE WHEN NOT (updates @> %s::jsonb) AND ('
                     'question IS DISTINCT FROM %s OR policy_id IS DISTINCT FROM COALESCE(%s,policy_id) '
                     'OR policy_version_id IS DISTINCT FROM COALESCE(%s,policy_version_id) '
                     'OR reason IS DISTINCT FROM %s OR urgency IS DISTINCT FROM %s '
                     'OR next_action IS DISTINCT FROM %s '
                     'OR context IS DISTINCT FROM (context || %s::jsonb) '
-                    'OR NOT (evidence @> %s::jsonb)) RETURNING case_id',
+                    'OR NOT (evidence @> %s::jsonb)) '
+                    'THEN updates || %s::jsonb ELSE updates END,'
+                    'policy_id=COALESCE(%s,policy_id),policy_version_id=COALESCE(%s,policy_version_id),'
+                    'reason=%s,urgency=%s,next_action=%s,context=context || %s::jsonb,'
+                    'evidence=CASE WHEN evidence @> %s::jsonb THEN evidence '
+                    'ELSE evidence || %s::jsonb END '
+                    'WHERE business_id=%s AND channel=%s AND external_id=%s AND ('
+                    'question IS DISTINCT FROM %s '
+                    'OR policy_id IS DISTINCT FROM COALESCE(%s,policy_id) '
+                    'OR policy_version_id IS DISTINCT FROM COALESCE(%s,policy_version_id) '
+                    'OR reason IS DISTINCT FROM %s OR urgency IS DISTINCT FROM %s '
+                    'OR next_action IS DISTINCT FROM %s '
+                    'OR context IS DISTINCT FROM (context || %s::jsonb) '
+                    'OR NOT (evidence @> %s::jsonb)) '
+                    'AND NOT (updates @> %s::jsonb) RETURNING case_id',
                     (
-                        question, policy_id, policy_version_id, reason, urgency,
-                        next_action, context_json, evidence_json, evidence_json, business_id,
-                        channel, external_id, question, policy_id,
+                        update_snapshot, question, policy_id, policy_version_id, reason,
+                        urgency, next_action, context_json, evidence_json, update_snapshot,
+                        policy_id,
+                        policy_version_id, reason, urgency, next_action, context_json,
+                        evidence_json, evidence_json, business_id, channel, external_id,
+                        question, policy_id,
                         policy_version_id, reason, urgency, next_action,
-                        context_json, evidence_json,
+                        context_json, evidence_json, update_snapshot,
                     ),
                 ).fetchone()
                 if not changed:
@@ -342,7 +376,7 @@ def get_case(case_id):
             if not case:
                 return None
             questions = conn.execute(
-                'SELECT channel,external_id,question,policy_id,policy_version_id,reason,'
+                'SELECT channel,external_id,question,updates,policy_id,policy_version_id,reason,'
                 'urgency,next_action,context,evidence,created_at FROM insurance_case_questions '
                 'WHERE case_id=%s ORDER BY created_at,question_id',
                 (case_id,),
