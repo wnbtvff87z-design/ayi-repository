@@ -98,7 +98,7 @@ def register(pg, data=PDF_TEXT, sha=None, key=KEY, **kw):
     with pg() as conn:
         return documents.register_existing_object(
             conn, actor_id='admin-1', business_id=BIZ, policy_id=POL, version_id=VER, document_id=DOC,
-            expected_sha256=sha or hashlib.sha256(data).hexdigest(), client=FakeS3({key: data}), **kw)
+            expected_sha256=sha or hashlib.sha256(data).hexdigest(), **kw)
 
 
 def run_worker(data=PDF_TEXT, ocr=lambda b, i: '', key=KEY):
@@ -124,8 +124,9 @@ def llm(monkeypatch):
 
 def test_register_and_process_textual_pdf(pg):
     r = register(pg)
-    assert r['status'] == 'registered' and r['sha256'] == hashlib.sha256(PDF_TEXT).hexdigest()
-    assert register(pg)['idempotent'] is True
+    assert r['status'] == 'pending_verification' and r['idempotent'] is False
+    again = register(pg)
+    assert again['idempotent'] is True and again['status'] == 'pending_verification'
     assert run_worker() == {'document_id': DOC, 'status': 'ready'}
     with pg() as conn:
         rows = conn.execute('SELECT page_number,section,source,quality,indexed FROM insurance_document_pages '
@@ -135,18 +136,85 @@ def test_register_and_process_textual_pdf(pg):
     assert run_worker() is None
 
 
-@pytest.mark.parametrize('case,kw', [
-    ('hash', {'sha': 'a' * 64}),
-    ('missing', {'key': KEY + 'x'}),
-])
-def test_register_rejects_bad_hash_or_missing_object(pg, case, kw):
-    data = PDF_TEXT
-    with pytest.raises(documents.RegistrationError):
-        with pg() as conn:
-            documents.register_existing_object(
-                conn, actor_id='a', business_id=BIZ, policy_id=POL, version_id=VER, document_id=DOC,
-                expected_sha256=kw.get('sha') or hashlib.sha256(data).hexdigest(),
-                client=FakeS3({kw.get('key', KEY) if case == 'hash' else KEY + 'y': data}))
+def status_of(pg):
+    with pg() as conn:
+        return conn.execute('SELECT status,last_error,attempts FROM insurance_documents').fetchone()
+
+
+def test_registration_is_pending_not_verified_and_unqueryable(pg, llm):
+    register(pg, sha='a' * 64)  # nothing about the object is checked at registration
+    assert status_of(pg)['status'] == 'pending_verification'
+    verify(pg)
+    with pg() as conn:
+        assert idialog.retrieval.retrieve(conn, BIZ, 'C1', 'daños por agua', date.today())['status'] == 'document_not_ready'
+
+
+def test_worker_hash_mismatch_is_explicit_and_not_indexed(pg):
+    register(pg, sha='a' * 64)
+    assert run_worker()['status'] == 'hash_mismatch'
+    assert status_of(pg)['last_error'] == 'hash_mismatch'
+    with pg() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_document_pages').fetchone()['n'] == 0
+    assert run_worker() is None  # terminal until re-registered
+
+
+def test_worker_missing_object_is_retriable_and_recovers(pg):
+    register(pg)
+    missing = FakeS3({})
+    missing.head_object = lambda Bucket, Key: (_ for _ in ()).throw(NotFound())
+    assert documents.process_next(missing, None)['status'] == 'object_missing'
+    assert run_worker()['status'] == 'ready'  # object appeared later -> same job recovers
+
+
+class NotFound(Exception):
+    response = {'ResponseMetadata': {'HTTPStatusCode': 404}}
+
+
+def test_not_a_pdf_is_invalid_object(pg):
+    register(pg, data=b'hello')
+    assert run_worker(b'hello')['status'] == 'invalid_object'
+
+
+def test_oversized_object_fails_before_download(pg, monkeypatch):
+    register(pg)
+
+    class Big(FakeS3):
+        def head_object(self, Bucket, Key):
+            return {'ContentLength': storage.MAX_PDF_BYTES + 1, 'ContentType': 'application/pdf'}
+
+        def get_object(self, Bucket, Key):
+            raise AssertionError('must not download an oversized object')
+
+    assert documents.process_next(Big({}), None)['status'] == 'failed'
+    assert status_of(pg)['last_error'] == 'object_too_large'
+
+
+def test_reregistration_with_corrected_hash_recovers_but_ready_is_immutable(pg):
+    register(pg, sha='a' * 64)
+    run_worker()
+    assert status_of(pg)['status'] == 'hash_mismatch'
+    assert register(pg)['status'] == 'pending_verification'
+    assert run_worker()['status'] == 'ready'
+    with pytest.raises(documents.RegistrationError, match='different_hash'):
+        register(pg, sha='b' * 64)
+
+
+def test_registration_is_idempotent_under_concurrency(pg):
+    import threading
+    out, errs = [], []
+
+    def go():
+        try:
+            out.append(register(pg)['idempotent'])
+        except Exception as exc:  # pragma: no cover
+            errs.append(exc)
+
+    ts = [threading.Thread(target=go) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errs and sorted(out) == [False] + [True] * 5
+    with pg() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_documents').fetchone()['n'] == 1
 
 
 def test_register_requires_authorization_and_rejects_non_pdf_and_other_business(pg):
@@ -156,13 +224,11 @@ def test_register_requires_authorization_and_rejects_non_pdf_and_other_business(
         register(pg)
     with pg() as conn:
         conn.execute('UPDATE insurance_authorizations SET revoked_at=NULL')
-    with pytest.raises(documents.RegistrationError, match='not_a_pdf'):
-        register(pg, data=b'hello')
     with pytest.raises(documents.RegistrationError, match='policy_version_not_found'):
         with pg() as conn:
             documents.register_existing_object(
                 conn, actor_id='a', business_id='OTHER', policy_id=POL, version_id=VER, document_id=DOC,
-                expected_sha256='a' * 64, client=FakeS3({}))
+                expected_sha256='a' * 64)
 
 
 def test_mixed_pdf_ocr_and_scanned_page(pg):
@@ -203,7 +269,7 @@ def test_ocr_failure_marks_page_failed_and_needs_review(pg):
     assert run_worker(data, boom)['status'] == 'needs_review'
 
 
-def test_bucket_failure_is_retried_then_stops(pg):
+def test_bucket_failure_is_retried_then_stops(pg):  # worker side
     register(pg)
     for _ in range(documents.MAX_ATTEMPTS):
         assert documents.process_next(FakeS3({}), None)['status'] == 'failed'
@@ -215,7 +281,7 @@ def test_bucket_failure_is_retried_then_stops(pg):
 
 def test_object_changed_after_registration_fails_hash(pg):
     register(pg)
-    assert run_worker(make_pdf(['otro documento distinto'])) ['status'] == 'failed'
+    assert run_worker(make_pdf(['otro documento distinto']))['status'] == 'hash_mismatch'
 
 
 def test_cited_answer_with_clause_and_exclusion_together(pg, llm):
@@ -337,10 +403,10 @@ def test_admin_endpoint_closed_by_default_and_per_actor_auth(pg, monkeypatch):
     with pg() as conn:
         conn.execute("INSERT INTO insurance_admin_users VALUES('admin-1',%s,%s,true)",
                      (BIZ, admin.token_hmac('tok-1')))
-    monkeypatch.setattr(documents.storage, '_client', lambda: FakeS3({KEY: PDF_TEXT}))
+    monkeypatch.setattr(documents.storage, '_client', lambda: pytest.fail('Web touched the bucket'))
     body = {'policy_id': POL, 'version_id': VER, 'document_id': DOC, 'sha256': hashlib.sha256(PDF_TEXT).hexdigest()}
     r = client.post(url, json=body, headers={'Authorization': BEARER})
-    assert r.status_code == 200 and r.json['status'] == 'registered'
+    assert r.status_code == 200 and r.json['status'] == 'pending_verification'
     r = client.post(url, json={**body, 'business_id': 'OTHER'}, headers={'Authorization': BEARER})
     assert r.status_code == 422 and r.json['error'] == 'business_mismatch'
     with pg() as conn:
@@ -352,3 +418,111 @@ def test_airtable_value_mapping():
         ['Hogar', 'Vida', 'Auto', 'Otro', 'Otro']
     assert [cases.airtable_value('urgency', v) for v in ('normal', 'high', 'critical')] == ['Normal', 'Alta', 'Crítica']
     assert [cases.airtable_value('status', v) for v in ('pending', 'resolved')] == ['Pendiente', 'Resuelto']
+
+
+def test_web_never_imports_pdf_or_bucket_libraries():
+    import subprocess
+    code = ("import sys; sys.path.insert(0, %r); import main; "
+            "bad=[m for m in ('boto3','botocore','pypdf','pypdfium2','pytesseract') if m in sys.modules]; "
+            "print(bad)" % str(WEB))
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip().splitlines()[-1] == '[]', out.stdout + out.stderr
+
+
+def test_register_path_makes_no_bucket_calls_and_works_without_bucket_config(pg, monkeypatch):
+    for name in [n for n in os.environ if n.startswith('INSURANCE_BUCKET')]:
+        monkeypatch.delenv(name)
+    boom = lambda *a, **k: pytest.fail('Web touched the bucket/PDF')
+    for fn in ('_client', 'head', 'read'):
+        monkeypatch.setattr(storage, fn, boom)
+    monkeypatch.setenv('INSURANCE_ADMIN_ENABLED', 'true')
+    monkeypatch.setenv('INSURANCE_ADMIN_TOKEN_KEY', 'k' * 40)
+    with pg() as conn:
+        conn.execute("INSERT INTO insurance_admin_users VALUES('admin-1',%s,%s,true)",
+                     (BIZ, admin.token_hmac('tok-1')))
+    client = __import__('main').app.test_client()
+    body = {'policy_id': POL, 'version_id': VER, 'document_id': DOC, 'sha256': 'c' * 64}
+    assert client.post('/insurance/admin/documents/register', json=body,
+                       headers={'Authorization': BEARER}).status_code == 200
+    big = client.post('/insurance/admin/documents/register', data=b'x' * 10000,
+                      headers={'Authorization': BEARER, 'Content-Type': 'application/json'})
+    assert big.status_code == 413
+    bad = client.post('/insurance/admin/documents/register', json={**body, 'document_id': '../x'},
+                      headers={'Authorization': BEARER})
+    assert bad.status_code == 422 and bad.json['error'] == 'invalid_identifier'
+
+
+def test_turns_stay_fast_while_admin_registrations_and_slow_bucket_worker_run(pg, monkeypatch):
+    """Concurrent admin registrations + a worker stuck on a very slow bucket vs Voice/WhatsApp turns."""
+    import threading
+    import time
+    monkeypatch.setenv('INSURANCE_ADMIN_ENABLED', 'true')
+    monkeypatch.setenv('INSURANCE_ADMIN_TOKEN_KEY', 'k' * 40)
+    with pg() as conn:
+        conn.execute("INSERT INTO insurance_admin_users VALUES('admin-1',%s,%s,true)",
+                     (BIZ, admin.token_hmac('tok-1')))
+    main = __import__('main')
+    stop = threading.Event()
+
+    def admin_loop(n):
+        c = main.app.test_client()
+        i = 0
+        while not stop.is_set():
+            i += 1
+            r = c.post('/insurance/admin/documents/register',
+                       json={'policy_id': POL, 'version_id': VER, 'document_id': f'DOC-L{n}-{i}', 'sha256': 'd' * 64},
+                       headers={'Authorization': BEARER})
+            assert r.status_code == 200
+
+    class SlowS3(FakeS3):
+        def head_object(self, Bucket, Key):
+            time.sleep(1.5)
+            raise KeyError(Key)
+
+    def worker_loop():
+        while not stop.is_set():
+            documents.process_next(SlowS3({}), None)
+
+    threads = [threading.Thread(target=admin_loop, args=(n,)) for n in range(6)] + [threading.Thread(target=worker_loop)]
+    [t.start() for t in threads]
+    lat = []
+    try:
+        for i in range(30):
+            channel = 'Voice' if i % 2 else 'WhatsApp'
+            t = time.perf_counter()
+            reply, _ = ask('¿Qué cubre mi póliza?', channel, f'CA-conc-{i}')
+            lat.append(time.perf_counter() - t)
+            assert 'He guardado' in reply
+    finally:
+        stop.set()
+        [t.join(30) for t in threads]
+    lat.sort()
+    print('in-process turn latency under admin+slow-bucket load: p50=%.0fms max=%.0fms' % (lat[15] * 1000, lat[-1] * 1000))
+    assert lat[-1] < 2.0  # a turn is never held behind the 1.5s bucket calls
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+@pytest.mark.parametrize('text', ['¿Me cubre el daño por agua?', 'Tengo una inundación urgente'])
+def test_pg_down_never_confirms_a_case(monkeypatch, channel, text):
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    monkeypatch.setattr(cases, 'db', lambda: (_ for _ in ()).throw(cases.CasePersistenceError('pg down')))
+    reply, state = ask(text, channel, 'SM-down')
+    assert state == {'insurance_result': 'case_persistence_failed'}
+    assert 'No se ha creado un caso' in reply
+    for forbidden in ('He guardado', 'registré', 'registre'):
+        assert forbidden not in reply
+
+
+def test_pg_lookup_ok_but_case_write_fails_does_not_confirm(pg, monkeypatch):
+    calls = {'n': 0}
+    real = cases.db
+
+    def flaky():
+        calls['n'] += 1
+        if calls['n'] > 1:
+            raise cases.CasePersistenceError('pg went away')
+        return real()
+
+    monkeypatch.setattr(cases, 'db', flaky)
+    reply, state = ask('¿Me cubre el daño por agua?')
+    assert state['insurance_result'] == 'case_persistence_failed' and 'He guardado' not in reply

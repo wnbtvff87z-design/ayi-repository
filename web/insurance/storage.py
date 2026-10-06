@@ -1,10 +1,15 @@
-"""Read-only access to the private Railway Bucket (S3 API). No uploads happen here."""
+"""Read-only access to the private Railway Bucket (S3 API). Used ONLY by insurance_doc_worker;
+the Web service must never import-and-call this module."""
 import os
 
 MAX_PDF_BYTES = 25 * 1024 * 1024
 
 
 class StorageError(Exception):
+    pass
+
+
+class ObjectNotFound(StorageError):
     pass
 
 
@@ -33,6 +38,9 @@ def head(key, client=None):
     try:
         r = (client or _client()).head_object(Bucket=os.environ['INSURANCE_BUCKET_NAME'].strip(), Key=key)
     except Exception as exc:
+        status = getattr(exc, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode')
+        if status == 404:
+            raise ObjectNotFound('object_missing') from exc
         raise StorageError('bucket_head_failed') from exc
     return {'size': int(r['ContentLength']), 'content_type': r.get('ContentType', '')}
 

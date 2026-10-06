@@ -1,4 +1,6 @@
-"""Authenticated admin API: per-person tokens bound to one business, with audit logging."""
+"""Authenticated admin API: per-person tokens bound to one business, with audit logging.
+
+Web only records a pending job in PostgreSQL. It never reads the bucket or the PDF."""
 import hashlib
 import hmac
 import logging
@@ -11,6 +13,8 @@ from insurance.cases import MIN_KEY_BYTES
 from insurance.documents import RegistrationError, register_existing_object
 
 log = logging.getLogger(__name__)
+MAX_BODY_BYTES = 4096
+PG_STATEMENT_TIMEOUT_MS = 3000
 bp = Blueprint('insurance_admin', __name__)
 
 
@@ -30,9 +34,15 @@ def register_document():
     digest = token_hmac(token) if token and len(token) <= 256 else None
     if not digest:
         return jsonify(error='unauthorized'), 401
-    body = request.get_json(silent=True) or {}
+    if (request.content_length or 0) > MAX_BODY_BYTES:
+        return jsonify(error='payload_too_large'), 413
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
     try:
         with _cases.db() as conn:
+            # Bound how long this request can hold a Web thread on PostgreSQL.
+            conn.execute(f'SET statement_timeout={PG_STATEMENT_TIMEOUT_MS}')
+            conn.execute(f'SET lock_timeout={PG_STATEMENT_TIMEOUT_MS}')
             admin = conn.execute(
                 'SELECT actor_id,business_id FROM insurance_admin_users WHERE token_hmac=%s AND active',
                 (digest,)).fetchone()

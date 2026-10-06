@@ -23,9 +23,17 @@ class RegistrationError(Exception):
         self.code = code
 
 
+RECOVERABLE = ('failed', 'object_missing', 'hash_mismatch', 'invalid_object', 'needs_review')
+
+
 def register_existing_object(conn, *, actor_id, business_id, policy_id, version_id,
-                             document_id, expected_sha256, client=None, today=None):
-    """Verify an object already in the bucket and register it; never uploads/copies it."""
+                             document_id, expected_sha256, today=None):
+    """Web-side registration: PostgreSQL only. It NEVER touches the bucket or the PDF bytes.
+
+    It validates identifiers, authorization and policy/version relations and records a
+    'pending_verification' job. The document worker later checks existence, type, size and
+    SHA-256. 'pending_verification' does NOT mean the PDF was verified or is ready.
+    """
     for v in (business_id, policy_id, version_id, document_id):
         if not isinstance(v, str) or not ID_RE.fullmatch(v):
             raise RegistrationError('invalid_identifier')
@@ -48,30 +56,22 @@ def register_existing_object(conn, *, actor_id, business_id, policy_id, version_
         (business_id, policy_id)).fetchone()
     if not auth:
         raise RegistrationError('no_active_authorization')
-    try:
-        data = storage.read(key, client)
-    except storage.StorageError as exc:
-        raise RegistrationError(str(exc)) from exc
-    if not data.startswith(b'%PDF-'):
-        raise RegistrationError('not_a_pdf')
-    digest = hashlib.sha256(data).hexdigest()
-    if digest != expected:
-        raise RegistrationError('hash_mismatch')
-    existing = conn.execute(
-        'SELECT business_id,document_id,sha256,status FROM insurance_documents WHERE object_key=%s',
-        (key,)).fetchone()
-    if existing:
-        if existing['sha256'] != digest:
-            raise RegistrationError('object_registered_with_different_hash')
-        return {'document_id': document_id, 'status': existing['status'], 'sha256': digest,
-                'size_bytes': len(data), 'idempotent': True}
-    conn.execute(
+    inserted = conn.execute(
         'INSERT INTO insurance_documents(document_id,business_id,policy_id,version_id,object_key,'
-        'sha256,size_bytes,content_type,registered_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)',
-        (document_id, business_id, policy_id, version_id, key, digest, len(data),
-         'application/pdf', actor_id))
-    return {'document_id': document_id, 'status': 'registered', 'sha256': digest,
-            'size_bytes': len(data), 'idempotent': False}
+        'sha256,registered_by) VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING 1',
+        (document_id, business_id, policy_id, version_id, key, expected, actor_id)).fetchone() is not None
+    row = conn.execute(
+        'SELECT sha256,status FROM insurance_documents '
+        'WHERE business_id=%s AND document_id=%s FOR UPDATE', (business_id, document_id)).fetchone()
+    if row['sha256'] != expected:
+        if row['status'] in RECOVERABLE:  # explicit re-registration with a corrected hash
+            conn.execute(
+                "UPDATE insurance_documents SET sha256=%s,status='pending_verification',attempts=0,"
+                'last_error=NULL,locked_until=NULL,updated_at=now() WHERE business_id=%s AND document_id=%s',
+                (expected, business_id, document_id))
+            return {'document_id': document_id, 'status': 'pending_verification', 'idempotent': False}
+        raise RegistrationError('object_registered_with_different_hash')
+    return {'document_id': document_id, 'status': row['status'], 'idempotent': not inserted}
 
 
 _SECTIONS = (
@@ -135,16 +135,24 @@ def extract_pages(pdf_bytes, ocr=default_ocr):
 def _claim(conn):
     row = conn.execute(
         "SELECT business_id,document_id,object_key,sha256 FROM insurance_documents "
-        "WHERE attempts<%s AND (status IN ('registered','failed') "
-        "OR (status='processing' AND locked_until<now())) "
+        "WHERE attempts<%s AND (status IN ('pending_verification','failed','object_missing') "
+        "OR (status='verifying' AND locked_until<now())) "
         "ORDER BY updated_at FOR UPDATE SKIP LOCKED LIMIT 1", (MAX_ATTEMPTS,)).fetchone()
     if row:
         conn.execute(
-            "UPDATE insurance_documents SET status='processing',attempts=attempts+1,"
+            "UPDATE insurance_documents SET status='verifying',attempts=attempts+1,"
             "locked_until=now()+make_interval(secs=>%s),updated_at=now() "
             "WHERE business_id=%s AND document_id=%s",
             (LEASE_SECONDS, row['business_id'], row['document_id']))
     return row
+
+
+def _terminal(bid, did, status, code):
+    with _cases.db() as conn:
+        conn.execute(
+            'UPDATE insurance_documents SET status=%s,last_error=%s,locked_until=NULL,updated_at=now() '
+            'WHERE business_id=%s AND document_id=%s', (status, code, bid, did))
+    return {'document_id': did, 'status': status}
 
 
 def process_next(client=None, ocr=default_ocr):
@@ -156,9 +164,15 @@ def process_next(client=None, ocr=default_ocr):
         return None
     bid, did = doc['business_id'], doc['document_id']
     try:
-        data = storage.read(doc['object_key'], client)
-        if hashlib.sha256(data).hexdigest() != doc['sha256']:
-            raise ValueError('hash_mismatch')
+        try:
+            data = storage.read(doc['object_key'], client)
+        except storage.ObjectNotFound:
+            return _terminal(bid, did, 'object_missing', 'object_missing')
+        if not data.startswith(b'%PDF-'):
+            return _terminal(bid, did, 'invalid_object', 'not_a_pdf')
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != doc['sha256']:
+            return _terminal(bid, did, 'hash_mismatch', 'hash_mismatch')
         pages = extract_pages(data, ocr)
         ok = sum(p['quality'] == 'ok' for p in pages)
         bad = any(p['quality'] in ('illegible', 'failed') for p in pages)
@@ -175,8 +189,8 @@ def process_next(client=None, ocr=default_ocr):
                          p['body'], status == 'ready' and p['quality'] == 'ok'))
                 conn.execute(
                     "UPDATE insurance_documents SET status=%s,last_error=%s,locked_until=NULL,"
-                    "processed_at=now(),updated_at=now() WHERE business_id=%s AND document_id=%s",
-                    (status, None if status == 'ready' else 'unreadable_pages', bid, did))
+                    "processed_at=now(),verified_at=now(),size_bytes=%s,content_type='application/pdf',updated_at=now() WHERE business_id=%s AND document_id=%s",
+                    (status, None if status == 'ready' else 'unreadable_pages', len(data), bid, did))
         return {'document_id': did, 'status': status}
     except Exception as exc:
         code = str(exc) if isinstance(exc, (storage.StorageError, ValueError)) else type(exc).__name__
