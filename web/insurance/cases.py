@@ -28,6 +28,7 @@ CHANNELS = {'Voice', 'WhatsApp'}
 MAX_TEXT = 12000
 MAX_CONTEXT_BYTES = 32768
 MAX_EVIDENCE_BYTES = 32768
+MAX_OUTBOX_ATTEMPTS = 8
 AIRTABLE_FIELDS = {
     'case_id': 'Insurance_Case_ID',
     'customer_ref': 'Customer_Ref',
@@ -416,8 +417,9 @@ def _upsert_airtable(payload, existing_record):
             json={'fields': fields},
             timeout=10,
         )
-        response.raise_for_status()
-        return str(existing_record)
+        if response.status_code != 404:
+            response.raise_for_status()
+            return str(existing_record)
     formula = '{' + AIRTABLE_FIELDS['case_id'] + '}=' + json.dumps(payload['case_id'])
     response = requests.get(
         base_url,
@@ -454,14 +456,24 @@ def _upsert_airtable(payload, existing_record):
 
 def _claim_outbox_item():
     with db() as conn:
+        expired = conn.execute(
+            "UPDATE insurance_outbox SET status='failed',locked_until=NULL,"
+            "last_error_code='lease_expired_max_attempts' "
+            "WHERE status='processing' AND locked_until<now() AND attempts>=%s "
+            'RETURNING outbox_id,case_id,attempts,last_error_code',
+            (MAX_OUTBOX_ATTEMPTS,),
+        ).fetchall()
+    for item in expired:
+        _notify_outbox_failure(item, item['last_error_code'], True)
+    with db() as conn:
         return conn.execute(
             """
             WITH candidate AS (
                 SELECT o.outbox_id
                 FROM insurance_outbox o
                 WHERE (
-                    (o.status='pending' AND o.next_attempt_at<=now())
-                    OR (o.status='processing' AND o.locked_until<now())
+                    (o.status='pending' AND o.next_attempt_at<=now() AND o.attempts<%s)
+                    OR (o.status='processing' AND o.locked_until<now() AND o.attempts<%s)
                 )
                 AND NOT EXISTS (
                     SELECT 1 FROM insurance_outbox older
@@ -478,8 +490,12 @@ def _claim_outbox_item():
                 locked_until=now()+interval '2 minutes'
             FROM candidate
             WHERE o.outbox_id=candidate.outbox_id
-            RETURNING o.outbox_id,o.case_id,o.payload,o.attempts
+            RETURNING o.outbox_id,o.case_id,o.payload,o.attempts,
+                      (SELECT c.airtable_record_id FROM insurance_cases c
+                       WHERE c.case_id=o.case_id) AS airtable_record_id
             """
+            ,
+            (MAX_OUTBOX_ATTEMPTS, MAX_OUTBOX_ATTEMPTS),
         ).fetchone()
 
 
@@ -496,18 +512,10 @@ def _finish_outbox(item, record_id):
         )
 
 
-def _retry_outbox(item, error_code):
-    delay = min(2 ** min(int(item['attempts']), 10) * 30, 3600)
-    with db() as conn:
-        conn.execute(
-            "UPDATE insurance_outbox SET status='pending',locked_until=NULL,"
-            "next_attempt_at=now()+(%s * interval '1 second'),last_error_code=%s "
-            'WHERE outbox_id=%s',
-            (delay, error_code, item['outbox_id']),
-        )
+def _notify_outbox_failure(item, error_code, permanent):
     log.critical(
-        'insurance_outbox_sync_failed case_id=%s outbox_id=%s attempt=%s error_code=%s',
-        str(item['case_id']), item['outbox_id'], item['attempts'], error_code,
+        'insurance_outbox_sync_failed case_id=%s outbox_id=%s attempt=%s permanent=%s error_code=%s',
+        str(item['case_id']), item['outbox_id'], item['attempts'], permanent, error_code,
     )
     alert_url = os.getenv('INSURANCE_ALERT_WEBHOOK_URL', '').strip()
     if alert_url:
@@ -518,6 +526,7 @@ def _retry_outbox(item, error_code):
                     'event': 'insurance_outbox_sync_failed',
                     'case_ref': str(item['case_id']),
                     'attempt': item['attempts'],
+                    'permanent': permanent,
                     'error_code': error_code,
                 },
                 timeout=3,
@@ -529,6 +538,19 @@ def _retry_outbox(item, error_code):
             )
 
 
+def _retry_outbox(item, error_code):
+    permanent = int(item['attempts']) >= MAX_OUTBOX_ATTEMPTS
+    delay = min(2 ** min(int(item['attempts']), 10) * 30, 3600)
+    with db() as conn:
+        conn.execute(
+            'UPDATE insurance_outbox SET status=%s,locked_until=NULL,'
+            "next_attempt_at=now()+(%s * interval '1 second'),last_error_code=%s "
+            'WHERE outbox_id=%s',
+            ('failed' if permanent else 'pending', delay, error_code, item['outbox_id']),
+        )
+    _notify_outbox_failure(item, error_code, permanent)
+
+
 def sync_outbox(limit=25):
     """Synchronize ready outbox rows; PG remains authoritative on all failures."""
     max_items = min(max(int(limit), 1), 100)
@@ -538,7 +560,7 @@ def sync_outbox(limit=25):
         if not item:
             break
         try:
-            record_id = _upsert_airtable(item['payload'], None)
+            record_id = _upsert_airtable(item['payload'], item['airtable_record_id'])
             _finish_outbox(item, record_id)
             results.append({'case_id': str(item['case_id']), 'synced': True})
         except Exception as exc:

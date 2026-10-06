@@ -13,6 +13,8 @@ WEB = Path(__file__).resolve().parents[1] / 'web'
 sys.path.insert(0, str(WEB))
 
 import insurance.cases as cases
+import insurance.migrate as insurance_migrate
+import insurance_sync_outbox as outbox_worker
 import main
 
 MIGRATIONS = sorted((WEB / 'insurance' / 'migrations').glob('*.sql'))
@@ -238,15 +240,52 @@ def test_outbox_retries_airtable_failure_and_alerts_without_losing_pg_case(pg_sc
     assert 'insurance_outbox_sync_failed' in caplog.text
 
 
+def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schema, monkeypatch):
+    case_id = submit_question(external_id='SM-permanent')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceTasks')
+    monkeypatch.setenv('INSURANCE_ALERT_WEBHOOK_URL', 'https://alerts.example/hook')
+    alerts = []
+
+    def alert(url, **kwargs):
+        alerts.append(kwargs['json'])
+        return FakeResponse({})
+
+    monkeypatch.setattr(cases.requests, 'get', lambda *args, **kwargs: FakeResponse({}, status=503))
+    monkeypatch.setattr(cases.requests, 'post', alert)
+
+    for attempt in range(cases.MAX_OUTBOX_ATTEMPTS):
+        assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+        if attempt + 1 < cases.MAX_OUTBOX_ATTEMPTS:
+            with pg_schema() as conn:
+                conn.execute(
+                    "UPDATE insurance_outbox SET next_attempt_at=now()-interval '1 second' "
+                    'WHERE case_id=%s',
+                    (case_id,),
+                )
+
+    with pg_schema() as conn:
+        state = conn.execute(
+            'SELECT status,attempts,last_error_code FROM insurance_outbox WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+
+    assert state == {'status': 'failed', 'attempts': 8, 'last_error_code': 'http_503'}
+    assert alerts[-1]['permanent'] is True
+    assert cases.sync_outbox() == []
+
+
 def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema, monkeypatch):
     case_id = submit_question()
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
     monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
     monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceTasks')
     record = {}
-    calls = {'post': 0, 'patch': 0}
+    calls = {'get': 0, 'post': 0, 'patch': 0}
 
     def get(url, **kwargs):
+        calls['get'] += 1
         if record:
             return FakeResponse({'records': [{'id': record['id'], 'fields': record['fields']}]})
         return FakeResponse({'records': []})
@@ -281,19 +320,65 @@ def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema
         'Consulta de seguro pendiente de revisión humana:'
     )
     assert record['fields']['Status'] not in ('resolved', 'completed', 'Completada')
+    submit_question(external_id='SM-second-question')
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    assert calls['post'] == 1
+    assert calls['get'] == 2
     assert cases.resolve_case(case_id, 'human-agent-1', 'Se revisó el documento ficticio.')
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
 
-    assert calls['post'] == 1
-    assert calls['patch'] == 2
+    assert calls['patch'] == 3
     assert record['fields']['Insurance_Case_ID'] == case_id
     assert record['fields']['Status'] == 'resolved'
     assert record['fields']['Task_Summary'] == 'Caso de seguro resuelto por agente humano.'
     assert '¿Está cubierto' not in json.dumps(record['fields'], ensure_ascii=False)
 
 
+def test_deleted_airtable_mirror_is_recreated_on_next_revision(pg_schema, monkeypatch):
+    case_id = submit_question(external_id='SM-deleted')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceTasks')
+    record = {}
+    posts = []
+
+    def get(url, **kwargs):
+        records = [{'id': record['id'], 'fields': record['fields']}] if record else []
+        return FakeResponse({'records': records})
+
+    def post(url, **kwargs):
+        record_id = f'rec-{len(posts) + 1}'
+        posts.append(record_id)
+        record.update({'id': record_id, 'fields': kwargs['json']['records'][0]['fields']})
+        return FakeResponse({'records': [{'id': record_id}]})
+
+    def patch(url, **kwargs):
+        if not record or url.endswith('/' + record.get('old_id', 'deleted')):
+            return FakeResponse({}, status=404)
+        record['fields'].update(kwargs['json']['fields'])
+        return FakeResponse({'id': record['id']})
+
+    monkeypatch.setattr(cases.requests, 'get', get)
+    monkeypatch.setattr(cases.requests, 'post', post)
+    monkeypatch.setattr(cases.requests, 'patch', patch)
+
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    old_id = record['id']
+    record.clear()
+    with pg_schema() as conn:
+        conn.execute(
+            'UPDATE insurance_cases SET airtable_record_id=%s WHERE case_id=%s',
+            (old_id, case_id),
+        )
+    submit_question(external_id='SM-after-delete')
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    assert posts == ['rec-1', 'rec-2']
+    assert record['id'] == 'rec-2'
+
+
 def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monkeypatch):
     case_id = submit_question(external_id='SM-human')
+    submit_question(external_id='SM-human-second', question='¿Qué documentos hacen falta?')
     monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
     client = main.app.test_client()
     path = f'/internal/insurance/cases/{case_id}'
@@ -302,6 +387,7 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
     headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
     detail = client.get(path, headers=headers)
     assert detail.status_code == 200
+    assert len(detail.json['questions']) == 2
     assert detail.json['questions'][0]['question'] == '¿Está cubierto el daño por agua?'
     assert detail.json['questions'][0]['policy_version_id'] == 'VERSION-TEST'
 
@@ -346,6 +432,47 @@ def test_human_resolution_does_not_echo_internal_validation_error(monkeypatch):
     assert response.status_code == 400
     assert response.json['message'] == 'Invalid resolution request'
     assert 'private internal detail' not in response.get_data(as_text=True)
+
+
+def test_migrations_run_as_whole_files_and_are_recorded_once(pg_schema, monkeypatch):
+    original_connect = psycopg.connect
+    schema = 'insurance_migration_test_' + uuid.uuid4().hex
+    dsn = os.environ['INSURANCE_TEST_DATABASE_URL']
+    with original_connect(dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+
+    def migration_connect(uri, **kwargs):
+        conn = original_connect(uri, **kwargs)
+        conn.execute(f'SET search_path TO "{schema}"')
+        return conn
+
+    monkeypatch.setattr(insurance_migrate.psycopg, 'connect', migration_connect)
+    monkeypatch.setenv('INSURANCE_MIGRATION_DATABASE_URL', dsn)
+    try:
+        insurance_migrate.main()
+        insurance_migrate.main()
+        with migration_connect(dsn) as conn:
+            versions = conn.execute(
+                'SELECT version FROM insurance_schema_migrations ORDER BY version'
+            ).fetchall()
+        assert [row[0] for row in versions] == [path.name for path in MIGRATIONS]
+    finally:
+        with original_connect(dsn, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_worker_imports_without_secrets_and_run_rejects_missing_config(monkeypatch):
+    for name in (
+        'INSURANCE_DATABASE_URL',
+        'AIRTABLE_INSURANCE_BASE_ID',
+        'AIRTABLE_INSURANCE_TOKEN',
+        'AIRTABLE_INSURANCE_CASES_TABLE',
+        'INSURANCE_ALERT_WEBHOOK_URL',
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(RuntimeError, match='INSURANCE_DATABASE_URL'):
+        outbox_worker.run()
 
 
 @pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
