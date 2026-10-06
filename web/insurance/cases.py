@@ -48,6 +48,22 @@ AIRTABLE_FIELDS = {
 }
 
 
+AIRTABLE_PRODUCTS = {'vida': 'Vida', 'hogar': 'Hogar', 'auto': 'Auto', 'coche': 'Auto'}
+AIRTABLE_URGENCIES = {'normal': 'Normal', 'high': 'Alta', 'critical': 'Crítica'}
+AIRTABLE_STATUSES = {'pending': 'Pendiente', 'resolved': 'Resuelto'}
+
+
+def airtable_value(key, value):
+    """Translate internal values to the existing Airtable single-select options."""
+    if key == 'product':
+        return AIRTABLE_PRODUCTS.get(str(value or '').strip().casefold(), 'Otro')
+    if key == 'urgency':
+        return AIRTABLE_URGENCIES.get(str(value or '').strip().casefold(), 'Normal')
+    if key == 'status':
+        return AIRTABLE_STATUSES.get(str(value or '').strip().casefold(), 'Pendiente')
+    return value
+
+
 class CasePersistenceError(Exception):
     pass
 
@@ -433,7 +449,7 @@ def _case_filter_formula(case_id):
 def _upsert_airtable(payload, existing_record):
     base_url, headers = _airtable_config()
     fields = {
-        AIRTABLE_FIELDS[key]: value
+        AIRTABLE_FIELDS[key]: airtable_value(key, value)
         for key, value in payload.items()
         if key in AIRTABLE_FIELDS
     }
