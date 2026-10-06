@@ -4,6 +4,7 @@
 
 - Rama de trabajo recibida: `copilot/feature-agente-seguros`.
 - SHA inicial y SHA de `origin/develop`: `306116185259ceeee56384e35b77285f7ae5f9c9`; el árbol estaba limpio y ambos refs coincidían.
+- PR #21 fue verificado mediante GitHub: base `develop` en SHA `306116185259ceeee56384e35b77285f7ae5f9c9`; rama `copilot/feature-agente-seguros`.
 - Antes de editar: `python -m pytest -q` → `230 passed, 58 subtests passed in 0.90s`.
 - Antes de editar: `python -m compileall -q .` → exit code 0.
 - `python -m unittest discover -v` → `Ran 0 tests`, exit code 5; el conjunto ejecutable usa pytest. pytest no estaba instalado inicialmente y se instaló solo en el entorno, sin cambiar dependencias del repositorio.
@@ -44,7 +45,7 @@ Relay genera el saludo y la voz usando `business.greeting`/`business.voice` si e
 
 ### Registro de números
 
-En `TENANT_LOOKUP_MODE=new`, el modelo existente ya usa Airtable: `Numeros` (`Numero_E164`, `Canal`, `Estado`, enlace `Negocio`) y `Negocios` (`Business_ID`, `Estado`, `Sector`, etc.) (`web/main.py:43-53`). El lookup filtra registros activos, solicita como máximo dos, falla ante duplicados y exige exactamente un negocio enlazado. El negocio debe estar activo y tener `Business_ID`. Los valores de canal actuales son exactamente `Voice` y `WhatsApp`. La caché es local al proceso y su TTL por defecto es 60 segundos (`web/main.py:54-73`).
+En `TENANT_LOOKUP_MODE=new`, el modelo existente ya usa Airtable: `Numeros` (`Numero_E164`, `Canal`, `Estado`, enlace `Negocio`) y `Negocios` (`Business_ID`, `Estado`, `Sector`, etc.) (`web/main.py:43-53`). El lookup filtra registros activos, solicita como máximo dos, falla ante duplicados y exige exactamente un negocio enlazado. El negocio debe estar activo y tener `Business_ID`. Los valores de canal actuales son exactamente `Voice` y `WhatsApp`. La caché positiva es local al proceso y su TTL por defecto es 60 segundos; las asignaciones de seguros ahora no se cachean y se consultan en cada resolución (`web/main.py:54-86`).
 
 En cambio, `TENANT_LOOKUP_MODE` tiene valor predeterminado `legacy` (`web/main.py:13`); legacy busca teléfonos en `Restaurantes`, ignora el canal y fuerza el sector restaurante (`web/main.py:28-42,63-72`). El repositorio no contiene configuración Railway que pruebe el valor efectivo en producción. Esto es un **bloqueante para activar seguros**: confirmar el modo `new` y el esquema/proveedor real antes del alta. El código legacy se conserva.
 
@@ -63,9 +64,9 @@ Opción 1 puede servir para prototipo con datos ficticios únicamente, mientras 
 ## Cambios de este PR 1
 
 - `web/dialog.py`: reconocer sectores explícitos; seguros solo si `INSURANCE_ENABLED=true`; sector no reconocido falla en vez de caer en `general`. Sectores `restaurante`, `consultora` y `general` conservan sus respectivos diálogos.
-- `web/main.py`: valida canales, sector antes de cachear/devuelve el negocio; no infiere un destino ausente desde `TWILIO_PHONE`; un turno de seguros activo usa un límite puro y no toca PostgreSQL compartido; `save_conversation` impide espejarlo a Airtable.
+- `web/main.py`: valida canales, sector antes de cachear/devuelve el negocio; no infiere un destino ausente desde `TWILIO_PHONE`; los destinos de seguros vuelven al registro en cada lookup (no se acepta una entrada positiva cacheada para una revocación); un turno de seguros activo usa un límite puro y no toca PostgreSQL compartido; `save_conversation` impide espejarlo a Airtable.
 - `web/insurance/`: dominio nuevo, sin LLM, pólizas, documentos ni proveedor de identidad; devuelve solamente una respuesta explícita de no disponibilidad y un resultado estructurado `identity_not_verified`. `INSURANCE_ENABLED` no habilita consulta de expedientes.
-- `tests/test_insurance_routing.py`: cobertura del enrutador actual, bandera, sector desconocido, aislamiento de escritura/reflejo, canal, normalización, destino faltante y mismatch de `business_id`.
+- `tests/test_insurance_routing.py`: cobertura del enrutador actual, bandera, sector desconocido, aislamiento de escritura/reflejo, canal, normalización, Webhook WhatsApp con `To` válido/ausente/inválido, Webhook Voice de restaurante, revocación sin caché, fallo del registro y mismatch de `business_id`.
 - `docs/insurance-pr1-audit.md`: esta auditoría, evaluación, límites y guía operativa.
 - No se añade DDL ni se edita Relay, `restaurant_dialog_agent.py`, `restaurant_dialog.py`, reservas, configuración Twilio ni la variable `RESTAURANT_AGENT`.
 
@@ -78,7 +79,7 @@ Opción 1 puede servir para prototipo con datos ficticios únicamente, mientras 
 5. Confirmar que el servicio Web usa `TENANT_LOOKUP_MODE=new`. Configurar los webhooks Twilio hacia las rutas ya existentes del canal; valores/URLs reales quedan **PENDIENTES DE CONFIGURAR**.
 6. Probar en entorno controlado con número autorizado y datos ficticios: Voice valida saludo/voz y un turno seguro; WhatsApp valida respuesta y deduplicación. No usar pólizas reales.
 7. Activar el registro solo después de aprobación de negocio, seguridad y privacidad. Seguros seguirá cerrado hasta que identidad, persistencia y casos estén implementados y aprobados.
-8. Para desactivar, marcar el registro inactivo, deshabilitar `INSURANCE_ENABLED` y, si corresponde, restaurar los webhooks. La caché puede retener el estado hasta el TTL configurado (60 s por defecto); reiniciar Web acelera la invalidación. No alterar números de restaurante/consultora.
+8. Para desactivar, marcar el registro inactivo, deshabilitar `INSURANCE_ENABLED` y, si corresponde, restaurar los webhooks. Las resoluciones de seguros no usan la caché positiva local, así que una desactivación se observa en la siguiente consulta al directorio; una indisponibilidad/error del directorio falla cerrada y no usa una entrada cacheada anterior. Esto no puede garantizar el tiempo de propagación interno de Airtable/proveedor. La caché de 60 s sigue aplicando a otros sectores. No alterar números de restaurante/consultora.
 
 No hay campos existentes comprobados para titularidad, configuración de saludo/voz, verificación de identidad, urgencias o producto asegurado; no se inventan aquí.
 
@@ -101,3 +102,41 @@ Airtable actual contiene campos de conversación libre (`Question`, `Answer`, te
 En este PR, mantener `INSURANCE_ENABLED=false` (valor por defecto). No configurar un número real como activo ni desplegar. Antes de una futura activación: aprobar bloqueantes; desplegar primero modo observación con datos sintéticos; probar cada número/canal; habilitar un negocio/número controlado; vigilar errores de lookup, casos críticos y sincronización; ampliar solo con aprobación humana. Para rollback, apagar la bandera, desactivar el registro por canal, restaurar webhook si se requiere y dejar los servicios de restaurantes/consultoras y `RESTAURANT_AGENT=true` intactos. No hay datos de seguros que migrar en este PR.
 
 **No implementado:** identidad, búsqueda de pólizas/cláusulas, OCR/PDF, indexación, casos/tareas, persistencia propia, outbox, Airtable separado, protocolo humano/urgencias, secretos/servicios de Railway y pruebas manuales con proveedores. Este PR no está listo para producción ni para activar seguros.
+
+## Verificación previa a aprobar PR #21
+
+### Base y diff exacto de los módulos de enrutamiento
+
+GitHub confirma PR #21 con base `develop` (`306116185259ceeee56384e35b77285f7ae5f9c9`). La comparación revisada es `origin/develop...HEAD`.
+
+Cambios en `web/dialog.py`:
+
+- Añade `BusinessSectorError`.
+- `sector_of` conserva las mismas equivalencias de restaurantes y consultoras. `general` solo se acepta si el campo dice literalmente `general`; cualquier sector vacío o desconocido antes caía al diálogo general y ahora falla cerrado.
+- Reconoce `seguro`, `seguros` e `insurance`; exige `INSURANCE_ENABLED=true`, por defecto falso. Deshabilitado, la resolución falla antes de `process` y no enruta al diálogo general.
+- Con bandera activa, delega a `insurance.dialog.process`. La ruta actual solo devuelve el límite de identidad no verificada; no lee expediente.
+
+Cambios en `web/main.py`:
+
+- `_tenant_lookup` ya no sustituye un campo `Sector` ausente por `general`; ahora conserva vacío para que falle cerrado.
+- `lookup` rechaza canales distintos de `Voice` y `WhatsApp`; valida el sector también en caché. Mantiene TTL de 60 s para los demás sectores, pero no cachea las asignaciones de seguros: cada lookup vuelve a consultar el registro. El error/caída del directorio no usa un registro cacheado de seguros.
+- Los dos webhooks usan solamente el `To` entrante, sin fallback a `TWILIO_PHONE`. Con `To` ausente/inválido no se resuelve un negocio.
+- `save_conversation` rechaza el espejo de seguros; `converse` ejecuta el límite de seguros antes de inicializar esquema o acceder al almacenamiento común.
+
+Impacto observable: restaurante y consultora con número/destino válido, canal exacto y sector configurado siguen por sus mismos diálogos y persistencia; restaurante continúa respetando `RESTAURANT_AGENT`. La caché de 60 s sigue para ellos. Cambios transversales intencionales: un webhook sin `To` ya no usa el número por defecto (antes sí); un sector vacío/desconocido ya no cae a `general`; canales no soportados se rechazan. Esas condiciones pueden cambiar respuestas de registros mal configurados o webhooks sin `To`, no el turno normal de un número correctamente registrado.
+
+### Pruebas del comportamiento por canal
+
+`tests/test_insurance_routing.py` envía formularios al Flask test client y usa un registro Airtable simulado; no realiza llamadas externas:
+
+- WhatsApp con `To=whatsapp:+34 600 111 222`: normaliza a `+34600111222`, resuelve `WhatsApp`, ejecuta el diálogo consultora existente y refleja la conversación como antes.
+- WhatsApp con `To` ausente o texto no-numérico: devuelve “No puedo identificar el negocio asociado a este número.”; no usa `TWILIO_PHONE`, no invoca diálogo/espejo y no consulta el registro.
+- Voice con destino restaurante activo y `Voice`: conserva el camino Web existente y devuelve `<Dial>` a la recepción configurada.
+- WhatsApp de seguros, `INSURANCE_ENABLED` ausente/falso: el lookup falla cerrado; la respuesta del webhook es “No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.” No se invocan `converse`, `save_conversation`, `init_schema` ni `db`; no se llama al diálogo general.
+- Voice de seguros, bandera ausente/falsa y Relay no configurado en el test: devuelve “La atención automática no está disponible.” y no invoca conversación ni esquema compartido. Con Relay configurado, el Web actual redirige a Relay; su `/voice` vuelve a resolver y, al no poder resolver el sector deshabilitado, responde con el fallback “No puedo atender ahora.”. No deriva a `general`.
+
+### Revocación inmediata y límite externo
+
+El TTL anterior podía servir un destino de seguros ya resuelto durante hasta 60 segundos tras desactivarlo en el directorio: eso no cumple una necesidad de revocación inmediata. El ajuste mínimo elimina solo el uso/almacenamiento de entradas positivas cacheadas para negocios de seguros; los demás sectores conservan el comportamiento de caché existente. La prueba cambia el resultado de registro activo a inactivo entre dos solicitudes y comprueba que la siguiente consulta niega el destino; otra prueba comprueba que el fallo del proveedor no cae a la entrada anterior.
+
+La comprobación sucede en cada consulta del Web al registro, pero no controla la latencia de propagación/caché interna del proveedor Airtable ni una carrera ocurrida después de resolver y antes de responder. Si “revocación inmediata” exige garantía más estricta que consultar el estado actual en cada request, hace falta un mecanismo de revocación de emergencia con autoridad/propagación acordadas (por ejemplo, una denylist operativa independiente); no se afirma esa garantía en este PR.

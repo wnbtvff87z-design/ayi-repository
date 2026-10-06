@@ -205,13 +205,12 @@ def test_insurance_flag_is_checked_even_for_cached_business(monkeypatch):
         calls.append((number, channel))
         return {'business_id': 'B1', 'sector': 'seguros'}
 
-    monkeypatch.setattr(main, '_tenant_lookup', lambda number, channel: {
-        'business_id': 'B1', 'sector': 'seguros'
-    })
+    monkeypatch.setattr(main, '_tenant_lookup', registry_lookup)
     assert main.lookup('+34600111222', 'Voice')['sector'] == 'seguros'
     monkeypatch.setenv('INSURANCE_ENABLED', 'false')
     with pytest.raises(BookingError):
         main.lookup('+34600111222', 'Voice')
+    assert calls == [('+34600111222', 'Voice'), ('+34600111222', 'Voice')]
 
 
 def test_insurance_number_is_rechecked_and_revocation_is_not_cached(monkeypatch):
@@ -395,7 +394,7 @@ def test_disabled_insurance_voice_does_not_enter_dialogue_or_storage(monkeypatch
     )
     monkeypatch.delenv('INSURANCE_ENABLED', raising=False)
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
-    monkeypatch.setattr(main, 'RELAY_VOICE_URL', '')
+    monkeypatch.setenv('RELAY_VOICE_URL', '')
     monkeypatch.setattr(main, 'converse', lambda *args, **kwargs: pytest.fail('insurance entered dialog'))
     monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
 
