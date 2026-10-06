@@ -128,6 +128,8 @@ def insurance_human_actor(credential=None):
   credential=os.getenv('INSURANCE_HUMAN_API_KEY','') if credential is None else credential
   key=credential.encode()
   audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','').encode()
+  if len(key)<MIN_KEY_BYTES or len(audit_key)<MIN_KEY_BYTES:
+    raise RuntimeError('Insurance human audit keys are not configured safely')
   return 'shared-key:v1:'+hmac.new(audit_key,key,hashlib.sha256).hexdigest()
 def _twilio_candidates(base,path,query):
   host=request.headers.get('Host','');xh=request.headers.get('X-Forwarded-Host','').split(',')[0].strip();xp=request.headers.get('X-Forwarded-Proto','').split(',')[0].strip()

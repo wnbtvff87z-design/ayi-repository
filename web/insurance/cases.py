@@ -586,6 +586,7 @@ def _retry_outbox(conn, item, error_code):
             (error_code, item['outbox_id']),
         )
     else:
+        # Attempts is incremented before this call, so attempt one waits 2 * base (60s).
         exponent = min(int(item['attempts']), OUTBOX_BACKOFF_MAX_EXPONENT)
         delay = min(
             2 ** exponent * OUTBOX_BACKOFF_BASE_SECONDS,

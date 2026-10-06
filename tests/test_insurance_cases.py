@@ -613,6 +613,17 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
     assert events == 1
 
 
+def test_human_actor_rejects_missing_or_weak_key_material(monkeypatch):
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'k' * 40)
+    monkeypatch.delenv('INSURANCE_HUMAN_AUDIT_KEY', raising=False)
+    with pytest.raises(RuntimeError, match='not configured safely'):
+        main.insurance_human_actor()
+
+    monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
+    with pytest.raises(RuntimeError, match='not configured safely'):
+        main.insurance_human_actor('short')
+
+
 def test_human_resolution_does_not_echo_internal_validation_error(monkeypatch):
     human_key = 'k' * 40
     monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', human_key)
