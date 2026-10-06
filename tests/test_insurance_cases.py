@@ -497,6 +497,9 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
     headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
     assert client.get(path, headers=headers).status_code == 401
     monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
+    assert client.get(
+        path, headers={'X-Insurance-Human-Key': 'clave-no-autorizada-ñ'}
+    ).status_code == 401
     detail = client.get(path, headers=headers)
     assert detail.status_code == 200
     assert len(detail.json['questions']) == 2
@@ -536,6 +539,8 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
         'resolved_by': main.insurance_human_actor(),
     }
     assert state['resolved_by'] != 'FORGED-CLIENT-ACTOR-NEVER-TRUST'
+    assert state['resolved_by'].startswith('shared-key:v1:')
+    assert len(state['resolved_by'].removeprefix('shared-key:v1:')) == 64
     assert events == 1
 
 
