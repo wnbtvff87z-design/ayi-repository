@@ -1,0 +1,366 @@
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+
+import psycopg
+import pytest
+import requests
+from psycopg.rows import dict_row
+
+WEB = Path(__file__).resolve().parents[1] / 'web'
+sys.path.insert(0, str(WEB))
+
+import insurance.cases as cases
+import main
+
+MIGRATION = WEB / 'insurance' / 'migrations' / '001_cases_outbox.sql'
+
+
+class FakeResponse:
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            error = RuntimeError(f'HTTP {self.status_code}')
+            error.response = self
+            raise error
+
+    def json(self):
+        return self.payload
+
+
+@pytest.fixture
+def pg_schema(monkeypatch):
+    dsn = os.getenv('INSURANCE_TEST_DATABASE_URL')
+    if not dsn:
+        pytest.skip('INSURANCE_TEST_DATABASE_URL is not configured')
+    schema = 'insurance_test_' + uuid.uuid4().hex
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+
+    def connect():
+        conn = psycopg.connect(dsn, row_factory=dict_row)
+        conn.execute(f'SET search_path TO "{schema}"')
+        return conn
+
+    monkeypatch.setattr(cases, 'db', connect)
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    with connect() as conn:
+        for statement in MIGRATION.read_text(encoding='utf-8').split(';'):
+            if statement.strip():
+                conn.execute(statement)
+    try:
+        yield connect
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def submit_question(*, external_id='SM-1', reason='missing_information', **changes):
+    values = {
+        'business_id': 'INS-BUSINESS',
+        'customer': '+34600111222',
+        'product': 'hogar',
+        'policy_id': 'POLICY-TEST',
+        'policy_version_id': 'VERSION-TEST',
+        'question': '¿Está cubierto el daño por agua?',
+        'evidence': [{'document': 'fixture.pdf', 'section': '4.2', 'page': 12}],
+        'reason': reason,
+        'channel': 'WhatsApp',
+        'external_id': external_id,
+        'urgency': 'normal',
+        'next_action': 'Revisar cláusula y vigencia.',
+        'context': {'date_of_event': '2030-01-02'},
+    }
+    values.update(changes)
+    return cases.create_or_update_case(**values)
+
+
+@pytest.mark.parametrize(
+    'reason',
+    [
+        'insufficient_evidence',
+        'missing_information',
+        'ambiguity',
+        'contradiction',
+        'unreadable_document',
+        'human_interpretation',
+        'identity_not_verified',
+    ],
+)
+def test_each_escalation_reason_preserves_original_query_and_evidence(pg_schema, reason):
+    case_id = submit_question(reason=reason)
+    with pg_schema() as conn:
+        row = conn.execute(
+            'SELECT c.policy_id,c.policy_version_id,c.status,c.urgency,q.question,q.reason,'
+            'q.channel,q.evidence,q.context,q.next_action FROM insurance_cases c '
+            'JOIN insurance_case_questions q USING(case_id) WHERE c.case_id=%s',
+            (case_id,),
+        ).fetchone()
+
+    assert row['status'] == 'pending'
+    assert row['reason'] == reason
+    assert row['question'] == '¿Está cubierto el daño por agua?'
+    assert row['channel'] == 'WhatsApp'
+    assert row['policy_id'] == 'POLICY-TEST'
+    assert row['policy_version_id'] == 'VERSION-TEST'
+    assert row['evidence'][0]['page'] == 12
+    assert row['context']['date_of_event'] == '2030-01-02'
+    assert row['next_action'] == 'Revisar cláusula y vigencia.'
+
+
+def test_repeated_events_are_idempotent_and_new_questions_append_to_same_case(pg_schema):
+    first = submit_question(external_id='SM-1')
+    duplicate = submit_question(external_id='SM-1')
+    second = submit_question(
+        external_id='SM-2',
+        question='La fecha del parte es distinta, ¿cambia la respuesta?',
+        context={'claim_reference': 'CLAIM-FICTITIOUS'},
+        evidence=[{'document': 'fixture.pdf', 'section': '4.3', 'page': 13}],
+        urgency='high',
+    )
+
+    assert first == duplicate == second
+    with pg_schema() as conn:
+        counts = conn.execute(
+            'SELECT (SELECT count(*) FROM insurance_cases WHERE case_id=%s) AS cases,'
+            '(SELECT count(*) FROM insurance_case_questions WHERE case_id=%s) AS questions,'
+            '(SELECT count(*) FROM insurance_outbox WHERE case_id=%s) AS outbox',
+            (first, first, first),
+        ).fetchone()
+        questions = conn.execute(
+            'SELECT question,context,evidence FROM insurance_case_questions '
+            'WHERE case_id=%s ORDER BY question_id',
+            (first,),
+        ).fetchall()
+        urgency = conn.execute(
+            'SELECT urgency FROM insurance_cases WHERE case_id=%s', (first,)
+        ).fetchone()['urgency']
+
+    assert counts == {'cases': 1, 'questions': 2, 'outbox': 2}
+    assert questions[1]['question'].startswith('La fecha')
+    assert questions[1]['context']['claim_reference'] == 'CLAIM-FICTITIOUS'
+    assert questions[1]['evidence'][0]['page'] == 13
+    assert urgency == 'high'
+
+
+def test_same_event_with_new_context_updates_without_duplicating_question(pg_schema):
+    case_id = submit_question(external_id='SM-retry')
+    again = submit_question(
+        external_id='SM-retry',
+        context={'new_fact': 'fact from retried webhook'},
+        evidence=[{'document': 'second-source', 'page': 21}],
+    )
+
+    assert again == case_id
+    with pg_schema() as conn:
+        data = conn.execute(
+            'SELECT q.context,q.evidence,(SELECT count(*) FROM insurance_case_questions '
+            'WHERE case_id=%s) AS questions,(SELECT count(*) FROM insurance_outbox '
+            'WHERE case_id=%s) AS outbox FROM insurance_case_questions q '
+            'WHERE q.case_id=%s',
+            (case_id, case_id, case_id),
+        ).fetchone()
+
+    assert data['questions'] == 1
+    assert data['outbox'] == 2
+    assert data['context']['new_fact'] == 'fact from retried webhook'
+    assert len(data['evidence']) == 2
+
+
+def test_outbox_retries_airtable_failure_and_alerts_without_losing_pg_case(pg_schema, monkeypatch, caplog):
+    case_id = submit_question()
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceTasks')
+    monkeypatch.setenv('INSURANCE_ALERT_WEBHOOK_URL', 'https://alerts.example/hook')
+    alerts = []
+    monkeypatch.setattr(cases.requests, 'get', lambda *args, **kwargs: FakeResponse({}, status=503))
+
+    def post(url, **kwargs):
+        alerts.append((url, kwargs['json']))
+        return FakeResponse({}, status=200)
+
+    monkeypatch.setattr(cases.requests, 'post', post)
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+
+    with pg_schema() as conn:
+        pending = conn.execute(
+            'SELECT status,attempts,last_error_code FROM insurance_outbox WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+        stored = conn.execute(
+            'SELECT status FROM insurance_cases WHERE case_id=%s', (case_id,)
+        ).fetchone()
+
+    assert pending['status'] == 'pending'
+    assert pending['attempts'] == 1
+    assert pending['last_error_code'] == 'http_503'
+    assert stored['status'] == 'pending'
+    assert alerts[0][0] == 'https://alerts.example/hook'
+    assert alerts[0][1]['event'] == 'insurance_outbox_sync_failed'
+    assert case_id == alerts[0][1]['case_ref']
+    assert 'insurance_outbox_sync_failed' in caplog.text
+
+
+def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema, monkeypatch):
+    case_id = submit_question()
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceTasks')
+    record = {}
+    calls = {'post': 0, 'patch': 0}
+
+    def get(url, **kwargs):
+        if record:
+            return FakeResponse({'records': [{'id': record['id'], 'fields': record['fields']}]})
+        return FakeResponse({'records': []})
+
+    def post(url, **kwargs):
+        calls['post'] += 1
+        fields = kwargs['json']['records'][0]['fields']
+        record.update({'id': 'rec-case-1', 'fields': fields})
+        if calls['post'] == 1:
+            raise requests.ConnectionError('lost response after Airtable accepted create')
+        return FakeResponse({'records': [{'id': 'rec-case-1'}]})
+
+    def patch(url, **kwargs):
+        calls['patch'] += 1
+        record['fields'].update(kwargs['json']['fields'])
+        return FakeResponse({'id': record['id']})
+
+    monkeypatch.setattr(cases.requests, 'get', get)
+    monkeypatch.setattr(cases.requests, 'post', post)
+    monkeypatch.setattr(cases.requests, 'patch', patch)
+
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+    with pg_schema() as conn:
+        conn.execute(
+            "UPDATE insurance_outbox SET next_attempt_at=now()-interval '1 minute' "
+            'WHERE case_id=%s',
+            (case_id,),
+        )
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    assert cases.resolve_case(case_id, 'human-agent-1', 'Se revisó el documento ficticio.')
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+
+    assert calls['post'] == 1
+    assert calls['patch'] == 2
+    assert record['fields']['Insurance_Case_ID'] == case_id
+    assert record['fields']['Status'] == 'resolved'
+    assert record['fields']['Task_Summary'] == 'Caso de seguro resuelto por agente humano.'
+    assert '¿Está cubierto' not in json.dumps(record['fields'], ensure_ascii=False)
+
+
+def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monkeypatch):
+    case_id = submit_question(external_id='SM-human')
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    client = main.app.test_client()
+    path = f'/internal/insurance/cases/{case_id}'
+
+    assert client.get(path).status_code == 401
+    headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
+    detail = client.get(path, headers=headers)
+    assert detail.status_code == 200
+    assert detail.json['questions'][0]['question'] == '¿Está cubierto el daño por agua?'
+    assert detail.json['questions'][0]['policy_version_id'] == 'VERSION-TEST'
+
+    resolved = client.post(
+        path + '/resolve',
+        headers=headers,
+        json={'resolved_by': 'human-agent-1', 'resolution': 'Consulta revisada.'},
+    )
+    assert resolved.status_code == 200
+    assert resolved.json['case_id'] == case_id
+    assert cases.resolve_case(case_id, 'human-agent-1', 'duplicate retry') == case_id
+    with pg_schema() as conn:
+        state = conn.execute(
+            'SELECT status,resolution,resolved_by FROM insurance_cases WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+        events = conn.execute(
+            "SELECT count(*) AS total FROM insurance_case_events WHERE case_id=%s AND event_type='resolved'",
+            (case_id,),
+        ).fetchone()['total']
+    assert state == {
+        'status': 'resolved',
+        'resolution': 'Consulta revisada.',
+        'resolved_by': 'human-agent-1',
+    }
+    assert events == 1
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_successful_escalation_persists_before_customer_confirmation(pg_schema, monkeypatch, channel):
+    monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    business = {
+        'business_id': 'INS-BUSINESS',
+        'sector': 'insurance',
+        'phone': '+34600111222',
+        'insurance_product': 'hogar',
+    }
+    monkeypatch.setattr(main, 'lookup', lambda number, requested_channel: business)
+    monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared conversation schema accessed'))
+    monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared conversation database accessed'))
+    monkeypatch.setattr(main.requests, 'post', lambda *args, **kwargs: pytest.fail('Airtable was written in request path'))
+    client = main.app.test_client()
+    question = '¿La póliza cubre esta filtración?'
+
+    if channel == 'WhatsApp':
+        monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+        response = client.post('/webhook-whatsapp', data={
+            'To': 'whatsapp:+34600111222',
+            'From': 'whatsapp:+34600999888',
+            'Body': question,
+            'MessageSid': 'SM-case-confirmation',
+        })
+        reply = response.get_data(as_text=True)
+    else:
+        monkeypatch.setattr(main, 'authorized', lambda: True)
+        response = client.post('/internal/turn', json={
+            'business_id': 'INS-BUSINESS',
+            'business_phone': '+34600111222',
+            'channel': 'Voice',
+            'customer_phone': '+34600999888',
+            'external_id': 'CA-case-confirmation:turn:1',
+            'text': question,
+        })
+        reply = response.json['reply']
+
+    assert response.status_code == 200
+    assert 'He guardado tu consulta para revisión humana.' in reply
+    assert 'plazo ni una resolución' in reply
+    with pg_schema() as conn:
+        stored = conn.execute(
+            'SELECT c.status,q.question,q.channel,q.external_id,o.status AS sync_status '
+            'FROM insurance_cases c JOIN insurance_case_questions q USING(case_id) '
+            'JOIN insurance_outbox o USING(case_id) WHERE q.question=%s',
+            (question,),
+        ).fetchone()
+    assert stored['status'] == 'pending'
+    assert stored['question'] == question
+    assert stored['channel'] == channel
+    assert stored['sync_status'] == 'pending'
+
+
+def test_persistence_failure_does_not_confirm_a_case(monkeypatch):
+    monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    monkeypatch.setattr(cases, 'db', lambda: (_ for _ in ()).throw(cases.CasePersistenceError('offline')))
+    reply, state = __import__('insurance.dialog', fromlist=['process']).process(
+        {'business_id': 'INS-BUSINESS', 'insurance_product': 'hogar'},
+        {},
+        [],
+        'Consulta sin respuesta',
+        'WhatsApp',
+        'SM-db-error',
+        '+34600111222',
+    )
+    assert state['insurance_result'] == 'case_persistence_failed'
+    assert 'No se ha creado un caso' in reply
+    assert 'He guardado' not in reply

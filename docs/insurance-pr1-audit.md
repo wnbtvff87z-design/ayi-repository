@@ -21,7 +21,7 @@ Comandos derivados de los archivos presentes:
 - Cron actual, con root directory `web`: `python sync_slots_job.py` (`web/sync_slots_job.py`).
 - Inicialización actual de esquema: `python migrate.py` desde `web` (`web/migrate.py` llama `init_schema()`); esa inicialización solo crea/ajusta tablas de reservas y conversación general.
 
-Las dependencias de Web y Relay están separadas en `web/requirements.txt` y `relay/requirements.txt`. No hay migración dedicada de seguros. El esquema actual de PostgreSQL tiene `booking_slots`, `booking_reservations`, `customer_sessions` y `conversation_turns` (`web/booking.py:10-31`); por tanto, PR 1 deliberadamente no almacena preguntas ni expedientes de seguros en las tablas compartidas.
+Las dependencias de Web y Relay están separadas en `web/requirements.txt` y `relay/requirements.txt`. La migración aditiva de casos ahora está separada en `web/insurance/migrations/001_cases_outbox.sql`; no modifica el esquema de reservas. El esquema general existente tiene `booking_slots`, `booking_reservations`, `customer_sessions` y `conversation_turns` (`web/booking.py:10-31`); el nuevo servicio no los usa para guardar conversaciones de seguros.
 
 ## Resolución actual de números y trazas
 
@@ -51,7 +51,7 @@ En cambio, `TENANT_LOOKUP_MODE` tiene valor predeterminado `legacy` (`web/main.p
 
 ## Opinión técnica y alternativas
 
-**Recomendación: evolución escalonada (opción 3).** Reutilizar Relay y el resolvedor Web solo como transportes/directorio tras validar su contrato; mantener el dominio de seguros independiente; antes de abrir acceso a pólizas, ejecutar el servicio de seguros y su worker con permisos, secretos, almacenamiento privado y persistencia separados. En este primer incremento solo se añade el límite de enrutamiento, sin acceso a pólizas. No reutilizar tablas de conversación compartidas ni Airtable para seguros.
+**Recomendación: evolución escalonada (opción 3).** Reutilizar Relay y el resolvedor Web solo como transportes/directorio tras validar su contrato; mantener el dominio de seguros independiente; usar credenciales PostgreSQL y Airtable separadas y un worker independiente. El incremento actual añade el circuito de casos no resueltos y outbox, sin acceso a pólizas ni documentos. No reutilizar tablas de conversación compartidas ni Airtable como fuente de verdad.
 
 | Alternativa | Seguridad / aislamiento | Latencia | Operación y despliegue | Coste / reversibilidad / regresión |
 |---|---|---|---|---|
@@ -64,8 +64,12 @@ Opción 1 puede servir para prototipo con datos ficticios únicamente, mientras 
 ## Cambios de este PR 1
 
 - `web/dialog.py`: reconocer sectores explícitos; seguros solo si `INSURANCE_ENABLED=true`; sector no reconocido falla en vez de caer en `general`. Sectores `restaurante`, `consultora` y `general` conservan sus respectivos diálogos.
-- `web/main.py`: valida canales, sector antes de cachear/devuelve el negocio; no infiere un destino ausente desde `TWILIO_PHONE`; los destinos de seguros vuelven al registro en cada lookup (no se acepta una entrada positiva cacheada para una revocación); un turno de seguros activo usa un límite puro y no toca PostgreSQL compartido; `save_conversation` impide espejarlo a Airtable.
-- `web/insurance/`: dominio nuevo, sin LLM, pólizas, documentos ni proveedor de identidad; devuelve solamente una respuesta explícita de no disponibilidad y un resultado estructurado `identity_not_verified`. `INSURANCE_ENABLED` no habilita consulta de expedientes.
+- `web/main.py`: valida canales y sectores, no infiere un destino ausente desde `TWILIO_PHONE`, evita caché positiva para seguros, omite el espejo Airtable general y añade endpoints internos de lectura/resolución humana con clave independiente.
+- `web/insurance/cases.py`, `web/insurance/migrations/001_cases_outbox.sql`, `web/insurance/migrate.py`: persisten casos, cada consulta no resuelta, evidencia/contexto, eventos y outbox en tablas aisladas; referencias de cliente seudonimizadas con HMAC.
+- `web/insurance_sync_outbox.py`: worker independiente para publicar tareas minimizadas desde el outbox PostgreSQL hacia un Airtable separado, con reintento exponencial e identificador de caso estable.
+- `web/insurance/dialog.py`: no contesta cobertura; al escalar, confirma solo después de que termina el commit PostgreSQL. Si no puede persistir, dice expresamente que el caso no se creó.
+- `tests/test_insurance_cases.py`: suite de integración contra PostgreSQL real local y Airtable simulado, con motivos, idempotencia, preguntas múltiples, reintentos, fallo y resolución humana.
+- `INSURANCE_ENABLED` sigue desactivado por defecto y no se habilitó en el entorno. No hay acceso a pólizas ni documentos.
 - `tests/test_insurance_routing.py`: cobertura del enrutador actual, bandera, sector desconocido, aislamiento de escritura/reflejo, canal, normalización, Webhook WhatsApp con `To` válido/ausente/inválido, Webhook Voice de restaurante, revocación sin caché, fallo del registro y mismatch de `business_id`.
 - `docs/insurance-pr1-audit.md`: esta auditoría, evaluación, límites y guía operativa.
 - No se añade DDL ni se edita Relay, `restaurant_dialog_agent.py`, `restaurant_dialog.py`, reservas, configuración Twilio ni la variable `RESTAURANT_AGENT`.
@@ -78,30 +82,29 @@ Opción 1 puede servir para prototipo con datos ficticios únicamente, mientras 
 4. Habilitar solo el canal efectivamente provisionado. Si Voice y WhatsApp se habilitan, cada par número/canal debe resolverse sin duplicados.
 5. Confirmar que el servicio Web usa `TENANT_LOOKUP_MODE=new`. Configurar los webhooks Twilio hacia las rutas ya existentes del canal; valores/URLs reales quedan **PENDIENTES DE CONFIGURAR**.
 6. Probar en entorno controlado con número autorizado y datos ficticios: Voice valida saludo/voz y un turno seguro; WhatsApp valida respuesta y deduplicación. No usar pólizas reales.
-7. Activar el registro solo después de aprobación de negocio, seguridad y privacidad. Seguros seguirá cerrado hasta que identidad, persistencia y casos estén implementados y aprobados.
+7. Mantener `INSURANCE_ENABLED=false` hasta que se configure y valide extremo a extremo el worker, PostgreSQL, Airtable real, alertas y circuito humano. Aun entonces, identidad, revisión de seguridad/privacidad y protocolo humano siguen siendo aprobación separada para abrir consultas de póliza.
 8. Para desactivar, marcar el registro inactivo, deshabilitar `INSURANCE_ENABLED` y, si corresponde, restaurar los webhooks. Las resoluciones de seguros no usan la caché positiva local, así que una desactivación se observa en la siguiente consulta al directorio; una indisponibilidad/error del directorio falla cerrada y no usa una entrada cacheada anterior. Esto no puede garantizar el tiempo de propagación interno de Airtable/proveedor. La caché de 60 s sigue aplicando a otros sectores. No alterar números de restaurante/consultora.
 
 No hay campos existentes comprobados para titularidad, configuración de saludo/voz, verificación de identidad, urgencias o producto asegurado; no se inventan aquí.
 
 ## Pendientes y secuencia posterior
 
-**Bloqueantes para activación real:** confirmar el modo de resolución efectivo en Railway; aprobación de identidad y autorización por póliza; PG/persistencia de seguros y rol mínimo; versión/vigencia documental; almacenamiento privado y borrado; responsables humanos y protocolo de urgencias/contactos oficiales; proveedores y acuerdos de seguridad/privacidad; campos de saludo/voz por negocio; revisión manual de Voice y WhatsApp. El teléfono de origen no autentica al asegurado. No se afirma cumplimiento normativo.
+**Bloqueantes para activación real:** confirmar el modo de resolución efectivo en Railway; provisionar `INSURANCE_DATABASE_URL` como rol de aplicación mínimo y `INSURANCE_MIGRATION_DATABASE_URL` separado; configurar `INSURANCE_CASE_HMAC_KEY`; crear base/tabla/campos Airtable y `AIRTABLE_INSURANCE_*`; desplegar y vigilar el worker; conectar alerta `INSURANCE_ALERT_WEBHOOK_URL` o un alert manager de logs; completar pruebas E2E contra proveedores reales. También siguen pendientes identidad y autorización por póliza, versiones/vigencias documentales, almacenamiento privado/borrado, responsables y protocolo de urgencias/contactos oficiales, aprobación de privacidad/proveedores, configuración de voz y pruebas manuales Voice/WhatsApp. El teléfono de origen no autentica al asegurado. No se afirma cumplimiento normativo.
 
-Fases propuestas:
+Fases propuestas (PR #21 contiene ahora la base del caso/outbox; las fases restantes siguen pendientes):
 
-1. **PR 1 (este):** auditoría, rutas sectoriales fail-closed, flag apagada y dominio aislado sin acceso a expedientes.
-2. **PR 2:** migración aditiva separada con clientes/autorizaciones, pólizas/versiones, documentos/pasajes, conversaciones/mensajes, casos/eventos, tareas y outbox; restricciones, retención y permisos revisados.
-3. **PR 3:** worker privado para PDF/OCR con límites, hash, calidad por página, errores/procedencia e índice filtrado por cliente/póliza/versión antes de recuperar evidencia.
-4. **PR 4:** identidad aprobada, agente con respuestas fundamentadas y casos humanos idempotentes; pruebas de acceso cruzado, contradicción, vigencia, canales, errores y urgencias.
-5. **PR 5:** Airtable separado como vista mínima PostgreSQL→outbox, métricas/alertas y piloto gradual.
+1. **PR #21:** auditoría, enrutamiento fail-closed, casos y consultas PostgreSQL idempotentes, outbox/worker, Airtable operacional minimizado, resolución humana protegida y `INSURANCE_ENABLED=false`.
+2. **Siguiente incremento:** identidad/autorización aprobada, políticas/versiones y evidencia documental consultables con filtros de acceso verificados.
+3. **Luego:** worker privado PDF/OCR, calidad por página, hash/procedencia, retención y borrado.
+4. **Luego:** pruebas E2E con Airtable/proveedor de alertas, pruebas manuales de ambos canales, permisos, urgencias y piloto gradual.
 
 Airtable actual contiene campos de conversación libre (`Question`, `Answer`, teléfono) y no es apropiado como autoridad de seguros. Preferir base separada y sincronizar solo IDs seudónimos, producto, urgencia, estado, resumen minimizado, responsable, próxima acción y fecha de sincronización; nunca PDF, cláusulas completas, transcripciones, datos bancarios/médicos ni número completo de póliza. El procesamiento de PDF no se agrega al Cron de reservas.
 
 ## Activación y rollback
 
-En este PR, mantener `INSURANCE_ENABLED=false` (valor por defecto). No configurar un número real como activo ni desplegar. Antes de una futura activación: aprobar bloqueantes; desplegar primero modo observación con datos sintéticos; probar cada número/canal; habilitar un negocio/número controlado; vigilar errores de lookup, casos críticos y sincronización; ampliar solo con aprobación humana. Para rollback, apagar la bandera, desactivar el registro por canal, restaurar webhook si se requiere y dejar los servicios de restaurantes/consultoras y `RESTAURANT_AGENT=true` intactos. No hay datos de seguros que migrar en este PR.
+Mantener `INSURANCE_ENABLED=false` (valor predeterminado) y no activar números ni desplegar mientras no se complete E2E contra PostgreSQL, Airtable y alerta configurados. Las pruebas locales actuales validan PostgreSQL real y simulan Airtable; no prueban Railway ni servicios externos. Antes de activación futura: configurar roles/secretos y campos Airtable, desplegar el worker, comprobar alertas y resolución humana, probar cada canal con datos ficticios y obtener aprobaciones. Rollback: apagar la bandera, desactivar el registro, restaurar webhook si se requiere y dejar intactos restaurantes/consultoras y `RESTAURANT_AGENT=true`.
 
-**No implementado:** identidad, búsqueda de pólizas/cláusulas, OCR/PDF, indexación, casos/tareas, persistencia propia, outbox, Airtable separado, protocolo humano/urgencias, secretos/servicios de Railway y pruebas manuales con proveedores. Este PR no está listo para producción ni para activar seguros.
+**No implementado:** identidad aprobada, búsqueda de pólizas/cláusulas, OCR/PDF, indexación, clasificación automatizada completa, permisos de base productiva, configuración real de Airtable/alertas, consola humana y pruebas manuales con proveedores. El flujo de caso está implementado y probado localmente, pero el PR no está listo para producción ni para activar seguros.
 
 ## Verificación previa a aprobar PR #21
 
@@ -139,3 +142,23 @@ Impacto observable: restaurante y consultora con número/destino válido, canal 
 El TTL anterior podía servir un destino de seguros ya resuelto durante hasta 60 segundos tras desactivarlo en el directorio: eso no cumple una necesidad de revocación inmediata. El ajuste mínimo elimina solo el uso/almacenamiento de entradas positivas cacheadas para negocios de seguros; los demás sectores conservan el comportamiento de caché existente. La prueba cambia el resultado de registro activo a inactivo entre dos solicitudes y comprueba que la siguiente consulta niega el destino; otra prueba comprueba que el fallo del proveedor no cae a la entrada anterior.
 
 La comprobación sucede en cada consulta del Web al registro, pero no controla la latencia de propagación/caché interna del proveedor Airtable ni una carrera ocurrida después de resolver y antes de responder. Si “revocación inmediata” exige garantía más estricta que consultar el estado actual en cada request, hace falta un mecanismo de revocación de emergencia con autoridad/propagación acordadas (por ejemplo, una denylist operativa independiente); no se afirma esa garantía en este PR.
+
+## Caso humano, persistencia y outbox (requisito prioritario)
+
+La ruta de seguros activa no consulta pólizas: el límite actual clasifica la consulta como `identity_not_verified` y crea un caso humano. `state['insurance_escalation']` acepta una clasificación estructurada futura con razón, producto, póliza/versión, contexto, evidencia, urgencia y próxima acción; razones admitidas: `insufficient_evidence`, `missing_information`, `ambiguity`, `contradiction`, `unreadable_document`, `human_interpretation`, `identity_not_verified`.
+
+El commit de estas tablas se completa antes de que `insurance.dialog.process` devuelva “He guardado tu consulta para revisión humana…”. Un fallo de clave/PG retorna “No pude guardar tu consulta. No se ha creado un caso…” y no afirma éxito.
+
+- `insurance_cases`: identidad aleatoria del caso, negocio, referencia HMAC del cliente, clave de hilo, producto, póliza/versión, estado, razón actual, urgencia, próxima acción, revisión, Airtable record ID y metadatos de resolución humana.
+- `insurance_case_questions`: una fila por evento no resuelto con consulta original, versión de póliza, motivo, canal, urgencia, evidencia y contexto; `UNIQUE(business_id,channel,external_id)` evita duplicar webhooks. Un evento repetido con datos nuevos actualiza/combina evidencia/contexto; una nueva pregunta con otro event ID se conserva como nueva fila dentro del caso abierto.
+- `insurance_case_events`: auditoría de creación, pregunta nueva/actualizada y resolución.
+- `insurance_outbox`: payload operativo por revisión, lease, intentos, próxima ejecución y código de error.
+- Un advisory transaction lock serializa solicitudes del mismo hilo; solo existe un caso `pending` por negocio, cliente HMAC y póliza. Al cerrar un caso, futuras preguntas no duplicadas abren otro.
+- Se almacena un HMAC del teléfono como agrupador seudónimo; el teléfono en claro no se persiste como referencia del caso. Esto **no verifica identidad** ni autoriza recuperar la póliza. `INSURANCE_CASE_HMAC_KEY` requiere al menos 32 bytes y debe tener ciclo de rotación aprobado.
+- La base Airtable de seguros se configura aparte mediante `AIRTABLE_INSURANCE_BASE_ID`, `AIRTABLE_INSURANCE_TOKEN` y `AIRTABLE_INSURANCE_CASES_TABLE`. El upsert busca el `Insurance_Case_ID` estable antes de crear, para recuperar respuestas perdidas; el worker ordena revisiones y reintenta con backoff exponencial de 60 s hasta una hora. La DB mantiene caso/outbox si Airtable falla.
+- Airtable recibe únicamente ID del caso, referencia HMAC, producto, urgencia, estado, resumen genérico, próxima acción genérica y revisión. No recibe consulta textual, transcripción, evidencia ni IDs de póliza/versión; los detalles solo están en el API humano protegido.
+- `GET /internal/insurance/cases/<uuid>` y `POST /internal/insurance/cases/<uuid>/resolve` exigen `X-Insurance-Human-Key` validado con `INSURANCE_HUMAN_API_KEY`. La resolución humana, actor y evento se escriben en PG y generan una nueva revisión de outbox que actualiza la misma tarea.
+- Worker separado, root `web`: `python insurance_sync_outbox.py`. Migración una vez con `python -m insurance.migrate` desde `web`, usando `INSURANCE_MIGRATION_DATABASE_URL`; runtime necesita `INSURANCE_DATABASE_URL` con permisos DML mínimos. No se añade el worker al Cron de reservas.
+- Al fallar sync, la fila se reencola y se genera un log `CRITICAL` sin pregunta ni evidencia, además de POST opcional al `INSURANCE_ALERT_WEBHOOK_URL`. **La alerta externa no está configurada aquí**; hasta conectar y probar un destino real de alertas, queda bloqueante para activar seguros.
+
+Prueba local E2E PostgreSQL + API Airtable simulada: `INSURANCE_TEST_DATABASE_URL=postgresql:///runner python -m pytest -q tests/test_insurance_cases.py`. Valida motivos, preguntas repetidas y con nueva información, idempotencia, escritura PG antes de confirmación en ambos canales, retry/error/alerta, upsert de tarea y resolución humana. La API de Airtable en esas pruebas está simulada; no hay credenciales Airtable, entorno Railway ni `DATABASE_URL` de servicio disponibles, así que **no** afirmo E2E real con proveedores. `INSURANCE_ENABLED` permanece `false` por defecto y no se configuró en el entorno.

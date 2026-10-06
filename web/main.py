@@ -112,6 +112,9 @@ def open_now(b):
 def authorized():
   key=os.getenv('INTERNAL_API_KEY','');got=request.headers.get('X-Internal-API-Key','')
   return bool(key and got and hmac.compare_digest(key,got))
+def insurance_human_authorized():
+  key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
+  return bool(key and got and hmac.compare_digest(key,got))
 def _twilio_candidates(base,path,query):
   host=request.headers.get('Host','');xh=request.headers.get('X-Forwarded-Host','').split(',')[0].strip();xp=request.headers.get('X-Forwarded-Proto','').split(',')[0].strip()
   rd=os.getenv('RAILWAY_PUBLIC_DOMAIN','').strip();c={}
@@ -231,7 +234,7 @@ def whatsapp():
    if not b:answer='No puedo identificar el negocio asociado a este número.'
    elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
    else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''))
-   if b and text and answer:
+   if b and text and answer and sector_of(b)!='insurance':
     try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
@@ -311,6 +314,24 @@ def internal_reconcile_pending():
    result=reconcile_pending((request.get_json(silent=True) or {}).get('limit',25))
    return jsonify(success=True,results=result)
   except Exception:log.exception('Reconciliation failed');return jsonify(success=False),503
+@app.get('/internal/insurance/cases/<uuid:case_id>')
+def insurance_case_detail(case_id):
+  if not insurance_human_authorized():return jsonify(success=False),401
+  try:
+   from insurance.cases import get_case
+   case=get_case(case_id)
+   return (jsonify(success=True,**case),200) if case else (jsonify(success=False),404)
+  except Exception:log.exception('Insurance case read failed');return jsonify(success=False),503
+@app.post('/internal/insurance/cases/<uuid:case_id>/resolve')
+def internal_resolve_insurance_case(case_id):
+  if not insurance_human_authorized():return jsonify(success=False),401
+  data=request.get_json(silent=True) or {}
+  try:
+   from insurance.cases import resolve_case
+   resolved=resolve_case(case_id,data.get('resolved_by'),data.get('resolution'))
+   return jsonify(success=True,case_id=resolved)
+  except ValueError as exc:return jsonify(success=False,message=str(exc)),400
+  except Exception:log.exception('Insurance case resolution failed');return jsonify(success=False),503
 @app.post('/internal/booking')
 @app.post('/internal/book-test')
 def internal_booking():

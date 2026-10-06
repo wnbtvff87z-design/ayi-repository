@@ -7,6 +7,7 @@ WEB = Path(__file__).resolve().parents[1] / 'web'
 sys.path.insert(0, str(WEB))
 
 import dialog
+import insurance.dialog as insurance_dialog
 import main
 from booking import BookingError
 
@@ -82,16 +83,18 @@ def test_insurance_is_disabled_by_default_and_unknown_sector_fails_closed(monkey
 
 def test_enabled_insurance_agent_returns_only_identity_boundary(monkeypatch):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: 'case-test-1')
     reply, state = dialog.process(
         {'sector': 'seguros'}, {}, [], '¿me cubre?', 'Voice', 'CA1:turn:1', '+100'
     )
-    assert state['insurance_result'] == 'identity_not_verified'
-    assert 'No puedo verificar identidad' in reply
-    assert 'confirmar coberturas' in reply
+    assert state == {'insurance_result': 'human_case_required', 'case_id': 'case-test-1'}
+    assert 'He guardado tu consulta' in reply
+    assert 'No puedo confirmar un plazo ni una resolución' in reply
 
 
 def test_insurance_turn_does_not_use_shared_conversation_storage(monkeypatch):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: 'case-test-1')
     monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
     reply, end_reason = main.converse(
         {'business_id': 'B1', 'sector': 'insurance'},
@@ -102,7 +105,7 @@ def test_insurance_turn_does_not_use_shared_conversation_storage(monkeypatch):
         include_end_reason=True,
     )
     assert end_reason is None
-    assert 'No puedo verificar identidad' in reply
+    assert 'He guardado tu consulta' in reply
 
 
 def test_insurance_conversations_cannot_be_mirrored_to_airtable(monkeypatch):
