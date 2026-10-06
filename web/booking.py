@@ -99,7 +99,8 @@ def _slot_payload(record):
  if not start:issues.append('Hora_Inicio')
  if not end:issues.append('Hora_Fin')
  if capacity<0:issues.append('Capacidad_Personas')
- if status not in ('Abierta','Cerrada'):issues.append('Estado')
+ if status not in ('Abierta','Cerrada'):
+  issues.append('Estado');log.debug('Slot ignored: invalid Estado=%r record=%s',f.get('Estado'),record.get('id'))
  if expected and f.get('Franja_ID')!=expected:issues.append('Franja_ID')
  return ({'business_id':bid,'slot_id':expected,'slot_date':d,'start_time':start,'end_time':end,'capacity':capacity,'status':status,'airtable_record_id':record.get('id')} if not issues else None),issues
 
@@ -107,11 +108,13 @@ def sync_airtable_slots(business_id=None):
  """Batch import for the scheduled sync job; never called in customer request paths."""
  init_schema();table=os.getenv('AIRTABLE_SLOTS_TABLE','Franjas')
  formula='{Business_ID}='+json.dumps(business_id) if business_id else None
- records=list_records(table,formula);invalid=[];by_key={}
+ records=list_records(table,formula);invalid=[];by_key={};skipped_capacity=0
  for record in records:
   slot,issues=_slot_payload(record)
   if not slot:
    invalid.append({'airtable_record_id':record.get('id'),'fields':issues});continue
+  if slot['capacity']<1:
+   skipped_capacity+=1;log.debug('Slot ignored: capacity<1 record=%s slot_id=%s capacity=%s',record.get('id'),slot['slot_id'],slot['capacity']);continue
   by_key.setdefault((slot['business_id'],slot['slot_id']),[]).append(slot)
  imported=closed=conflicts=0;seen_ids=set()
  with db() as c:
@@ -135,7 +138,7 @@ def sync_airtable_slots(business_id=None):
   for row in existing:
    if row['airtable_record_id'] and row['airtable_record_id'] not in seen_ids:
     c.execute("UPDATE booking_slots SET admin_status='Cerrada',status='Cerrada',synced_at=now() WHERE business_id=%s AND slot_id=%s",(row['business_id'],row['slot_id']))
- return {'airtable_records':len(records),'imported':imported,'closed_or_blocked':closed,'duplicate_keys':conflicts,'invalid':invalid}
+ return {'airtable_records':len(records),'imported':imported,'closed_or_blocked':closed,'duplicate_keys':conflicts,'skipped_capacity':skipped_capacity,'invalid':invalid}
 def slots(b,start=None,days=3):
  enabled(b);init_schema();tz=b.get('timezone') or 'Europe/Madrid';start=day(start) if start else datetime.now(ZoneInfo(tz)).date().isoformat()
  if not start:raise BookingError('Fecha inválida')
