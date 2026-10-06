@@ -462,6 +462,52 @@ def test_expired_final_lease_sweep_is_bounded_per_batch(pg_schema, monkeypatch):
     assert len(notified) == cases.EXPIRED_OUTBOX_SWEEP_LIMIT + 1
 
 
+def test_outbox_retry_schedule_failure_recovers_after_lease_expiry(pg_schema, monkeypatch, caplog):
+    case_id = submit_question(external_id='SM-retry-schedule-failure')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'Insurance Cases')
+    calls = {'post': 0}
+    monkeypatch.setattr(
+        cases.requests,
+        'get',
+        lambda *args, **kwargs: FakeResponse({'records': []}),
+    )
+
+    def post(*args, **kwargs):
+        calls['post'] += 1
+        return FakeResponse(
+            {} if calls['post'] == 1 else {'records': [{'id': 'rec-recovered'}]},
+            status=503 if calls['post'] == 1 else 200,
+        )
+
+    monkeypatch.setattr(cases.requests, 'post', post)
+    original_retry = cases._retry_outbox
+    monkeypatch.setattr(
+        cases,
+        '_retry_outbox',
+        lambda *args: (_ for _ in ()).throw(RuntimeError('simulated retry write failure')),
+    )
+
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+    assert 'insurance_outbox_retry_schedule_failed' in caplog.text
+    with pg_schema() as conn:
+        state = conn.execute(
+            'SELECT status,attempts,locked_until>now() AS lease_active '
+            'FROM insurance_outbox WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE insurance_outbox SET locked_until=now()-interval '1 second' "
+            'WHERE case_id=%s',
+            (case_id,),
+        )
+    assert state == {'status': 'processing', 'attempts': 1, 'lease_active': True}
+
+    monkeypatch.setattr(cases, '_retry_outbox', original_retry)
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+
+
 def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema, monkeypatch):
     case_id = submit_question()
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')

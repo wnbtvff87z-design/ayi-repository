@@ -128,28 +128,25 @@ def insurance_human_authorized():
   if len(key_bytes)<MIN_KEY_BYTES or len(audit_key_bytes)<MIN_KEY_BYTES:
     log.error('insurance_human_auth_configuration_invalid')
     return False
-  if not got or len(got_bytes)>INSURANCE_HUMAN_API_KEY_MAX_BYTES:
-    _record_insurance_human_auth_failure(audit_key_bytes)
-    log.warning('insurance_human_auth_failed')
-    return False
   client_key=hmac.new(
       audit_key_bytes,(request.remote_addr or 'unknown').encode(),hashlib.sha256
   ).digest()
   if _insurance_human_auth_is_limited(client_key):
     log.warning('insurance_human_auth_rate_limited')
     return False
+  if not got or len(got_bytes)>INSURANCE_HUMAN_API_KEY_MAX_BYTES:
+    _record_insurance_human_auth_failure(client_key)
+    log.warning('insurance_human_auth_failed')
+    return False
   if not hmac.compare_digest(key_bytes,got_bytes):
-    _record_insurance_human_auth_failure(audit_key_bytes)
+    _record_insurance_human_auth_failure(client_key)
     log.warning('insurance_human_auth_failed')
     return False
   with _insurance_human_auth_lock:
     _insurance_human_auth_failures.pop(client_key,None)
   return True
 
-def _record_insurance_human_auth_failure(audit_key_bytes):
-  client_key=hmac.new(
-      audit_key_bytes,(request.remote_addr or 'unknown').encode(),hashlib.sha256
-  ).digest()
+def _record_insurance_human_auth_failure(client_key):
   now=time.monotonic()
   with _insurance_human_auth_lock:
     _prune_insurance_human_auth_failures(now)
