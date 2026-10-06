@@ -276,6 +276,11 @@ def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema
             (case_id,),
         )
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    assert record['fields']['Status'] == 'pending'
+    assert record['fields']['Task_Summary'].startswith(
+        'Consulta de seguro pendiente de revisión humana:'
+    )
+    assert record['fields']['Status'] not in ('resolved', 'completed', 'Completada')
     assert cases.resolve_case(case_id, 'human-agent-1', 'Se revisó el documento ficticio.')
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
 
