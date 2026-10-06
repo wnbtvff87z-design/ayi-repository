@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS insurance_outbox (
     revision integer NOT NULL,
     payload jsonb NOT NULL,
     status text NOT NULL DEFAULT 'pending'
+        CONSTRAINT insurance_outbox_status_check
         CHECK (status IN ('pending', 'processing', 'done')),
     attempts integer NOT NULL DEFAULT 0,
     next_attempt_at timestamptz NOT NULL DEFAULT now(),

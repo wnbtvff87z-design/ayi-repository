@@ -299,6 +299,7 @@ def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkey
     }
     assert captured['Status'] == 'pending'
     assert captured['Urgency'] == 'normal'
+    assert captured['Next Action'] == 'Abrir el caso en el sistema seguro y seguir el protocolo aprobado.'
     assert isinstance(captured['Revision'], int)
     assert lookup['filterByFormula'] == '{Case ID}=' + json.dumps(case_id)
     with pg_schema() as conn:
