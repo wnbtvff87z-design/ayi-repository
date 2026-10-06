@@ -118,7 +118,8 @@ def authorized():
 def insurance_human_authorized():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
   audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','')
-  return bool(key and got and len(audit_key.encode())>=32 and hmac.compare_digest(key.encode(),got.encode()))
+  key_bytes=key.encode();got_bytes=got.encode()
+  return bool(len(key_bytes)>=32 and got and len(audit_key.encode())>=32 and hmac.compare_digest(key_bytes,got_bytes))
 def insurance_human_actor():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','').encode()
   audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','').encode()

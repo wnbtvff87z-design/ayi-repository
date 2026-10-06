@@ -271,11 +271,13 @@ def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkey
     monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'Insurance Cases')
     captured = {}
 
-    monkeypatch.setattr(
-        cases.requests,
-        'get',
-        lambda *args, **kwargs: FakeResponse({'records': []}),
-    )
+    lookup = {}
+
+    def get(url, **kwargs):
+        lookup.update(kwargs.get('params', {}))
+        return FakeResponse({'records': []})
+
+    monkeypatch.setattr(cases.requests, 'get', get)
 
     def reject_schema(url, **kwargs):
         captured.update(kwargs['json']['records'][0]['fields'])
@@ -298,6 +300,7 @@ def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkey
     assert captured['Status'] == 'pending'
     assert captured['Urgency'] == 'normal'
     assert isinstance(captured['Revision'], int)
+    assert lookup['filterByFormula'] == '{Case ID}=' + json.dumps(case_id)
     with pg_schema() as conn:
         state = conn.execute(
             'SELECT status,attempts,last_error_code FROM insurance_outbox WHERE case_id=%s',
@@ -531,12 +534,16 @@ def test_deleted_airtable_mirror_is_recreated_on_next_revision(pg_schema, monkey
 def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monkeypatch):
     case_id = submit_question(external_id='SM-human')
     submit_question(external_id='SM-human-second', question='¿Qué documentos hacen falta?')
-    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    human_key = 'k' * 40
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', human_key)
     client = main.app.test_client()
     path = f'/internal/insurance/cases/{case_id}'
 
     assert client.get(path).status_code == 401
-    headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
+    headers = {'X-Insurance-Human-Key': human_key}
+    assert client.get(
+        path, headers={'X-Insurance-Human-Key': 'human-console-test-key'}
+    ).status_code == 401
     assert client.get(path, headers=headers).status_code == 401
     monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
     assert client.get(
@@ -587,7 +594,8 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
 
 
 def test_human_resolution_does_not_echo_internal_validation_error(monkeypatch):
-    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    human_key = 'k' * 40
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', human_key)
     monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
     monkeypatch.setattr(
         cases,
@@ -596,7 +604,7 @@ def test_human_resolution_does_not_echo_internal_validation_error(monkeypatch):
     )
     response = main.app.test_client().post(
         f'/internal/insurance/cases/{uuid.uuid4()}/resolve',
-        headers={'X-Insurance-Human-Key': 'human-console-test-key'},
+        headers={'X-Insurance-Human-Key': human_key},
         json={'resolved_by': 'agent', 'resolution': 'done'},
     )
 
@@ -651,7 +659,8 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
 ):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
-    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    human_key = 'k' * 40
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', human_key)
     monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
     monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
@@ -736,7 +745,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     }
 
     case_id = record['fields']['Case ID']
-    human_headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
+    human_headers = {'X-Insurance-Human-Key': human_key}
     path = f'/internal/insurance/cases/{case_id}'
     details = client.get(path, headers=human_headers)
     assert details.status_code == 200

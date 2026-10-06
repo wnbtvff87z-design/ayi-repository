@@ -91,7 +91,7 @@ def _thread_key(policy_id, product):
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
-def _payload(case_id, customer_ref, product, urgency, reason, status, next_action, revision):
+def _payload(case_id, customer_ref, product, urgency, reason, status, revision):
     return {
         'case_id': str(case_id),
         'customer_ref': customer_ref,
@@ -136,7 +136,7 @@ def _record_case_revision(
     ).fetchone()
     payload = _payload(
         case_id, customer_ref, product, urgency_value, reason, 'pending',
-        next_action, updated['revision'],
+        updated['revision'],
     )
     conn.execute(
         'INSERT INTO insurance_case_events(case_id,event_type,actor,details) '
@@ -365,7 +365,7 @@ def resolve_case(case_id, resolved_by, resolution):
             )
             payload = _payload(
                 case_id, row['customer_ref'], row['product'], row['urgency'],
-                row['latest_reason'], 'resolved', 'Resuelta por el agente humano.', updated['revision'],
+                row['latest_reason'], 'resolved', updated['revision'],
             )
             conn.execute(
                 'INSERT INTO insurance_outbox(case_id,revision,payload) VALUES(%s,%s,%s::jsonb)',
