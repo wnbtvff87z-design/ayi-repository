@@ -369,8 +369,9 @@ def test_disabled_insurance_whatsapp_responds_without_shared_storage_or_general_
     )
     monkeypatch.delenv('INSURANCE_ENABLED', raising=False)
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
-    for name in ('converse', 'save_conversation', 'init_schema', 'db'):
+    for name in ('converse', 'save_conversation', 'init_schema', 'db', 'process'):
         monkeypatch.setattr(main, name, lambda *args, _name=name, **kwargs: pytest.fail(f'{_name} should not be called'))
+    monkeypatch.setattr(main.requests, 'post', lambda *args, **kwargs: pytest.fail('Airtable write should not be called'))
 
     response = main.app.test_client().post('/webhook-whatsapp', data={
         'To': 'whatsapp:' + number,
@@ -381,8 +382,9 @@ def test_disabled_insurance_whatsapp_responds_without_shared_storage_or_general_
     body = response.get_data(as_text=True)
 
     assert response.status_code == 200
-    assert 'No puedo verificar el resultado ahora.' in body
-    assert 'general' not in body.lower()
+    assert main.INSURANCE_DISABLED_REPLY in body
+    assert 'pendiente' not in body.lower()
+    assert 'recepción' not in body.lower()
 
 
 def test_disabled_insurance_voice_does_not_enter_dialogue_or_storage(monkeypatch):
@@ -394,13 +396,15 @@ def test_disabled_insurance_voice_does_not_enter_dialogue_or_storage(monkeypatch
     )
     monkeypatch.delenv('INSURANCE_ENABLED', raising=False)
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
-    monkeypatch.setenv('RELAY_VOICE_URL', '')
-    monkeypatch.setattr(main, 'converse', lambda *args, **kwargs: pytest.fail('insurance entered dialog'))
-    monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
+    monkeypatch.setenv('RELAY_VOICE_URL', 'https://relay.example/voice')
+    for name in ('converse', 'save_conversation', 'init_schema', 'db', 'process'):
+        monkeypatch.setattr(main, name, lambda *args, _name=name, **kwargs: pytest.fail(f'{_name} should not be called'))
+    monkeypatch.setattr(main.requests, 'post', lambda *args, **kwargs: pytest.fail('Airtable write should not be called'))
 
     response = main.app.test_client().post('/webhook-voice', data={'To': number})
     body = response.get_data(as_text=True)
 
     assert response.status_code == 200
-    assert 'La atención automática no está disponible.' in body
-    assert 'general' not in body.lower()
+    assert main.INSURANCE_DISABLED_REPLY in body
+    assert 'pendiente' not in body.lower()
+    assert 'recepción' not in body.lower()

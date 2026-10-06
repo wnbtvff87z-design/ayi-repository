@@ -132,8 +132,7 @@ Impacto observable: restaurante y consultora con número/destino válido, canal 
 - WhatsApp con `To=whatsapp:+34 600 111 222`: normaliza a `+34600111222`, resuelve `WhatsApp`, ejecuta el diálogo consultora existente y refleja la conversación como antes.
 - WhatsApp con `To` ausente o texto no-numérico: devuelve “No puedo identificar el negocio asociado a este número.”; no usa `TWILIO_PHONE`, no invoca diálogo/espejo y no consulta el registro.
 - Voice con destino restaurante activo y `Voice`: conserva el camino Web existente y devuelve `<Dial>` a la recepción configurada.
-- WhatsApp de seguros, `INSURANCE_ENABLED` ausente/falso: el lookup falla cerrado; la respuesta del webhook es “No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.” No se invocan `converse`, `save_conversation`, `init_schema` ni `db`; no se llama al diálogo general.
-- Voice de seguros, bandera ausente/falsa y Relay no configurado en el test: devuelve “La atención automática no está disponible.” y no invoca conversación ni esquema compartido. Con Relay configurado, el Web actual redirige a Relay; su `/voice` vuelve a resolver y, al no poder resolver el sector deshabilitado, responde con el fallback “No puedo atender ahora.”. No deriva a `general`.
+- WhatsApp y Voice de seguros, `INSURANCE_ENABLED` ausente/falso: responden “Este canal no está disponible para esta consulta.” La respuesta no promete una operación pendiente ni remite a una recepción. No se invocan `converse`, `save_conversation`, `init_schema`, `db` ni el diálogo general; tampoco se escribe en Airtable. Voice termina con `<Hangup/>` sin redirigir a Relay.
 
 ### Revocación inmediata y límite externo
 

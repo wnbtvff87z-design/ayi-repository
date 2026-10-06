@@ -8,10 +8,12 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
-from dialog import BusinessSectorError, process, sector_of
+from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
 app=Flask(__name__);log=logging.getLogger(__name__)
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
+INSURANCE_DISABLED_REPLY='Este canal no está disponible para esta consulta.'
+class InsuranceDisabledError(BookingError):pass
 def phone(v):
   digits=re.sub(r'\D','',str(v or '').removeprefix('whatsapp:'))
   return '+'+digits if digits else ''
@@ -64,7 +66,9 @@ def lookup(number,channel):
     cached_sector=None
     if cached[1]:
      try:cached_sector=sector_of(cached[1])
-     except BusinessSectorError as exc:raise BookingError(str(exc)) from exc
+     except BusinessSectorError as exc:
+      error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
+      raise error(str(exc)) from exc
     if cached_sector!='insurance':return cached[1]
   if MODE=='new':b=_tenant_lookup(number,channel)
   else:
@@ -78,7 +82,9 @@ def lookup(number,channel):
   sector=None
   if b:
    try:sector=sector_of(b)
-   except BusinessSectorError as exc:raise BookingError(str(exc)) from exc
+   except BusinessSectorError as exc:
+    error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
+    raise error(str(exc)) from exc
   with _lookup_lock:
    if sector=='insurance':_lookup_cache.pop(key,None)
    else:_lookup_cache[key]=(now+ttl,b)
@@ -229,6 +235,7 @@ def whatsapp():
     try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
+  except InsuranceDisabledError:tw.message(INSURANCE_DISABLED_REPLY)
   except Exception:log.exception('WhatsApp error');tw.message('No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
   return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
@@ -236,6 +243,9 @@ def voice():
   if not twilio_valid():return Response('Forbidden',status=403)
   r=VoiceResponse();relay=os.getenv('RELAY_VOICE_URL','')
   try:b=lookup(request.form.get('To'),'Voice')
+  except InsuranceDisabledError:
+   r.say(INSURANCE_DISABLED_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
   except Exception:log.exception('Voice business lookup failed');b=None
   if b and open_now(b) and phone(b.get('reception')):
    dial=r.dial(action='/voice-dial-result',method='POST',timeout=20,answer_on_bridge=True);dial.number(phone(b['reception']))

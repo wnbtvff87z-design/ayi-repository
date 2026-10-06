@@ -9,6 +9,10 @@ class BusinessSectorError(ValueError):
     pass
 
 
+class InsuranceDisabledSectorError(BusinessSectorError):
+    pass
+
+
 def sector_of(business):
     raw=str(business.get('sector') or '').strip().casefold()
     if raw in ('restaurante','restaurant'):
@@ -19,7 +23,7 @@ def sector_of(business):
         return 'general'
     if raw in ('seguro','seguros','insurance'):
         if os.getenv('INSURANCE_ENABLED','false').strip().lower()!='true':
-            raise BusinessSectorError('El agente de seguros está deshabilitado')
+            raise InsuranceDisabledSectorError('El agente de seguros está deshabilitado')
         return 'insurance'
     raise BusinessSectorError('Sector de negocio desconocido')
 
