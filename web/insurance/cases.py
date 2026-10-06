@@ -473,7 +473,7 @@ def _claim_outbox_item():
                     SELECT 1 FROM insurance_outbox older
                     WHERE older.case_id=o.case_id
                     AND older.revision<o.revision
-                    AND older.status<>'done'
+                    AND older.status NOT IN ('done','failed')
                 )
                 ORDER BY o.next_attempt_at,o.outbox_id
                 FOR UPDATE SKIP LOCKED

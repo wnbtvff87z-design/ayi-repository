@@ -55,10 +55,10 @@ def _tenant_lookup(number,channel):
   return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or '').strip().lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 _lookup_cache={}
 _lookup_lock=threading.Lock()
-def lookup(number,channel):
+def lookup(number,channel,with_sector=False):
   if channel not in ('Voice','WhatsApp'):raise BookingError('Canal no reconocido')
   number=phone(number)
-  if not number:return None
+  if not number:return (None,None) if with_sector else None
   key=(number,channel);now=time.monotonic();ttl=int(os.getenv('BUSINESS_CACHE_TTL_SECONDS','60'))
   with _lookup_lock:
    cached=_lookup_cache.get(key)
@@ -69,7 +69,7 @@ def lookup(number,channel):
      except BusinessSectorError as exc:
       error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
       raise error(str(exc)) from exc
-    if cached_sector!='insurance':return cached[1]
+    if cached_sector!='insurance':return (cached[1],cached_sector) if with_sector else cached[1]
   if MODE=='new':b=_tenant_lookup(number,channel)
   else:
    if MODE not in ('legacy','shadow'):raise BookingError('TENANT_LOOKUP_MODE inválido')
@@ -88,9 +88,9 @@ def lookup(number,channel):
   with _lookup_lock:
    if sector=='insurance':_lookup_cache.pop(key,None)
    else:_lookup_cache[key]=(now+ttl,b)
-  return b
-def save_conversation(b,customer,question,answer,status):
-  if sector_of(b)=='insurance':raise BookingError('Las conversaciones de seguros no se espejan en Airtable')
+  return (b,sector) if with_sector else b
+def save_conversation(b,customer,question,answer,status,sector=None):
+  if (sector if sector is not None else sector_of(b))=='insurance':raise BookingError('Las conversaciones de seguros no se espejan en Airtable')
   table=os.getenv('AIRTABLE_CONVERSATIONS_TABLE','Conversaciones')
   f={'Twilio_Phone':phone(b['phone']),'Customer_Phone':phone(customer),'Question':str(question),'Answer':str(answer or ''),'Timestamp':datetime.now(timezone.utc).isoformat(),'Status':status}
   if MODE=='new':f['Business_ID']=b['business_id']
@@ -179,10 +179,10 @@ def recent_history(c,bid,channel,customer,external_id):
    (bid,channel,customer),
   ).fetchall()
 
-def converse(b,channel,customer,text,external_id,include_end_reason=False):
+def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
-  if sector_of(b)=='insurance':
-   reply,_=process(b,{},[],text,channel,external_id,customer)
+  if (sector if sector is not None else sector_of(b))=='insurance':
+   reply,_=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector)
    return (reply,None) if include_end_reason else reply
   init_schema();bid=b['business_id']
   with db() as c:
@@ -230,12 +230,12 @@ def whatsapp():
   if not twilio_valid():return Response('Forbidden',status=403)
   tw=MessagingResponse()
   try:
-   b=lookup(request.form.get('To'),'WhatsApp');text=request.form.get('Body','').strip()
+   b,sector=lookup(request.form.get('To'),'WhatsApp',with_sector=True);text=request.form.get('Body','').strip()
    if not b:answer='No puedo identificar el negocio asociado a este número.'
    elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
-   else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''))
-   if b and text and answer and sector_of(b)!='insurance':
-    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
+   else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''),sector=sector)
+   if b and text and answer and sector!='insurance':
+    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp',sector=sector)
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
   except InsuranceDisabledError:tw.message(INSURANCE_DISABLED_REPLY)
@@ -300,9 +300,9 @@ def internal_turn():
   if not authorized():return jsonify(success=False),401
   d=request.get_json(silent=True) or {}
   try:
-   channel=d.get('channel','Voice');b=lookup(d.get('business_phone'),channel)
+   channel=d.get('channel','Voice');b,sector=lookup(d.get('business_phone'),channel,with_sector=True)
    if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-   reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),include_end_reason=True)
+   reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),include_end_reason=True,sector=sector)
    end_reason=end_reason if end_reason in ('goodbye','cancelled','verification') else None
    return jsonify(success=True,reply=reply,end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
   except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503

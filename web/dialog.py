@@ -28,8 +28,8 @@ def sector_of(business):
     raise BusinessSectorError('Sector de negocio desconocido')
 
 
-def process(business,state,history,text,channel,external_id,customer):
-    sector=sector_of(business)
+def process(business,state,history,text,channel,external_id,customer,resolved_sector=None):
+    sector=resolved_sector if resolved_sector is not None else sector_of(business)
     if sector=='restaurante':
         if os.getenv('RESTAURANT_AGENT','false').strip().lower()=='true':
             from restaurant_dialog_agent import process as agent_process

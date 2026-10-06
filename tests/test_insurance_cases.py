@@ -53,9 +53,7 @@ def pg_schema(monkeypatch):
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
     with connect() as conn:
         for migration in MIGRATIONS:
-            for statement in migration.read_text(encoding='utf-8').split(';'):
-                if statement.strip():
-                    conn.execute(statement)
+            conn.execute(migration.read_text(encoding='utf-8'))
     try:
         yield connect
     finally:
@@ -300,6 +298,23 @@ def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schem
     assert state == {'status': 'failed', 'attempts': 8, 'last_error_code': 'http_503'}
     assert alerts[-1]['permanent'] is True
     assert cases.sync_outbox() == []
+    submit_question(external_id='SM-after-terminal')
+    monkeypatch.setattr(cases.requests, 'get', lambda *args, **kwargs: FakeResponse({'records': []}))
+    monkeypatch.setattr(
+        cases.requests,
+        'post',
+        lambda *args, **kwargs: FakeResponse({'records': [{'id': 'rec-recovered'}]}),
+    )
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    with pg_schema() as conn:
+        revisions = conn.execute(
+            'SELECT revision,status FROM insurance_outbox WHERE case_id=%s ORDER BY revision',
+            (case_id,),
+        ).fetchall()
+    assert revisions == [
+        {'revision': 1, 'status': 'failed'},
+        {'revision': 2, 'status': 'done'},
+    ]
 
 
 def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema, monkeypatch):
@@ -515,7 +530,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
         'sector': 'insurance',
         'insurance_product': 'hogar',
     }
-    monkeypatch.setattr(main, 'lookup', lambda *args: business)
+    monkeypatch.setattr(main, 'lookup', lambda *args, **kwargs: (business, 'insurance'))
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
     monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
     monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared database accessed'))
@@ -624,7 +639,7 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
         'phone': '+34600111222',
         'insurance_product': 'hogar',
     }
-    monkeypatch.setattr(main, 'lookup', lambda number, requested_channel: business)
+    monkeypatch.setattr(main, 'lookup', lambda *args, **kwargs: (business, 'insurance'))
     monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared conversation schema accessed'))
     monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared conversation database accessed'))
     monkeypatch.setattr(main.requests, 'post', lambda *args, **kwargs: pytest.fail('Airtable was written in request path'))

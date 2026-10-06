@@ -252,9 +252,10 @@ def test_insurance_registry_failure_does_not_fall_back_to_cached_assignment(monk
 
 def test_turn_rejects_client_supplied_business_id_mismatch(monkeypatch):
     monkeypatch.setattr(main, 'authorized', lambda: True)
-    monkeypatch.setattr(main, 'lookup', lambda phone, channel: {
-        'business_id': 'trusted-business', 'sector': 'restaurante'
-    })
+    monkeypatch.setattr(main, 'lookup', lambda phone, channel, with_sector=False: (
+        {'business_id': 'trusted-business', 'sector': 'restaurante'},
+        'restaurante',
+    ) if with_sector else {'business_id': 'trusted-business', 'sector': 'restaurante'})
     monkeypatch.setattr(main, 'converse', lambda *args, **kwargs: pytest.fail('turn accepted'))
     response = main.app.test_client().post('/internal/turn', json={
         'business_id': 'attacker-selected-business',
@@ -274,7 +275,10 @@ def test_turn_rejects_client_supplied_business_id_mismatch(monkeypatch):
 def test_missing_destination_does_not_fall_back_to_default_phone(monkeypatch, path, channel):
     seen = []
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
-    monkeypatch.setattr(main, 'lookup', lambda number, requested_channel: seen.append((number, requested_channel)))
+    def lookup(number, requested_channel, with_sector=False):
+        seen.append((number, requested_channel))
+        return (None, None) if with_sector else None
+    monkeypatch.setattr(main, 'lookup', lookup)
     monkeypatch.setattr(main, 'PHONE', '+34911111111')
     monkeypatch.setenv('RELAY_VOICE_URL', 'https://relay.invalid/voice')
     client = main.app.test_client()
@@ -298,7 +302,7 @@ def test_whatsapp_webhook_routes_valid_to_and_normalizes_whatsapp_prefix(monkeyp
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
     turns, mirrors = [], []
     monkeypatch.setattr(main, 'converse', lambda *args, **kwargs: turns.append(args) or 'respuesta consultora')
-    monkeypatch.setattr(main, 'save_conversation', lambda *args: mirrors.append(args))
+    monkeypatch.setattr(main, 'save_conversation', lambda *args, **kwargs: mirrors.append(args))
 
     response = main.app.test_client().post('/webhook-whatsapp', data={
         'To': 'whatsapp:+34 600 111 222',
@@ -411,3 +415,34 @@ def test_disabled_insurance_voice_does_not_enter_dialogue_or_storage(monkeypatch
     assert main.INSURANCE_DISABLED_REPLY in body
     assert 'pendiente' not in body.lower()
     assert 'recepción' not in body.lower()
+
+
+def test_whatsapp_uses_one_resolved_sector_for_the_entire_request(monkeypatch):
+    number = '+34600111222'
+    configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'WhatsApp', 'Estado': 'Activo', 'Negocio': ['insurance']}}],
+        {'insurance': {'Estado': 'Activo', 'Business_ID': 'INS-1', 'Sector': 'seguros'}},
+    )
+    monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    routed_sectors = []
+
+    def process(business, state, history, text, channel, external_id, customer, resolved_sector=None):
+        routed_sectors.append(resolved_sector)
+        monkeypatch.setenv('INSURANCE_ENABLED', 'false')
+        return 'stored safely', {}
+
+    monkeypatch.setattr(main, 'process', process)
+    monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
+    monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared database accessed'))
+    response = main.app.test_client().post('/webhook-whatsapp', data={
+        'To': number,
+        'From': '+34600999888',
+        'Body': 'consulta ficticia',
+        'MessageSid': 'SM-sector-snapshot',
+    })
+
+    assert response.status_code == 200
+    assert 'stored safely' in response.get_data(as_text=True)
+    assert routed_sectors == ['insurance']
