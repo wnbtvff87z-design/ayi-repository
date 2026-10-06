@@ -382,6 +382,52 @@ def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schem
     ]
 
 
+def test_outbox_retry_schedule_failure_recovers_after_lease_expiry(pg_schema, monkeypatch, caplog):
+    case_id = submit_question(external_id='SM-retry-schedule-failure')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'Insurance Cases')
+    monkeypatch.setattr(
+        cases.requests,
+        'get',
+        lambda *args, **kwargs: FakeResponse({'records': []}),
+    )
+    monkeypatch.setattr(
+        cases.requests,
+        'post',
+        lambda *args, **kwargs: FakeResponse({}, status=503),
+    )
+    original_retry = cases._retry_outbox
+    monkeypatch.setattr(
+        cases,
+        '_retry_outbox',
+        lambda *args: (_ for _ in ()).throw(RuntimeError('simulated PostgreSQL update error')),
+    )
+
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+    assert 'insurance_outbox_retry_schedule_failed' in caplog.text
+    with pg_schema() as conn:
+        state = conn.execute(
+            'SELECT status,attempts,locked_until>now() AS lease_active '
+            'FROM insurance_outbox WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE insurance_outbox SET locked_until=now()-interval '1 second' "
+            'WHERE case_id=%s',
+            (case_id,),
+        )
+    assert state == {'status': 'processing', 'attempts': 1, 'lease_active': True}
+
+    monkeypatch.setattr(cases, '_retry_outbox', original_retry)
+    monkeypatch.setattr(
+        cases.requests,
+        'post',
+        lambda *args, **kwargs: FakeResponse({'records': [{'id': 'rec-recovered'}]}),
+    )
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+
+
 def test_expired_final_lease_sweep_is_bounded_per_batch(pg_schema, monkeypatch):
     for index in range(cases.EXPIRED_OUTBOX_SWEEP_LIMIT + 1):
         submit_question(
@@ -622,6 +668,23 @@ def test_human_actor_rejects_missing_or_weak_key_material(monkeypatch):
     monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
     with pytest.raises(RuntimeError, match='not configured safely'):
         main.insurance_human_actor('short')
+
+
+def test_human_api_logs_and_rate_limits_failed_authentication(monkeypatch, caplog):
+    monkeypatch.setattr(main, '_insurance_human_auth_failures', {})
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'k' * 40)
+    monkeypatch.setenv('INSURANCE_HUMAN_AUDIT_KEY', 'h' * 40)
+    client = main.app.test_client()
+    path = f'/internal/insurance/cases/{uuid.uuid4()}'
+
+    for _ in range(main.INSURANCE_HUMAN_AUTH_FAILURE_LIMIT):
+        response = client.get(path, headers={'X-Insurance-Human-Key': 'x' * 40})
+        assert response.status_code == 401
+    assert 'insurance_human_auth_failed' in caplog.text
+
+    blocked = client.get(path, headers={'X-Insurance-Human-Key': 'k' * 40})
+    assert blocked.status_code == 401
+    assert 'insurance_human_auth_rate_limited' in caplog.text
 
 
 def test_human_resolution_does_not_echo_internal_validation_error(monkeypatch):

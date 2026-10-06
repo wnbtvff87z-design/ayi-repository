@@ -624,6 +624,7 @@ def sync_outbox(limit=25):
                 try:
                     _retry_outbox(conn, item, code[:80])
                 except Exception:
+                    # The durable claim lease enables recovery if PostgreSQL cannot record the retry.
                     log.critical(
                         'insurance_outbox_retry_schedule_failed case_id=%s outbox_id=%s',
                         str(item['case_id']), item['outbox_id'],

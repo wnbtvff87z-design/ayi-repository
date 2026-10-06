@@ -12,6 +12,11 @@ from booking import BookingError,db,init_schema,url,headers,availability,options
 from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
 from insurance.cases import CaseWorkflowError, MIN_KEY_BYTES
 app=Flask(__name__);log=logging.getLogger(__name__)
+INSURANCE_HUMAN_AUTH_FAILURE_LIMIT=5
+INSURANCE_HUMAN_AUTH_WINDOW_SECONDS=60
+INSURANCE_HUMAN_API_KEY_MAX_BYTES=256
+_insurance_human_auth_failures={}
+_insurance_human_auth_lock=threading.Lock()
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
 INSURANCE_DISABLED_REPLY='Este canal no está disponible para esta consulta.'
@@ -119,11 +124,52 @@ def insurance_human_authorized():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
   audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','')
   key_bytes=key.encode();got_bytes=got.encode()
-  if len(key_bytes)<MIN_KEY_BYTES or not got:
+  audit_key_bytes=audit_key.encode()
+  if len(key_bytes)<MIN_KEY_BYTES or len(audit_key_bytes)<MIN_KEY_BYTES:
+    log.error('insurance_human_auth_configuration_invalid')
     return False
-  if len(audit_key.encode())<MIN_KEY_BYTES:
+  if not got or len(got_bytes)>INSURANCE_HUMAN_API_KEY_MAX_BYTES:
+    _record_insurance_human_auth_failure(audit_key_bytes)
+    log.warning('insurance_human_auth_failed')
     return False
-  return hmac.compare_digest(key_bytes,got_bytes)
+  client_key=hmac.new(
+      audit_key_bytes,(request.remote_addr or 'unknown').encode(),hashlib.sha256
+  ).digest()
+  if _insurance_human_auth_is_limited(client_key):
+    log.warning('insurance_human_auth_rate_limited')
+    return False
+  if not hmac.compare_digest(key_bytes,got_bytes):
+    _record_insurance_human_auth_failure(audit_key_bytes)
+    log.warning('insurance_human_auth_failed')
+    return False
+  with _insurance_human_auth_lock:
+    _insurance_human_auth_failures.pop(client_key,None)
+  return True
+
+def _record_insurance_human_auth_failure(audit_key_bytes):
+  client_key=hmac.new(
+      audit_key_bytes,(request.remote_addr or 'unknown').encode(),hashlib.sha256
+  ).digest()
+  now=time.monotonic()
+  with _insurance_human_auth_lock:
+    _prune_insurance_human_auth_failures(now)
+    failures=_insurance_human_auth_failures.setdefault(client_key,[])
+    failures.append(now)
+
+def _insurance_human_auth_is_limited(client_key):
+  now=time.monotonic()
+  with _insurance_human_auth_lock:
+    _prune_insurance_human_auth_failures(now)
+    return len(_insurance_human_auth_failures.get(client_key,[]))>=INSURANCE_HUMAN_AUTH_FAILURE_LIMIT
+
+def _prune_insurance_human_auth_failures(now):
+  cutoff=now-INSURANCE_HUMAN_AUTH_WINDOW_SECONDS
+  for client_key,failures in list(_insurance_human_auth_failures.items()):
+    recent=[failed_at for failed_at in failures if failed_at>cutoff]
+    if recent:
+      _insurance_human_auth_failures[client_key]=recent
+    else:
+      _insurance_human_auth_failures.pop(client_key,None)
 def insurance_human_actor(credential=None):
   credential=os.getenv('INSURANCE_HUMAN_API_KEY','') if credential is None else credential
   key=credential.encode()
