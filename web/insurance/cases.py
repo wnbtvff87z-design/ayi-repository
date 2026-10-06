@@ -32,14 +32,14 @@ MAX_EVIDENCE_BYTES = 32768
 MAX_OUTBOX_ATTEMPTS = 8
 EXPIRED_OUTBOX_SWEEP_LIMIT = 25
 AIRTABLE_FIELDS = {
-    'case_id': 'Insurance_Case_ID',
-    'customer_ref': 'Customer_Ref',
-    'product': 'Product',
+    'case_id': 'Case ID',
+    'customer_ref': 'Customer Reference',
+    'product': 'Product Type',
     'urgency': 'Urgency',
     'status': 'Status',
-    'reason': 'Escalation_Reason',
-    'summary': 'Task_Summary',
-    'next_action': 'Next_Action',
+    'reason': 'Reason Summary',
+    'summary': 'Task Summary',
+    'next_action': 'Next Action',
     'revision': 'Revision',
 }
 

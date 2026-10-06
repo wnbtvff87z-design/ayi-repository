@@ -264,6 +264,48 @@ def test_airtable_permission_or_contract_rejection_is_retried(
     assert state == {'status': 'pending', 'attempts': 1, 'last_error_code': code}
 
 
+def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkeypatch):
+    case_id = submit_question(external_id='SM-schema-rejected')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'Insurance Cases')
+    captured = {}
+
+    monkeypatch.setattr(
+        cases.requests,
+        'get',
+        lambda *args, **kwargs: FakeResponse({'records': []}),
+    )
+
+    def reject_schema(url, **kwargs):
+        captured.update(kwargs['json']['records'][0]['fields'])
+        return FakeResponse({'error': {'type': 'INVALID_VALUE_FOR_COLUMN'}}, status=422)
+
+    monkeypatch.setattr(cases.requests, 'post', reject_schema)
+
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+    assert set(captured) == {
+        'Case ID',
+        'Customer Reference',
+        'Product Type',
+        'Urgency',
+        'Status',
+        'Reason Summary',
+        'Task Summary',
+        'Next Action',
+        'Revision',
+    }
+    assert captured['Status'] == 'pending'
+    assert captured['Urgency'] == 'normal'
+    assert isinstance(captured['Revision'], int)
+    with pg_schema() as conn:
+        state = conn.execute(
+            'SELECT status,attempts,last_error_code FROM insurance_outbox WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+    assert state == {'status': 'pending', 'attempts': 1, 'last_error_code': 'http_422'}
+
+
 def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schema, monkeypatch):
     case_id = submit_question(external_id='SM-permanent')
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
@@ -391,7 +433,7 @@ def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema
         )
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     assert record['fields']['Status'] == 'pending'
-    assert record['fields']['Task_Summary'].startswith(
+    assert record['fields']['Task Summary'].startswith(
         'Consulta de seguro pendiente de revisión humana:'
     )
     assert record['fields']['Status'] not in ('resolved', 'completed', 'Completada')
@@ -403,9 +445,9 @@ def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
 
     assert calls['patch'] == 3
-    assert record['fields']['Insurance_Case_ID'] == case_id
+    assert record['fields']['Case ID'] == case_id
     assert record['fields']['Status'] == 'resolved'
-    assert record['fields']['Task_Summary'] == 'Caso de seguro resuelto por agente humano.'
+    assert record['fields']['Task Summary'] == 'Caso de seguro resuelto por agente humano.'
     assert '¿Está cubierto' not in json.dumps(record['fields'], ensure_ascii=False)
 
 
@@ -681,8 +723,19 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     incoming('SM-integrated-2', '¿Y si el daño ocurrió antes de la vigencia?')
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     assert record['fields']['Status'] == 'pending'
+    assert set(record['fields']) == {
+        'Case ID',
+        'Customer Reference',
+        'Product Type',
+        'Urgency',
+        'Status',
+        'Reason Summary',
+        'Task Summary',
+        'Next Action',
+        'Revision',
+    }
 
-    case_id = record['fields']['Insurance_Case_ID']
+    case_id = record['fields']['Case ID']
     human_headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
     path = f'/internal/insurance/cases/{case_id}'
     details = client.get(path, headers=human_headers)
