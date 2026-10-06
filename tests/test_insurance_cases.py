@@ -325,6 +325,24 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
     assert events == 1
 
 
+def test_human_resolution_does_not_echo_internal_validation_error(monkeypatch):
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    monkeypatch.setattr(
+        cases,
+        'resolve_case',
+        lambda *args: (_ for _ in ()).throw(ValueError('private internal detail')),
+    )
+    response = main.app.test_client().post(
+        f'/internal/insurance/cases/{uuid.uuid4()}/resolve',
+        headers={'X-Insurance-Human-Key': 'human-console-test-key'},
+        json={'resolved_by': 'agent', 'resolution': 'done'},
+    )
+
+    assert response.status_code == 400
+    assert response.json['message'] == 'Invalid resolution request'
+    assert 'private internal detail' not in response.get_data(as_text=True)
+
+
 @pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
 def test_successful_escalation_persists_before_customer_confirmation(pg_schema, monkeypatch, channel):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')

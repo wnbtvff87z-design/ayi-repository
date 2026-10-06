@@ -330,7 +330,7 @@ def internal_resolve_insurance_case(case_id):
    from insurance.cases import resolve_case
    resolved=resolve_case(case_id,data.get('resolved_by'),data.get('resolution'))
    return jsonify(success=True,case_id=resolved)
-  except ValueError as exc:return jsonify(success=False,message=str(exc)),400
+  except ValueError:return jsonify(success=False,message='Invalid resolution request'),400
   except Exception:log.exception('Insurance case resolution failed');return jsonify(success=False),503
 @app.post('/internal/booking')
 @app.post('/internal/book-test')
