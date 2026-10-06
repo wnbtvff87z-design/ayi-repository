@@ -10,7 +10,7 @@ from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
 from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
-from insurance.cases import CaseWorkflowError
+from insurance.cases import CaseWorkflowError, MIN_KEY_BYTES
 app=Flask(__name__);log=logging.getLogger(__name__)
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
@@ -119,7 +119,11 @@ def insurance_human_authorized():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
   audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','')
   key_bytes=key.encode();got_bytes=got.encode()
-  return bool(len(key_bytes)>=32 and got and len(audit_key.encode())>=32 and hmac.compare_digest(key_bytes,got_bytes))
+  if len(key_bytes)<MIN_KEY_BYTES or not got:
+    return False
+  if len(audit_key.encode())<MIN_KEY_BYTES:
+    return False
+  return hmac.compare_digest(key_bytes,got_bytes)
 def insurance_human_actor():
   key=os.getenv('INSURANCE_HUMAN_API_KEY','').encode()
   audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','').encode()

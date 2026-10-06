@@ -31,6 +31,7 @@ MAX_CONTEXT_BYTES = 32768
 MAX_EVIDENCE_BYTES = 32768
 MAX_OUTBOX_ATTEMPTS = 8
 EXPIRED_OUTBOX_SWEEP_LIMIT = 25
+MIN_KEY_BYTES = 32
 AIRTABLE_FIELDS = {
     'case_id': 'Case ID',
     'customer_ref': 'Customer Reference',
@@ -70,7 +71,7 @@ def _json_object(value, label, maximum):
 
 def _customer_ref(business_id, customer):
     key = os.getenv('INSURANCE_CASE_HMAC_KEY', '')
-    if len(key.encode('utf-8')) < 32:
+    if len(key.encode('utf-8')) < MIN_KEY_BYTES:
         raise CasePersistenceError('Insurance case identity key is not configured')
     normalized = re.sub(r'\D', '', str(customer or ''))
     if not normalized:
@@ -418,6 +419,11 @@ def _airtable_config():
     )
 
 
+def _case_filter_formula(case_id):
+    canonical_case_id = str(uuid.UUID(str(case_id)))
+    return '{' + AIRTABLE_FIELDS['case_id'] + '}=' + json.dumps(canonical_case_id)
+
+
 def _upsert_airtable(payload, existing_record):
     base_url, headers = _airtable_config()
     fields = {
@@ -435,7 +441,7 @@ def _upsert_airtable(payload, existing_record):
         if response.status_code != 404:
             response.raise_for_status()
             return str(existing_record)
-    formula = '{' + AIRTABLE_FIELDS['case_id'] + '}=' + json.dumps(payload['case_id'])
+    formula = _case_filter_formula(payload['case_id'])
     response = requests.get(
         base_url,
         headers=headers,

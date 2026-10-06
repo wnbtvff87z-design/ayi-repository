@@ -310,6 +310,11 @@ def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkey
     assert state == {'status': 'pending', 'attempts': 1, 'last_error_code': 'http_422'}
 
 
+def test_airtable_case_filter_requires_uuid():
+    with pytest.raises(ValueError):
+        cases._case_filter_formula('not-a-uuid')
+
+
 def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schema, monkeypatch):
     case_id = submit_question(external_id='SM-permanent')
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
