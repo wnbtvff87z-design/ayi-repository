@@ -240,6 +240,32 @@ def test_outbox_retries_airtable_failure_and_alerts_without_losing_pg_case(pg_sc
     assert 'insurance_outbox_sync_failed' in caplog.text
 
 
+@pytest.mark.parametrize(
+    ('status', 'code'),
+    [(403, 'http_403'), (404, 'http_404'), (422, 'http_422')],
+)
+def test_airtable_permission_or_contract_rejection_is_retried(
+    pg_schema, monkeypatch, status, code
+):
+    case_id = submit_question(external_id=f'SM-rejected-{status}')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceTasks')
+    monkeypatch.setattr(
+        cases.requests,
+        'get',
+        lambda *args, **kwargs: FakeResponse({}, status=status),
+    )
+
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+    with pg_schema() as conn:
+        state = conn.execute(
+            'SELECT status,attempts,last_error_code FROM insurance_outbox WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+    assert state == {'status': 'pending', 'attempts': 1, 'last_error_code': code}
+
+
 def test_permanent_outbox_failure_stops_after_eight_attempts_and_alerts(pg_schema, monkeypatch):
     case_id = submit_question(external_id='SM-permanent')
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
@@ -473,6 +499,119 @@ def test_worker_imports_without_secrets_and_run_rejects_missing_config(monkeypat
 
     with pytest.raises(RuntimeError, match='INSURANCE_DATABASE_URL'):
         outbox_worker.run()
+
+
+def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
+    pg_schema, monkeypatch
+):
+    monkeypatch.setenv('INSURANCE_ENABLED', 'true')
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    monkeypatch.setenv('INSURANCE_HUMAN_API_KEY', 'human-console-test-key')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceCases')
+    business = {
+        'business_id': 'INS-BUSINESS',
+        'sector': 'insurance',
+        'insurance_product': 'hogar',
+    }
+    monkeypatch.setattr(main, 'lookup', lambda *args: business)
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
+    monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared database accessed'))
+    monkeypatch.setattr(
+        main,
+        'save_conversation',
+        lambda *args: pytest.fail('shared Airtable conversation table accessed'),
+    )
+    record = {}
+    calls = {'get': 0, 'post': 0, 'patch': 0}
+
+    def get(url, **kwargs):
+        calls['get'] += 1
+        records = [{'id': record['id'], 'fields': record['fields']}] if record else []
+        return FakeResponse({'records': records})
+
+    def post(url, **kwargs):
+        calls['post'] += 1
+        fields = kwargs['json']['records'][0]['fields']
+        record.update({'id': 'rec-integrated-case', 'fields': fields})
+        if calls['post'] == 1:
+            raise requests.ConnectionError('simulated lost create response')
+        return FakeResponse({'records': [{'id': record['id']}]})
+
+    def patch(url, **kwargs):
+        calls['patch'] += 1
+        record['fields'].update(kwargs['json']['fields'])
+        return FakeResponse({'id': record['id']})
+
+    monkeypatch.setattr(cases.requests, 'get', get)
+    monkeypatch.setattr(cases.requests, 'post', post)
+    monkeypatch.setattr(cases.requests, 'patch', patch)
+    client = main.app.test_client()
+
+    def incoming(sid, question):
+        response = client.post(
+            '/webhook-whatsapp',
+            data={
+                'To': 'whatsapp:+34600111222',
+                'From': 'whatsapp:+34600999888',
+                'Body': question,
+                'MessageSid': sid,
+            },
+        )
+        assert response.status_code == 200
+        assert 'He guardado tu consulta para revisión humana.' in response.get_data(as_text=True)
+
+    incoming('SM-integrated-1', '¿La póliza cubre esta filtración?')
+    with pg_schema() as conn:
+        case_id = str(conn.execute('SELECT case_id FROM insurance_cases').fetchone()['case_id'])
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': False}]
+    with pg_schema() as conn:
+        conn.execute(
+            "UPDATE insurance_outbox SET next_attempt_at=now()-interval '1 second' "
+            "WHERE status='pending'"
+        )
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    record['fields']['Status'] = 'resolved'
+    incoming('SM-integrated-2', '¿Y si el daño ocurrió antes de la vigencia?')
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    assert record['fields']['Status'] == 'pending'
+
+    case_id = record['fields']['Insurance_Case_ID']
+    human_headers = {'X-Insurance-Human-Key': 'human-console-test-key'}
+    path = f'/internal/insurance/cases/{case_id}'
+    details = client.get(path, headers=human_headers)
+    assert details.status_code == 200
+    assert [row['question'] for row in details.json['questions']] == [
+        '¿La póliza cubre esta filtración?',
+        '¿Y si el daño ocurrió antes de la vigencia?',
+    ]
+    resolved = client.post(
+        path + '/resolve',
+        headers=human_headers,
+        json={'resolved_by': 'fictional-agent', 'resolution': 'Revisión ficticia completada.'},
+    )
+    assert resolved.status_code == 200
+    assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
+    assert record['fields']['Status'] == 'resolved'
+    assert calls['post'] == 1
+    assert calls['patch'] == 3
+    assert '¿La póliza' not in json.dumps(record['fields'], ensure_ascii=False)
+    assert '+34600999888' not in json.dumps(record['fields'], ensure_ascii=False)
+    assert 'POLICY-TEST' not in json.dumps(record['fields'], ensure_ascii=False)
+    with pg_schema() as conn:
+        state = conn.execute(
+            'SELECT status,resolved_by FROM insurance_cases WHERE case_id=%s',
+            (case_id,),
+        ).fetchone()
+        queue = conn.execute(
+            "SELECT count(*) AS total FROM insurance_outbox "
+            "WHERE case_id=%s AND status='done'",
+            (case_id,),
+        ).fetchone()['total']
+    assert state == {'status': 'resolved', 'resolved_by': 'fictional-agent'}
+    assert queue == 3
 
 
 @pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])

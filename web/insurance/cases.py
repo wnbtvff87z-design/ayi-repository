@@ -164,47 +164,41 @@ def create_or_update_case(
                 (f'{business_id}:{customer_ref}:{thread_key}',),
             )
             existing = conn.execute(
-                'SELECT case_id FROM insurance_case_questions '
-                'WHERE business_id=%s AND channel=%s AND external_id=%s',
-                (business_id, channel, external_id),
+                'SELECT case_id,updates,'
+                '(question IS DISTINCT FROM %s '
+                'OR policy_id IS DISTINCT FROM COALESCE(%s,policy_id) '
+                'OR policy_version_id IS DISTINCT FROM COALESCE(%s,policy_version_id) '
+                'OR reason IS DISTINCT FROM %s OR urgency IS DISTINCT FROM %s '
+                'OR next_action IS DISTINCT FROM %s '
+                'OR context IS DISTINCT FROM (context || %s::jsonb) '
+                'OR NOT (evidence @> %s::jsonb)) AS changed,'
+                '(updates @> %s::jsonb) AS snapshot_exists '
+                'FROM insurance_case_questions '
+                'WHERE business_id=%s AND channel=%s AND external_id=%s FOR UPDATE',
+                (
+                    question, policy_id, policy_version_id, reason, urgency,
+                    next_action, context_json, evidence_json, update_snapshot,
+                    business_id, channel, external_id,
+                ),
             ).fetchone()
             if existing:
+                if not existing['changed'] or existing['snapshot_exists']:
+                    return str(existing['case_id'])
                 changed = conn.execute(
                     'UPDATE insurance_case_questions SET '
-                    'updates=CASE WHEN NOT (updates @> %s::jsonb) AND ('
-                    'question IS DISTINCT FROM %s OR policy_id IS DISTINCT FROM COALESCE(%s,policy_id) '
-                    'OR policy_version_id IS DISTINCT FROM COALESCE(%s,policy_version_id) '
-                    'OR reason IS DISTINCT FROM %s OR urgency IS DISTINCT FROM %s '
-                    'OR next_action IS DISTINCT FROM %s '
-                    'OR context IS DISTINCT FROM (context || %s::jsonb) '
-                    'OR NOT (evidence @> %s::jsonb)) '
-                    'THEN updates || %s::jsonb ELSE updates END,'
+                    'updates=updates || %s::jsonb,'
                     'policy_id=COALESCE(%s,policy_id),policy_version_id=COALESCE(%s,policy_version_id),'
                     'reason=%s,urgency=%s,next_action=%s,context=context || %s::jsonb,'
                     'evidence=CASE WHEN evidence @> %s::jsonb THEN evidence '
                     'ELSE evidence || %s::jsonb END '
-                    'WHERE business_id=%s AND channel=%s AND external_id=%s AND ('
-                    'question IS DISTINCT FROM %s '
-                    'OR policy_id IS DISTINCT FROM COALESCE(%s,policy_id) '
-                    'OR policy_version_id IS DISTINCT FROM COALESCE(%s,policy_version_id) '
-                    'OR reason IS DISTINCT FROM %s OR urgency IS DISTINCT FROM %s '
-                    'OR next_action IS DISTINCT FROM %s '
-                    'OR context IS DISTINCT FROM (context || %s::jsonb) '
-                    'OR NOT (evidence @> %s::jsonb)) '
-                    'AND NOT (updates @> %s::jsonb) RETURNING case_id',
+                    'WHERE business_id=%s AND channel=%s AND external_id=%s '
+                    'RETURNING case_id',
                     (
-                        update_snapshot, question, policy_id, policy_version_id, reason,
-                        urgency, next_action, context_json, evidence_json, update_snapshot,
-                        policy_id,
-                        policy_version_id, reason, urgency, next_action, context_json,
-                        evidence_json, evidence_json, business_id, channel, external_id,
-                        question, policy_id,
-                        policy_version_id, reason, urgency, next_action,
-                        context_json, evidence_json, update_snapshot,
+                        update_snapshot, policy_id, policy_version_id, reason, urgency,
+                        next_action, context_json, evidence_json, evidence_json,
+                        business_id, channel, external_id,
                     ),
                 ).fetchone()
-                if not changed:
-                    return str(existing['case_id'])
                 case_id = changed['case_id']
                 row = conn.execute(
                     'SELECT customer_ref,product,urgency FROM insurance_cases '
