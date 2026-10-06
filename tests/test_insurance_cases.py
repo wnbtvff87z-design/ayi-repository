@@ -305,8 +305,8 @@ def test_airtable_schema_rejection_retries_exact_case_contract(pg_schema, monkey
         'Next Action',
         'Revision',
     }
-    assert captured['Status'] == 'pending'
-    assert captured['Urgency'] == 'normal'
+    assert captured['Status'] == 'Pendiente'
+    assert captured['Urgency'] == 'Normal'
     assert captured['Next Action'] == 'Abrir el caso en el sistema seguro y seguir el protocolo aprobado.'
     assert isinstance(captured['Revision'], int)
     assert lookup['filterByFormula'] == '{Case ID}=' + json.dumps(case_id)
@@ -547,7 +547,7 @@ def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema
             (case_id,),
         )
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
-    assert record['fields']['Status'] == 'pending'
+    assert record['fields']['Status'] == 'Pendiente'
     assert record['fields']['Task Summary'].startswith(
         'Consulta de seguro pendiente de revisión humana:'
     )
@@ -561,7 +561,7 @@ def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema
 
     assert calls['patch'] == 3
     assert record['fields']['Case ID'] == case_id
-    assert record['fields']['Status'] == 'resolved'
+    assert record['fields']['Status'] == 'Resuelto'
     assert record['fields']['Task Summary'] == 'Caso de seguro resuelto por agente humano.'
     assert '¿Está cubierto' not in json.dumps(record['fields'], ensure_ascii=False)
 
@@ -871,7 +871,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     record['fields']['Status'] = 'resolved'
     incoming('SM-integrated-2', '¿Y si el daño ocurrió antes de la vigencia?')
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
-    assert record['fields']['Status'] == 'pending'
+    assert record['fields']['Status'] == 'Pendiente'
     assert set(record['fields']) == {
         'Case ID',
         'Customer Reference',
@@ -900,7 +900,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     )
     assert resolved.status_code == 200
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
-    assert record['fields']['Status'] == 'resolved'
+    assert record['fields']['Status'] == 'Resuelto'
     assert calls['post'] == 1
     assert calls['patch'] == 3
     assert '¿La póliza' not in json.dumps(record['fields'], ensure_ascii=False)

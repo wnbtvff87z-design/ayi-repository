@@ -12,6 +12,8 @@ from booking import BookingError,db,init_schema,url,headers,availability,options
 from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
 from insurance.cases import CaseWorkflowError, MIN_KEY_BYTES
 app=Flask(__name__);log=logging.getLogger(__name__)
+from insurance.admin import bp as insurance_admin_bp
+app.register_blueprint(insurance_admin_bp)
 INSURANCE_HUMAN_AUTH_FAILURE_LIMIT=5
 INSURANCE_HUMAN_AUTH_WINDOW_SECONDS=60
 INSURANCE_HUMAN_API_KEY_MAX_BYTES=256
