@@ -9,6 +9,7 @@ from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
 from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
+from insurance.cases import CaseWorkflowError
 app=Flask(__name__);log=logging.getLogger(__name__)
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
@@ -55,6 +56,9 @@ def _tenant_lookup(number,channel):
   return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or '').strip().lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 _lookup_cache={}
 _lookup_lock=threading.Lock()
+def _raise_sector_lookup_error(exc):
+  error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
+  raise error(str(exc)) from exc
 def lookup(number,channel,with_sector=False):
   if channel not in ('Voice','WhatsApp'):raise BookingError('Canal no reconocido')
   number=phone(number)
@@ -67,8 +71,7 @@ def lookup(number,channel,with_sector=False):
     if cached[1]:
      try:cached_sector=sector_of(cached[1])
      except BusinessSectorError as exc:
-      error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
-      raise error(str(exc)) from exc
+      _raise_sector_lookup_error(exc)
     if cached_sector!='insurance':return (cached[1],cached_sector) if with_sector else cached[1]
   if MODE=='new':b=_tenant_lookup(number,channel)
   else:
@@ -83,8 +86,7 @@ def lookup(number,channel,with_sector=False):
   if b:
    try:sector=sector_of(b)
    except BusinessSectorError as exc:
-    error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
-    raise error(str(exc)) from exc
+    _raise_sector_lookup_error(exc)
   with _lookup_lock:
    if sector=='insurance':_lookup_cache.pop(key,None)
    else:_lookup_cache[key]=(now+ttl,b)
@@ -331,6 +333,7 @@ def internal_resolve_insurance_case(case_id):
    resolved=resolve_case(case_id,data.get('resolved_by'),data.get('resolution'))
    return jsonify(success=True,case_id=resolved)
   except ValueError:return jsonify(success=False,message='Invalid resolution request'),400
+  except CaseWorkflowError:return jsonify(success=False,message='Pending insurance case not found'),404
   except Exception:log.exception('Insurance case resolution failed');return jsonify(success=False),503
 @app.post('/internal/booking')
 @app.post('/internal/book-test')

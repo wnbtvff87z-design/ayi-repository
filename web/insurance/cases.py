@@ -448,53 +448,53 @@ def _upsert_airtable(payload, existing_record):
     return str(record_id)
 
 
-def _claim_outbox_item():
-    with db() as conn:
-        expired = conn.execute(
-            "UPDATE insurance_outbox SET status='failed',locked_until=NULL,"
-            "last_error_code='lease_expired_max_attempts' "
-            "WHERE status='processing' AND locked_until<now() AND attempts>=%s "
-            'RETURNING outbox_id,case_id,attempts,last_error_code',
-            (MAX_OUTBOX_ATTEMPTS,),
-        ).fetchall()
+def _fail_expired_outbox_leases(conn):
+    expired = conn.execute(
+        "UPDATE insurance_outbox SET status='failed',locked_until=NULL,"
+        "last_error_code='lease_expired_max_attempts' "
+        "WHERE status='processing' AND locked_until<now() AND attempts>=%s "
+        'RETURNING outbox_id,case_id,attempts,last_error_code',
+        (MAX_OUTBOX_ATTEMPTS,),
+    ).fetchall()
     for item in expired:
         _notify_outbox_failure(item, item['last_error_code'], True)
-    with db() as conn:
-        return conn.execute(
-            """
-            WITH candidate AS (
-                SELECT o.outbox_id
-                FROM insurance_outbox o
-                WHERE (
-                    (o.status='pending' AND o.next_attempt_at<=now() AND o.attempts<%s)
-                    OR (o.status='processing' AND o.locked_until<now() AND o.attempts<%s)
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM insurance_outbox older
-                    WHERE older.case_id=o.case_id
-                    AND older.revision<o.revision
-                    AND older.status NOT IN ('done','failed')
-                )
-                ORDER BY o.next_attempt_at,o.outbox_id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
+
+
+def _claim_outbox_item(conn):
+    return conn.execute(
+        """
+        WITH candidate AS (
+            SELECT o.outbox_id
+            FROM insurance_outbox o
+            WHERE (
+                (o.status='pending' AND o.next_attempt_at<=now() AND o.attempts<%s)
+                OR (o.status='processing' AND o.locked_until<now() AND o.attempts<%s)
             )
-            UPDATE insurance_outbox o
-            SET status='processing',attempts=o.attempts+1,
-                locked_until=now()+interval '2 minutes'
-            FROM candidate
-            WHERE o.outbox_id=candidate.outbox_id
-            RETURNING o.outbox_id,o.case_id,o.payload,o.attempts,
-                      (SELECT c.airtable_record_id FROM insurance_cases c
-                       WHERE c.case_id=o.case_id) AS airtable_record_id
-            """
-            ,
-            (MAX_OUTBOX_ATTEMPTS, MAX_OUTBOX_ATTEMPTS),
-        ).fetchone()
+            AND NOT EXISTS (
+                SELECT 1 FROM insurance_outbox older
+                WHERE older.case_id=o.case_id
+                AND older.revision<o.revision
+                AND older.status NOT IN ('done','failed')
+            )
+            ORDER BY o.next_attempt_at,o.outbox_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        UPDATE insurance_outbox o
+        SET status='processing',attempts=o.attempts+1,
+            locked_until=now()+interval '2 minutes'
+        FROM candidate
+        WHERE o.outbox_id=candidate.outbox_id
+        RETURNING o.outbox_id,o.case_id,o.payload,o.attempts,
+                  (SELECT c.airtable_record_id FROM insurance_cases c
+                   WHERE c.case_id=o.case_id) AS airtable_record_id
+        """,
+        (MAX_OUTBOX_ATTEMPTS, MAX_OUTBOX_ATTEMPTS),
+    ).fetchone()
 
 
-def _finish_outbox(item, record_id):
-    with db() as conn:
+def _finish_outbox(conn, item, record_id):
+    with conn.transaction():
         conn.execute(
             "UPDATE insurance_outbox SET status='done',completed_at=now(),locked_until=NULL "
             'WHERE outbox_id=%s',
@@ -532,15 +532,21 @@ def _notify_outbox_failure(item, error_code, permanent):
             )
 
 
-def _retry_outbox(item, error_code):
+def _retry_outbox(conn, item, error_code):
     permanent = int(item['attempts']) >= MAX_OUTBOX_ATTEMPTS
-    delay = min(2 ** min(int(item['attempts']), 10) * 30, 3600)
-    with db() as conn:
+    if permanent:
         conn.execute(
-            'UPDATE insurance_outbox SET status=%s,locked_until=NULL,'
+            "UPDATE insurance_outbox SET status='failed',locked_until=NULL,last_error_code=%s "
+            'WHERE outbox_id=%s',
+            (error_code, item['outbox_id']),
+        )
+    else:
+        delay = min(2 ** min(int(item['attempts']), 10) * 30, 3600)
+        conn.execute(
+            "UPDATE insurance_outbox SET status='pending',locked_until=NULL,"
             "next_attempt_at=now()+(%s * interval '1 second'),last_error_code=%s "
             'WHERE outbox_id=%s',
-            ('failed' if permanent else 'pending', delay, error_code, item['outbox_id']),
+            (delay, error_code, item['outbox_id']),
         )
     _notify_outbox_failure(item, error_code, permanent)
 
@@ -549,23 +555,27 @@ def sync_outbox(limit=25):
     """Synchronize ready outbox rows; PG remains authoritative on all failures."""
     max_items = min(max(int(limit), 1), 100)
     results = []
-    for _ in range(max_items):
-        item = _claim_outbox_item()
-        if not item:
-            break
-        try:
-            record_id = _upsert_airtable(item['payload'], item['airtable_record_id'])
-            _finish_outbox(item, record_id)
-            results.append({'case_id': str(item['case_id']), 'synced': True})
-        except Exception as exc:
-            response = getattr(exc, 'response', None)
-            code = f'http_{response.status_code}' if response is not None else type(exc).__name__
+    with db() as conn:
+        conn.commit()
+        conn.autocommit = True
+        _fail_expired_outbox_leases(conn)
+        for _ in range(max_items):
+            item = _claim_outbox_item(conn)
+            if not item:
+                break
             try:
-                _retry_outbox(item, code[:80])
-            except Exception:
-                log.critical(
-                    'insurance_outbox_retry_schedule_failed case_id=%s outbox_id=%s',
-                    str(item['case_id']), item['outbox_id'],
-                )
-            results.append({'case_id': str(item['case_id']), 'synced': False})
+                record_id = _upsert_airtable(item['payload'], item['airtable_record_id'])
+                _finish_outbox(conn, item, record_id)
+                results.append({'case_id': str(item['case_id']), 'synced': True})
+            except Exception as exc:
+                response = getattr(exc, 'response', None)
+                code = f'http_{response.status_code}' if response is not None else type(exc).__name__
+                try:
+                    _retry_outbox(conn, item, code[:80])
+                except Exception:
+                    log.critical(
+                        'insurance_outbox_retry_schedule_failed case_id=%s outbox_id=%s',
+                        str(item['case_id']), item['outbox_id'],
+                    )
+                results.append({'case_id': str(item['case_id']), 'synced': False})
     return results

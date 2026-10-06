@@ -375,6 +375,41 @@ def test_outbox_retry_upserts_same_airtable_task_and_orders_resolution(pg_schema
     assert '¿Está cubierto' not in json.dumps(record['fields'], ensure_ascii=False)
 
 
+def test_outbox_batch_reuses_one_postgres_connection(pg_schema, monkeypatch):
+    case_ids = [
+        submit_question(
+            external_id=f'SM-batch-{index}',
+            policy_id=f'POLICY-{index}',
+        )
+        for index in range(3)
+    ]
+    monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'test-token')
+    monkeypatch.setenv('AIRTABLE_INSURANCE_CASES_TABLE', 'InsuranceTasks')
+    original_db = cases.db
+    connections = []
+    records = []
+
+    def db():
+        connections.append(True)
+        return original_db()
+
+    def post(url, **kwargs):
+        record_id = f'rec-batch-{len(records)}'
+        records.append(record_id)
+        return FakeResponse({'records': [{'id': record_id}]})
+
+    monkeypatch.setattr(cases, 'db', db)
+    monkeypatch.setattr(cases.requests, 'get', lambda *args, **kwargs: FakeResponse({'records': []}))
+    monkeypatch.setattr(cases.requests, 'post', post)
+
+    result = cases.sync_outbox(limit=3)
+
+    assert result == [{'case_id': case_id, 'synced': True} for case_id in case_ids]
+    assert len(connections) == 1
+    assert len(records) == 3
+
+
 def test_deleted_airtable_mirror_is_recreated_on_next_revision(pg_schema, monkeypatch):
     case_id = submit_question(external_id='SM-deleted')
     monkeypatch.setenv('AIRTABLE_INSURANCE_BASE_ID', 'appTestBase')
@@ -438,6 +473,13 @@ def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monk
         json={'resolved_by': 'human-agent-1', 'resolution': 'Consulta revisada.'},
     )
     assert resolved.status_code == 200
+    missing = client.post(
+        f'/internal/insurance/cases/{uuid.uuid4()}/resolve',
+        headers=headers,
+        json={'resolved_by': 'human-agent-1', 'resolution': 'No existe.'},
+    )
+    assert missing.status_code == 404
+    assert missing.json['message'] == 'Pending insurance case not found'
     assert resolved.json['case_id'] == case_id
     assert cases.resolve_case(case_id, 'human-agent-1', 'duplicate retry') == case_id
     with pg_schema() as conn:
