@@ -1,4 +1,5 @@
 import hmac,json,logging,os,re,time,threading,unicodedata
+import hashlib
 from datetime import timezone, datetime, timedelta
 from urllib.parse import quote,urlparse
 from zoneinfo import ZoneInfo
@@ -8,10 +9,18 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
-from dialog import process
+from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
+from insurance.cases import CaseWorkflowError, MIN_KEY_BYTES
 app=Flask(__name__);log=logging.getLogger(__name__)
+INSURANCE_HUMAN_AUTH_FAILURE_LIMIT=5
+INSURANCE_HUMAN_AUTH_WINDOW_SECONDS=60
+INSURANCE_HUMAN_API_KEY_MAX_BYTES=256
+_insurance_human_auth_failures={}
+_insurance_human_auth_lock=threading.Lock()
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
+INSURANCE_DISABLED_REPLY='Este canal no está disponible para esta consulta.'
+class InsuranceDisabledError(BookingError):pass
 def phone(v):
   digits=re.sub(r'\D','',str(v or '').removeprefix('whatsapp:'))
   return '+'+digits if digits else ''
@@ -50,16 +59,26 @@ def _tenant_lookup(number,channel):
   if len(links)!=1:raise BookingError('Número sin negocio único')
   r=requests.get(url(os.getenv('AIRTABLE_BUSINESSES_TABLE','Negocios'),links[0]),headers=headers(),timeout=10);r.raise_for_status();f=r.json()['fields']
   if f.get('Estado')!='Activo' or not f.get('Business_ID'):return None
-  return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or 'general').lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
+  return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or '').strip().lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 _lookup_cache={}
 _lookup_lock=threading.Lock()
-def lookup(number,channel):
+def _raise_sector_lookup_error(exc):
+  error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
+  raise error(str(exc)) from exc
+def lookup(number,channel,with_sector=False):
+  if channel not in ('Voice','WhatsApp'):raise BookingError('Canal no reconocido')
   number=phone(number)
-  if not number:return None
+  if not number:return (None,None) if with_sector else None
   key=(number,channel);now=time.monotonic();ttl=int(os.getenv('BUSINESS_CACHE_TTL_SECONDS','60'))
   with _lookup_lock:
    cached=_lookup_cache.get(key)
-   if cached and cached[0]>now:return cached[1]
+   if cached and cached[0]>now:
+    cached_sector=None
+    if cached[1]:
+     try:cached_sector=sector_of(cached[1])
+     except BusinessSectorError as exc:
+      _raise_sector_lookup_error(exc)
+    if cached_sector!='insurance':return (cached[1],cached_sector) if with_sector else cached[1]
   if MODE=='new':b=_tenant_lookup(number,channel)
   else:
    if MODE not in ('legacy','shadow'):raise BookingError('TENANT_LOOKUP_MODE inválido')
@@ -69,9 +88,17 @@ def lookup(number,channel):
      other=_tenant_lookup(number,channel)
      if other and b and other['name'].casefold()!=b['name'].casefold():log.warning('Shadow lookup mismatch for %s',channel)
     except Exception:log.exception('Shadow lookup failed')
-  with _lookup_lock:_lookup_cache[key]=(now+ttl,b)
-  return b
-def save_conversation(b,customer,question,answer,status):
+  sector=None
+  if b:
+   try:sector=sector_of(b)
+   except BusinessSectorError as exc:
+    _raise_sector_lookup_error(exc)
+  with _lookup_lock:
+   if sector=='insurance':_lookup_cache.pop(key,None)
+   else:_lookup_cache[key]=(now+ttl,b)
+  return (b,sector) if with_sector else b
+def save_conversation(b,customer,question,answer,status,sector=None):
+  if (sector if sector is not None else sector_of(b))=='insurance':raise BookingError('Las conversaciones de seguros no se espejan en Airtable')
   table=os.getenv('AIRTABLE_CONVERSATIONS_TABLE','Conversaciones')
   f={'Twilio_Phone':phone(b['phone']),'Customer_Phone':phone(customer),'Question':str(question),'Answer':str(answer or ''),'Timestamp':datetime.now(timezone.utc).isoformat(),'Status':status}
   if MODE=='new':f['Business_ID']=b['business_id']
@@ -93,6 +120,60 @@ def open_now(b):
 def authorized():
   key=os.getenv('INTERNAL_API_KEY','');got=request.headers.get('X-Internal-API-Key','')
   return bool(key and got and hmac.compare_digest(key,got))
+def insurance_human_authorized():
+  key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
+  audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','')
+  key_bytes=key.encode();got_bytes=got.encode()
+  audit_key_bytes=audit_key.encode()
+  if len(key_bytes)<MIN_KEY_BYTES or len(audit_key_bytes)<MIN_KEY_BYTES:
+    log.error('insurance_human_auth_configuration_invalid')
+    return False
+  client_key=hmac.new(
+      audit_key_bytes,(request.remote_addr or 'unknown').encode(),hashlib.sha256
+  ).digest()
+  if _insurance_human_auth_is_limited(client_key):
+    log.warning('insurance_human_auth_rate_limited')
+    return False
+  if not got or len(got_bytes)>INSURANCE_HUMAN_API_KEY_MAX_BYTES:
+    _record_insurance_human_auth_failure(client_key)
+    log.warning('insurance_human_auth_failed')
+    return False
+  if not hmac.compare_digest(key_bytes,got_bytes):
+    _record_insurance_human_auth_failure(client_key)
+    log.warning('insurance_human_auth_failed')
+    return False
+  with _insurance_human_auth_lock:
+    _insurance_human_auth_failures.pop(client_key,None)
+  return True
+
+def _record_insurance_human_auth_failure(client_key):
+  now=time.monotonic()
+  with _insurance_human_auth_lock:
+    _prune_insurance_human_auth_failures(now)
+    failures=_insurance_human_auth_failures.setdefault(client_key,[])
+    failures.append(now)
+
+def _insurance_human_auth_is_limited(client_key):
+  now=time.monotonic()
+  with _insurance_human_auth_lock:
+    _prune_insurance_human_auth_failures(now)
+    return len(_insurance_human_auth_failures.get(client_key,[]))>=INSURANCE_HUMAN_AUTH_FAILURE_LIMIT
+
+def _prune_insurance_human_auth_failures(now):
+  cutoff=now-INSURANCE_HUMAN_AUTH_WINDOW_SECONDS
+  for client_key,failures in list(_insurance_human_auth_failures.items()):
+    recent=[failed_at for failed_at in failures if failed_at>cutoff]
+    if recent:
+      _insurance_human_auth_failures[client_key]=recent
+    else:
+      _insurance_human_auth_failures.pop(client_key,None)
+def insurance_human_actor(credential=None):
+  credential=os.getenv('INSURANCE_HUMAN_API_KEY','') if credential is None else credential
+  key=credential.encode()
+  audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','').encode()
+  if len(key)<MIN_KEY_BYTES or len(audit_key)<MIN_KEY_BYTES:
+    raise RuntimeError('Insurance human audit keys are not configured safely')
+  return 'shared-key:v1:'+hmac.new(audit_key,key,hashlib.sha256).hexdigest()
 def _twilio_candidates(base,path,query):
   host=request.headers.get('Host','');xh=request.headers.get('X-Forwarded-Host','').split(',')[0].strip();xp=request.headers.get('X-Forwarded-Proto','').split(',')[0].strip()
   rd=os.getenv('RAILWAY_PUBLIC_DOMAIN','').strip();c={}
@@ -157,8 +238,11 @@ def recent_history(c,bid,channel,customer,external_id):
    (bid,channel,customer),
   ).fetchall()
 
-def converse(b,channel,customer,text,external_id,include_end_reason=False):
+def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
+  if (sector if sector is not None else sector_of(b))=='insurance':
+   reply,_=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector)
+   return (reply,None) if include_end_reason else reply
   init_schema();bid=b['business_id']
   with db() as c:
    c.execute('INSERT INTO customer_sessions(business_id,channel,customer_phone) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING',(bid,channel,customer))
@@ -205,21 +289,25 @@ def whatsapp():
   if not twilio_valid():return Response('Forbidden',status=403)
   tw=MessagingResponse()
   try:
-   b=lookup(request.form.get('To') or PHONE,'WhatsApp');text=request.form.get('Body','').strip()
+   b,sector=lookup(request.form.get('To'),'WhatsApp',with_sector=True);text=request.form.get('Body','').strip()
    if not b:answer='No puedo identificar el negocio asociado a este número.'
    elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
-   else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''))
-   if b and text and answer:
-    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
+   else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''),sector=sector)
+   if b and text and answer and sector!='insurance':
+    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp',sector=sector)
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
+  except InsuranceDisabledError:tw.message(INSURANCE_DISABLED_REPLY)
   except Exception:log.exception('WhatsApp error');tw.message('No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
   return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
 def voice():
   if not twilio_valid():return Response('Forbidden',status=403)
   r=VoiceResponse();relay=os.getenv('RELAY_VOICE_URL','')
-  try:b=lookup(request.form.get('To') or PHONE,'Voice')
+  try:b=lookup(request.form.get('To'),'Voice')
+  except InsuranceDisabledError:
+   r.say(INSURANCE_DISABLED_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
   except Exception:log.exception('Voice business lookup failed');b=None
   if b and open_now(b) and phone(b.get('reception')):
    dial=r.dial(action='/voice-dial-result',method='POST',timeout=20,answer_on_bridge=True);dial.number(phone(b['reception']))
@@ -271,9 +359,9 @@ def internal_turn():
   if not authorized():return jsonify(success=False),401
   d=request.get_json(silent=True) or {}
   try:
-   channel=d.get('channel','Voice');b=lookup(d.get('business_phone'),channel)
+   channel=d.get('channel','Voice');b,sector=lookup(d.get('business_phone'),channel,with_sector=True)
    if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-   reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),include_end_reason=True)
+   reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),include_end_reason=True,sector=sector)
    end_reason=end_reason if end_reason in ('goodbye','cancelled','verification') else None
    return jsonify(success=True,reply=reply,end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
   except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
@@ -285,6 +373,29 @@ def internal_reconcile_pending():
    result=reconcile_pending((request.get_json(silent=True) or {}).get('limit',25))
    return jsonify(success=True,results=result)
   except Exception:log.exception('Reconciliation failed');return jsonify(success=False),503
+@app.get('/internal/insurance/cases/<uuid:case_id>')
+def insurance_case_detail(case_id):
+  if not insurance_human_authorized():return jsonify(success=False),401
+  try:
+   from insurance.cases import get_case
+   case=get_case(case_id)
+   return (jsonify(success=True,**case),200) if case else (jsonify(success=False),404)
+  except Exception:log.exception('Insurance case read failed');return jsonify(success=False),503
+@app.post('/internal/insurance/cases/<uuid:case_id>/resolve')
+def internal_resolve_insurance_case(case_id):
+  if not insurance_human_authorized():return jsonify(success=False),401
+  data=request.get_json(silent=True) or {}
+  try:
+   from insurance.cases import resolve_case
+   resolved=resolve_case(
+       case_id,
+       insurance_human_actor(request.headers.get('X-Insurance-Human-Key','')),
+       data.get('resolution'),
+   )
+   return jsonify(success=True,case_id=resolved)
+  except ValueError:return jsonify(success=False,message='Invalid resolution request'),400
+  except CaseWorkflowError:return jsonify(success=False,message='Pending insurance case not found'),404
+  except Exception:log.exception('Insurance case resolution failed');return jsonify(success=False),503
 @app.post('/internal/booking')
 @app.post('/internal/book-test')
 def internal_booking():
