@@ -12,12 +12,13 @@ itself must already be in the bucket at storage.object_key(...); the document wo
     --document-id DOC-000456 --sha256 <64 hex> --apply
 """
 import argparse
+import hashlib
 import os
 import sys
 from datetime import date
 
 from insurance import cases as _cases
-from insurance import identity
+from insurance import identity, storage
 from insurance.documents import ID_RE, RegistrationError, register_existing_object
 
 
@@ -28,6 +29,8 @@ def provision(conn, *, actor, business_id, customer_id, display_name, document, 
                      ('policy_id', policy_id), ('version_id', version_id)):
         if not isinstance(v, str) or not ID_RE.fullmatch(v):
             raise ValueError(f'invalid {label}')
+    if contract_number is not None and not identity.CONTRACT_NUMBER_RE.fullmatch(contract_number):
+        raise ValueError('invalid contract_number')
     if bool(document_id) != bool(sha256):
         raise ValueError('--document-id and --sha256 must be given together')
     if not identity.document_hmac(business_id, document) or not identity.name_hmac(
@@ -75,8 +78,25 @@ def main(argv=None):
     p.add_argument('--valid-to', type=date.fromisoformat)
     p.add_argument('--document-id')
     p.add_argument('--sha256')
+    p.add_argument('--sha256-from-bucket', action='store_true',
+                   help='read the PDF from the bucket (needs INSURANCE_BUCKET_* vars) and use its real SHA-256')
     p.add_argument('--apply', action='store_true', help='commit; default is a dry run (rollback)')
     a = p.parse_args(argv)
+    if a.sha256_from_bucket:
+        if a.sha256 or not a.document_id:
+            print('error: use --sha256-from-bucket with --document-id and without --sha256', file=sys.stderr)
+            return 2
+        key = storage.object_key(a.business_id, a.policy_id, a.version_id, a.document_id)
+        try:
+            data = storage.read(key)
+        except storage.StorageError as exc:
+            print(f'error: {exc} ({key})', file=sys.stderr)
+            return 1
+        if not data.startswith(b'%PDF-'):
+            print('error: not_a_pdf', file=sys.stderr)
+            return 1
+        a.sha256 = hashlib.sha256(data).hexdigest()
+        print(f'bucket object {key} size={len(data)} sha256={a.sha256}')
     try:
         with _cases.db() as conn:
             try:

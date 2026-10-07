@@ -53,3 +53,17 @@ def test_loads_idempotently(monkeypatch):
     finally:
         with psycopg.connect(dsn, autocommit=True) as c:
             c.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_contract_number_with_slash_is_parsed_and_matched():
+    from insurance import identity, retrieval
+    d = identity.parse_declaration('Mi póliza 058342561/00000 cubre agua')
+    assert d['contract_number'] == '058342561/00000'
+    assert identity.parse_declaration('058342561/00000', 'policy')['contract_number'] == '058342561/00000'
+    assert retrieval._mentions('póliza 058342561/00000', '058342561/00000')
+    assert not retrieval._mentions('póliza 058342561/000001', '058342561/00000')
+
+
+def test_rejects_bad_contract_number():
+    with pytest.raises(ValueError):
+        provision.provision(None, **{**KW, 'contract_number': 'a b'})
