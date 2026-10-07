@@ -2,7 +2,7 @@
 
 `web/insurance/provision.py` loads customer, policy (+`contract_number`), policy version, authorization and the
 document registration in ONE transaction, idempotently. Dry run by default; `--apply` commits. No Airtable.
-Load order follows the FKs (migrations 004–007). The PDF is only *registered* (`pending_verification`);
+Load order follows the FKs (apply all additive Insurance migrations first). The PDF is only *registered* (`pending_verification`);
 `insurance_doc_worker.py` is the only process that reads the bucket and verifies SHA-256.
 
 ## Values that cannot be derived from the repo (must be supplied by the owner)
@@ -11,7 +11,8 @@ Load order follows the FKs (migrations 004–007). The PDF is only *registered* 
 | `--product` | `insurance_policies.product` NOT NULL | the policy's product (e.g. hogar/auto/vida), from the contract |
 | `--valid-from` (and `--valid-to` if it ends) | `insurance_policy_versions.valid_from` NOT NULL | start date on the policy's Condiciones Particulares; retrieval only uses versions in force at the fact date |
 | `--actor` | `insurance_authorizations.granted_by`, audit log, `documents.registered_by` | the operator's name/id |
-| Full name | `name_hmac` needs name + surname; the caller must say it identically (accents/ñ matter, order kept) | `--display-name`/`--full-name` exactly as the caller will say it (a bare "Sandra Vargas" only matches that) |
+| Registered full name | `name_hmac` plus ordered `name_prefix_hmacs`; first given name and first surname are required, subsequent surnames optional | `--display-name`/`--full-name` from the trusted customer record, never inferred from a caller |
+| Compound name boundary | Prevents treating a second given name or an incomplete compound surname as the first surname | Supply both `--given-names` and `--first-surname` from the trusted record when components contain several words |
 | SHA-256 | `insurance_documents.sha256` | computed from the real bucket object (below); never typed by hand |
 
 ## Where to run
@@ -35,7 +36,7 @@ Alternatively let the tool do it: `--sha256-from-bucket` (below) prints and uses
 
 ## 2. Dry run (rolled back)
 ```
-railway ssh --service insurance-docs-worker -- sh -c 'cd /app/web 2>/dev/null || cd web; INSURANCE_PROVISION_DOCUMENT=51959566J python -m insurance.provision \
+railway ssh --service insurance-docs-worker -- sh -c 'cd /app/web 2>/dev/null || cd web; INSURANCE_PROVISION_DOCUMENT="<DNI_O_NIE>" python -m insurance.provision \
   --actor <OPERADOR> --business-id INS-BIZ-001 --customer-id <CUSTOMER_ID> --display-name "Sandra Vargas" \
   --policy-id POL-000123 --contract-number "058342561/00000" --product <PRODUCTO> \
   --version-id VER-001 --valid-from <AAAA-MM-DD> \
@@ -47,7 +48,7 @@ Expected: `DRY-RUN {... 'status': 'pending_verification' ...}`.
 ## 3. Apply: same command plus `--apply` → `APPLIED {...}`.
 
 ## 4. Order after provisioning
-1. (`insurance-migrate-job` is already done: 001–007; do not re-run for provisioning.)
+1. Apply all additive Insurance migrations before using the new web code; provisioning does not apply migrations.
 2. `insurance-docs-worker` running (polls every 15 s) → document becomes `ready` and pages indexed.
 3. `web` with `INSURANCE_ENABLED=true` and the number's Business config resolving to `INS-BIZ-001`/sector seguros.
 4. `insurance-outbox-worker` only for escalations/cases to Airtable; not needed for the document flow.
@@ -83,7 +84,17 @@ SELECT EXISTS(SELECT 1 FROM insurance_customers WHERE business_id='INS-BIZ-001' 
   failed `policy_not_matched` in retrieval. Fixed here (identity.py, retrieval.py) with tests.
 - No new Railway variable is required by the tool; `INSURANCE_CASE_HMAC_KEY` must be the SAME on web and the
   provisioning service, otherwise identity never matches (HMACs differ).
-- Name matching is exact (accents folded except ñ, order kept): store the name the caller will say.
+- Name matching is deterministic (accents folded except ñ, order kept). `Celia Zorro` matches
+  `Celia Zorro Condes`; `Celia`, `Celia Condes`, `Celia Zor` do not. DNI/NIE must match exactly and
+  only one active customer of the resolved business may remain. No fuzzy/phonetic matching.
+- Hyphenated first surnames are complete components: `Ana Peña-López` and `Ana Peña López`
+  are equivalent, but `Ana Peña` is insufficient for that registered first surname. For multiple
+  given names or surnames with particles, provide trusted `--given-names` and `--first-surname`
+  together (for example `José María` and `de la Cruz`). A combined full-name string alone cannot
+  reliably establish those semantic boundaries; its fallback minimum is two registered components.
+- Pre-008 rows have no prefix HMACs. Partial matching can use their display name only when its
+  complete normalized value reproduces the trusted full-name HMAC. Otherwise controlled
+  re-provisioning with the trusted complete name is required; no plaintext document is reconstructed.
 - Real data in PostgreSQL requires the separate insurance DB/role (docs/insurance-pr1-audit.md); verify it.
 - Airtable is not used by this flow (only the case outbox); bucket key must match
   `insurance-policies/<business>/<policy>/<version>/<document>.pdf` exactly (case sensitive).

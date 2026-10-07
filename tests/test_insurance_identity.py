@@ -159,3 +159,24 @@ def test_provision_accepts_trusted_name_components(pg):
     assert result['customer_id'] == 'P'
     assert identity.match_by_hashes(pg, 'A', identity.document_hmac('A', '33333333P'),
                                     identity.name_hmac('A', 'José María')) == []
+
+
+def test_session_migration_is_additive_idempotent_and_does_not_import_unscoped_voice(pg):
+    for channel in ('WhatsApp', 'Voice'):
+        pg.execute(
+            'INSERT INTO insurance_conversation_summary(business_id,channel,conversation_ref,customer_id,'
+            "summary,last_turn_id) VALUES('A',%s,'legacy','C1','{\"topics\":[]}',4)", (channel,))
+    migration = (WEB / 'insurance' / 'migrations' / '009_session_memory.sql').read_text()
+    pg.execute(migration)
+    assert pg.execute("SELECT count(*) AS n FROM insurance_conversation_summary").fetchone()['n'] == 2
+    imported = pg.execute("SELECT channel,session_ref FROM insurance_session_summary").fetchall()
+    assert imported == [{'channel': 'WhatsApp', 'session_ref': ''}]
+    for session in ('CA1', 'CA2'):
+        pg.execute(
+            'INSERT INTO insurance_session_summary(business_id,channel,conversation_ref,session_ref,customer_id)'
+            " VALUES('A','Voice','legacy',%s,'C1')", (session,))
+    pg.execute("UPDATE insurance_session_summary SET last_turn_id=10 WHERE channel='WhatsApp'")
+    pg.execute(migration)
+    assert pg.execute("SELECT count(*) AS n FROM insurance_session_summary").fetchone()['n'] == 3
+    assert pg.execute("SELECT last_turn_id FROM insurance_session_summary WHERE channel='WhatsApp'").fetchone() \
+        ['last_turn_id'] == 10

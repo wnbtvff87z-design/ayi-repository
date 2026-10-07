@@ -2,20 +2,18 @@
 
 Tier A  insurance_conversation_turns: every turn (retention-bound), idempotent per webhook retry.
 Tier B  recent window: the last INSURANCE_RECENT_TURNS exchanges, read from tier A.
-Tier C  insurance_conversation_summary: structured, incremental, idempotent (keyed by last_turn_id).
+Tier C  insurance_session_summary: structured, incremental, idempotent (keyed by last_turn_id).
 Tier D  recall: scoped search over the retained questions of ONE verified customer.
 Everything is scoped by (business_id, channel, conversation_ref, customer_id). Voice and WhatsApp
 never share memory (channel is part of the key). The summary never replaces contract evidence.
 """
 import json
-import logging
 import os
 import re
 from collections import namedtuple
 
-from insurance import identity, retrieval
+from insurance import retrieval
 
-log = logging.getLogger(__name__)
 Scope = namedtuple('Scope', 'bid channel ref sess customer_id')
 
 DEFAULTS = {
@@ -92,7 +90,9 @@ def record_user(conn, sc, external_id, content, kind, corr, normalized=None):
 
 
 def set_user_kind(conn, turn_id, kind, content, normalized=None):
-    conn.execute('UPDATE insurance_conversation_turns SET kind=%s,content=%s,normalized=%s WHERE turn_id=%s',
+    conn.execute("UPDATE insurance_conversation_turns SET kind=%s,"
+                 "content=CASE WHEN content='' THEN %s ELSE content END,normalized=%s "
+                 "WHERE turn_id=%s AND role='user'",
                  (kind, redact(content) if kind != 'other' else '', redact(normalized) if normalized else None,
                   turn_id))
 
@@ -225,7 +225,7 @@ def _lock_scope(conn, sc):
 
 
 def _enforce_limits(conn, sc, turn_id):
-    """Cheap, bounded housekeeping on write: per-conversation cap always; global purge every 25th turn."""
+    """Exact cap on every write, deleting overflow in bounded batches; periodic global expiry purge."""
     cap = cfg('INSURANCE_MAX_TURNS_PER_CONVERSATION')
     while True:
         deleted = conn.execute(
@@ -248,9 +248,12 @@ def purge_expired(conn):
         'DELETE FROM insurance_conversation_turns WHERE turn_id IN (SELECT turn_id FROM '
         'insurance_conversation_turns WHERE created_at < now() - make_interval(days=>%s) '
         'ORDER BY created_at LIMIT %s)', (days, batch)).rowcount
-    s = conn.execute('DELETE FROM insurance_conversation_summary WHERE ctid IN '
-                     '(SELECT ctid FROM insurance_conversation_summary WHERE updated_at < now() - '
+    s = conn.execute('DELETE FROM insurance_session_summary WHERE ctid IN '
+                     '(SELECT ctid FROM insurance_session_summary WHERE updated_at < now() - '
                      'make_interval(days=>%s) LIMIT %s)', (days, batch)).rowcount
+    s += conn.execute('DELETE FROM insurance_conversation_summary WHERE ctid IN '
+                      '(SELECT ctid FROM insurance_conversation_summary WHERE updated_at < now() - '
+                      'make_interval(days=>%s) LIMIT %s)', (days, batch)).rowcount
     st = conn.execute('DELETE FROM insurance_conversation_state WHERE ctid IN '
                       '(SELECT ctid FROM insurance_conversation_state WHERE updated_at < now() - '
                       'make_interval(secs=>%s) LIMIT %s)',
@@ -262,7 +265,7 @@ def purge_expired(conn):
 
 
 def erase_customer(conn, business_id, customer_id):
-    """Right-to-erasure helper: removes this customer's turns and summaries (not cases)."""
+    """Erase memory and linked verification/dialogue state, without touching contractual cases."""
     st = conn.execute(
         'DELETE FROM insurance_conversation_state s WHERE s.business_id=%s AND '
         "(s.state->>'customer_id'=%s OR EXISTS (SELECT 1 FROM insurance_identity_verifications v "
@@ -275,7 +278,9 @@ def erase_customer(conn, business_id, customer_id):
                      (business_id, customer_id)).rowcount
     t = conn.execute('DELETE FROM insurance_conversation_turns WHERE business_id=%s AND customer_id=%s',
                      (business_id, customer_id)).rowcount
-    s = conn.execute('DELETE FROM insurance_conversation_summary WHERE business_id=%s AND customer_id=%s',
+    s = conn.execute('DELETE FROM insurance_session_summary WHERE business_id=%s AND customer_id=%s',
+                     (business_id, customer_id)).rowcount
+    s += conn.execute('DELETE FROM insurance_conversation_summary WHERE business_id=%s AND customer_id=%s',
                      (business_id, customer_id)).rowcount
     return {'turns': t, 'summaries': s, 'states': st, 'verifications': v}
 
@@ -283,7 +288,7 @@ def erase_customer(conn, business_id, customer_id):
 # ---- Tier C: incremental structured summary -------------------------------------------------
 def load_summary(conn, sc):
     _lock_scope(conn, sc)
-    r = conn.execute('SELECT summary,last_turn_id FROM insurance_conversation_summary WHERE business_id=%s AND '
+    r = conn.execute('SELECT summary,last_turn_id FROM insurance_session_summary WHERE business_id=%s AND '
                      'channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s '
                      'AND updated_at > now()-make_interval(days=>%s) FOR UPDATE',
                      _pair_params(sc)).fetchone()
@@ -299,6 +304,7 @@ def _prune_summary(conn, sc, s):
     sources = s.get('_sources', {})
     ids = {v for t in topics for v in (t.get('id'), t.get('a_turn')) if isinstance(v, int)}
     ids.update(i.get('turn') for i in facts + issues + conclusions if isinstance(i.get('turn'), int))
+    ids.update(i.get('question_turn') for i in conclusions if isinstance(i.get('question_turn'), int))
     ids.update(v for v in sources.values() if isinstance(v, int))
     rows = conn.execute(
         'SELECT turn_id FROM insurance_conversation_turns WHERE business_id=%s AND channel=%s '
@@ -309,7 +315,7 @@ def _prune_summary(conn, sc, s):
     s['topics'] = [t for t in topics if t.get('id') in valid and t.get('a_turn') in valid]
     s['facts'] = [f for f in facts if f.get('turn') in valid]
     s['open_issues'] = [i for i in issues if i.get('turn') in valid]
-    s['conclusions'] = [i for i in conclusions if i.get('turn') in valid]
+    s['conclusions'] = [i for i in conclusions if i.get('turn') in valid and i.get('question_turn') in valid]
     for name in ('active', 'event_date', 'pending'):
         if sources.get(name) not in valid:
             s.pop(name, None)
@@ -353,8 +359,10 @@ def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answe
     if not finished:
         return False
     topics = [t for t in s.get('topics', []) if t['id'] != user_turn_id]
+    clean_answer = redact(answer)
     topics.append({'id': user_turn_id, 'q': redact(question)[:160], 'a_turn': assistant_turn_id,
-                   'answer': redact(answer)[:200] if decision == 'answer' else None, 'decision': decision,
+                   'answer': clean_answer if decision == 'answer' and len(clean_answer) <= 200 else None,
+                   'decision': decision,
                    'policy_id': policy_id, 'version_id': version_id,
                    'pages': [{'d': p.get('document_id'), 'p': p.get('page'), 'v': p.get('version_id', version_id),
                               's': p.get('section')} for p in (pages or [])][:5]})
@@ -374,12 +382,13 @@ def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answe
     if open_issue:
         issues.append({'turn': user_turn_id, 'issue': redact(open_issue)[:160]})
     s['open_issues'] = issues[-10:]
-    if decision == 'answer':
+    if decision == 'answer' and len(clean_answer) <= 120:
         s['conclusions'] = (s.get('conclusions', []) + [{'turn': assistant_turn_id,
-                                                         'text': redact(answer)[:120]}])[-10:]
+                                                         'question_turn': user_turn_id,
+                                                         'text': clean_answer}])[-10:]
     s = _bounded_summary(s)
     conn.execute(
-        'INSERT INTO insurance_conversation_summary(business_id,channel,conversation_ref,session_ref,customer_id,summary,'
+        'INSERT INTO insurance_session_summary(business_id,channel,conversation_ref,session_ref,customer_id,summary,'
         'last_turn_id) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT (business_id,channel,conversation_ref,'
         'session_ref,customer_id) DO UPDATE SET summary=EXCLUDED.summary,last_turn_id=EXCLUDED.last_turn_id,updated_at=now()',
         (sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id, json.dumps(s, ensure_ascii=False), assistant_turn_id))
@@ -405,7 +414,6 @@ def render_summary(s, limit):
         lines.append(f'Pendiente: {p}')
     for i in s.get('open_issues', []):
         lines.append(f"Asunto abierto: {i['issue']}")
-    out = '\n'.join(lines)
     if limit <= 0:
         return ''
     # Keep complete lines; slicing a sentence can invert the meaning of a remembered condition.
@@ -482,7 +490,8 @@ def build_context(*, question, evidence, policy=None, version=None, pending=None
            relevant.append({**t, 'text': t['content']})
     ctx = {'identity': identity_line, 'question': str(question or ''),
            'policy': f'{policy} versión {version}' if policy else '',
-           'pending': pending or '', 'evidence': [dict(e) for e in evidence],
+           'pending': pending or '',
+           'evidence': [{**e, 'version_id': e.get('version_id') or version} for e in evidence],
            'recent': relevant, 'summary': summary_text or '',
            'recalled': [{**r, 'a': r.get('a') or '(sin respuesta)'} for r in recalled]}
     dropped = []

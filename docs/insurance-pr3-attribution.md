@@ -1,5 +1,8 @@
 # Insurance: escalation cause, attribution and operator access
 
+Sections 1–8 below are the historical PR3 audit, not the current conversational contract.
+The persistent-memory implementation and changed escalation semantics are documented in section 9.
+
 Base: `develop` SHA `2db88ebebfefd103f1520c219dcb15dbaf7c4790` (the `copilot/improve-query-response-flow` branch was cut from it).
 Baseline suite: 268 passed / 54 skipped without PostgreSQL; 322 passed with a local PostgreSQL (`INSURANCE_TEST_DATABASE_URL`).
 
@@ -66,3 +69,164 @@ The field is sent only if `INSURANCE_AIRTABLE_ATTRIBUTION=true` (create the colu
 ## 8. Tests
 
 Local with PostgreSQL: `tests/test_insurance_attribution.py` (synthetic data). Mocks: LLM, Airtable HTTP. Not run: any real Railway/Airtable/Bucket/Twilio/PDF test. Restaurant/consultora routing is covered by the existing `test_known_sectors_keep_existing_dialogues`.
+
+## 9. Persistent conversational Insurance (develop after PR #26)
+
+### Base, root cause and alternatives
+
+The task branch starts at `develop` **`ea8285a907db752adc3c225e7a439d9830bee240`**,
+the merge of PR #26. The PR targets `develop`; it does not merge or deploy anything.
+No Railway data, destination numbers, configuration, Twilio, Relay, reservations, restaurant/
+consultora handlers, workers or Cron are modified.
+
+PR #26 introduced memory tables and helper modules but the dialogue still used a five-question
+JSON array. The LLM received only the current retrieval query and page excerpts. A broad regex
+matched the isolated conjunction `y`, references fell back silently to one question, pre-identity
+pending questions required `?`, verification and state lifetimes were coupled, and ordinary
+missing evidence created a case without consent.
+
+Chosen architecture: deterministic PostgreSQL-backed tiers, explicit authentication and policy
+selection, retention-scoped streaming recall, and one bounded structured LLM package.
+
+| Alternative | Decision |
+|---|---|
+| Increase `MAX_HISTORY` | Rejected: no persistence, retention, evidence provenance or bounded context |
+| Send all turns to the LLM | Rejected: unbounded cost/context and accidental contractual reliance on history |
+| Vector database or a separate memory service | Not added: unnecessary dependencies and another consistency/tenant boundary |
+| LLM-generated summary on every turn | Rejected: repeated full-history cost, fabricated facts and retry instability |
+| Incremental structured summary plus scoped lexical recall | Selected: deterministic provenance, bounded batches, testable ambiguity |
+
+### Identity and policy state
+
+DNI/NIE is exact after removing spaces, dots and hyphens and folding case. Names are ordered,
+accent-folded except `ñ`, with complete normalized registered prefixes. `Celia Zorro` and
+`Celia Zorro Condes` both verify against `Celia Zorro Condes` only if the exact document selects
+one active customer **inside the already resolved business**. `Celia`, `Zorro`, `Celia Condes`,
+`Celia Zor` and `Celia Vargas` do not. Duplicate matching customers never select a person.
+Replies do not reveal which individual datum failed; ambiguity requests a complete declaration.
+Provisioning can supply trusted compound-name boundaries; see `insurance-provisioning.md`.
+
+The durable dialogue state distinguishes customer verification, active policy/version, requested
+contract, a policy switch awaiting resolution, the original pending question and its normalized
+retrieval representation, reference clarification, event date and pending human review. Numbers
+remain text, including leading zeros. A failed switch clears the previous active policy rather
+than answering using it. Multiple policies request a contractual number, never a pre-verification
+list. Old-topic recall carries its previous policy, version, date and document/page references;
+the current authorization and applicable version are checked again before retrieving evidence.
+
+### Memory tiers and isolation
+
+* **A — retained exchanges:** `insurance_conversation_turns`, with business, channel, HMAC
+  conversation reference, Voice CallSid session, verified customer (nullable before verification),
+  user/assistant role, original/redacted text and normalized query, timestamp, correlation ID,
+  confirmed policy/version, decision, reply linkage and document/page/section provenance.
+  Identity-only declarations are not retained as conversational text; DNI/NIE is redacted.
+  The unique webhook/role key and transaction-level locking prevent duplicate exchanges.
+* **B — recent window:** configurable complete exchanges read from PostgreSQL, not a fixed JSON
+  array. Only directly relevant recent pairs enter the prompt.
+* **C — summary:** incremental structured topics, prior answers, pending questions, user facts,
+  active policy/version, event dates, provisional conclusions, open issues and evidence references.
+  Each entry carries turn provenance; retention checks remove expired sources even if the summary
+  was updated recently. The assistant turn high-water mark makes retries idempotent.
+  Migration `009_session_memory.sql` adds `insurance_session_summary` with a session-scoped
+  composite primary key and an exchange `event_date` column. It preserves the legacy summary
+  table, imports only session-compatible WhatsApp summaries and deliberately does not import
+  unscoped legacy Voice summaries. Reapplying it cannot overwrite newer session summaries.
+* **D — old recall:** keyset batches scan the entire permitted retained conversation, not just the
+  most recent batch. Clear matches restore a question/answer/evidence reference. Competing topics
+  ask which one; no match asks the user to specify. `volviendo a lo primero` can retrieve the
+  earliest retained question after 30 or more exchanges.
+
+Every memory read is scoped by business, channel, conversation, customer **and session**.
+Voice calls do not share authentication or memory across CallSids. WhatsApp continues within its
+business/phone HMAC scope. There is no implicit Voice/WhatsApp or cross-customer linkage.
+
+### Exact LLM messages and budget
+
+`dialog.llm_explain` sends `memory.INSTRUCTIONS` as the system message and
+`memory.format_prompt(context)` as the user message, with these optional/mandatory blocks:
+
+1. `IDENTIDAD`: only that the client is verified and authorized; no name, DNI or phone.
+2. `PÓLIZA ACTIVA`: policy and applicable version.
+3. `ACLARACIÓN PENDIENTE`, when relevant.
+4. `RESUMEN DE LA CONVERSACIÓN (no contractual)`.
+5. `TURNOS ANTIGUOS RECUPERADOS (no contractual)`: prior question, answer and source identifiers.
+6. `TURNOS RECIENTES (no contractual)`: selected complete relevant user/assistant exchanges.
+7. `PREGUNTA ACTUAL`.
+8. `CLÁUSULAS`: current PostgreSQL page text labelled with page, document, version and section.
+
+The system explicitly forbids using memory as contractual evidence, invented coverage, claim
+approval/denial and missing citations; insufficient evidence returns `ESCALAR`. Equal page
+numbers in different documents are not interchangeable. No original PDF is sent to the LLM.
+Prior source identifiers help interpret “¿por qué?”, “¿dónde dice eso?” and reformulations,
+but authorization/version/ready-document checks and **current page retrieval** remain mandatory.
+
+The budget includes the system instructions and the exact rendered user message. Removal
+priority is recalled memory, summary, old recent pairs, pending clarification and metadata.
+Complete current evidence and the current question are never silently sliced to fit: if the
+essential package cannot fit, no LLM request is made and the dialogue fails safely. Context
+reports record budget, used characters and discarded categories, not confidential prompt text.
+Character budgeting is deliberately not represented as exact tokenizer counts.
+
+### Confirmation and source-of-truth boundaries
+
+Routine no-evidence/interpretation outcomes preserve the question/reason and ask:
+**“No encontré evidencia suficiente en tu póliza. ¿Quieres que registre la consulta para revisión humana?”**
+Only affirmative consent persists a case; declining does not. Greetings, identity checks, policy
+selection and clarifiable references never create cases. Approved urgent protocol and technical
+failures on actual questions are controlled exceptions. No saved-case confirmation precedes
+PostgreSQL persistence. Database failure never yields policy evidence or a fictitious saved case.
+
+PostgreSQL remains the source of truth. The existing case outbox asynchronously projects the
+minimal task to Airtable; dialogue memory is not mirrored there. The original PDF remains in
+the bucket, SHA-256 checks that original object, and conversation-time retrieval reads only
+`insurance_documents`/`insurance_document_pages`. `ready` without usable indexed pages is
+not evidence. Document/page FKs are composite business/document keys; document→policy/version
+uses the existing composite FK.
+
+### Configuration, lifetimes and operational limits
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `INSURANCE_RECENT_TURNS` | 6 | Complete recent exchanges; selected by relevance |
+| `INSURANCE_LLM_CONTEXT_CHARS` | 12000 | System plus rendered user message budget |
+| `INSURANCE_TURN_RETENTION_DAYS` | 90 | Logical retention of turns and sourced summary facts |
+| `INSURANCE_MAX_TURNS_PER_CONVERSATION` | 2000 | Stored user/assistant rows per conversation/session, not policy capacity |
+| `INSURANCE_MEMORY_SCAN_LIMIT` | 500 | Recall **batch size**, not historical search horizon |
+| `INSURANCE_RECALLED_TURNS` | 2 | Recalled exchanges admitted to the package |
+| `INSURANCE_TURN_MAX_CHARS` | 4000 | Persisted turn text bound |
+| `INSURANCE_SUMMARY_MAX_TOPICS` | 30 | Summary topics; older retained turns remain searchable |
+| `INSURANCE_SUMMARY_MAX_CHARS` | 6000 | Structured summary JSON bound |
+| `INSURANCE_STATE_TTL_SECONDS` | 86400 | Dialogue inactivity lifetime, separate from authentication |
+| `INSURANCE_STATE_RETENTION_SECONDS` | 604800 | Physical cleanup age for inactive state |
+| `INSURANCE_PURGE_BATCH` | 500 | Bounded cleanup batch |
+| `INSURANCE_VERIFICATION_TTL_SECONDS` | 1800 | Existing absolute verification expiry, never extended by automatic updates |
+| `INSURANCE_IDENTITY_WINDOW_SECONDS` | 900 | Existing failed-attempt window |
+| `INSURANCE_IDENTITY_MAX_ATTEMPTS` | 5 | Existing failed-attempt limit |
+
+Values are optional and have validated safe bounds; no Railway variable has been changed.
+Verification expiry requires identity again. Reverification of the same customer can resume
+retained conversation; a different customer cannot inherit the previous state/evidence.
+Inactivity expiration removes dialogue state from use, not retained conversational history.
+Retention/cap evicts oldest rows; summary provenance prevents resurrecting them. Memory is
+finite and recall of evicted/expired sources requests clarification rather than pretending to
+remember. Physical cleanup is bounded and opportunistic on writes; the existing Cron and
+workers are unchanged. Idle installations can call `memory.purge_expired` through controlled
+maintenance; no new scheduler is introduced. `memory.erase_customer` removes conversational
+turns, summaries, states and verifications for the business/customer; case retention remains
+the existing, separately governed policy.
+
+### Rollout and rollback
+
+Apply additive migrations with the existing Insurance migration command and authorized DB role
+before releasing web code. Check prefix provisioning for legacy customers and ready usable pages.
+New functionality remains behind the existing `INSURANCE_ENABLED` switch (default off).
+Rollback can disable Insurance or restore the previous web release **without dropping retained
+tables or customer data**. Keep additive schema changes; reverting them would destroy provenance.
+Restaurant/consultora, Voice/WhatsApp transports, document/outbox workers and Cron are untouched.
+No merge, deployment or live data/number/configuration changes are performed by this task.
+
+Local synthetic results demonstrate isolation and bounded candidate handling, **not Railway
+production performance**. They do not establish LLM contractual correctness, legal interpretation,
+OCR quality of actual PDFs, exact model-token accounting or infinite memory. A full trusted
+compound-name boundary cannot be inferred reliably from an ambiguous combined-name string.

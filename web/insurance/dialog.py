@@ -205,6 +205,10 @@ def _answer(business, state, text, channel, external_id, customer):
             if customer_id and st.get('customer_id') not in (None, customer_id):
                 _drop_customer_state(st)
             decl = identity.parse_declaration(text, st.get('awaiting'))
+            if st.get('awaiting') == 'identity':
+                independent = identity.parse_declaration(text)
+                if _business_question(text, independent):
+                    decl = independent
             # A declaration is a new authentication attempt, not permission to reuse the phone's identity.
             if customer_id and (decl.get('name') or decl.get('document')):
                 conn.execute('UPDATE insurance_identity_verifications SET revoked_at=now() WHERE '
@@ -219,8 +223,10 @@ def _answer(business, state, text, channel, external_id, customer):
             _merge_declaration(st, decl, bid)
             is_query = _business_question(text, decl, st.get('awaiting'))
             turn_id, _ = memory.record_user(
-                conn, sc._replace(customer_id=customer_id), external_id, text,
-                'question' if is_query else 'clarification' if st.get('awaiting') else 'other', corr,
+                conn, sc._replace(customer_id=customer_id), external_id,
+                decl.get('question') if is_query else text,
+                'question' if is_query else 'identity' if decl.get('name') or decl.get('document') else
+                'clarification' if st.get('awaiting') else 'other', corr,
                 normalized=decl.get('question') if is_query else None)
 
             def finish(reply, out, *, decision=None, evidence=None, policy_id=None, version_id=None,
@@ -314,9 +320,9 @@ def _answer(business, state, text, channel, external_id, customer):
                 st.pop('reference_options', None)
                 st.pop('awaiting', None)
                 _use_pair(st, pair)
-            elif is_query and st.get('awaiting') not in ('policy', 'date'):
+            elif (is_query or just_verified) and st.get('question') and st.get('awaiting') not in ('policy', 'date'):
                 prior = [p for p in memory.pairs(conn, sc) if p['q_id'] != turn_id]
-                classified = references.classify(text, has_last_answer=bool(prior and prior[0].get('a')),
+                classified = references.classify(st['question'], has_last_answer=bool(prior and prior[0].get('a')),
                                                 has_recent=bool(prior))
                 kind = classified['kind']
                 pair = None
@@ -426,6 +432,10 @@ def _use_pair(st, pair, continuation=''):
     fact = _fact_date(pair.get('normalized') or pair['q'])
     if fact:
         st['event_date'] = fact.isoformat()
+        if not _fact_date(query):
+            query = f'{query} Fecha del hecho: {fact.isoformat()}.'
+            st['normalized_question'] = query
+            memory.set_user_kind(conn, st['question_turn_id'], 'question', question, query)
 
 
 def _documental(conn, business, bid, channel, ref, sess, st, text, question, customer_id, corr, ctx,

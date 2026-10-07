@@ -29,7 +29,7 @@ def _mention_sql(column):
     # Quote SQL regex metacharacters so identifiers are literal, not search patterns.
     return (
         "lower(%s) ~ ('(^|[^a-z0-9/-])' || "
-        r"regexp_replace(lower(" + column + r"), '([\\.^$|?*+()\[\]{}])', '\\\1', 'g') "
+        r"regexp_replace(lower(NULLIF(" + column + r", '')), '([\\.^$|?*+()\[\]{}])', '\\\1', 'g') "
         "|| '($|[^a-z0-9/-])')")
 
 
@@ -98,6 +98,8 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
         'SELECT version_id FROM insurance_policy_versions WHERE business_id=%s AND policy_id=%s '
         'AND valid_from<=%s AND (valid_to IS NULL OR valid_to>=%s) LIMIT 2',
         (business_id, rows[0]['policy_id'], fact_date, fact_date)).fetchall()
+    if not versions:
+        return out('no_policy', 'version_not_applicable')
     pol = {**rows[0], 'version_id': versions[0]['version_id']}
     if len(versions) > 1:  # several versions apply on the same date: do not guess
         return out('ambiguity', 'multiple_versions', policy_id=pol['policy_id'])
@@ -115,7 +117,7 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
     hits, support = [], {section: [] for section in SUPPORT}
     # A named cursor bounds client memory; every scoped page is ranked, including late evidence.
     # Retain five per support section: three hits plus preceding support picks can occupy four.
-    with conn.cursor(name='insurance_retrieval_' + uuid.uuid4().hex) as cursor:
+    with conn.transaction(), conn.cursor(name='insurance_retrieval_' + uuid.uuid4().hex) as cursor:
         cursor.execute(PAGE_SQL, (*doc_args, 'ready', fact_date, fact_date, *scope_args))
         while batch := cursor.fetchmany(PAGE_BATCH_SIZE):
             for page in batch:
@@ -130,6 +132,7 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
                     best.append((score, page))
                     best.sort(key=lambda item: -item[0])
                     del best[MAX_PAGES:]
+            batch.clear()
     if not diag['usable_pages']:
         return out('ready_without_pages', 'ready_without_usable_pages', **base)
     if not hits:

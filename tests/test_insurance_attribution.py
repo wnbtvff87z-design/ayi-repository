@@ -45,6 +45,7 @@ def pg(monkeypatch):
 
     monkeypatch.setattr(cases, 'db', connect)
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Sigue el protocolo aprobado de pruebas.')
     with connect() as conn:
         for m in MIGRATIONS:
             conn.execute(m.read_text(encoding='utf-8'))
@@ -173,7 +174,7 @@ def test_mismatches_get_one_identical_generic_reply_and_never_say_which_datum_fa
             'Me llamo Pedro Ruiz Soto, DNI 12345678Z',      # DNI right, name wrong
             'Me llamo Ana Pérez López, DNI 11111111H',      # name right, DNI wrong
             'Me llamo Pedro Ruiz Soto, DNI 11111111H',      # both wrong
-            'Me llamo Ana Pérez, DNI 12345678Z',            # partial surname
+            'Me llamo Ana López Pérez, DNI 12345678Z',      # wrong surname order
             'Me llamo Ana Pérez López Gil, DNI 12345678Z']):  # extra surname
         replies.append(say(declared, ext=f'M{n}')[0])
     assert set(replies) == {replies[0]} and GENERIC in replies[0]
@@ -204,21 +205,18 @@ def test_zero_ambiguous_and_inactive_do_not_verify(pg):
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
 
 
-def test_attempt_limit_blocks_and_creates_review_case_without_false_attribution(pg, llm, monkeypatch):
+def test_attempt_limit_blocks_without_creating_an_identity_case(pg, llm, monkeypatch):
     add_document(pg, 'POL-900', 'DOC-900')
     monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '3')
     for n in range(2):
         assert GENERIC in say('Me llamo Pedro Ruiz Soto, DNI 11111111H', ext=f'L{n}')[0]
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     reply, out = say(f'{TEXT} Me llamo Pedro Ruiz Soto, DNI 11111111H', ext='L2')
-    assert 'He guardado' in reply and out['insurance_result'] == 'human_case_required'
-    case = rows(pg, 'SELECT customer_id,attribution_state,latest_reason FROM insurance_cases')[0]
-    assert case['customer_id'] is None and case['attribution_state'] == 'customer_unknown'
-    q = rows(pg, 'SELECT diagnostic_code,question FROM insurance_case_questions')[0]
-    assert q['diagnostic_code'] == 'identity_attempts_exceeded' and q['question'] == TEXT
+    assert GENERIC in reply and out['insurance_result'] == 'identity_not_verified'
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     # blocked: even correct data does not verify now
     reply, _ = say(ANA, ext='L3')
-    assert 'He guardado' in reply
+    assert GENERIC in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
     with pg() as conn:  # window elapses -> attempts allowed again
         conn.execute("UPDATE insurance_identity_attempts SET attempted_at=now()-interval '2 hours'")
@@ -288,26 +286,27 @@ def test_multiple_policies_ask_number_then_leading_zeros_are_kept(pg, llm):
     assert 'DOC-X' in reply and 'DOC-000456' not in reply
     assert 'DOC-000456' in say(f'{TEXT} póliza 000123')[0]
     reply, out = say(f'{TEXT} póliza 123')                              # no partial / zero-stripped match
-    assert out['insurance_result'] == 'human_case_required'
+    assert out['insurance_result'] == 'missing_information' and 'número de póliza' in reply
 
 
 def test_policy_of_another_customer_is_rejected_without_disclosure(pg, llm):
     add_document(pg, 'POL-900', 'DOC-900')
     verify(pg, 'C1')
     reply, out = say(f'{TEXT} póliza 900')
-    assert 'DOC-900' not in reply and out['insurance_result'] == 'human_case_required'
-    q = rows(pg, 'SELECT diagnostic_code FROM insurance_case_questions')[0]
-    assert q['diagnostic_code'] == 'policy_not_authorized'
+    assert 'DOC-900' not in reply and out['insurance_result'] == 'missing_information'
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
 
 def test_document_not_ready_and_ready_without_pages_escalate_as_document_not_ready(pg, llm):
     add_document(pg, 'POL-900', 'DOC-900', status='pending_verification')
     verify(pg, 'C2')
     reply, _ = say(TEXT, ext='D1')
-    assert 'He guardado' in reply and 'no cubre' not in reply.lower()
+    assert reply == idialog.OFFER_REVIEW and 'no cubre' not in reply.lower()
+    say('sí', ext='D1-accept')
     add_document(pg, 'POL-300', 'DOC-300', pages=())
     verify(pg, 'C3')
     say(TEXT, ext='D2')
+    say('sí', ext='D2-accept')
     codes = {r['diagnostic_code'] for r in rows(pg, 'SELECT diagnostic_code FROM insurance_case_questions')}
     assert codes == {'document_not_ready'}
     details = {r['d'] for r in rows(pg, "SELECT context->>'detail' AS d FROM insurance_case_questions")}
@@ -318,7 +317,9 @@ def test_missing_evidence_escalates_with_no_evidence_and_never_says_not_covered(
     add_document(pg, 'POL-900', 'DOC-900', pages=('Texto sin relación alguna.',))
     verify(pg, 'C2')
     reply, _ = say('¿Qué pasa con el zxqv?')
-    assert 'He guardado' in reply and 'no cubre' not in reply.lower() and 'no está cubierto' not in reply.lower()
+    assert reply == idialog.OFFER_REVIEW and 'no cubre' not in reply.lower() and 'no está cubierto' not in reply.lower()
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+    say('sí')
     q = rows(pg, 'SELECT diagnostic_code FROM insurance_case_questions')[0]
     assert q['diagnostic_code'] == 'no_evidence'
     c = rows(pg, 'SELECT customer_id,policy_id,attribution_state FROM insurance_cases')[0]
@@ -330,6 +331,7 @@ def test_llm_escalation_keeps_evidence_and_verified_attribution(pg, monkeypatch)
     add_document(pg, 'POL-900', 'DOC-900')
     verify(pg, 'C2')
     say(TEXT)
+    say('sí')
     q = rows(pg, 'SELECT diagnostic_code,evidence FROM insurance_case_questions')[0]
     assert q['diagnostic_code'] == 'no_evidence' and q['evidence'][0]['page'] == 1
 
@@ -351,7 +353,7 @@ def test_postgres_down_never_claims_the_query_was_saved(monkeypatch):
     assert out['insurance_result'] == 'case_persistence_failed'
 
 
-def test_attempts_exceeded_with_postgres_failing_on_case_write_does_not_confirm(pg, monkeypatch):
+def test_attempts_exceeded_does_not_attempt_a_case_write(pg, monkeypatch):
     monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
     calls = {'n': 0}
     real = cases.db
@@ -363,7 +365,8 @@ def test_attempts_exceeded_with_postgres_failing_on_case_write_does_not_confirm(
         return real()
     monkeypatch.setattr(cases, 'db', flaky)
     reply, out = say(f'{TEXT} Me llamo Pedro Ruiz Soto, DNI 11111111H')
-    assert out['insurance_result'] == 'case_persistence_failed' and 'He guardado' not in reply
+    assert out['insurance_result'] == 'identity_not_verified' and 'He guardado' not in reply
+    assert calls['n'] == 1
 
 
 def test_diagnostics_are_structured_and_contain_no_personal_data(pg, caplog, monkeypatch):
@@ -386,7 +389,7 @@ def test_diagnostics_are_structured_and_contain_no_personal_data(pg, caplog, mon
 
 def test_attribution_unverified_case_is_not_linked_to_the_declared_customer(pg, monkeypatch):
     monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
-    say(f'{TEXT} Me llamo Ana Pérez Falsa, DNI 12345678Z')   # real DNI, wrong name
+    say(f'{TEXT} Me llamo Ana Pérez Falsa, DNI 12345678Z. Incendio urgente')  # approved urgent exception
     c = rows(pg, 'SELECT customer_id,policy_id,attribution_state FROM insurance_cases')[0]
     assert c['customer_id'] is None and c['policy_id'] is None and c['attribution_state'] == 'customer_unknown'
     claim = rows(pg, 'SELECT * FROM insurance_case_claims')[0]
@@ -425,7 +428,9 @@ def test_operator_sees_whose_case_policy_state_questions_and_reads_are_audited(p
     add_document(pg, 'POL-900', 'DOC-900')
     verify(pg, 'C2')
     ask(TEXT, ext='SM1')
-    ask('Otra duda', ext='SM2')
+    ask('sí', ext='SM1-accept')
+    ask('¿Qué exclusiones hay para daños por agua?', ext='SM2')
+    ask('sí', ext='SM2-accept')
     cid = rows(pg, 'SELECT case_id FROM insurance_cases')[0]['case_id']
     r = get(operator, cid, 'tok-ok')
     body = r.get_json()
@@ -440,7 +445,7 @@ def test_operator_sees_whose_case_policy_state_questions_and_reads_are_audited(p
 
 def test_operator_shows_unverified_claims_as_unverified(pg, operator, monkeypatch):
     monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
-    ask(f'{TEXT} Me llamo Ana Pérez Falsa, DNI {DNI}.')
+    ask(f'{TEXT} Me llamo Ana Pérez Falsa, DNI {DNI}. Incendio urgente')
     cid = rows(pg, 'SELECT case_id FROM insurance_cases')[0]['case_id']
     body = get(operator, cid, 'tok-ok').get_json()
     assert body['case']['identity_verified'] is False and body['case']['customer_display_name'] is None
@@ -481,7 +486,7 @@ def test_shared_key_detail_is_blocked_by_default(pg, monkeypatch):
 # ---- PostgreSQL -> Airtable mirror --------------------------------------------------------
 def test_outbox_payload_carries_attribution_and_airtable_field_is_opt_in(pg, monkeypatch):
     monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
-    ask(f'{TEXT} Me llamo Ana Pérez Falsa, DNI {DNI}.')
+    ask(f'{TEXT} Me llamo Ana Pérez Falsa, DNI {DNI}. Incendio urgente')
     payload = rows(pg, 'SELECT payload FROM insurance_outbox')[0]['payload']
     assert payload['attribution_state'] == 'customer_unknown'
     assert DNI not in str(payload) and 'Ana' not in str(payload) and PHONE not in str(payload)
@@ -572,14 +577,16 @@ def test_multi_turn_conversation_reuses_identity_policy_and_references(pg, monke
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     assert rows(pg, "SELECT count(*) AS n FROM insurance_audit_log WHERE action='identity_verified'")[0]['n'] == 1
     st = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
-    assert st['policy_id'] == 'POL-900' and len(st['history']) == 4
+    assert st['policy_id'] == 'POL-900'
+    assert rows(pg, "SELECT count(*) AS n FROM insurance_conversation_turns WHERE kind='answer'")[0]['n'] == 4
 
 
 def test_only_a_real_unanswerable_question_escalates_and_the_session_stays_verified(pg, llm):
     add_document(pg, 'POL-900', 'DOC-900')
     say('Soy Luis Gil Mora, DNI 87654321X', ext='E1')
     reply, _ = say('¿Qué pasa con el zxqv?', ext='E2')
-    assert 'He guardado' in reply
+    assert reply == idialog.OFFER_REVIEW
+    say('sí', ext='E2-accept')
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 1
     reply, out = say('¿Cubre los daños por agua en tuberías rotas?', ext='E3')   # no re-identification
     assert out['insurance_result'] == 'evidence_backed_explanation'
