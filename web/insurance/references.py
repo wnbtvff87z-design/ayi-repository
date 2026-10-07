@@ -10,6 +10,7 @@ STOPS = {'eso', 'esto', 'ello', 'esa', 'ese', 'esos', 'esas', 'aquello', 'asi', 
          'mismo', 'misma', 'pues', 'bueno'}
 EXPLAIN_RE = re.compile(
     r'^(y\s+)?(por\s+que|donde\s+(dice|pone|aparece|lo\s+dice|viene)|en\s+que\s+(pagina|clausula|apartado)|'
+    r'que\s+(?:excluye|queda\s+excluido|no\s+cubre)|'
     r'que\s+(exclusion|clausula|condicion|limite|pagina)\s+(mencionaste|citaste|dijiste)|'
     r'como\s+(lo\s+)?sabes|en\s+que\s+te\s+basas|explica(me|lo|melo)?\s+(lo\s+)?(de\s+otra\s+(manera|forma)|'
     r'otra\s+vez|mejor|mas\s+(sencillo|simple|claro))|puedes\s+explicar(lo|melo)|'

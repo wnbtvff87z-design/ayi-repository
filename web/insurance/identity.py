@@ -173,7 +173,10 @@ def parse_declaration(text, awaiting=None):
                 rest = rest[:t.start()] + ' ' + rest[t.end() + end:]
     if name is None and (awaiting == 'identity' or (
             doc and re.search(r'\b(?:dni|nie|documento)\b', text, re.I))) and '?' not in rest:
-        words = WORD_RE.findall(KEYWORD_RE.sub(' ', rest))
+        name_text = re.sub(
+            r'\s+(?:con\s+(?:su|mi|el|la)|y\s+(?:mi|su))\s*$',
+            '', rest, flags=re.I)
+        words = WORD_RE.findall(KEYWORD_RE.sub(' ', name_text))
         if (2 <= len(normalize_name(' '.join(words)).split()) <= MAX_NAME_TOKENS
                 and not {w.casefold() for w in words} & NAME_STOP):
             name, rest = ' '.join(words), ''

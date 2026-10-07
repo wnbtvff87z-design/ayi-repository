@@ -33,6 +33,16 @@ def test_natural_complete_declarations(text):
     assert parsed['policy_only'] is False
 
 
+def test_name_before_document_allows_natural_spoken_connectors():
+    parsed = prepare(
+        'Celia Zorro Condes con su DNI cinco uno nueve cinco nueve cinco seis seis jota',
+        {'awaiting': 'identity'})
+    assert parsed['name'] == 'Celia Zorro Condes'
+    assert parsed['document'] == '51959566J'
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['question'] == ''
+
+
 @pytest.mark.parametrize('name,document', [
     ('Celia Zorro', 'cinco uno nueve cinco nueve cinco seis seis jota'),
     ('Me llamo Celia Zorro', 'Mi documento es 51 959 566 J'),

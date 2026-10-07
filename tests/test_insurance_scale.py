@@ -300,7 +300,7 @@ def test_scoring_preserves_late_exclusions_and_bounds_candidates(pg):
             INSERT INTO insurance_document_pages(business_id,document_id,page_number,
                                                  section,source,quality,body,indexed)
             SELECT %s,'S-LARGE',n,CASE WHEN n=10001 THEN 'exclusions' ELSE 'coverage' END,
-                   'text','ok',CASE WHEN n=10001 THEN 'desgaste' ELSE 'agua tuberias' END,true
+                   'text','ok',CASE WHEN n=10001 THEN 'desgaste agua' ELSE 'agua tuberias' END,true
             FROM generate_series(1,10001) n
         """, (BIZ,))
         observed = ObservedConnection(conn)

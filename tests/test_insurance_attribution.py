@@ -541,6 +541,46 @@ def test_operator_sees_whose_case_policy_state_questions_and_reads_are_audited(p
     assert rows(pg, "SELECT outcome FROM insurance_audit_log WHERE action='case_read'")[0]['outcome'] == 'ok'
 
 
+def test_operator_retrieval_diagnostic_is_scoped_audited_and_read_only(
+        pg, operator, monkeypatch, caplog):
+    add_document(pg, 'POL-900', 'DOC-DIAG', pages=(
+        'Cobertura de daños por agua: cubre tuberías rotas.',
+        'Exclusiones de agua: falta de mantenimiento.',
+    ))
+    monkeypatch.setattr(idialog, 'llm_explain', lambda context, evidence: 'Respuesta de prueba.')
+    before_cases = rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n']
+    before_documents = rows(pg, 'SELECT count(*) AS n FROM insurance_documents')[0]['n']
+    with caplog.at_level(logging.INFO):
+        response = operator.post(
+            '/insurance/admin/retrieval/diagnose',
+            json={'customer_id': 'C2', 'policy_id': 'POL-900',
+                  'question': '¿Cubre daños por agua?', 'run_llm': True},
+            headers={'Authorization': 'Bearer ' + 'tok-ok'})
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body['correlation_id'] and body['stage'] == 'retrieval'
+    assert body['retrieval_status'] == 'ok' and body['diagnostics']['trace']['candidate_count'] >= 1
+    assert body['selected'] and body['selected'][0]['position_start'] >= 0
+    assert body['text_chars_to_llm'] > 0 and body['llm_result']['status'] == 'answered'
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == before_cases
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_documents')[0]['n'] == before_documents
+    audit = rows(pg, "SELECT target,outcome FROM insurance_audit_log "
+                     "WHERE action='retrieval_diagnose'")[0]
+    assert audit['target'] == body['correlation_id'] and audit['outcome'] == 'ok'
+    assert '¿Cubre daños por agua?' not in '\n'.join(
+        record.getMessage() for record in caplog.records)
+
+
+def test_retrieval_diagnostic_requires_operator_permission(pg, operator):
+    response = operator.post(
+        '/insurance/admin/retrieval/diagnose',
+        json={'customer_id': 'C2', 'question': '¿Cubre agua?'},
+        headers={'Authorization': 'Bearer ' + 'tok-noperm'})
+    assert response.status_code == 403
+    assert rows(pg, "SELECT outcome FROM insurance_audit_log "
+                    "WHERE action='retrieval_diagnose'")[0]['outcome'] == 'forbidden'
+
+
 def test_operator_shows_unverified_claims_as_unverified(pg, operator, monkeypatch):
     monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
     ask(f'{TEXT} Me llamo Ana Pérez Falsa, DNI {DNI}.')

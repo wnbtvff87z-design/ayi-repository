@@ -7,6 +7,9 @@ from insurance import identity
 STOP = set('de la el los las un una y o en que por para con del al se mi me es lo a su sus si no'.split())
 SUPPORT = ('exclusions', 'general_conditions', 'particular')
 MAX_PAGES = 5
+MAX_FRAGMENTS_PER_PAGE = 2
+MAX_EVIDENCE_REFS = MAX_PAGES * (MAX_FRAGMENTS_PER_PAGE + 1)
+MAX_TRACE_CANDIDATES = 100
 STREAM_CHUNK = 128
 
 AUTHORIZED = (
@@ -43,6 +46,22 @@ PAGES_SQL = (
     'AND pp.indexed AND pp.quality=\'ok\' AND pp.source IN (\'text\',\'ocr\') '
     'AND length(btrim(pp.body))>0 ORDER BY pp.document_id,pp.page_number'
 )
+FTS_VECTOR = "to_tsvector('simple',translate(lower(pp.body),'áéíóúüñ','aeiouun'))"
+MATCHING_PAGES_SQL = (
+    'SELECT pp.document_id,pp.page_number,pp.section,pp.source,pp.body,'
+    f'ts_rank_cd({FTS_VECTOR},to_tsquery(\'simple\',%s)) AS fts_rank '
+    'FROM insurance_documents d JOIN insurance_document_pages pp '
+    'ON pp.business_id=d.business_id AND pp.document_id=d.document_id '
+    'WHERE d.business_id=%s AND d.policy_id=%s AND d.version_id=%s AND d.status=\'ready\' '
+    'AND pp.indexed AND pp.quality=\'ok\' AND pp.source IN (\'text\',\'ocr\') '
+    'AND length(btrim(pp.body))>0 '
+    f'AND {FTS_VECTOR} @@ to_tsquery(\'simple\',%s) '
+    'ORDER BY pp.document_id,pp.page_number'
+)
+SUMMARY_SECTION_ORDER = ('particular', 'coverage', 'general_conditions', 'exclusions', 'general', 'annex')
+GLASS_TERMS = frozenset(('vidrio', 'vidrios', 'cristal', 'cristales', 'cristale'))
+FIRE_TERMS = frozenset(('incendio', 'incendios', 'fuego', 'fuegos'))
+SENTENCE_SPLIT = re.compile(r'(?<=[.!?;])\s+|\n+')
 
 
 def _stream(conn, sql, params):
@@ -64,24 +83,40 @@ def _evidence(page, version_id):
             'text': page['body']}
 
 
+def _evidence_fragment(page, version_id, start, end):
+    evidence = _evidence(page, version_id)
+    evidence.update(text=page['body'][start:end], position_start=start, position_end=end)
+    return evidence
+
+
 def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages):
     """Reload bounded prior citations; fail closed on any invalid or mixed scope."""
-    if not isinstance(pages, (list, tuple)) or not 0 < len(pages) <= MAX_PAGES:
+    if not isinstance(pages, (list, tuple)) or not 0 < len(pages) <= MAX_EVIDENCE_REFS:
         return []
     refs = []
+    unique_pages = set()
     for page in pages:
         if not isinstance(page, dict):
             return []
         doc, number = page.get('document_id'), page.get('page', page.get('page_number'))
+        start, end = page.get('position_start'), page.get('position_end')
         if (not isinstance(doc, str) or not isinstance(number, int) or isinstance(number, bool)
                 or number < 1 or page.get('version_id', version_id) != version_id
                 or page.get('business_id', business_id) != business_id
-                or page.get('policy_id', policy_id) != policy_id):
+                or page.get('policy_id', policy_id) != policy_id
+                or ((start is None) != (end is None))
+                or (start is not None and (not isinstance(start, int) or isinstance(start, bool)
+                                           or not isinstance(end, int) or isinstance(end, bool)
+                                           or start < 0 or end <= start))):
             return []
-        if (doc, number) not in refs:
-            refs.append((doc, number))
+        unique_pages.add((doc, number))
+        ref = (doc, number, start, end)
+        if ref not in refs:
+            refs.append(ref)
+    if len(unique_pages) > MAX_PAGES:
+        return []
     evidence = []
-    for doc, number in refs:
+    for doc, number, start, end in refs:
         row = conn.execute(
             'SELECT pp.document_id,pp.page_number,pp.section,pp.source,pp.body '
             'FROM insurance_policies p JOIN insurance_policy_versions v '
@@ -96,14 +131,90 @@ def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages)
             (business_id, customer_id, policy_id, version_id, doc, number)).fetchone()
         if not row:
             return []
-        evidence.append(_evidence(row, version_id))
+        if start is None:
+            evidence.append(_evidence(row, version_id))
+        elif end <= len(row['body']):
+            evidence.append(_evidence_fragment(row, version_id, start, end))
+        else:
+            return []
     return evidence
 
 
 def _tokens(text):
     t = unicodedata.normalize('NFD', text.casefold())
     t = ''.join(c for c in t if unicodedata.category(c) != 'Mn')
-    return {w for w in re.findall(r'[a-z0-9]{3,}', t) if w not in STOP}
+    words = {w for w in re.findall(r'[a-z0-9]{3,}', t) if w not in STOP}
+    return {w[:-1] if len(w) > 4 and w.endswith('s') else w for w in words}
+
+
+def _raw_tokens(text):
+    folded = unicodedata.normalize('NFD', str(text or '').casefold())
+    folded = ''.join(c for c in folded if unicodedata.category(c) != 'Mn')
+    return {w for w in re.findall(r'[a-z0-9]{3,}', folded) if w not in STOP}
+
+
+def _query_terms(question):
+    raw = _raw_tokens(question)
+    terms = set(_tokens(question))
+    if raw & GLASS_TERMS:
+        terms.update(GLASS_TERMS)
+    if raw & FIRE_TERMS:
+        terms.update(FIRE_TERMS)
+    return terms
+
+
+def _fts_query(terms):
+    words = set()
+    for term in terms:
+        if not re.fullmatch(r'[a-z0-9]{3,}', term):
+            continue
+        words.add(term)
+        if not term.endswith('s'):
+            words.add(term + 's')
+    return ' | '.join(sorted(words))
+
+
+def _fragment_ranges(body, terms):
+    """Return separate, source-positioned windows around matching sentences."""
+    sentences = []
+    start = 0
+    for match in SENTENCE_SPLIT.finditer(body):
+        end = match.start()
+        if body[start:end].strip():
+            sentences.append((start, end, body[start:end]))
+        start = match.end()
+    if body[start:].strip():
+        sentences.append((start, len(body), body[start:]))
+    if not sentences:
+        return []
+    scores = [len(terms & _tokens(sentence)) for _, _, sentence in sentences]
+    ranked = sorted((i for i, score in enumerate(scores) if score), key=lambda i: (-scores[i], i))
+    chosen = []
+    for index in ranked:
+        left, right = max(0, index - 1), min(len(sentences) - 1, index + 1)
+        if any(left <= old_right and old_left <= right for old_left, old_right in chosen):
+            continue
+        chosen.append((left, right))
+        if len(chosen) >= MAX_FRAGMENTS_PER_PAGE:
+            break
+    if not chosen:
+        return []
+    # A short opening line can be the page heading even when the relevant clause is much later.
+    heading = sentences[0]
+    heading_text = heading[2].strip()
+    if (len(heading_text) <= 200 and re.search(
+            r'\b(?:cobertura|garant[ií]a|condiciones|exclusiones|l[ií]mites?|franquicia)\b',
+            heading_text, re.I) and not any(a == 0 for a, _ in chosen)):
+        chosen.append((0, 0))
+    return [(sentences[left][0], sentences[right][1]) for left, right in sorted(chosen)]
+
+
+def _trace_page(page, *, score, fts_rank, selected=False, reason=None, fragments=()):
+    return {'document_id': page['document_id'], 'page': page['page_number'],
+            'section': page['section'], 'normalized_score': score,
+            'full_text_score': round(float(fts_rank or 0), 6),
+            'selected': selected, 'discard_reason': reason,
+            'fragments': [{'start': a, 'end': b} for a, b in fragments]}
 
 
 def _mentions(question, ident):
@@ -119,16 +230,25 @@ def _mentions(question, ident):
                      question, re.I) is not None
 
 
-def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=None, fact_end=None):
+def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=None, fact_end=None,
+             mode='question', include_trace=False):
     """Returns {'status','reason_code','evidence','policy_id','version_id','diagnostics'}.
 
     fact_end optionally requires one version to cover the entire inclusive incident range.
     diagnostics holds only counters/enums (no PII, no document text)."""
+    if mode not in ('question', 'summary', 'availability'):
+        raise ValueError('unsupported retrieval mode')
     diag = {'authorization_status': 'none', 'document_status': 'n/a', 'usable_pages': 0,
             'retrieval_status': 'not_run', 'evidence_count': 0}
+    trace = []
 
     def out(status, reason_code, evidence=(), **base):
         diag.update(retrieval_status=status, evidence_count=len(evidence))
+        if include_trace:
+            diag['trace'] = {'candidate_count': diag.get('fts_candidate_pages', 0),
+                             'candidates': trace[:MAX_TRACE_CANDIDATES],
+                             'truncated': len(trace) > MAX_TRACE_CANDIDATES,
+                             'selected': [row for row in trace if row['selected']]}
         return {'status': status, 'reason_code': reason_code, 'evidence': list(evidence),
                 'diagnostics': dict(diag), **base}
 
@@ -196,31 +316,97 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
     diag['page_candidates'] = int(docs['usable'])
     if docs['empty_ready'] or not docs['usable']:
         return out('ready_without_pages', 'ready_without_usable_pages', **base)
-    q = _tokens(question)
+    if mode == 'availability':
+        return out('available', 'authorized_documents_ready', **base)
+    if mode == 'summary':
+        selected = {}
+        for page in _stream(conn, PAGES_SQL, params):
+            if page['section'] not in selected:
+                selected[page['section']] = page
+        chosen = [selected[section] for section in SUMMARY_SECTION_ORDER if section in selected][:MAX_PAGES]
+        if not chosen:
+            return out('ready_without_pages', 'ready_without_usable_pages', **base)
+        evidence = []
+        for page in chosen:
+            sentences = [part for part in SENTENCE_SPLIT.split(page['body']) if part.strip()]
+            end = len(page['body']) if len(sentences) <= 3 else page['body'].find(sentences[3])
+            evidence.append(_evidence_fragment(page, pol['version_id'], 0, end))
+        return out('ok', 'summary_sections_selected', evidence, **base)
+    terms = _query_terms(question)
+    query = _fts_query(terms)
+    if not query:
+        return out('no_match', 'no_searchable_terms', **base)
     hits, support = [], {section: [] for section in SUPPORT}
     diag['scored_pages'] = 0
+    diag['normalized_candidate_pages'] = 0
+    diag['fts_candidate_pages'] = 0
     diag['retained_page_candidates'] = 0
-    # Preserve exact original scoring and tie order without retaining the full corpus.
-    for page in _stream(conn, PAGES_SQL, params):
-        score = len(q & _tokens(page['body']))
+    matching_params = (query, *params, query)
+    for page in _stream(conn, MATCHING_PAGES_SQL, matching_params):
+        fts_rank = float(page['fts_rank'] or 0)
+        score = len(terms & _tokens(page['body']))
         diag['scored_pages'] += 1
-        if score > 0:
-            hits.append((score, page))
-            hits.sort(key=lambda item: -item[0])
+        diag['fts_candidate_pages'] += 1
+        if score:
+            diag['normalized_candidate_pages'] += 1
+        if score or fts_rank:
+            candidate = (score, fts_rank, page)
+            hits.append(candidate)
+            hits.sort(key=lambda item: (-item[0], -item[1], item[2]['document_id'],
+                                        item[2]['page_number']))
             del hits[3:]
-        if page['section'] in support:
+        if page['section'] in support and (score or fts_rank):
             shortlist = support[page['section']]
-            shortlist.append((score, page))
-            shortlist.sort(key=lambda item: -item[0])
+            shortlist.append((score, fts_rank, page))
+            shortlist.sort(key=lambda item: (-item[0], -item[1], item[2]['document_id'],
+                                             item[2]['page_number']))
             del shortlist[MAX_PAGES:]
         diag['retained_page_candidates'] = max(
             diag['retained_page_candidates'], len(hits) + sum(map(len, support.values())))
     if not hits:
         return out('no_match', 'no_matching_pages', **base)
-    chosen = [page for _, page in hits]
-    for section in SUPPORT:  # keep coverage together with conditions and exclusions
-        extra = next((p for s, p in support[section] if p not in chosen), None)
+    chosen = [page for _, _, page in hits]
+    for section in SUPPORT:
+        extra = next((p for score, rank, p in support[section]
+                      if p not in chosen and (score or rank)), None)
         if extra and len(chosen) < MAX_PAGES:
             chosen.append(extra)
-    evidence = [_evidence(p, pol['version_id']) for p in sorted(chosen, key=lambda p: p['page_number'])]
+    ranked_candidates = {(page['document_id'], page['page_number']): (score, rank, page)
+                         for section in SUPPORT for score, rank, page in support[section]}
+    ranked = sorted(ranked_candidates.values(), key=lambda item: (-item[0], -item[1],
+                                                                   item[2]['document_id'],
+                                                                   item[2]['page_number']))
+    for score, rank, page in ranked:
+        if page not in chosen and len(chosen) < MAX_PAGES:
+            chosen.append(page)
+    chosen.sort(key=lambda page: (page['document_id'], page['page_number']))
+    evidence, fragment_map = [], {}
+    for page in chosen:
+        ranges = _fragment_ranges(page['body'], terms)
+        if not ranges:
+            ranges = [(0, len(page['body']))]
+        fragment_map[(page['document_id'], page['page_number'])] = ranges
+        evidence.extend(_evidence_fragment(page, pol['version_id'], start, end)
+                        for start, end in ranges)
+    diag['selected_pages'] = len(chosen)
+    diag['text_chars'] = sum(len(item['text']) for item in evidence)
+    if include_trace:
+        selected_refs = {(page['document_id'], page['page_number']) for page in chosen}
+        candidates = {}
+        for score, rank, page in hits:
+            candidates[(page['document_id'], page['page_number'])] = (
+                score, rank, page)
+        for section in SUPPORT:
+            for score, rank, page in support[section]:
+                candidates[(page['document_id'], page['page_number'])] = (
+                    score, rank, page)
+        for score, rank, page in sorted(candidates.values(),
+                                        key=lambda item: (-item[0], -item[1],
+                                                          item[2]['document_id'],
+                                                          item[2]['page_number'])):
+            selected = (page['document_id'], page['page_number']) in selected_refs
+            ranges = fragment_map.get((page['document_id'], page['page_number']), ())
+            trace.append(_trace_page(
+                page, score=score, fts_rank=rank, selected=selected,
+                reason=None if selected else 'rank_below_page_limit', fragments=ranges))
     return out('ok', 'ok', evidence, **base)
