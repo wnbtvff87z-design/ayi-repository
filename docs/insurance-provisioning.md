@@ -364,3 +364,108 @@ constante.
 `tests/test_insurance_scale.py` imprime los planes JSON completos antes/después
 y contadores al ejecutar con `pytest -s`. No se guardan PDFs reales, datos de
 clientes ni informes temporales dentro del repositorio.
+
+## Auditoría Voice: recorrido comprobado y diagnóstico
+
+### Recorrido anterior y causa reproducida
+
+1. `web/main.py:voice` recibe el webhook firmado de Twilio y resuelve el número
+   `To` mediante `lookup(..., 'Voice')`. Cuando corresponde atención automática,
+   redirige al Relay existente; no se cambian números ni webhooks.
+2. `relay/main.py:voice` valida la firma y consulta `/internal/business`.
+   El TwiML existente configura ConversationRelay en `es-ES`, STT **Deepgram**
+   y TTS ElevenLabs. El reconocimiento ocurre en ese proveedor, no en Python Web.
+3. `relay/main.py:websocket` recibe `setup` con `callSid/from/to`; posteriormente,
+   recibe `prompt` con `voicePrompt` y `last`. Antes de estos cambios, solo
+   reenviaba `last=true`, convertía a string y quitaba espacios de los extremos.
+   No concatenaba hipótesis intermedias y descartaba finales vacíos.
+4. `core('/internal/turn', ...)` enviaba el texto final, negocio resuelto,
+   teléfonos de origen/destino y `external_id`, con autenticación interna.
+   `event_external_id` utiliza ID estable del evento cuando existe o
+   `<CallSid>:turn:<secuencia>`; la sesión Insurance es el prefijo CallSid.
+5. `web/main.py:internal_turn` vuelve a resolver destino/canal y exige el mismo
+   `business_id`. `converse` distingue Insurance, que llama al router sin pasar
+   por el almacén compartido de restaurantes.
+6. `insurance.dialog` extrae declaraciones, normaliza nombre/DNI, consulta un
+   único cliente activo autorizado para ese negocio y crea verificación temporal.
+   Devuelve la respuesta por Web → Relay → mensaje WebSocket TTS.
+
+Payload anterior reproducible (valores sintéticos; los teléfonos viajan por
+el canal autenticado, no se escriben en el transcript ni en logs):
+
+```json
+{
+  "business_id": "INS-BIZ-001",
+  "business_phone": "+34000000000",
+  "channel": "Voice",
+  "customer_phone": "+34000000001",
+  "external_id": "CA-SYNTHETIC:turn:2",
+  "text": "Cinco uno nueve cinco nueve cinco seis seis jota"
+}
+```
+
+**Defecto comprobado en código y reproducible con texto sintético:** `DOC_RE`
+solo reconocía cifras escritas y letra, no los dígitos/letter names pronunciados.
+Además, el nombre sin «me llamo» antes del estado `awaiting=identity` no se
+extraía de la misma manera que un nombre etiquetado. La petición genérica de
+todos los datos ocultaba cuáles todavía no se habían comprendido.
+Un DNI hablado podía ser clasificado como pregunta en vez de identidad.
+No había un transcript administrativo Insurance que permitiera distinguir
+este fallo de un texto STT realmente incompleto.
+
+**No se afirma haber escuchado la llamada real ni conocer su transcripción.**
+La prueba aportada demuestra documentos listos, no el contenido del evento STT.
+La instrumentación nueva permite comprobarlo en la siguiente llamada autorizada.
+La documentación pública de ConversationRelay describe `voicePrompt` como texto
+reconocido y `last` como final de intervención; no se asume sin evidencia que
+cualquier hipótesis intermedia sea un fragmento que deba concatenarse.
+Se conserva el final recibido y se diagnostican intermedios/finales ausentes.
+
+### Comparación con WhatsApp y restaurantes
+
+- WhatsApp usa `Body` completo y `MessageSid`; no hay STT. Ambos canales pasan
+  después por el mismo resolvedor de negocio y verificador exacto.
+- Voice de restaurantes usa el mismo transporte. `converse` conserva
+  `customer_sessions`, historial `conversation_turns` y estado por CallSid;
+  el intérprete/diálogo aprovecha valores ya comprendidos y preguntas pendientes.
+- Insurance omite intencionadamente ese almacén compartido y el espejo Airtable
+  de conversaciones. Sus tablas propias conservan estado, turnos, evidencia y
+  trazabilidad de Voice sin mezclar sectores.
+- Se reutiliza el patrón conversacional —estado explícito, aclarar solo lo
+  pendiente, ventanas de contexto, continuidad y separación por llamada—,
+  **no** reglas de reservas ni datos de restaurante.
+
+### Identidad natural, sin relajar la coincidencia
+
+Los dígitos pronunciados individualmente y los nombres de letras se convierten
+por vocabulario cerrado, en contexto de documento. No se corrigen apellidos,
+fonemas ni números por similitud; un DNI incompleto nunca verifica.
+Se permiten nombre y documento en turnos distintos de la misma llamada.
+Cuando el dato declarado es incompleto o ambiguo, se pide únicamente completarlo
+o repetirlo, sin revelar cuál de los datos almacenados no coincidió.
+Tras verificar se pregunta qué desea consultar, salvo que ya exista una pregunta
+real pendiente, que se retoma sin exigir repetición.
+
+El buffer de cifras parciales se cifra/autentica con Fernet (`cryptography==50.0.2`,
+sin avisos en la consulta de advisories realizada). La clave se deriva con
+separación de dominio del secreto HMAC existente y del ámbito negocio/canal/
+conversación/CallSid; no se añade un secreto obligatorio de Railway.
+El buffer caduca y se elimina al completarse. Rotar el secreto invalida buffers
+pendientes; el usuario repite solo el documento, no se cambia un cliente por
+una descodificación errónea. No se almacena el DNI completo en claro.
+
+Los diagnósticos distinguen transporte de identidad:
+
+| Código | Significado |
+|---|---|
+| `voice_transcription_missing` | No llegó texto final utilizable |
+| `voice_transcription_partial` | Hubo hipótesis intermedias sin final completo observado |
+| `identity_data_partial` | Faltan datos declarados para verificar |
+| `identity_parse_failed` | Texto recibido, pero no hay interpretación determinista segura |
+| `identity_no_match` | La combinación completa no verifica |
+| `identity_ambiguous` | Varias coincidencias activas; nunca se elige una |
+| `identity_verified` | Coincidencia única dentro del negocio/canal/sesión |
+
+Los códigos técnicos no llevan DNI, nombre, teléfono, transcripción, tokens ni
+contenido contractual en logs generales. Los datos reconocidos en pruebas son
+sintéticos; el transcript operativo conserva una representación enmascarada.

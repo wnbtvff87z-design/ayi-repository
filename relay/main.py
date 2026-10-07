@@ -61,6 +61,15 @@ async def core(path,data):
  async with httpx.AsyncClient(timeout=25) as h:
   r=await h.post(base+path,headers={'X-Internal-API-Key':key},json=data)
   r.raise_for_status();return r.json()
+def insurance_reference(call_sid):
+ return hashlib.sha256(('insurance-voice:'+str(call_sid)).encode()).hexdigest()
+def insurance_error(stage,exc,call_sid):
+ ref=insurance_reference(call_sid)
+ log.error('insurance_voice stage=%s error_type=%s call_ref=%s correlation_id=%s',stage,type(exc).__name__,ref,ref)
+async def insurance_transport(state,event,diagnostic,text=''):
+ try:
+  await core('/internal/insurance/voice/transport',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','CallSid':state['call_sid'],'external_id':state['call_sid']+':transport:'+event,'text':text,'diagnostic':diagnostic,'transport':{'event':event,'last':False,'partial_count':state['partial_count'],'fragment_count':state['partial_count'],'final_count':state['final_count']},'correlation_id':insurance_reference(state['call_sid'])})
+ except Exception as exc:insurance_error('transport_'+event,exc,state['call_sid'])
 @app.get('/health')
 async def health():return JSONResponse({'status':'OK','build':'relay-diag1','core_configured':bool(env('CORE_BASE_URL') and env('INTERNAL_API_KEY')),'ws_configured':bool(env('RELAY_WS_URL'))})
 @app.api_route('/voice',methods=['GET','POST'])
@@ -68,6 +77,7 @@ async def voice(req:Request):
  if req.method!='POST':return Response('Forbidden',status_code=403)
  form=await req.form()
  if not valid_http(req,form):return Response('Forbidden',status_code=403)
+ b=None
  try:
   b=(await core('/internal/business',{'phone':number(form.get('To')),'channel':'Voice'}))['business']
   if not b:raise ValueError('Unknown business')
@@ -78,8 +88,10 @@ async def voice(req:Request):
   action=escape(env('RELAY_PUBLIC_URL').rstrip('/')+'/relay-ended',{'"':'&quot;'})
   xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect action="{action}" method="POST"><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="es-ES" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="es-ES" /></Connect><Hangup/></Response>'
   return Response(xml,media_type='application/xml')
- except Exception:
-  log.exception('Voice setup failed');return Response('<Response><Say language="es-ES">No puedo atender ahora.</Say><Hangup/></Response>',media_type='application/xml')
+ except Exception as exc:
+  if b and str(b.get('sector') or '').strip().casefold() in ('insurance','seguro','seguros'):insurance_error('setup',exc,form.get('CallSid',''))
+  else:log.exception('Voice setup failed')
+  return Response('<Response><Say language="es-ES">No puedo atender ahora.</Say><Hangup/></Response>',media_type='application/xml')
 @app.api_route('/relay-ended',methods=['POST'])
 async def relay_ended(req:Request):
  form=await req.form()
@@ -103,18 +115,38 @@ async def relay_ended(req:Request):
 @app.websocket('/ws')
 async def websocket(ws:WebSocket):
  if not valid_ws(ws):await ws.close(code=1008);return
- await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0,'processed_ids':set()}
+ await ws.accept();state={'call_sid':'','from':'','to':'','business':None,'seq':0,'processed_ids':set(),'insurance':False,'partial_count':0,'final_count':0,'last_partial':''}
  try:
   while True:
    event=json.loads(await ws.receive_text());kind=event.get('type')
    if kind=='setup':
+    call_sid=event.get('callSid','')
+    if state['insurance'] and state['business']:
+     if not isinstance(call_sid,str) or not call_sid.strip():
+      insurance_error('technical_call_id_missing',ValueError(),state['call_sid'])
+      await ws.close(code=1008);return
+     if call_sid==state['call_sid']:continue
+     if not state['final_count']:
+      await insurance_transport(state,'disconnect','voice_transcription_partial' if state['partial_count'] else 'voice_transcription_missing',state['last_partial'])
+     state['seq']=0;state['partial_count']=0;state['final_count']=0;state['last_partial']='';state['processed_ids']=set()
     state['call_sid']=event.get('callSid','')
     state['from']=number(event.get('from'))
     state['to']=number(event.get('to'))
     state['business']=(await core('/internal/business',{'phone':state['to'],'channel':'Voice'}))['business']
+    state['insurance']=bool(state['business'] and str(state['business'].get('sector') or '').strip().casefold() in ('insurance','seguro','seguros'))
+    if state['insurance']:
+     if not isinstance(state['call_sid'],str) or not state['call_sid'].strip():
+      insurance_error('technical_call_id_missing',ValueError(),state['call_sid'])
+      await ws.close(code=1008);return
+     await insurance_transport(state,'setup','voice_transcription_missing')
+   elif kind=='prompt' and not event.get('last',True) and state['insurance']:
+    state['partial_count']=min(10000,state['partial_count']+1)
+    # No verified delta/cumulative contract: never merge interim STT into a final.
+    state['last_partial']=str(event.get('voicePrompt') or '')[:4000]
    elif kind=='prompt' and event.get('last',True) and state['business']:
     text=str(event.get('voicePrompt') or '').strip()
-    if not text:continue
+    if not text and not state['insurance']:continue
+    if state['insurance']:state['final_count']+=1
     state['seq']+=1
     external_id=event_external_id(event,state['call_sid'],text,state['seq'])
     if external_id in state['processed_ids']:
@@ -125,12 +157,19 @@ async def websocket(ws:WebSocket):
      state['processed_ids']={external_id}
     end_reason=None
     try:
-     out=await core('/internal/turn',{'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':external_id,'text':text})
+     data={'business_id':state['business']['business_id'],'business_phone':state['to'],'channel':'Voice','customer_phone':state['from'],'external_id':external_id,'text':text}
+     if state['insurance']:
+      data['voice_transport']={'last':True,'last_present':'last' in event,'partial_count':state['partial_count'],'fragment_count':state['partial_count']+1}
+      state['partial_count']=0;state['last_partial']=''
+     out=await core('/internal/turn',data)
      reply=out.get('reply')
      end_reason=out.get('end_reason') if out.get('end_call') is True else None
      state['processed_ids'].add(external_id)
      if not reply:continue
-    except Exception:log.exception('Voice turn failed');reply='No pude verificar el estado de tu solicitud. No la repitas; contacta con recepción.'
+    except Exception as exc:
+     if state['insurance']:insurance_error('turn',exc,state['call_sid'])
+     else:log.exception('Voice turn failed')
+     reply='No pude verificar el estado de tu solicitud. No la repitas; contacta con recepción.'
     if end_reason not in ('goodbye','cancelled','verification'):
      end_reason={'¡Gracias a ti! Hasta luego.':'goodbye','De acuerdo, no hice cambios. ¡Hasta luego!':'cancelled','La operación sigue pendiente de verificación. No la repitas; consulta con recepción. Hasta luego.':'verification'}.get(reply)
     # Do not synthesize the goodbye over WebSocket and then end immediately:
@@ -139,6 +178,16 @@ async def websocket(ws:WebSocket):
      await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':end_reason,'voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
      return
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))
-   elif kind=='error':log.error('ConversationRelay error: %s',event.get('description'))
+   elif kind=='error':
+    if state['insurance']:
+     ref=insurance_reference(state['call_sid'])
+     log.error('insurance_voice stage=transport_error call_ref=%s correlation_id=%s',ref,ref)
+     await insurance_transport(state,'error','voice_transcription_missing')
+    else:log.error('ConversationRelay error: %s',event.get('description'))
  except WebSocketDisconnect:pass
- except Exception:log.exception('Relay disconnected')
+ except Exception as exc:
+  if state['insurance']:insurance_error('disconnect',exc,state['call_sid'])
+  else:log.exception('Relay disconnected')
+ finally:
+  if state['insurance'] and isinstance(state['call_sid'],str) and state['call_sid'].strip() and not state['final_count']:
+   await insurance_transport(state,'disconnect','voice_transcription_partial' if state['partial_count'] else 'voice_transcription_missing',state['last_partial'])

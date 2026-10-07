@@ -45,8 +45,20 @@ def cfg(name):
 
 def redact(text, *, bounded=True):
     """No DNI/NIE in clear in stored text."""
+    from insurance import voice_identity
     text = unicodedata.normalize('NFKC', str(text or ''))
     text = _DOCUMENT.sub('[documento]', identity.DOC_RE.sub('[documento]', text))
+    # Mask only declaration spans: blanket transcript masking would erase contractual amounts/dates.
+    text = voice_identity.mask_declarations(text)
+    digit = r'\b(?:' + '|'.join(voice_identity.DIGITS) + r')\b'
+    letter = r'(?:i\s+griega|uve\s+doble|' + '|'.join(voice_identity.LETTERS) + r'|[A-Za-z])\b'
+    spoken_document = (r'(?:(?:equis|ye|zeta|[XYZ])[\s,.-]+)?' + digit +
+                       r'(?:[\s,.-]+' + digit + r'){6,7}[\s,.-]+' + letter)
+    text = re.sub(spoken_document, lambda m: voice_identity.mask_transcript(m.group()), text, flags=re.I)
+    text = re.sub(digit + r'(?:[\s,.-]+' + digit + r')+',
+                  lambda m: voice_identity.mask_transcript(m.group()), text, flags=re.I)
+    phone = r'(?:\b(?:tel[eé]fono|m[oó]vil)\b\s*(?:es\b\s*)?[:=-]?\s*)?\+\d(?:[\s().-]*\d){6,14}'
+    text = re.sub(phone, lambda m: voice_identity.mask_transcript(m.group()), text, flags=re.I)
     return text[:cfg('INSURANCE_TURN_MAX_CHARS')] if bounded else text
 
 
@@ -112,11 +124,12 @@ def record_assistant(conn, sc, external_id, content, decision, reply_to, corr, k
 
 def find_reply(conn, sc, external_id):
     """Retry record with ownership/evidence metadata; caller must revalidate before disclosure."""
-    return conn.execute(
+    row = conn.execute(
         'SELECT turn_id,content,decision,customer_id,policy_id,version_id,pages '
         'FROM insurance_conversation_turns WHERE business_id=%s AND '
         "channel=%s AND conversation_ref=%s AND session_ref=%s AND external_id=%s AND role='assistant'",
         (sc.bid, sc.channel, sc.ref, sc.sess, external_id)).fetchone()
+    return dict(row, content=redact(row['content'], bounded=False)) if row else None
 
 
 def claim_unverified(conn, sc):
@@ -141,7 +154,7 @@ def recent(conn, sc, n=None):
         'FROM insurance_conversation_turns t JOIN exchanges e ON t.turn_id=e.q_id OR t.turn_id=e.a_id '
         'ORDER BY e.q_id,t.turn_id',
         (*_scope(sc), cfg('INSURANCE_TURN_RETENTION_DAYS'), cfg('INSURANCE_TURN_RETENTION_DAYS'), n)).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r, content=redact(r['content'], bounded=False)) for r in rows]
 
 
 PAIR_SQL = (
@@ -167,19 +180,27 @@ def pairs(conn, sc, oldest_first=False, limit=None, exclude_question_id=None, an
         sql + f"ORDER BY q.turn_id {'ASC' if oldest_first else 'DESC'} LIMIT %s",
         params + (
          limit or cfg('INSURANCE_MEMORY_SCAN_LIMIT'),)).fetchall()
-    return [dict(r) for r in rows]
+    return [_clean_pair(r) for r in rows]
 
 
 def pair_by_question(conn, sc, q_id):
     r = conn.execute(PAIR_SQL + 'AND q.turn_id=%s', _pair_params(sc) + (q_id,)).fetchone()
-    return dict(r) if r else None
+    return _clean_pair(r) if r else None
 
 
 def last_answered(conn, sc):
     r = conn.execute(
         PAIR_SQL + 'AND a.turn_id IS NOT NULL ORDER BY q.turn_id DESC LIMIT 1',
         _pair_params(sc)).fetchone()
-    return dict(r) if r else None
+    return _clean_pair(r) if r else None
+
+
+def _clean_pair(row):
+    pair = dict(row)
+    for key in ('q', 'a', 'normalized'):
+        if pair.get(key):
+            pair[key] = redact(pair[key], bounded=False)
+    return pair
 
 
 def _pair_params(sc):
@@ -204,7 +225,7 @@ def iter_pairs(conn, sc, exclude_question_id=None, answered_only=False):
                             params + (cfg('INSURANCE_MEMORY_SCAN_LIMIT'),)).fetchall()
         if not rows:
             return
-        yield [dict(r) for r in rows]
+        yield [_clean_pair(r) for r in rows]
         before = rows[-1]['q_id']
 
 
@@ -306,6 +327,12 @@ def _prune_summary(conn, sc, summary):
         summary[key] = [e for e in summary.get(key, []) if isinstance(e, dict)
                        and e.get('turn', e.get('id')) in alive
                        and (not e.get('a_turn') or e['a_turn'] in alive)]
+        for entry in summary[key]:
+            for field in ('q', 'answer', 'text', 'issue'):
+                if entry.get(field):
+                    entry[field] = redact(entry[field], bounded=False)
+    if summary.get('event_date'):
+        summary['event_date'] = redact(summary['event_date'], bounded=False)
     if (summary.get('active') or {}).get('turn') not in alive:
         summary.pop('active', None)
     if summary.get('event_date_turn') not in alive:
@@ -463,19 +490,21 @@ def build_context(*, question, evidence, policy=None, version=None, pending=None
         if not turn.get('content'):
            continue
         if turn['role'] == 'user':
-           groups.append([{'role': 'user', 'text': turn['content']}])
+           groups.append([{'role': 'user', 'text': redact(turn['content'], bounded=False)}])
         elif groups and groups[-1][-1]['role'] == 'user':
-           groups[-1].append({'role': 'assistant', 'text': turn['content']})
+           groups[-1].append({'role': 'assistant', 'text': redact(turn['content'], bounded=False)})
     groups = [g for g in groups if len(g) == 2]
     # Retain the most relevant exchanges first, recency breaking ties; each exchange stays whole.
     wanted = toks(question)
     ranked = sorted(enumerate(groups), key=lambda item:
                    (len(wanted & toks(' '.join(t['text'] for t in item[1]))), item[0]))
-    ctx = {'identity': identity_line, 'question': question or '',
+    ctx = {'identity': identity_line, 'question': redact(question, bounded=False),
            'policy': f'{policy} versión {version}' if policy else '',
-           'pending': pending or '', 'evidence': [dict(e) for e in evidence],
+           'pending': redact(pending, bounded=False), 'evidence': [dict(e) for e in evidence],
            'recent': [t for g in groups for t in g],
-           'summary': summary_text or '', 'recalled': [{'q': r['q'], 'a': r.get('a') or '(sin respuesta)'}
+           'summary': redact(summary_text, bounded=False),
+           'recalled': [{'q': redact(r['q'], bounded=False),
+                        'a': redact(r.get('a') or '(sin respuesta)', bounded=False)}
                                                         for r in islice(recalled, cfg('INSURANCE_RECALLED_TURNS'))]}
     dropped = []
 

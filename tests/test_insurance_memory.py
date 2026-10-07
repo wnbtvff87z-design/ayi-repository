@@ -59,6 +59,28 @@ def test_document_redaction(document):
     assert memory.redact('DNI: ' + document + ', agua') == 'DNI: [documento], agua'
 
 
+@pytest.mark.parametrize('text', [
+    'DNI cinco ocho dos seis cuatro uno siete nueve J',
+    'cinco ocho dos seis cuatro uno siete nueve jota',
+    'mi documento equis uno dos tres cuatro cinco seis siete ele',
+    'DNI uno dos tres',
+    'Teléfono 600111222', '+34 600 111 222',
+])
+def test_spoken_documents_partial_fragments_and_phones_redacted(text):
+    redacted = memory.redact(text, bounded=False)
+    assert text not in redacted
+    assert 'cinco ocho' not in redacted
+    assert 'uno dos tres' not in redacted
+    assert '600' not in redacted
+
+
+def test_identity_redaction_preserves_contractual_amounts_and_dates():
+    text = 'Cobertura agua según documento de póliza: límite 10000 euros, franquicia 250, fecha 01/01/2026.'
+    assert memory.redact(text, bounded=False) == text
+    assert memory.redact('hace dos días quiero consultar una póliza') == 'hace dos días quiero consultar una póliza'
+    assert memory.redact('DNI 12345678Z 10000 euros', bounded=False) == 'DNI [documento] 10000 euros'
+
+
 def test_prompt_budget_mandatory_not_truncated():
     evidence = [{'document_id': 'DOC', 'version_id': 'V2', 'page': 8,
                  'text': 'Cubre agua. ' + 'x' * 900 + ' Excepto falta de mantenimiento.'}]
@@ -449,3 +471,31 @@ def test_pg_new_incident_clears_current_date_facts_but_keeps_retained_history(pg
     assert [f['text'] for f in summary['facts']] == ['robo']
     assert not summary['open_issues']
     assert [t['id'] for t in summary['topics']] == [q, q2, q3]
+
+
+def test_pg_legacy_spoken_pii_sanitized_on_reads_and_prompt(pg):
+    sc = memory.Scope('B', 'WhatsApp', 'ref', '', 'C')
+    q, a = exchange(pg, sc)
+    sensitive = 'DNI cinco ocho dos seis cuatro uno siete nueve J'
+    body = sensitive + '; límite 10000 euros, franquicia 250.'
+    pg.execute('UPDATE insurance_conversation_turns SET content=%s,normalized=%s WHERE turn_id=ANY(%s)',
+               (body, body, [q, a]))
+    summarize(pg, sc, q, a)
+    pg.execute('UPDATE insurance_conversation_summary SET summary=%s::jsonb',
+               (json.dumps({'facts': [{'turn': q, 'text': body}],
+                            'topics': [{'id': q, 'a_turn': a, 'q': body, 'answer': body}]}),))
+    recent = memory.recent(pg, sc)
+    pairs = memory.pairs(pg, sc)
+    summary, _ = memory.load_summary(pg, sc)
+    assert sensitive not in json.dumps(recent)
+    assert sensitive not in json.dumps(pairs, default=str)
+    assert sensitive not in json.dumps(summary)
+    assert sensitive not in memory.find_reply(pg, sc, pg.execute(
+        'SELECT external_id FROM insurance_conversation_turns WHERE turn_id=%s', (a,)).fetchone()['external_id']
+                                              )['content']
+    ctx = memory.build_context(question='¿Cubre agua?', evidence=[], recent_turns=recent,
+                               recalled=pairs, summary_text=memory.render_summary(summary, 6000))
+    prompt = memory.format_prompt(ctx)
+    assert 'cinco ocho' not in prompt
+    assert '10000 euros' in prompt
+    assert 'franquicia 250' in prompt

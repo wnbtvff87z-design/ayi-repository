@@ -430,13 +430,21 @@ def test_consented_review_write_failure_never_confirms_a_case(pg, monkeypatch):
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_outbox')[0]['n'] == 0
 
 
-def test_several_questions_are_kept_in_one_pending_case(pg, urgent_protocol):
+def test_several_questions_are_kept_in_one_pending_case(pg):
     verify(pg, 'C2')
-    for text, ext in [('Hay una inundación en curso ahora mismo en casa', 'S1'),
-                      ('Hay un incendio en curso ahora mismo en la cocina', 'S2')]:
-        urgent_review(pg, urgent_protocol, text=text, ext=ext)
+    for count, (text, ext) in enumerate([
+            ('¿Qué cubre la póliza para daños por agua?', 'S1'),
+            ('¿Qué cubre la póliza para incendios en la cocina?', 'S2')]):
+        reply, out = say(text, ext=ext)
+        assert '¿Quieres que registre' in reply and 'He guardado' not in reply
+        assert out['insurance_result'] == 'missing_information'
+        assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == count
+        reply, out = say('Sí', ext=ext + '-consent')
+        assert 'He guardado' in reply and out['insurance_result'] == 'human_case_required'
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 1
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 2
+    assert rows(pg, 'SELECT customer_id,attribution_state FROM insurance_cases')[0] == {
+        'customer_id': 'C2', 'attribution_state': 'verified_authorized'}
 
 
 def test_postgres_down_never_claims_the_query_was_saved(monkeypatch):
@@ -467,7 +475,7 @@ def test_diagnostics_are_structured_and_contain_no_personal_data(pg, caplog, mon
     for token in ('correlation_id=', 'business_id=INS-BIZ-001', 'stage=identity', 'reason_code=identity_data_missing',
                   'reason_code=identity_no_match', 'match_count=0', 'identity_verified=false',
                   'identity_verified=true', 'policy_found=true', 'document_ready=true',
-                  'retrieval_status=ok', 'evidence_count=1', 'decision=escalate'):
+                  'retrieval_status=ok', 'evidence_count=1', 'decision=offer_human'):
         assert token in text, token
     for secret in ('Pedro', 'Ruiz', 'Luis', 'Gil', 'Mora', '11111111H', '87654321X', PHONE, '600111222',
                    '900', 'POL-900', 'tuberías', 'daños', 'Cobertura'):

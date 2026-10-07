@@ -28,13 +28,20 @@ TODAY = date(2026, 10, 7)
     ('el 6 de octubre de 2025', '2025-10-06', '2025-10-06', 'day'),
     ('el 6 de octubre de este año', '2026-10-06', '2026-10-06', 'day'),
     ('el 6 de octubre de el año pasado', '2025-10-06', '2025-10-06', 'day'),
+    ('seis de octubre de dos mil veintiséis', '2026-10-06', '2026-10-06', 'day'),
+    ('Seis octubre dos mil veintiséis', '2026-10-06', '2026-10-06', 'day'),
+    ('6 de octubre de 2026', '2026-10-06', '2026-10-06', 'day'),
+    ('seis de octubre de dos mil veinticinco', '2025-10-06', '2025-10-06', 'day'),
+    ('treinta y uno de octubre de dos mil veintiséis', '2026-10-31', '2026-10-31', 'day'),
+    ('octubre de dos mil veintiséis', '2026-10-01', '2026-10-31', 'month'),
 ])
 def test_natural_incident_dates(text, start, end, precision):
     span = incident_dates.parse(text, today=TODAY)
     assert span.as_state() == {'start': start, 'end': end, 'precision': precision, 'status': 'resolved'}
 
 
-@pytest.mark.parametrize('text', ['ayer o anteayer', '31/02/2026', 'el 31 de febrero', '2026-13-01'])
+@pytest.mark.parametrize('text', ['ayer o anteayer', '31/02/2026', 'el 31 de febrero', '2026-13-01',
+                                 'seis de octubre de dos mil veintisei'])
 def test_ambiguous_or_invalid_dates_are_not_guessed(text):
     assert incident_dates.parse(text, today=TODAY).status == 'ambiguous'
 

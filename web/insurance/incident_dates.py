@@ -16,6 +16,15 @@ MONTHS = {
 WEEKDAYS = ('lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo')
 NUMBERS = {'un': 1, 'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4,
            'cinco': 5, 'seis': 6, 'siete': 7, 'ocho': 8, 'nueve': 9, 'diez': 10}
+SPOKEN_NUMBERS = dict(NUMBERS, cero=0, once=11, doce=12, trece=13, catorce=14,
+                      quince=15, dieciseis=16, diecisiete=17, dieciocho=18, diecinueve=19,
+                      veinte=20, veintiuno=21, veintidos=22, veintitres=23, veinticuatro=24,
+                      veinticinco=25, veintiseis=26, veintisiete=27, veintiocho=28, veintinueve=29)
+for _decade, _value in (('treinta', 30), ('cuarenta', 40), ('cincuenta', 50),
+                       ('sesenta', 60), ('setenta', 70), ('ochenta', 80), ('noventa', 90)):
+    SPOKEN_NUMBERS[_decade] = _value
+    for _unit in ('uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete', 'ocho', 'nueve'):
+        SPOKEN_NUMBERS[f'{_decade} y {_unit}'] = _value + NUMBERS[_unit]
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,19 @@ def parse(text, today=None, tz='Europe/Madrid'):
     folded = ''.join(c for c in unicodedata.normalize('NFD', str(text or '').casefold())
                      if unicodedata.category(c) != 'Mn')
     folded = ' '.join(folded.split())
+    months = '|'.join(MONTHS)
+    spoken = '|'.join(re.escape(word) for word in sorted(SPOKEN_NUMBERS, key=len, reverse=True))
+    year_pattern = (r'\b(' + months + r')\s+(?:de\s+)?dos\s+mil(?:\s+(' + spoken +
+                    r'))?\b(?!\s+(?:veinti\w*|treint\w*|cuarent\w*|cincuent\w*|'
+                    r'sesent\w*|setent\w*|ochent\w*|novent\w*)\b)')
+    folded = re.sub(year_pattern, lambda match:
+                    f'{match.group(1)} de {2000 + SPOKEN_NUMBERS.get(match.group(2), 0)}', folded)
+    if re.search(r'\b(?:' + months + r')\s+(?:de\s+)?dos\s+mil\b', folded):
+        return DateSpan(None, None, 'unknown', 'ambiguous')
+    day_words = '|'.join(re.escape(word) for word in sorted(SPOKEN_NUMBERS, key=len, reverse=True)
+                         if 1 <= SPOKEN_NUMBERS[word] <= 31)
+    folded = re.sub(r'\b(' + day_words + r')\s+(?:de\s+)?(' + months + r')\b',
+                    lambda match: f'{SPOKEN_NUMBERS[match.group(1)]} de {match.group(2)}', folded)
     spans, invalid = [], False
 
     def add(year, month, day):
@@ -74,9 +96,8 @@ def parse(text, today=None, tz='Europe/Madrid'):
     for match in re.finditer(r'\b(?:el\s+)?(' + '|'.join(WEEKDAYS) + r')\b', folded):
         value = today - timedelta(days=(today.weekday() - WEEKDAYS.index(match.group(1))) % 7)
         spans.append(DateSpan(value, value, 'day'))
-    months = '|'.join(MONTHS)
-    day_pattern = (r'\b(?:el\s+)?(\d{1,2})\s+de\s+(' + months +
-                   r')(?:\s+de\s+(\d{4}|este\s+ano|el\s+ano\s+pasado))?\b')
+    day_pattern = (r'\b(?:el\s+)?(\d{1,2})\s+(?:de\s+)?(' + months +
+                   r')(?:\s+(?:de\s+)?(\d{4}|este\s+ano|el\s+ano\s+pasado))?\b')
     consumed = []
     for match in re.finditer(day_pattern, folded):
         day, month = int(match.group(1)), MONTHS[match.group(2)]

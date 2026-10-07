@@ -8,3 +8,4 @@ boto3>=1.40,<2
 pypdf>=6.19,<7
 pypdfium2>=4.30,<5
 pytesseract>=0.3.13,<0.4
+cryptography==50.0.2

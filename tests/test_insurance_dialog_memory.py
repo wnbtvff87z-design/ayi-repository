@@ -1,5 +1,6 @@
 """Synthetic PostgreSQL integration tests for persistent, evidence-scoped dialogue."""
 import json
+import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -79,12 +80,16 @@ def test_themed_recall_crosses_all_retained_batches(pg, explained, monkeypatch):
     monkeypatch.setenv('INSURANCE_MEMORY_SCAN_LIMIT', '3')
     ready(pg)
     ask('¿Cubre daños por agua en el techo?', ext='old-theme')
-    for n in range(12):
+    for n in range(30):
         ask(f'¿Cubre cristales en ventana número {n}?', ext=f'intervening-{n}')
     reply, out = ask('Volviendo a daños por agua', ext='theme-recall')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert 'agua' in explained[-1][0]['question'] and 'DOC-POL-900' in reply
     assert explained[-1][0]['recalled'][0]['q'] == '¿Cubre daños por agua en el techo?'
+    assert explained[-1][0]['recalled'][0]['a'] == (
+        'La cláusula exige revisar las condiciones y exclusiones indicadas.\n'
+        'Fuente: documento DOC-POL-900, versión VER-001, página 1. '
+        'Esto no es una aprobación ni denegación de un siniestro.')
 
 
 def test_required_prompt_over_budget_does_not_truncate_evidence_or_call_llm(pg, explained, monkeypatch):
@@ -102,7 +107,8 @@ def test_independent_y_inside_sentence_does_not_merge_prior_question(pg, explain
     ready(pg)
     ask('¿Cubre daños por agua?', ext='water')
     ask('¿Cubre cristales y ventanas?', ext='glass')
-    assert explained[-1][0]['question'] == '¿Cubre cristales y ventanas?'
+    assert explained[-1][0]['question'].startswith('¿Cubre cristales y ventanas?')
+    assert 'agua' not in explained[-1][0]['question']
 
 
 def test_ambiguous_reference_clarifies_then_resumes_selected_topic(pg, explained):
@@ -127,6 +133,15 @@ def test_reference_without_history_never_guesses_or_creates_case(pg, explained):
     assert not explained and count(pg, 'insurance_cases') == 0
 
 
+def test_first_reference_without_any_answered_pair_clarifies_instead_of_selecting_itself(pg, explained):
+    verify(pg, customer='C2')
+    ask('¿Cubre agua?', ext='unanswered-question')
+    add_document(pg, 'POL-900', 'DOC-NOW-READY')
+    reply, out = ask('Volviendo a lo primero', ext='first-without-answer')
+    assert '¿A qué consulta' in reply and out['insurance_result'] == 'missing_information'
+    assert not explained and count(pg, 'insurance_cases') == 0
+
+
 def test_explain_prior_reloads_only_original_pages_and_never_trusts_history(pg, explained):
     ready(pg)
     ask('¿Cubre agua y tuberías?', ext='prior')
@@ -140,6 +155,32 @@ def test_explain_prior_reloads_only_original_pages_and_never_trusts_history(pg, 
     assert any('actualizada' in e['text'] for e in evidence)
     assert not any('ilimitada' in e['text'] for e in evidence)
     assert context['recalled'][0]['a'] == 'Inventada cobertura ilimitada.'
+
+
+@pytest.mark.parametrize('still_ready', [True, False])
+def test_multi_document_prior_response_reloads_each_original_document_or_fails_closed(pg, explained, still_ready):
+    ready(pg)
+    add_document(pg, 'POL-900', 'DOC-EXCLUSIONS', pages=(
+        'Agua: exclusiones por falta de mantenimiento.',
+    ))
+    ask('¿Cubre daños por agua?', ext='multi-document-original')
+    original = {(e['document_id'], e['page']) for e in explained[-1][1]}
+    assert {doc for doc, _ in original} == {'DOC-POL-900', 'DOC-EXCLUSIONS'}
+    with pg() as conn:
+        if still_ready:
+            conn.execute("UPDATE insurance_document_pages SET body='Agua: exclusión actualizada.' "
+                         "WHERE document_id='DOC-EXCLUSIONS'")
+        else:
+            conn.execute("UPDATE insurance_documents SET status='failed' WHERE document_id='DOC-EXCLUSIONS'")
+    before = len(explained)
+    reply, out = ask('¿Dónde lo dice?', ext='multi-document-explanation')
+    if still_ready:
+        assert out['insurance_result'] == 'evidence_backed_explanation'
+        assert {(e['document_id'], e['page']) for e in explained[-1][1]} == original
+        assert any('actualizada' in e['text'] for e in explained[-1][1])
+    else:
+        assert len(explained) == before and reply == dialog.OFFER_HUMAN
+        assert count(pg, 'insurance_cases') == 0
 
 
 @pytest.mark.parametrize('change', ['document', 'authorization'])
@@ -167,6 +208,15 @@ def test_consent_is_pending_in_postgres_and_negative_cancels(pg, explained):
     assert 'pending_human' not in state(pg)
     assert count(pg, 'insurance_cases') == 0
     ask('Sí', ext='late-yes')
+    assert count(pg, 'insurance_cases') == 0
+
+
+def test_consent_offer_diagnostic_is_not_a_false_escalation(pg, caplog):
+    verify(pg, customer='C2')
+    with caplog.at_level(logging.INFO, logger='insurance.dialog'):
+        ask('¿Cubre daños por agua?', ext='diagnostic-offer')
+    assert 'decision=offer_human' in caplog.text
+    assert 'decision=escalate' not in caplog.text
     assert count(pg, 'insurance_cases') == 0
 
 
@@ -244,7 +294,8 @@ def test_policy_switch_failure_remains_pending_and_never_reverts_silently(pg, ex
     reply, out = ask('000124', ext='policy-b')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert 'DOC-OTHER' in reply and state(pg)['policy_id'] == 'POL-000124'
-    assert explained[-1][0]['question'] == '¿Cubre cristales?'
+    assert explained[-1][0]['question'].startswith('¿Cubre cristales?')
+    assert explained[-1][0]['question'].count('Tema:') <= 1
 
 
 def test_failed_policy_only_switch_clears_previous_confirmed_selection(pg, explained):
@@ -331,6 +382,37 @@ def test_undated_reference_and_independent_query_do_not_inherit_previous_event_d
     assert 'fact_date' not in state(pg) and event.isoformat() not in explained[-1][0]['question']
 
 
+def test_cumulative_user_facts_and_declared_event_date_are_non_contractual(pg, explained):
+    ready(pg)
+    ask('Mi vivienda está alquilada. ¿Cubre daños por agua?', ext='rental-fact')
+    ask('Tuve daños por agua en mi vivienda', ext='occurred-fact')
+    event = date.today() - timedelta(days=20)
+    ask(event.strftime('%d/%m/%Y'), ext='declared-date-fact')
+    summary = rows(pg, 'SELECT summary FROM insurance_conversation_summary')[0]['summary']
+    facts = [fact['text'] for fact in summary['facts']]
+    assert any('vivienda está alquilada' in fact for fact in facts)
+    assert any('Tuve daños por agua' in fact for fact in facts)
+    assert any(event.isoformat() in fact for fact in facts)
+    assert all('usuario' in fact and 'no contractual' in fact for fact in facts)
+    assert summary['event_date'] == event.isoformat()
+    before = facts
+    ask('¿Mi vivienda está vacía?', ext='question-not-fact')
+    ask('Me llamo Luis Gil Mora, DNI 87654321X. Póliza 900', ext='identity-not-fact')
+    after = rows(pg, 'SELECT summary FROM insurance_conversation_summary')[0]['summary']['facts']
+    assert [fact['text'] for fact in after] == before
+    assert '87654321X' not in str(after) and 'Póliza 900' not in str(after)
+    assert 'La cláusula exige' not in str(after)
+
+
+def test_fact_extraction_never_records_identity_or_policy_identifiers():
+    assert dialog._user_fact('Me llamo Ana Pérez, DNI 12345678Z') is None
+    assert dialog._user_fact('Póliza 000123') is None
+    assert dialog._user_fact('¿Mi vivienda está alquilada?') is None
+    assert dialog._user_fact('Mi vivienda tiene mi DNI de referencia') is None
+    fact = dialog._user_fact('Mi vivienda está alquilada. Póliza 000123.')
+    assert 'vivienda está alquilada' in fact and '000123' not in fact
+
+
 def test_invalid_date_keeps_pending_question_without_escalation(pg, explained):
     ready(pg)
     ask('Tuve daños por agua en mi vivienda', ext='undated')
@@ -408,12 +490,14 @@ def test_changed_verified_customer_never_reuses_previous_customers_topics(pg, ex
 def test_channels_and_voice_sessions_never_share_context_without_verification(pg, explained):
     ready(pg)
     ask(TEXT, ext='whatsapp')
-    reply, _ = ask('¿Dónde lo dice?', ext='CA1:1', channel='Voice')
-    assert 'nombre, apellidos y DNI' in reply and len(explained) == 1
+    reply, out = ask('¿Dónde lo dice?', ext='CA1:1', channel='Voice')
+    assert out['insurance_result'] == 'identity_not_verified' and len(explained) == 1
+    assert 'DNI' in reply or 'nombre' in reply
     verify(pg, customer='C2', channel='Voice', session='CA1')
     ask(TEXT, ext='CA1:2', channel='Voice')
-    reply, _ = ask('¿Dónde lo dice?', ext='CA2:1', channel='Voice')
-    assert 'nombre, apellidos y DNI' in reply and len(explained) == 2
+    reply, out = ask('¿Dónde lo dice?', ext='CA2:1', channel='Voice')
+    assert out['insurance_result'] == 'identity_not_verified' and len(explained) == 2
+    assert 'DNI' in reply or 'nombre' in reply
 
 
 def test_no_escalation_for_greetings_identity_or_external_escalation_payload(pg, explained):
@@ -499,7 +583,7 @@ def test_ambiguous_identity_and_no_match_request_full_name_without_field_disclos
     assert 'coincid' not in ambiguous and count(pg, 'insurance_cases') == 0
 
 
-def test_llm_technical_failure_records_only_a_real_question(pg, monkeypatch):
+def test_llm_technical_failure_records_only_a_real_question_after_consent(pg, monkeypatch):
     ready(pg)
 
     def failed(*args):
@@ -509,6 +593,9 @@ def test_llm_technical_failure_records_only_a_real_question(pg, monkeypatch):
     ask('Gracias', ext='thanks')
     assert count(pg, 'insurance_cases') == 0
     reply, out = ask('¿Cubre agua?', ext='technical-question')
+    assert reply == dialog.OFFER_HUMAN and out['insurance_result'] == 'missing_information'
+    assert count(pg, 'insurance_cases') == 0
+    reply, out = ask('Sí', ext='technical-consent')
     assert 'He guardado' in reply and out['insurance_result'] == 'human_case_required'
     assert count(pg, 'insurance_cases') == 1
 
