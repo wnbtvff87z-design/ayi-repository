@@ -59,6 +59,9 @@ def redact(text, *, bounded=True):
                   lambda m: voice_identity.mask_transcript(m.group()), text, flags=re.I)
     phone = r'(?:\b(?:tel[eé]fono|m[oó]vil)\b\s*(?:es\b\s*)?[:=-]?\s*)?\+\d(?:[\s().-]*\d){6,14}'
     text = re.sub(phone, lambda m: voice_identity.mask_transcript(m.group()), text, flags=re.I)
+    # Domestic contact numbers can occur without a declaration or international prefix.
+    text = re.sub(r'(?<![\w\d])(?:[6789]\d{8}|[6789]\d{2}[ .-]\d{3}[ .-]\d{3})(?![\w\d])',
+                  '[phone]', text)
     return text[:cfg('INSURANCE_TURN_MAX_CHARS')] if bounded else text
 
 
@@ -464,7 +467,9 @@ def format_prompt(ctx):
     """The exact user message sent to the LLM (instructions travel as the system message)."""
     parts = []
     if ctx.get('identity'):
-        parts.append(f"IDENTIDAD: {ctx['identity']}")
+        parts.append("IDENTIDAD: cliente verificado y autorizado sobre esta póliza")
+    if ctx.get('intent'):
+        parts.append(f"INTENCIÓN: {redact(ctx['intent'], bounded=False)}")
     if ctx.get('policy'):
         parts.append(f"PÓLIZA ACTIVA: {ctx['policy']}")
     if ctx.get('pending'):
@@ -479,7 +484,7 @@ def format_prompt(ctx):
             f"{'Usuario' if r['role'] == 'user' else 'Asistente'}: {r['text']}" for r in ctx['recent']))
     parts.append(f"PREGUNTA ACTUAL: {ctx['question']}")
     parts.append(f"CLÁUSULAS:\n{_fmt_evidence(ctx['evidence'])}")
-    return '\n\n'.join(parts)
+    return redact('\n\n'.join(parts), bounded=False)
 
 
 class ContextBudgetExceeded(ValueError):
@@ -488,7 +493,7 @@ class ContextBudgetExceeded(ValueError):
 
 def build_context(*, question, evidence, policy=None, version=None, pending=None, recent_turns=(),
                   summary_text='', recalled=(), identity_line='cliente verificado y autorizado sobre esta póliza',
-                  budget=None):
+                  budget=None, intent=None, private_names=()):
     """Assemble the bounded package. Priority (kept first -> dropped last): 1 evidence, 2 question,
     3 policy/version, 4 pending clarification, 5 recent relevant turns, 6 summary, 7 recalled old turns.
     The returned ctx['report'] says what was cut so behaviour at the limit is observable."""
@@ -501,19 +506,41 @@ def build_context(*, question, evidence, policy=None, version=None, pending=None
            groups.append([{'role': 'user', 'text': redact(turn['content'], bounded=False)}])
         elif groups and groups[-1][-1]['role'] == 'user':
            groups[-1].append({'role': 'assistant', 'text': redact(turn['content'], bounded=False)})
-    groups = [g for g in groups if len(g) == 2]
+    groups = [g for g in groups if len(g) == 2][-cfg('INSURANCE_RECENT_TURNS'):]
     # Retain the most relevant exchanges first, recency breaking ties; each exchange stays whole.
     wanted = toks(question)
     ranked = sorted(enumerate(groups), key=lambda item:
                    (len(wanted & toks(' '.join(t['text'] for t in item[1]))), item[0]))
-    ctx = {'identity': identity_line, 'question': redact(question, bounded=False),
-           'policy': f'{policy} versión {version}' if policy else '',
-           'pending': redact(pending, bounded=False), 'evidence': [dict(e) for e in evidence],
+    ctx = {'identity': ('cliente verificado y autorizado sobre esta póliza' if identity_line else ''),
+           'intent': redact(intent, bounded=False),
+           'question': redact(question, bounded=False),
+           'policy': redact(f'{policy} versión {version}' if version else str(policy or ''), bounded=False),
+           'pending': redact(pending, bounded=False),
+           'evidence': [{**e, 'text': redact(e['text'], bounded=False)} for e in evidence],
            'recent': [t for g in groups for t in g],
            'summary': redact(summary_text, bounded=False),
            'recalled': [{'q': redact(r['q'], bounded=False),
                         'a': redact(r.get('a') or '(sin respuesta)', bounded=False)}
                                                         for r in islice(recalled, cfg('INSURANCE_RECALLED_TURNS'))]}
+    # Verified names can occur in old assistant replies without an explicit identity declaration.
+    # They are used only locally for redaction and never included in the returned package.
+    for name in private_names:
+        name = unicodedata.normalize('NFKC', str(name or '')).strip()
+        if not name:
+            continue
+        pattern = re.compile(r'(?<!\w)' + re.escape(name) + r'(?!\w)', re.I)
+
+        def scrub(value):
+            if isinstance(value, str):
+                return pattern.sub('[name]', value)
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            if isinstance(value, dict):
+                return {key: scrub(item) for key, item in value.items()}
+            return value
+
+        ctx = scrub(ctx)
+        groups = scrub(groups)
     dropped = []
 
     def size():

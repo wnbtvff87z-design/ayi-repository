@@ -198,7 +198,7 @@ def diagnose_retrieval():
         log.error('insurance_retrieval_diagnostic_failed correlation_id=%s error_type=%s',
                   corr, type(exc).__name__)
     if llm_request:
-        from insurance import dialog, memory
+        from insurance import dialog, llm, memory
         question, evidence, policy_id, version_id = llm_request
         try:
             package = memory.build_context(
@@ -207,11 +207,15 @@ def diagnose_retrieval():
             response['text_chars_to_llm'] = len(memory.INSTRUCTIONS) + len(prompt)
             answer = dialog.llm_explain(package, evidence)
             response['llm_result'] = {
-                'status': 'answered' if answer and 'ESCALAR' not in answer.upper() else 'escalated',
+                'status': 'answered' if answer and answer.strip().upper() != 'ESCALAR' else 'evidence_insufficient',
                 'text': answer,
             }
         except memory.ContextBudgetExceeded:
             response['llm_result'] = {'status': 'context_budget_exceeded'}
+        except llm.LLMError as exc:
+            response['llm_result'] = {'status': exc.code}
+            log.error('insurance_retrieval_diagnostic_failed correlation_id=%s reason_code=%s',
+                      corr, exc.code)
         except Exception as exc:
             response['llm_result'] = {'status': 'error', 'error_type': type(exc).__name__}
             log.error('insurance_retrieval_diagnostic_failed correlation_id=%s error_type=%s',

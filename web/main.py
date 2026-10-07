@@ -12,6 +12,15 @@ from booking import BookingError,db,init_schema,url,headers,availability,options
 from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
 from insurance.cases import CaseWorkflowError, MIN_KEY_BYTES
 app=Flask(__name__);log=logging.getLogger(__name__)
+_insurance_log_level=getattr(logging,os.getenv('LOG_LEVEL','INFO').strip().upper(),logging.INFO)
+if not isinstance(_insurance_log_level,int):_insurance_log_level=logging.INFO
+_insurance_logger=logging.getLogger('insurance')
+_insurance_logger.setLevel(_insurance_log_level)
+if not _insurance_logger.handlers:
+ _insurance_handler=logging.StreamHandler()
+ _insurance_handler.setFormatter(logging.Formatter('%(levelname)s %(name)s %(message)s'))
+ _insurance_logger.addHandler(_insurance_handler)
+_insurance_logger.propagate=False
 from insurance.admin import bp as insurance_admin_bp
 app.register_blueprint(insurance_admin_bp)
 INSURANCE_HUMAN_AUTH_FAILURE_LIMIT=5
@@ -315,18 +324,28 @@ def booking_health():
 def whatsapp():
   if request.method=='GET':return jsonify(status='OK')
   if not twilio_valid():return Response('Forbidden',status=403)
-  tw=MessagingResponse()
+  tw=MessagingResponse();b=None;sector=None;stage='tenant_lookup'
   try:
    b,sector=lookup(request.form.get('To'),'WhatsApp',with_sector=True);text=request.form.get('Body','').strip()
    if not b:answer='No puedo identificar el negocio asociado a este número.'
    elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
-   else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''),sector=sector)
+   else:
+    stage='dialogue'
+    answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''),sector=sector)
    if b and text and answer and sector!='insurance':
     try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp',sector=sector)
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
   except InsuranceDisabledError:tw.message(INSURANCE_DISABLED_REPLY)
-  except Exception:log.exception('WhatsApp error');tw.message('No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
+  except Exception as exc:
+   raw=f"{b.get('business_id') if b else 'unresolved'}|WhatsApp|{request.form.get('MessageSid','')}"
+   corr=hashlib.sha256(raw.encode()).hexdigest()[:16]
+   if sector=='insurance':
+    _insurance_logger.error('insurance_diag correlation_id=%s stage=%s reason_code=webhook_failed error_type=%s',corr,stage,type(exc).__name__)
+    tw.message('No pude procesar tu consulta de seguros ahora. No he confirmado ninguna operación.')
+   else:
+    log.error('WhatsApp error correlation_id=%s stage=%s error_type=%s',corr,stage,type(exc).__name__)
+    tw.message('No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
   return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
 def voice():

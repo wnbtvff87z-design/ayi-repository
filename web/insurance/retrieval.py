@@ -270,7 +270,8 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
         if include_trace:
             diag['trace'] = {'candidate_count': diag.get('fts_candidate_pages', 0),
                              'candidates': trace[:MAX_TRACE_CANDIDATES],
-                             'truncated': len(trace) > MAX_TRACE_CANDIDATES,
+                             'truncated': (len(trace) > MAX_TRACE_CANDIDATES or
+                                           diag.get('fts_candidate_pages', 0) > len(trace)),
                              'selected': [row for row in trace if row['selected']]}
         return {'status': status, 'reason_code': reason_code, 'evidence': list(evidence),
                 'diagnostics': dict(diag), **base}
@@ -356,9 +357,9 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
             return out('ready_without_pages', 'ready_without_usable_pages', **base)
         evidence = []
         for page in chosen:
-            sentences = [part for part in SENTENCE_SPLIT.split(page['body']) if part.strip()]
-            end = len(page['body']) if len(sentences) <= 3 else page['body'].find(sentences[3])
-            evidence.append(_evidence_fragment(page, pol['version_id'], 0, end))
+            # A late limitation is as contractual as an opening coverage statement.
+            # Preserve selected pages whole; the prompt builder fails closed if they cannot fit.
+            evidence.append(_evidence_fragment(page, pol['version_id'], 0, len(page['body'])))
         if include_trace:
             selected_refs = {(p['document_id'], p['page_number']) for p in chosen}
             diag['fts_candidate_pages'] = diag['page_candidates']
@@ -424,10 +425,25 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
     for score, rank, page in ranked:
         if page not in chosen and len(chosen) < MAX_PAGES:
             chosen.append(page)
+    supplementary = set()
+    if len(chosen) < MAX_PAGES:
+        # Section metadata, not a repeated query word, links standalone exclusions/conditions.
+        # Matching ranked pages retain priority and the same scoped server-side cursor is used.
+        present = {page['section'] for page in chosen}
+        fallback = {}
+        for page in _stream(conn, SCOPED_PAGES_SQL, (business_id, customer_id, *params)):
+            if page['section'] in SUPPORT and page['section'] not in present:
+                fallback.setdefault(page['section'], page)
+        for section in SUPPORT:
+            if section in fallback and len(chosen) < MAX_PAGES:
+                page = fallback[section]
+                chosen.append(page)
+                supplementary.add((page['document_id'], page['page_number']))
     chosen.sort(key=lambda page: (page['document_id'], page['page_number']))
     evidence, fragment_map = [], {}
     for page in chosen:
-        ranges = _fragment_ranges(page['body'], terms)
+        ranges = ([] if (page['document_id'], page['page_number']) in supplementary
+                  else _fragment_ranges(page['body'], terms))
         if not ranges:
             ranges = [(0, len(page['body']))]
         fragment_map[(page['document_id'], page['page_number'])] = ranges
@@ -441,6 +457,9 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
                            for section in SUPPORT for score, rank, page in support[section]}
         selected_scores.update({(page['document_id'], page['page_number']): (score, rank, page)
                                 for score, rank, page in hits})
+        selected_scores.update({(page['document_id'], page['page_number']): (0, 0, page)
+                                for page in chosen
+                                if (page['document_id'], page['page_number']) in supplementary})
         trace_map = {(meta['document_id'], meta['page_number']): (score, rank, meta)
                      for score, rank, meta in trace_candidates}
         for (document_id, page_number), (score, rank, page) in selected_scores.items():

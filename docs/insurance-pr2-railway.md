@@ -13,7 +13,7 @@ El teléfono solo identifica la conversación. El agente solo lee una póliza si
 Voice acepta DNI/NIE dictados por dígitos, pares cardinales o mezcla de ambos. Si el documento llega incompleto, solo guarda un fragmento cifrado y ligado a negocio/canal/conversación/sesión; no calcula su HMAC ni consulta clientes hasta completarlo. Correcciones, fechas y números de póliza no se concatenan al fragmento. `INSURANCE_IDENTITY_BUFFER_TTL_SECONDS` es opcional (300 s por defecto); utiliza la clave existente `INSURANCE_CASE_HMAC_KEY`. La confirmación se emite solo tras una verificación persistida y retoma la pregunta pendiente.
 
 ## Recuperación y diagnóstico de póliza
-El retrieval revalida cliente autorizado, póliza, versión aplicable y documentos `ready` antes de procesar texto. Combina candidatos FTS de PostgreSQL con puntuación de tokens normalizados; los fragmentos conservan encabezados/contexto y procedencia documento-versión-página-posición. Las exclusiones solo acompañan si son pertinentes para la consulta. La consulta sigue acotada por documento autorizado; no se añade un índice GIN global porque el plan medido sobre 10.000 pólizas usa los índices existentes de autorización/documento y la clave de página, con 12 páginas utilizables en el ámbito seleccionado. Esta entrega no añade migraciones.
+El retrieval revalida cliente autorizado, póliza, versión aplicable y documentos `ready` antes de procesar texto. Combina candidatos FTS de PostgreSQL con puntuación de tokens normalizados; los fragmentos conservan encabezados/contexto y procedencia documento-versión-página-posición. Prioriza condiciones/exclusiones coincidentes; si queda espacio, incluye una página de una sección de apoyo ausente aunque no repita el término, sin afirmar que aplique al objeto consultado. La consulta sigue acotada por documento autorizado; no se añade un índice GIN global porque el plan medido sobre 10.000 pólizas usa los índices existentes de autorización/documento y la clave de página, con 12 páginas utilizables en el ámbito seleccionado. Esta entrega no añade migraciones.
 
 El endpoint administrativo `POST /insurance/admin/retrieval/diagnose` es de solo lectura y requiere `INSURANCE_ADMIN_ENABLED=true`, token individual activo y permiso `can_read_cases`. Acepta pregunta sintética, `customer_id` del mismo negocio, `policy_id` opcional, modo (`question`, `summary`, `availability`), fechas ISO opcionales y `run_llm`. Devuelve `correlation_id`, etapa/estado, candidatas y seleccionadas, puntuación, posiciones, caracteres de contexto y resultado del LLM. La respuesta puede incluir texto contractual y pregunta; solo debe entregarse a operadores autorizados. Cada evaluación se audita por correlación, sin guardar la pregunta ni el texto contractual en logs generales. No usar este endpoint para tráfico de clientes.
 
@@ -48,11 +48,11 @@ Todos: root directory `web` (Relay: `relay`), migraciones antes de desplegar el 
 
 **Credenciales del Bucket: Web NO las recibe.** Solo el worker documental (`insurance_doc_worker.py`) las recibe; ni Web, ni Relay, ni outbox, ni Cron. Variables del worker, conectadas a las referencias de Railway: `INSURANCE_BUCKET_NAME=${{<Bucket>.BUCKET}}` (identificador S3, **no** el nombre visible), `INSURANCE_BUCKET_ENDPOINT=${{<Bucket>.ENDPOINT}}`, `INSURANCE_BUCKET_REGION=${{<Bucket>.REGION}}`, `INSURANCE_BUCKET_ACCESS_KEY_ID=${{<Bucket>.ACCESS_KEY_ID}}`, `INSURANCE_BUCKET_SECRET_ACCESS_KEY=${{<Bucket>.SECRET_ACCESS_KEY}}`. Solo lectura (`HeadObject`/`GetObject`, máx. 25 MiB, 5 s de conexión, 30 s de lectura).
 OCR: el worker documental necesita el binario `tesseract` con idioma `spa`; en Nixpacks, variable de build `NIXPACKS_APT_PKGS=tesseract-ocr tesseract-ocr-spa`. Sin él, las páginas escaneadas quedan `failed` y el documento `needs_review` (no se indexa).
-Permisos PG del rol runtime: SELECT/INSERT/UPDATE (y DELETE en `insurance_document_pages`) sobre las tablas nuevas, USAGE en secuencias identity. Las tablas de identidad/autorización/admin deberían ser solo SELECT para el rol del Web si el escritor es otro servicio.
+No ampliar permisos desde esta tarea. Comprobar con el administrador los permisos existentes mínimos: Web lee clientes/pólizas/versiones/autorizaciones/admin/páginas; el diálogo escribe verificaciones, intentos, estado, turnos, resumen y auditoría, y al aceptar un caso escribe casos/outbox. Por eso las verificaciones no pueden ser solo SELECT con la identificación autodeclarada vigente. La limpieza de memoria requiere sus DELETE previstos. El worker documental necesita sus escrituras y DELETE de páginas; Web no debe heredar permisos del Bucket. Si faltan permisos, detener la comprobación y seguir el procedimiento aprobado, no conceder permisos globales.
 ## Aislamiento de Web frente al PDF (conclusión: **Web NO lee bytes del PDF**)
 `POST /insurance/admin/documents/register` (`web/insurance/admin.py` → `documents.register_existing_object`) hace solo: validar cuerpo (≤4 KiB, IDs `[A-Za-z0-9_-]{1,64}`, SHA-256 hexadecimal), autenticar el token individual (HMAC) contra `insurance_admin_users`, comprobar negocio, póliza, versión en vigor y autorización vigente, insertar de forma idempotente (`ON CONFLICT DO NOTHING`) un trabajo `pending_verification` y escribir auditoría. Todo en PostgreSQL con `statement_timeout`/`lock_timeout` de 3 s y `connect_timeout` de 5 s. No hay HEAD, GET, hash, parsing, OCR ni indexación en Web; Web ni siquiera importa boto3/pypdf (test `test_web_never_imports_pdf_or_bucket_libraries`).
 Estados: `pending_verification` (solo registrado; **no** verificado ni consultable) → `verifying` → `ready` (verificado e indexado, único estado consultable) | `needs_review` (páginas ilegibles/fallidas) | `failed` (error transitorio, reintento hasta 5) | `object_missing` (reintenta; se recupera si el objeto aparece) | `hash_mismatch` e `invalid_object` (terminales hasta re-registrar con el hash correcto; un documento `ready` es inmutable). El agente solo consulta documentos `ready` con páginas `indexed`.
-Si PostgreSQL no está disponible: el turno **no crea ni confirma caso**; responde «No pude guardar tu consulta. No se ha creado un caso…» (corrige una afirmación previa errónea de que se creaba un caso). Registro administrativo → 503.
+Si PostgreSQL no está disponible: no se confirma identidad ni creación de caso; el diagnóstico es `persistence_failed`. Un fallo de respuesta/commit puede dejar resultado desconocido: no se debe afirmar que un caso previamente confirmado por otra transacción no existe. Registro administrativo → 503.
 Medición (ver abajo) en `tests/perf/insurance_web_isolation.py`.
 
 Orden: migración → worker outbox → worker documental → Web (INSURANCE_ENABLED=false) → pruebas manuales → activación.
@@ -76,3 +76,175 @@ Objeto de 20 MB, S3 limitado a 1,5 MB/s, 8 registros simultáneos (= todos los h
 | DESPUÉS, Bucket lento | 11 ms / 12 ms / 13 ms | 8 × 200 en <0,1 s; 0 peticiones al Bucket |
 | DESPUÉS, Bucket colgado | 9 ms / 11 ms / 13 ms | 8 × 200 en <0,1 s; 0 peticiones al Bucket |
 Limitaciones: máquina única, loopback, turno = `converse()` de seguros (PG), sin Twilio/Airtable ni restaurantes ni tráfico real; memoria no medida por separado (antes Web retenía hasta 25 MiB por petición; ahora ninguno).
+
+## Corrección conversacional: auditoría sobre develop remoto
+
+Base comprobada: `8b2a6455fa88df8ff50f907f457d906857d8e154`; árbol inicial limpio,
+rama de trabajo nueva `copilot/fix-insurance-conversational-agent`, mismo SHA que
+`git fetch origin develop`. La ascendencia y GitHub confirman incorporados los
+PRs Insurance #21, #22, #24, #25, #26, #28 y #29. No se ha hecho merge ni despliegue.
+Suite inicial: **707 passed, 58 subtests passed**, con PostgreSQL 16 local y esquemas
+sintéticos únicos; ninguna prueba se ejecutó contra la base del propietario.
+Fue necesario instalar los requisitos ya existentes de `web/requirements-dev.txt`
+y `relay/requirements.txt`; no se añadió una dependencia.
+
+### Rutas de las respuestas observadas (antes del cambio)
+
+| Respuesta / ruta | Condición y estado | Selección / retrieval / OpenAI / caso |
+|---|---|---|
+| Web `/webhook-whatsapp`, `except Exception` | Error de resolución Airtable, identificadores, router o excepción que sale de `converse`. Texto versionado: **«No puedo»**, no exactamente «No pude» del reporte. No prueba por sí mismo qué excepción hubo. | Puede fallar antes de seleccionar una póliza. Retrieval/LLM dependen de dónde falló. No implica una operación ni un caso confirmado. |
+| `dialog._urgent` | Peligro activo, incluso sin identidad verificada; protocolo prioritario. | Sin retrieval/LLM; solo ofrece caso. No usa la existencia de evidencia como requisito de seguridad. |
+| `dialog._consent` | `pending_human` y respuesta no interpretada como consentimiento inequívoco ni nueva consulta. | No selecciona ni recupera de nuevo; repite oferta. Solo «sí» inequívoco llama a `_case`; confirma después del commit, o devuelve `NOT_SAVED`. |
+| `dialog._documental`, salida insuficiente | Póliza ausente/no autorizada, documento no listo, páginas inutilizables, ninguna coincidencia, ambigüedad o LLM devuelve `ESCALAR`/vacío. | Selección y retrieval intentados; OpenAI solo si hay evidencia. Crea `pending_human`, **no** un caso. |
+| Misma salida, excepción LLM/contexto | Cualquier excepción de OpenAI/configuración/parsing se capturaba como `llm_error`; contexto excesivo como `context_budget_exceeded`; ambos asignaban `ESCALAR`. | Había texto recuperado, pero igualmente se devolvía «No encontré evidencia suficiente». No demuestra fallo de retrieval. |
+| `memory.find_reply`, reintento | El mismo MessageSid tiene respuesta persistida y sigue perteneciendo al ámbito de identidad/autorización válido. | Puede repetir cualquiera de las ofertas/confirmaciones anteriores desde caché; no vuelve a recuperar, invocar OpenAI ni crear un caso. Una respuesta contractual cacheada revalida autorización y páginas. |
+| `finish`, confirmación de identidad | Coincidencia única de HMACs, verificación y estado escritos dentro de la transacción. Reintento del mismo webhook puede repetir la respuesta cacheada, no crea otra verificación. | Si existe pregunta pendiente continúa; si no, pide consulta. Confirmación no significa documento disponible. |
+| `_answer`, excepción de almacenamiento | Fallo de conexión, consulta, estado o commit. | `NOT_SAVED`; no confirma identidad ni creación de caso. Antes el diagnóstico lo llamaba genéricamente `lookup_failed`. |
+
+La frase de recepción no está en Insurance: es un fallback compartido de Web.
+Sin logs privados del turno y SHA desplegado, **la causa exacta de ese saludo en
+WhatsApp real queda NO VERIFICADA**. Aquí se corrige el comportamiento local y
+se añade diagnóstico para distinguirlo. No se cambia el fallback de otros sectores.
+Disponibilidad, revisión y explicación de insuficiencia ya tenían rutas específicas
+en este develop. Que en el servicio real todas devolvieran la misma oferta puede
+obedecer a estado, código desplegado u otra ruta; no permite atribuirles a todas
+un único fallo léxico. Hay que verificar el commit y correlaciones del servicio.
+
+Defectos demostrables adicionales: `SOCIAL_RE` no reconocía «hola buenas»;
+`pending_human` trataba prefijos «no/sí» sin `?` como confirmación completa, bloqueando
+«no y ventanas»; las consultas de nombre/vigencia caían en búsqueda de páginas;
+el resumen «de forma general» no se reconocía como resumen. El cambio separa
+intención, consentimiento y consulta, en lugar de ampliar solo términos de cobertura.
+
+### Flujo y estados
+
+Saludo → pedir identificación cuando falta → acumular datos parciales →
+persistir verificación única → retomar pregunta pendiente o pedir consulta.
+Después, nombre/vigencia usan metadatos autorizados; disponibilidad comprueba
+documentos/páginas; resumen selecciona secciones; pregunta contractual recupera
+cláusulas; seguimiento reinterpreta el tema previo y revalida evidencia.
+Rechazar una oferta y hacer otra pregunta son acciones separadas del mismo turno.
+Aceptar sin pregunta nueva crea el caso; rechazo no crea nada. La oferta no es
+estado terminal. Revisar conserva la pregunta previa; explicar insuficiencia
+indica qué quedó sin resolver, sin repetir mecánicamente la oferta.
+
+Se mantienen turnos durables, ventana reciente, resumen incremental y recall;
+no se borran estados históricos ni conversaciones. Cambio de póliza revalida
+autorización y descarta evidencia incompatible. Memoria y hechos del usuario
+solo interpretan, nunca demuestran cobertura. Incidentes conservan fecha solo
+en el mismo tema; preguntas hipotéticas no requieren fecha. Las fechas naturales
+existentes usan reloj del turno y zona del negocio.
+
+El modelo versionado tiene `product`, `contract_number` y fechas de versión.
+No tiene un campo confirmado de denominación comercial, aseguradora o renovación:
+si faltan, se dice explícitamente, sin convertir `hogar` en nombre comercial.
+`insurance_policy_versions.valid_to` es **día final incluido**; autorización
+`valid_to` es **instante excluido**. No se alteran esos límites. La fecha corriente
+de selección se calcula en zona del negocio, no con la fecha local del servidor.
+
+### Recuperación y contrato OpenAI
+
+`ready` no prueba que Web use la misma base. Comparar en la consola autorizada
+la huella de conexión/esquema, cliente autorizado, selección de versión,
+documentos y páginas utilizables. Una búsqueda SQL sobre `body` puede encontrar
+palabras fuera de `left(body,600)`; además ignora las decisiones conversacionales,
+autorizaciones, fechas, calidad, ranking y contexto. Una coincidencia de
+«cristal» no demuestra cobertura de mobiliario.
+
+En esta base develop **ya no existe un recorte a los primeros 1500 caracteres**
+en retrieval: #29 introdujo FTS y fragmentos por posiciones. Las nuevas pruebas
+protegen cláusulas tardías y exclusiones en otra página. Se conserva FTS
+PostgreSQL `simple`, normalización textual y expansión controlada; no embeddings.
+La selección se acota antes de puntuar: negocio → cliente autorizado → póliza →
+versión → documentos ready → páginas indexed/text-or-ocr/quality-ok.
+Los cursores de servidor y listas acotadas evitan cargar páginas de otras pólizas.
+Las pruebas comparan normalización/FTS, relevancia, contexto y planes SQL; no
+constituyen evaluación exhaustiva de recall semántico con pólizas reales.
+
+El SDK real usa **Chat Completions** (`/chat/completions`), temperatura 0, timeout
+15 s y reintentos desactivados; salida de texto plano, no JSON inventado. Solo
+`ESCALAR` exacto significa insuficiencia. Respuesta vacía, malformada, truncada,
+rechazo y errores técnicos tienen códigos propios. El paquete contiene intención,
+pregunta, póliza/versión, memoria seleccionada y cláusulas con documento, página
+y posición. Se aplica presupuesto antes de enviar y se minimizan datos de
+identidad. Ni DNI ni teléfono ni declaración de identificación se necesitan
+para la explicación.
+
+Códigos: `no_matching_pages`/`no_match` (retrieval), `evidence_insufficient`
+(LLM no puede determinar), `llm_not_configured`, `llm_timeout`,
+`llm_rate_limited`, `llm_auth_failed`, `llm_invalid_response`, `llm_refusal`,
+`llm_error`, `context_budget_exceeded`, `persistence_failed`. Fallo técnico no
+se presenta como falta de evidencia ni crea automáticamente un caso.
+
+### Configuración y diagnóstico desde /app
+
+No cambiar números, credenciales ni servicios existentes. Web requiere las
+variables de la tabla anterior y las de tenant/Twilio existentes:
+`TENANT_LOOKUP_MODE=new`, resolución `Numeros`/`Negocios`, `TWILIO_AUTH_TOKEN`,
+`CORE_PUBLIC_URL` exactamente igual a la URL pública firmada,
+`INSURANCE_DATABASE_URL`, `INSURANCE_CASE_HMAC_KEY`, `INSURANCE_LLM_MODEL`,
+`OPENAI_API_KEY`. No publicar sus valores.
+
+Opcionales Web: `LOG_LEVEL=INFO` (lo lee y configura el logger `insurance` con
+salida stderr), `OPENAI_BASE_URL` para endpoint compatible,
+`INSURANCE_LLM_TIMEOUT_SECONDS=15` (1–120),
+`INSURANCE_LLM_MAX_TOKENS=512` (64–4096). El modelo debe soportar Chat Completions,
+temperatura y `max_tokens`; incompatibilidad es fallo técnico, no prueba de
+ausencia de cobertura. `INSURANCE_LLM_CONTEXT_CHARS` mantiene 12000 por defecto.
+Relay, outbox, worker documental y Cron no cambian. Web no requiere Bucket.
+
+La consola administrativa ejecuta, desde `/app` con root directory `web`:
+
+```sh
+printf '%s' 'Pregunta de prueba autorizada' | python -m insurance.diagnose \
+  --business-id '<negocio>' --customer-id '<cliente autorizado>' \
+  --policy-id '<póliza>' --timezone '<zona del negocio>' --run-llm
+```
+
+Usar el token individual ya autorizado en la variable temporal de consola
+`INSURANCE_DIAGNOSTIC_TOKEN`; no incluirlo en argumentos, GitHub ni logs.
+Se valida contra `insurance_admin_users`, negocio y `can_read_cases`, con la
+clave existente `INSURANCE_ADMIN_TOKEN_KEY`. Sin token/permiso falla cerrado.
+Omitir `--run-llm` para no hacer llamadas facturables. El comando usa
+`SET TRANSACTION READ ONLY`, no escribe auditoría en PG, casos, outbox, estado,
+verificaciones ni documentos; solo emite metadatos y registro operativo de
+correlación/actor seudónimo/resultado a stderr. Conservar la auditoría de acceso
+a consola del proveedor. No imprime preguntas, respuestas ni cláusulas.
+Detalle sensible: usar el endpoint administrativo existente, que audita cada
+lectura en PG; no publicar su respuesta.
+
+Para diagnosticar estado añadir `--conversation-ref '<HMAC existente>'`
+(`--channel Voice --session-ref '<CallSid>'` solo para sesión Voice).
+No usar teléfono ni DNI como referencia. Distingue selección, retrieval,
+construcción de contexto, OpenAI y estado ausente/expirado/incompatible.
+
+### Comprobación de despliegue por el propietario (NO EJECUTADA)
+
+1. Comparar commit de Railway con el SHA final del PR; no asumir que un merge
+   previo significa que ese servicio desplegó ese commit. Verificar root/start
+   command Web y dependencias de ese build, sin imprimir secretos.
+2. Comparar huella de base/esquema y ámbito autorizado del diagnóstico con
+   la base consultada por SQL. No registrar PDF otra vez ni borrar estados.
+3. Confirmar configuración/modelo/API, ejecutar primero diagnóstico sin LLM
+   y luego con LLM. Comprobar candidatas, páginas, posiciones y tamaño; si es
+   técnico, atender su código antes de interpretar insuficiencia contractual.
+4. Por WhatsApp real y autorización existente: repetir saludo, identificación,
+   mesa, rechazo+ventanas, resumen, nombre, vigencia, disponibilidad, revisión
+   y explicación. Guardar evidencia solo en entorno privado; correlacionar
+   MessageSid con el hash y logs seguros. Repetir tras reinicio y con oferta
+   pendiente sin borrar conversaciones.
+5. Verificar que rechazo no genera caso; aceptación inequívoca confirma solo
+   tras PG, luego outbox por su worker existente. No aprobar/denegar siniestros.
+
+Railway, Twilio, Airtable, OpenAI en vivo, Bucket y PDF real: **NO EJECUTADOS**.
+Faltan acceso autorizado, datos privados y verificación del build/configuración
+de servicios. El transporte controlado comprueba el adaptador, no la calidad o
+latencia del modelo real ni el despliegue. Evaluar esos aspectos con preguntas
+autorizadas privadas, métricas operativas y revisión humana.
+
+Rollback: volver al SHA inicial del código (o desactivar Insurance mediante el
+flag existente según protocolo), conservando todas las tablas/estados; este
+cambio no modifica migraciones aplicadas ni requiere borrar datos. No tocar
+restaurantes, consultoras, Cron ni credenciales. Riesgos: interpretación del
+modelo, evidencia extensa que exceda presupuesto, terminología no encontrada,
+configuración de fecha/zona/modelo y diferencias de capacidad local/Railway.
