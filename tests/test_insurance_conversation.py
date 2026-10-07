@@ -94,6 +94,33 @@ def test_long_conversation_recalls_first_question_outside_recent_window(pg, grou
     assert summary['conclusions']
 
 
+def test_old_event_date_selects_original_version_after_thirty_exchanges(pg, grounded):
+    authenticate(pg)
+    old_date = date.today() - timedelta(days=5)
+    say(f'Tuve daños por agua en tuberías el {old_date.isoformat()}')
+    with pg() as conn:
+        conn.execute('UPDATE insurance_policy_versions SET valid_to=%s WHERE policy_id=%s',
+                     (date.today() - timedelta(days=2), 'POL-900'))
+        conn.execute('INSERT INTO insurance_policy_versions(business_id,policy_id,version_id,valid_from) '
+                     'VALUES(%s,%s,%s,%s)', (BIZ, 'POL-900', 'VER-NEW', date.today() - timedelta(days=1)))
+        conn.execute('INSERT INTO insurance_documents(document_id,business_id,policy_id,version_id,object_key,'
+                     'sha256,registered_by,status) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',
+                     ('DOC-NEW', BIZ, 'POL-900', 'VER-NEW', 'k/new', '0' * 64, 'test', 'ready'))
+        conn.execute("INSERT INTO insurance_document_pages(business_id,document_id,page_number,source,"
+                     "quality,body,indexed) VALUES(%s,%s,1,'text','ok',%s,true)",
+                     (BIZ, 'DOC-NEW', 'Robo y franquicia. Cobertura nueva de daños por agua en tuberías.'))
+    for n in range(32):
+        say(f'¿Qué franquicia de robo corresponde al supuesto {n}?')
+    assert grounded[-1][1][0]['version_id'] == 'VER-NEW'
+    reply, out = say('Volviendo a la primera pregunta')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert grounded[-1][1][0]['version_id'] == 'VER-001'
+    assert grounded[-1][2]['recalled'][0]['event_date'] == old_date.isoformat()
+    assert 'DOC-900' in reply and 'DOC-NEW' not in reply
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['event_date'] == old_date.isoformat()
+
+
 def test_ambiguous_old_reference_clarifies_then_resumes(pg, grounded):
     authenticate(pg)
     say('¿Cubre daños por agua de lluvia?')
@@ -175,7 +202,8 @@ def test_fact_date_survives_policy_and_identity_clarifications(pg, monkeypatch):
     assert summary['event_date'] == str(captured[-1]) and summary['facts']
     state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
     assert state['event_date'] == str(captured[-1])
-    say('¿Y la franquicia?')
+    _, followup = say('¿Y la franquicia?')
+    assert followup['insurance_result'] == 'evidence_backed_explanation'
     assert captured[-1] == date.today() - timedelta(days=3)
 
 
@@ -293,6 +321,29 @@ def test_impossible_context_budget_offers_review_without_calling_model(pg, groun
     assert question['question'] == TEXT and question['evidence'][0]['document_id'] == 'DOC-900'
 
 
+@pytest.mark.parametrize('budget', [12000, 1000])
+def test_complete_page_with_late_exclusion_is_never_truncated(pg, grounded, monkeypatch, budget):
+    authenticate(pg)
+    clause = ('Cobertura de daños por agua y tuberías rotas. ' * 65 +
+              'Exclusión final: no cubre daños por mantenimiento insuficiente.')
+    with pg() as conn:
+        conn.execute('UPDATE insurance_document_pages SET body=%s WHERE document_id=%s',
+                     (clause, 'DOC-900'))
+    monkeypatch.setenv('INSURANCE_LLM_CONTEXT_CHARS', str(budget))
+    reply, out = say(TEXT)
+    if budget == 12000:
+        assert out['insurance_result'] == 'evidence_backed_explanation'
+        assert grounded[-1][1][0]['text'] == grounded[-1][2]['evidence'][0]['text'] == clause
+    else:
+        assert reply == dialog.OFFER_REVIEW and not grounded
+        assert not rows(pg, 'SELECT * FROM insurance_cases')
+        state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+        assert state['pending_escalation']['evidence'][0]['text'] == clause
+        say('sí')
+        saved = rows(pg, 'SELECT evidence FROM insurance_case_questions')[0]['evidence']
+        assert saved[0]['text'] == clause
+
+
 @pytest.mark.parametrize('answer', ['sí', 'no'])
 def test_routine_review_offer_requires_explicit_consent_and_is_idempotent(pg, grounded, answer):
     authenticate(pg)
@@ -389,6 +440,34 @@ def test_question_without_punctuation_while_waiting_identity_is_not_a_name(pg, g
     assert grounded[-1][0] == question
 
 
+@pytest.mark.parametrize('fact', ['Tengo dos hijos', 'Vivo en una vivienda alquilada',
+                                 'Mi coche tiene diez años'])
+def test_non_event_user_facts_are_retained_with_turn_provenance(pg, grounded, fact):
+    authenticate(pg)
+    reply, out = say(fact, ext='family-fact')
+    assert out['insurance_result'] == 'missing_information' and not grounded
+    turn = rows(pg, "SELECT turn_id,content FROM insurance_conversation_turns "
+                    "WHERE external_id='family-fact' AND role='user'")[0]
+    assert turn['content'] == fact
+    summary = rows(pg, 'SELECT summary FROM insurance_session_summary')[0]['summary']
+    assert summary['facts'][0] == {'turn': turn['turn_id'], 'text': fact}
+    say(TEXT)
+    assert fact in grounded[-1][2]['summary']
+    assert not rows(pg, 'SELECT * FROM insurance_cases')
+
+
+def test_fact_before_identity_is_bound_only_after_verification(pg, grounded):
+    say('Tengo dos hijos', ext='unverified-family-fact')
+    assert not rows(pg, 'SELECT * FROM insurance_session_summary')
+    say(LUIS)
+    turn = rows(pg, "SELECT turn_id,customer_id FROM insurance_conversation_turns "
+                    "WHERE external_id='unverified-family-fact' AND role='user'")[0]
+    assert turn['customer_id'] == 'C2'
+    summary = rows(pg, 'SELECT summary FROM insurance_session_summary')[0]['summary']
+    assert summary['facts'][0] == {'turn': turn['turn_id'], 'text': 'Tengo dos hijos'}
+    assert not rows(pg, 'SELECT * FROM insurance_cases')
+
+
 def test_old_customer_retry_cannot_replay_answer_or_modify_new_customer_auth(pg, grounded):
     authenticate(pg)
     say(TEXT, ext='old-customer-message')
@@ -401,6 +480,24 @@ def test_old_customer_retry_cannot_replay_answer_or_modify_new_customer_auth(pg,
     turn = rows(pg, "SELECT customer_id,normalized FROM insurance_conversation_turns "
                     "WHERE external_id='old-customer-message' AND role='user'")[0]
     assert turn['customer_id'] == 'C2' and turn['normalized'] == TEXT
+
+
+def test_expired_webhook_retry_is_read_only_until_same_customer_is_verified(pg, grounded):
+    authenticate(pg)
+    original = say(TEXT, ext='expiry-webhook')
+    saved_state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    saved_summary = rows(pg, 'SELECT summary FROM insurance_session_summary')[0]['summary']
+    with pg() as conn:
+        conn.execute("UPDATE insurance_identity_verifications SET expires_at=now()-interval '1 second'")
+    reply, out = say(TEXT, ext='expiry-webhook')
+    assert reply == dialog.ASK_IDENTITY and out['insurance_result'] == 'identity_not_verified'
+    assert len(grounded) == 1 and len(rows(pg, 'SELECT * FROM insurance_conversation_turns')) == 2
+    assert rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state'] == saved_state
+    assert rows(pg, 'SELECT summary FROM insurance_session_summary')[0]['summary'] == saved_summary
+    assert not rows(pg, 'SELECT * FROM insurance_cases')
+    say(LUIS, ext='expiry-reverification')
+    assert say(TEXT, ext='expiry-webhook') == original
+    assert len(grounded) == 1
 
 
 def test_expired_pending_question_is_not_claimed_by_a_different_customer(pg, grounded):
@@ -425,6 +522,27 @@ def test_review_decline_clears_pending_summary_and_identity_turns_are_empty(pg, 
     assert not summary['pending'] and not summary['open_issues']
     turns = rows(pg, "SELECT content FROM insurance_conversation_turns WHERE role='user' AND kind='identity'")
     assert turns and all(turn['content'] == '' for turn in turns)
+
+
+def test_split_identity_while_awaiting_identity_stores_no_declared_text(pg, grounded):
+    say('Hola')
+    say('Luis Gil Mora', ext='split-name')
+    say('87654321X', ext='split-document')
+    turns = rows(pg, "SELECT kind,content,normalized FROM insurance_conversation_turns "
+                    "WHERE role='user' AND external_id IN ('split-name','split-document')")
+    assert len(turns) == 2
+    assert all(turn['kind'] == 'identity' and turn['content'] == '' and turn['normalized'] is None
+               for turn in turns)
+    assert not grounded
+
+
+def test_mixed_identity_and_question_stores_only_original_business_question(pg, grounded):
+    reply, out = say(TEXT + ' ' + LUIS, ext='mixed-identity')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    turn = rows(pg, "SELECT kind,content,normalized FROM insurance_conversation_turns "
+                    "WHERE role='user' AND external_id='mixed-identity'")[0]
+    assert turn['kind'] == 'question' and turn['content'] == turn['normalized'] == TEXT
+    assert all(value not in str(turn) for value in ('Luis', 'Gil', 'Mora', '87654321X'))
 
 
 def test_urgent_exception_requires_approved_protocol_and_business_incident(pg, grounded, monkeypatch):

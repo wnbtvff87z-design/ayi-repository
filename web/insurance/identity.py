@@ -56,6 +56,9 @@ NAME_STOP = {'dni', 'nie', 'con', 'mi', 'y', 'e', 'documento', 'numero', 'númer
              'nombre', 'apellido', 'apellidos', 'es', 'en', 'por'}
 NAME_TRIGGER_RE = re.compile(
     r'(?:me\s+llamo|mi\s+nombre\s+es|nombre\s+y\s+apellidos?|nombre\s+completo|soy)\s*[:,-]?\s*', re.I)
+ROLE_DECLARATION_RE = re.compile(
+    r'soy\s+(?:(?:el|la|un|una)\s+)?(?:propietari[oa]|inquilin[oa]|tomador[a]?|asegurad[oa]|'
+    r'beneficiari[oa]|arrendador[a]?|arrendatari[oa]|aut[oó]nom[oa])\b', re.I)
 LABEL_RE = re.compile(r'\b(nombre|apellidos?)\s*[:=-]\s*', re.I)
 KEYWORD_RE = re.compile(r'\b(dni|nie|documento|n[úu]mero|nombre|apellidos?|y)\b', re.I)
 MAX_NAME_TOKENS = 7
@@ -164,6 +167,8 @@ def parse_declaration(text, awaiting=None):
             rest = rest[:a] + ' ' + rest[b:]
     else:
         t = NAME_TRIGGER_RE.search(rest)
+        if t and not document and ROLE_DECLARATION_RE.match(rest, t.start()):
+            t = None
         if t:
             words, end = _take_words(rest[t.end():])
             if words:

@@ -199,7 +199,7 @@ def test_zero_ambiguous_and_inactive_do_not_verify(pg):
     r1, _ = say(ANA, ext='Z1')
     r2, _ = say('Me llamo Marta Sanz Ruiz, DNI 55555555K', ext='Z2')
     r3, _ = say('Me llamo Nadie Existe Aqui, DNI 00000000T', ext='Z3')
-    assert r1 == r2 == r3 and GENERIC in r1
+    assert r1 == r2 == r3 and GENERIC in r1 and 'nombre completo' in r1
     assert [r['outcome'] for r in rows(pg, 'SELECT outcome FROM insurance_identity_attempts ORDER BY attempt_id')] \
         == ['ambiguous', 'no_match', 'no_match']
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0

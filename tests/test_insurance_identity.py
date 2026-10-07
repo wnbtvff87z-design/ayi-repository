@@ -161,6 +161,65 @@ def test_policy_extraction_keeps_the_business_question_and_original():
     assert identity.parse_declaration('póliza 000123 o póliza 000124')['contract_numbers'] == ['000123', '000124']
 
 
+def test_recalled_exchange_restores_its_date_without_rewriting_original_question():
+    from insurance import dialog
+    state = {'question': '¿Por qué?'}
+    dialog._use_pair(state, {
+        'q': 'Tuve daños por agua', 'normalized': 'Tuve daños por agua',
+        'policy_id': 'P1', 'event_date': date(2025, 1, 2),
+    }, '¿Por qué?')
+    assert state['event_date'] == '2025-01-02'
+    assert state['recalled'][0]['event_date'] == '2025-01-02'
+    assert state['question'] == '¿Por qué?'
+    assert '¿Por qué?' in state['normalized_question']
+
+
+@pytest.mark.parametrize('role', ['propietario', 'el propietario', 'inquilina', 'tomador', 'autónoma'])
+def test_role_statements_are_not_mistaken_for_identity_declarations(role):
+    text = f'Soy {role}, ¿cubre daños por agua?'
+    declaration = identity.parse_declaration(text)
+    assert declaration['name'] is None
+    assert declaration['question'] == text
+
+
+def test_case_gate_redacts_documents_in_urgent_original_text(monkeypatch):
+    from insurance import dialog
+    captured = {}
+    def persist(**kwargs):
+        captured.update(kwargs)
+        return 'synthetic-case'
+    monkeypatch.setattr(dialog, 'create_or_update_case', persist)
+    result = dialog._case(
+        {'business_id': 'A'}, '+34600000000',
+        'Inundación urgente. DNI 12-345-678-Z', 'WhatsApp', 'synthetic-event',
+        reason='human_interpretation')
+    assert result == 'synthetic-case'
+    assert '12-345-678-Z' not in captured['question']
+    assert '[documento]' in captured['question']
+
+
+@pytest.mark.parametrize('prefix', ['', '¿Cubre agua? '])
+def test_identity_name_containing_incident_word_is_not_an_urgency(pg, monkeypatch, prefix):
+    from insurance import cases, dialog
+    identity.upsert_customer(pg, 'A', 'C1', 'Celia Incendio', '12345678Z')
+    schema = pg.execute('SELECT current_schema() AS schema').fetchone()['schema']
+    dsn = pg.info.dsn
+    pg.commit()
+    def connect():
+        conn = psycopg.connect(dsn, row_factory=dict_row)
+        conn.execute(f'SET search_path TO "{schema}"')
+        return conn
+    monkeypatch.setattr(cases, 'db', connect)
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Protocolo sintético.')
+    monkeypatch.setattr(dialog, '_urgent', lambda *args, **kwargs: pytest.fail('identity triggered urgency'))
+    reply, result = dialog.process(
+        {'business_id': 'A'}, {}, [], prefix + 'Soy Celia Incendio, DNI 12345678Z',
+        'WhatsApp', 'synthetic-identity', '+34600000000')
+    assert result['insurance_result'] == 'missing_information'
+    assert 'He guardado' not in reply
+    assert pg.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
+
+
 def test_provision_accepts_trusted_name_components(pg):
     result = provision.provision(
         pg, actor='ops', business_id='A', customer_id='P', display_name='José María de la Cruz Gil',

@@ -48,10 +48,10 @@ UNVERIFIED_ACTION = ('Identidad NO verificada: los datos declarados no coincidie
                      'No atribuir el caso a ningún cliente; revisar por un canal aprobado.')
 VERIFIED_ACTION = ('Identidad verificada (nombre, apellidos y DNI/NIE coinciden). Revisar la evidencia '
                    'consultada (ver preguntas del caso) y responder al cliente.')
-ASK_IDENTITY = ('Para consultar tu póliza necesito tu nombre, apellidos y DNI o NIE. Puedes indicarlos '
-                'juntos en un mensaje.')
-IDENTITY_FAILED = ('No he podido verificar tus datos. Revisa nombre, apellidos y DNI o NIE e indícalos '
-                   'de nuevo.')
+ASK_IDENTITY = ('Para consultar tu póliza necesito tu nombre, apellidos y DNI o NIE. Indica todos tus '
+                'nombres y al menos tu primer apellido completo; puedes enviarlos juntos.')
+IDENTITY_FAILED = ('No he podido verificar tus datos. Revisa e indica tu nombre completo, apellidos '
+                   'y DNI o NIE de nuevo.')
 ASK_POLICY = ('Para continuar necesito el número de póliza sobre el que preguntas. Indícalo tal como '
               'figura en tu contrato.')
 ASK_QUERY = ('Gracias, ya he verificado tu identidad. ¿Qué quieres consultar sobre tu póliza?')
@@ -67,6 +67,12 @@ BUSINESS_RE = re.compile(
     r'cubr|cobertura|exclu|franquicia|indemn|limite|condicion|danos|rotura|agua|robo|'
     r'siniestro|accidente|responsabilidad|prima|renov|cancel|asistencia|repar|vivienda|'
     r'cristal|tuberia|incendio|inund|hurto|pagar|pago|protege|asegur|zxqv')
+DECLARED_FACT_RE = re.compile(
+    r'^(?:(?:tengo|tenemos)\s+(?:\d+|un[oa]?|dos|tres|cuatro|cinco)\s+'
+    r'(?:hijos?|hijas?|mascotas?|perros?|gatos?|personas?|vehiculos?|coches?)\b|'
+    r'(?:vivo|vivimos)\s+(?:solo|sola|con|en)\b|somos\s+(?:\d+|dos|tres|cuatro|cinco)\b|'
+    r'(?:mi|el)\s+(?:coche|vehiculo)\s+(?:tiene|es)\b|'
+    r'(?:mi|la)\s+(?:vivienda|casa)\s+(?:es|tiene|esta)\b)')
 
 
 def _correlation_id(business, channel, external_id):
@@ -117,7 +123,7 @@ def _case(business, customer, text, channel, external_id, **kw):
             business_id=business.get('business_id'), customer=customer,
             product=kw.get('product') or business.get('insurance_product'),
             policy_id=kw.get('policy_id'), policy_version_id=kw.get('policy_version_id'),
-            question=text, evidence=kw.get('evidence') or [], reason=kw['reason'],
+            question=memory.redact(text), evidence=kw.get('evidence') or [], reason=kw['reason'],
             channel=channel, external_id=external_id, urgency=kw.get('urgency', 'normal'),
             next_action=kw.get('next_action', UNVERIFIED_ACTION),
             context=kw.get('context') or {}, customer_id=kw.get('customer_id'),
@@ -163,6 +169,8 @@ def _business_question(text, declaration, awaiting=None):
     folded = references.fold(clean).strip(' ¿?!.,')
     if not folded or OPENING_RE.fullmatch(folded):
         return False
+    if '?' not in clean and DECLARED_FACT_RE.match(folded):
+        return False
     if awaiting == 'date' and DATE_RE.fullmatch(clean.strip()):
         return False
     if references.classify(clean, has_last_answer=True, has_recent=True)['kind'] != 'independent':
@@ -174,14 +182,15 @@ def _business_question(text, declaration, awaiting=None):
     if SMALLTALK_RE.match(clean) or len(memory.toks(clean)) < 2:
         return False
     return '?' in clean or bool(re.match(
-        r'^(que|como|cuando|cuanto|cual|puede|puedo|tengo|necesito saber|quiero saber|otra duda)\b', folded))
+        r'^(que|como|cuando|cuanto|cual|puede|puedo|necesito saber|quiero saber|otra duda)\b', folded))
 
 
 def _drop_customer_state(st):
     for key in ('policy_id', 'contract_number', 'requested_policy', 'policy_change_pending',
                 'question', 'normalized_question', 'question_turn_id',
                 'event_date', 'pending_escalation', 'reference_options', 'recalled', 'awaiting',
-                'reference_remainder', 'reply_outputs', 'verified', 'customer_id', 'resume_customer_id'):
+                'reference_remainder', 'reply_outputs', 'pending_facts',
+                'verified', 'customer_id', 'resume_customer_id'):
         st.pop(key, None)
 
 
@@ -223,37 +232,44 @@ def _answer(business, state, text, channel, external_id, customer):
                 st.pop('verified', None)
             _merge_declaration(st, decl, bid)
             is_query = _business_question(text, decl, st.get('awaiting'))
+            fact_text = (decl.get('question') or '').strip()
+            user_fact = fact_text if '?' not in fact_text and DECLARED_FACT_RE.match(
+                references.fold(fact_text)) else None
             turn_id, created = memory.record_user(
                 conn, sc._replace(customer_id=customer_id), external_id,
-                decl.get('question') if is_query else text,
-                'question' if is_query else 'identity' if decl.get('name') or decl.get('document') else
-                'clarification' if st.get('awaiting') else 'other', corr,
+                decl.get('question') if is_query or user_fact else text,
+                'question' if is_query else 'clarification' if user_fact else
+                'identity' if decl.get('name') or decl.get('document') else
+                'clarification' if st.get('awaiting') or user_fact else 'other', corr,
                 normalized=(decl.get('normalized_question') or decl.get('question')) if is_query else None)
             if not created:
-                return NOT_SAVED, {'insurance_result': 'case_persistence_failed'}
+                return ASK_IDENTITY, {'insurance_result': ResultKind.IDENTITY_NOT_VERIFIED.value}
             if new_declaration:
                 conn.execute('UPDATE insurance_identity_verifications SET revoked_at=now() WHERE '
                              'business_id=%s AND conversation_ref=%s AND channel=%s AND session_ref=%s '
                              'AND revoked_at IS NULL', (bid, ref, channel, sess))
+            if user_fact and not customer_id:
+                st['pending_facts'] = (st.get('pending_facts') or [])[-9:] + [
+                    {'turn_id': turn_id, 'text': memory.redact(user_fact)}]
 
             def finish(reply, out, *, decision=None, evidence=None, policy_id=None, version_id=None,
                        answer=False):
                 active_sc = sc._replace(customer_id=customer_id)
-                original_turn = st.get('question_turn_id') or turn_id
+                original_turn = turn_id if user_fact else st.get('question_turn_id') or turn_id
                 pages = memory.pages_of(evidence or [])
                 assistant_id = memory.record_assistant(
                     conn, active_sc, external_id, reply, out['insurance_result'], original_turn, corr,
                     kind='answer' if answer else 'clarification', policy_id=policy_id,
                     version_id=version_id, pages=pages, event_date=st.get('event_date'))
-                if customer_id and st.get('question'):
+                if customer_id and (st.get('question') or user_fact):
                     memory.update_summary(
                         conn, active_sc, user_turn_id=original_turn, assistant_turn_id=assistant_id,
-                        question=st['question'], answer=reply.split('\nFuente:', 1)[0],
+                        question=user_fact or st['question'], answer=reply.split('\nFuente:', 1)[0],
                         decision=decision or ('answer' if answer else 'clarify'),
                         policy_id=policy_id, version_id=version_id, pages=pages,
-                        event_date=st.get('event_date'),
-                        fact=st['question'] if OCCURRED_RE.search(st['question']) else None,
-                        pending=st['question'] if st.get('awaiting') and
+                        event_date=None if user_fact else st.get('event_date'),
+                        fact=user_fact or (st['question'] if OCCURRED_RE.search(st.get('question') or '') else None),
+                        pending=st.get('question') if st.get('awaiting') and
                         decision not in ('accepted', 'declined', 'technical_case') else None,
                         open_issue=(st.get('pending_escalation') or {}).get('reason'))
                 if answer or decision in ('accepted', 'declined', 'technical_case'):
@@ -273,7 +289,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 st['question_turn_id'] = turn_id
                 st.pop('pending_escalation', None)
                 st.pop('event_date', None)
-            if urgent:
+            if urgent and is_query and URGENT_RE.search(decl.get('question') or ''):
                 reply, out = _urgent(business, customer, text, channel, external_id, corr, customer_id,
                                      _claim_record(bid, st) if not customer_id else None, ctx)
                 return finish(reply, out)
@@ -304,6 +320,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 claimed_turns = [turn_id]
                 if st.get('question_turn_id'):
                     claimed_turns.append(st['question_turn_id'])
+                claimed_turns.extend(f['turn_id'] for f in st.get('pending_facts') or [])
                 conn.execute(
                     'UPDATE insurance_conversation_turns SET customer_id=%s WHERE business_id=%s '
                     'AND channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id IS NULL '
@@ -312,6 +329,23 @@ def _answer(business, state, text, channel, external_id, customer):
             st['verified'] = True
             st['customer_id'] = customer_id
             sc = sc._replace(customer_id=customer_id)
+            for fact in st.pop('pending_facts', []):
+                prior_reply = conn.execute(
+                    "SELECT turn_id,content FROM insurance_conversation_turns WHERE business_id=%s "
+                    "AND channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s "
+                    "AND role='assistant' AND reply_to=%s ORDER BY turn_id DESC LIMIT 1",
+                    (bid, channel, ref, sess, customer_id, fact['turn_id'])).fetchone()
+                if prior_reply:
+                    memory.update_summary(
+                        conn, sc, user_turn_id=fact['turn_id'], assistant_turn_id=prior_reply['turn_id'],
+                        question=fact['text'], answer=prior_reply['content'], decision='fact',
+                        policy_id=None, version_id=None, pages=[], fact=fact['text'])
+            if user_fact:
+                reply = OFFER_REVIEW if st.get('pending_escalation') else (
+                    ASK_POLICY if st.get('awaiting') == 'policy' else
+                    '¿En qué fecha ocurrió el hecho? Indícala como día/mes/año.' if st.get('awaiting') == 'date' else
+                    'He anotado el dato que has indicado. ¿Qué quieres consultar sobre tu póliza?')
+                return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, decision='fact')
             if st.get('pending_escalation') and not is_query:
                 if references.YES_RE.match(text or ''):
                     details = st['pending_escalation']
@@ -453,16 +487,15 @@ def _urgent(business, customer, text, channel, external_id, corr, customer_id, c
 
 def _use_pair(st, pair, continuation=''):
     st['normalized_question'] = f"{pair.get('normalized') or pair['q']} {continuation}".strip()[:4000]
-    st['recalled'] = [pair]
+    st['recalled'] = [{k: pair.get(k) for k in
+                       ('q_id', 'q', 'normalized', 'a', 'policy_id', 'version_id', 'pages')}]
     if not st.get('policy_change_pending') and pair.get('policy_id'):
         st['policy_id'] = pair['policy_id']
     fact = _fact_date(str(pair.get('event_date') or '')) or _fact_date(pair.get('normalized') or pair['q'])
     if fact:
         st['event_date'] = fact.isoformat()
-        if not _fact_date(query):
-            query = f'{query} Fecha del hecho: {fact.isoformat()}.'
-            st['normalized_question'] = query
-            memory.set_user_kind(conn, st['question_turn_id'], 'question', question, query)
+        st['recalled'][0]['event_date'] = fact.isoformat()
+        st['recalled'][0]['event_date'] = fact.isoformat()
 
 
 def _documental(conn, business, bid, channel, ref, sess, st, text, question, customer_id, corr, ctx,

@@ -248,7 +248,11 @@ The starting PostgreSQL suite had **365 passing tests and one existing failure**
 test expected `Ana Pérez` not to match `Ana Pérez López`, contradicting the already merged
 prefix matching from PR #26. The related test now treats that declaration as valid rather than
 preserving the inconsistent expectation. Standalone identity/provisioning/additive-session
-migration and question-preservation validation passed **33 tests** on local PostgreSQL.
+migration, question-preservation and identity/privacy boundary validation passed **42 tests**
+on local PostgreSQL. Related case/document/routing regression fixtures passed **92 tests**.
+Role facts such as “Soy propietario” do not revoke verification as if they were a new name;
+an incident word in a declared surname cannot trigger urgency, and urgent original text is
+document-redacted before it reaches case persistence.
 
 ### SQL audit and scale experiment
 
@@ -286,3 +290,23 @@ The scale test checks real `pg_indexes` and FK constraints, scopes pages before 
 plans under transactionally removed/restored new indexes, and measures local retrieval rather
 than promising an external-host service level. Reproduce with the existing pytest suite and
 `INSURANCE_TEST_DATABASE_URL` pointed only at a disposable **local** PostgreSQL.
+
+Recorded local run (PostgreSQL 16, synthetic data; milliseconds, not Railway measurements):
+
+| Probe | Before | After | Observed plan change |
+|---|---:|---:|---|
+| One authorized policy | 1.259 | 0.090 | Authorization sequential scan → scope index |
+| Ready document/pages | 14.189 | 4.035 | Document sequential scan → scope index-only scan; page PK retained |
+| Exact historical exchange | 0.715 | 0.026 | 299 nonmatching answer rows → `reply_to` index |
+| Last answer | 0.465 | 0.047 | Indexed answer linkage |
+| Historical verification | 1.931 | 0.165 | PK discarding 12,000 rows → exact scope index; expired rows still filtered |
+| Exact session summary | 0.033 | 0.028 | Existing session-summary PK; no new index |
+| Many-policy legacy regex vs exact candidates | 126.581 | 12.160 | Exact candidate matching instead of per-owned-policy regex |
+
+End-to-end local retrieval over the selected 1,027-page scope used 128-page batches and at most
+18 retained ranking entries, never all policy documents. Five-sample medians with the optimized
+query were **55.83 → 12.93 ms** (one policy) and **58.04 → 13.41 ms** (many-policy exact selection)
+when comparing missing/new scope indexes in the same run. Maximums after indexing were 15.62 /
+13.55 ms. These include local SQL plus lexical ranking, **not** LLM latency or deployment load.
+The reproducible scale test prints the complete SQL, parameters, `pg_indexes`, constraints and
+JSON query plans; its separate final execution passed **19 tests**.

@@ -297,6 +297,23 @@ def test_exact_candidate_selection_preserves_conflicting_declarations(conn):
     assert result['status'] == 'ok' and result['policy_id'] == 'POL-006000'
 
 
+def test_normalized_historical_query_does_not_block_explicit_policy_switch(conn):
+    original = '¿Cubre agua en mi póliza 000123 y fuego cuando hay exclusiones?'
+    previous = identity.parse_declaration(original)
+    current = identity.parse_declaration('Ahora quiero consultar póliza 006000')
+    assert previous['original'] == previous['question'] == original
+    normalized = previous['normalized_question']
+    assert '000123' not in normalized and 'fuego' in normalized and 'exclusiones' in normalized
+    result = retrieval.retrieve(
+        conn, 'SCALE-A', 'MANY', normalized + ' ' + current['normalized_question'], TODAY,
+        policy_hint=current['contract_number'])
+    assert result['status'] == 'ok' and result['policy_id'] == 'POL-006000'
+    # Actual current conflicting identifiers remain ambiguous, rather than choosing the hint.
+    conflict = retrieval.retrieve(conn, 'SCALE-A', 'MANY', previous['question'], TODAY,
+                                   policy_hint=current['contract_number'])
+    assert conflict['reason_code'] == 'multiple_policies' and not conflict['evidence']
+
+
 def test_unusual_legacy_identifiers_keep_literal_boundary_matching(conn):
     conn.execute(
         "INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) "
