@@ -121,6 +121,8 @@ def _correlation_id(business, channel, external_id):
 
 
 def _is_social(text):
+    if not text or len(text) > 256:
+        return False
     normalized = ' '.join(re.sub(r'[^\w\s]', ' ', references.fold(text or '')).split())
     return normalized in SOCIAL_PHRASES
 
@@ -257,7 +259,8 @@ def _answer(business, state, text, channel, external_id, customer):
                                 'AND session_ref=%s AND customer_id=%s AND last_turn_id=%s',
                                 (json.dumps(summary), sc.bid, sc.channel, sc.ref, sc.sess,
                                  sc.customer_id, cached['turn_id']))
-                        for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent'):
+                        for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent',
+                                    'recalled_id', 'explain_prior'):
                             st.pop(key, None)
                     identity.save_state(conn, bid, channel, ref, sess, st, user_activity=True)
                     _turn_diag(corr, bid, out['insurance_result'], customer_id, 'write_pending_commit')

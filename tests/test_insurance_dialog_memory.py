@@ -1,10 +1,8 @@
 """Synthetic PostgreSQL integration tests for persistent, evidence-scoped dialogue."""
 import json
 import logging
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
-from types import SimpleNamespace
 
 import pytest
 
@@ -102,6 +100,7 @@ def test_required_prompt_over_budget_does_not_truncate_evidence_or_call_llm(pg, 
     assert not state(pg).get('pending_human')
     last = state(pg)['last_retrieval']
     assert last['llm_diagnostic'] == 'context_budget_exceeded'
+    assert last['llm_invoked'] is False
     with pg() as conn:
         evidence = dialog.retrieval.prior_evidence(
             conn, BIZ, 'C2', last['policy_id'], last['version_id'], last['pages'])
@@ -618,6 +617,8 @@ def test_llm_technical_failure_records_only_a_real_question_after_consent(pg, mo
     reply, out = ask('¿Cubre agua?', ext='technical-question')
     assert reply != dialog.OFFER_HUMAN
     assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'llm_error'}
+    assert state(pg)['last_retrieval']['llm_diagnostic'] == 'llm_error'
+    assert state(pg)['last_retrieval']['llm_invoked'] is True
     assert not state(pg).get('pending_human')
     assert count(pg, 'insurance_cases') == 0
     reply, out = ask('Sí', ext='technical-consent')

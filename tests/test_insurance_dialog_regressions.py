@@ -1,5 +1,6 @@
 """Synthetic PostgreSQL regressions for insurance dialogue intent and failure handling."""
 import logging
+import time
 from datetime import date, datetime, timezone
 
 import pytest
@@ -664,3 +665,19 @@ def test_ambiguous_case_commit_is_neutral_and_same_message_retry_confirms_existi
     assert not state(pg).get('pending_human')
     summary = rows(pg, 'SELECT summary FROM insurance_conversation_summary')[0]['summary']
     assert not summary.get('pending')
+
+
+@pytest.mark.parametrize('greeting', [
+    'hola buenas', '¡Hola, buenas!', 'hola \t buenas\n', 'Buenos días.', 'Gracias por tu ayuda!',
+])
+def test_social_classifier_uses_normalized_phrase_membership(greeting):
+    assert dialog._is_social(greeting)
+    assert not dialog._is_question(greeting)
+
+
+def test_social_classifier_rejects_adversarial_whitespace_without_regex_backtracking():
+    adversarial = 'hola' + ' ' * 2_000_000 + 'buenas'
+    started = time.monotonic()
+    assert not dialog._is_social(adversarial)
+    assert time.monotonic() - started < 1
+    assert not dialog._is_social('hola buenas, ¿qué cubre ventanas?')
