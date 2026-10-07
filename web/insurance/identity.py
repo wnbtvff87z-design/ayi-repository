@@ -120,7 +120,7 @@ def parse_declaration(text, awaiting=None):
             rest = rest[:m.start()] + ' ' + rest[m.end():]
             break
     if contract is None and awaiting == 'policy':
-        bare = re.fullmatch(r'\s*(?:la\s+|el\s+)?([A-Za-z0-9][A-Za-z0-9-]{2,29})\s*[.]?\s*', rest, re.I)
+        bare = re.fullmatch(r'(?:(?:la|el) )?([A-Za-z0-9][A-Za-z0-9-]{2,29})\.?', ' '.join(rest.split()), re.I)
         if bare and re.search(r'\d', bare.group(1)):
             contract, rest = bare.group(1), ''
     name = None
