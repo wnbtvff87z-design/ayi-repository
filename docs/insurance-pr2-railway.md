@@ -8,7 +8,7 @@
 - Mapeo Airtable en `insurance/cases.py::airtable_value`: producto Vida/Hogar/Auto/Otro; urgencia normal→Normal, high→Alta, critical→Crítica; estado pending→Pendiente, resolved→Resuelto. Insurance Human Tasks sigue sin sincronizarse.
 
 ## Identidad (BLOQUEANTE para datos reales)
-El teléfono solo identifica la conversación. El agente solo lee una póliza si existe una fila vigente en `insurance_identity_verifications` (HMAC de negocio+canal+teléfono → cliente) creada por un verificador externo; **no existe aún ese verificador** (decisión pendiente: OTP a un contacto registrado, enlace firmado, etc.). Sin fila, cualquier consulta crea un caso `identity_not_verified`. La verificación es por canal.
+El teléfono solo identifica la conversación. El agente solo lee una póliza si existe una fila vigente en `insurance_identity_verifications` (HMAC de negocio+canal+teléfono → cliente) creada al coincidir exactamente nombre, apellidos y DNI/NIE con un único cliente activo del negocio (ver docs/insurance-pr3-attribution.md); no se usa OTP. Sin fila, el agente pide esos datos. La verificación es por canal.
 
 ## API humana
 La API humana existente con clave compartida **sigue sin servir para expedientes reales**; no se ha implementado identidad individual ni auditoría de lectura/resolución para ella (solo el endpoint administrativo de documentos las tiene). La resolución al cliente **no se envía automáticamente**: un humano contacta al cliente por el canal aprobado.

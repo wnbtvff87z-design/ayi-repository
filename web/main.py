@@ -378,6 +378,8 @@ def internal_reconcile_pending():
 @app.get('/internal/insurance/cases/<uuid:case_id>')
 def insurance_case_detail(case_id):
   if not insurance_human_authorized():return jsonify(success=False),401
+  # Shared key = no individual identity, no per-business scope, no read audit: not fit for real data.
+  if os.getenv('INSURANCE_HUMAN_SHARED_DETAIL_ENABLED','false').strip().lower()!='true':return jsonify(success=False,message='Use /insurance/admin/cases/<id> with an individual token'),403
   try:
    from insurance.cases import get_case
    case=get_case(case_id)
