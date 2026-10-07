@@ -155,7 +155,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 'He guardado tu consulta como urgente para revisión humana. No puedo confirmar un plazo '
                 'ni una resolución.', {'insurance_result': ResultKind.URGENT.value, 'case_id': case_id})
     extra = {'customer_id': customer_id, 'claim': claim,
-             'ask_identity': customer_id is None and claim is None}
+             'ask_identity': customer_id is None and not (claims.get('document') or claims.get('name'))}
     if result:
         d = result.get('diagnostics', {})
         _diag(corr, 'retrieval', identity_state=identity_state, reason_code=result.get('reason_code'),

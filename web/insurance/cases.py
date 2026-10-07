@@ -143,7 +143,10 @@ def _payload(case_id, customer_ref, product, urgency, reason, status, revision,
 
 
 def _refresh_attribution(conn, case_id):
-    """Derive the case attribution state from PG facts. Returns the new state."""
+    """Derive the case attribution state from PG facts. Returns the new state.
+
+    policy_id is only ever set by the dialogue from a retrieval that already checked business,
+    customer, authorization and version; this function does not re-check authorization."""
     row = conn.execute(
         'SELECT c.customer_id,c.policy_id,EXISTS(SELECT 1 FROM insurance_case_claims k '
         "WHERE k.case_id=c.case_id AND k.match_status='candidate_found') AS has_candidate "

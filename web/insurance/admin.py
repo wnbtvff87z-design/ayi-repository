@@ -92,7 +92,8 @@ def read_case(case_id):
             else:
                 case = _cases.get_case_for_operator(case_id, admin['business_id'])
                 outcome, body, code = (('ok', case, 200) if case else ('not_found', {'error': 'not_found'}, 404))
-            # The audit row is committed with the read; if it cannot be written nothing is returned.
+            # Read and audit use separate connections; the body is returned only after the audit
+            # row is committed, so an audit failure returns nothing.
             conn.execute(
                 'INSERT INTO insurance_audit_log(actor_id,business_id,action,target,outcome) '
                 "VALUES(%s,%s,'case_read',%s,%s)",

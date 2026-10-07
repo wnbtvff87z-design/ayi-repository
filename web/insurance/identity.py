@@ -39,7 +39,8 @@ NAME_RE = re.compile(
     r'(?i:me llamo|mi nombre es|soy)\s+((?-i:[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]+(?:(?:\s+(?:de|del|la|las|los))*'
     r'\s+[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]+){1,5}))')
 CONTRACT_RE = re.compile(
-    r'p[óo]liza\s*(?:n[úu]mero|n[ºo°.]*|num(?:ero)?\.?)?\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9-]{2,29})', re.I)
+    r'p[óo]liza[ \t]{0,3}(?:n[úu]mero|n[ºo°.]{1,2}|num(?:ero)?\.?)?[ \t]{0,3}[:#]?[ \t]{0,3}'
+    r'([A-Za-z0-9][A-Za-z0-9-]{2,29})', re.I)
 CONTRACT_STOP = {'de', 'del', 'que', 'mi', 'la', 'el', 'por', 'para', 'con'}
 
 
@@ -72,7 +73,7 @@ def name_hmac(business_id, name):
 
 def extract_claims(text):
     """Unverified things the caller said. Contract numbers keep leading zeros (text, exact)."""
-    text = str(text or '')
+    text = str(text or '')[:2000]
     doc = DOC_RE.search(text)
     name = NAME_RE.search(text)
     contract = next((m.group(1) for m in CONTRACT_RE.finditer(text)
@@ -90,6 +91,8 @@ def locate_candidate(conn, business_id, claims):
     dh = document_hmac(business_id, claims.get('document'))
     if not claims.get('document') and not claims.get('name'):
         return 'no_claim', None
+    if not claims.get('document'):
+        return 'no_claim', None  # a bare name is never enough to look anyone up
     if not dh:
         return 'not_found', None
     rows = conn.execute('SELECT customer_id,name_hmac FROM insurance_customers WHERE business_id=%s '
