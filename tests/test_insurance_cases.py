@@ -799,6 +799,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     pg_schema, monkeypatch
 ):
     monkeypatch.setenv('INSURANCE_HUMAN_SHARED_DETAIL_ENABLED', 'true')
+    monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
     human_key = 'k' * 40
@@ -853,7 +854,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
             data={
                 'To': 'whatsapp:+34600111222',
                 'From': 'whatsapp:+34600999888',
-                'Body': question,
+                'Body': question + ' Me llamo Ana Pérez López, DNI 99999999R.',
                 'MessageSid': sid,
             },
         )
@@ -937,14 +938,16 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
     monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared conversation database accessed'))
     monkeypatch.setattr(main.requests, 'post', lambda *args, **kwargs: pytest.fail('Airtable was written in request path'))
     client = main.app.test_client()
+    monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
     question = '¿La póliza cubre esta filtración?'
+    declared = ' Me llamo Ana Pérez López, DNI 99999999R.'
 
     if channel == 'WhatsApp':
         monkeypatch.setattr(main, 'twilio_valid', lambda: True)
         response = client.post('/webhook-whatsapp', data={
             'To': 'whatsapp:+34600111222',
             'From': 'whatsapp:+34600999888',
-            'Body': question,
+            'Body': question + declared,
             'MessageSid': 'SM-case-confirmation',
         })
         reply = response.get_data(as_text=True)
@@ -956,7 +959,7 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
             'channel': 'Voice',
             'customer_phone': '+34600999888',
             'external_id': 'CA-case-confirmation:turn:1',
-            'text': question,
+            'text': question + declared,
         })
         reply = response.json['reply']
 

@@ -105,12 +105,12 @@ def run_worker(data=PDF_TEXT, ocr=lambda b, i: '', key=KEY):
     return documents.process_next(FakeS3({key: data}), ocr)
 
 
-def verify(pg, channel='WhatsApp', customer='C1', business=BIZ):
+def verify(pg, channel='WhatsApp', customer='C1', business=BIZ, session=''):
     with pg() as conn:
         conn.execute(
             "INSERT INTO insurance_identity_verifications(business_id,conversation_ref,customer_id,method,"
-            "verified_by,expires_at) VALUES(%s,%s,%s,'external-test','verifier-1',now()+interval '1 hour')",
-            (business, identity.conversation_ref(business, channel, PHONE), customer))
+            "verified_by,expires_at,session_ref) VALUES(%s,%s,%s,'external-test','verifier-1',now()+interval '1 hour',%s)",
+            (business, identity.conversation_ref(business, channel, PHONE), customer, session))
 
 
 def ask(text, channel='WhatsApp', ext='SM1'):
@@ -292,8 +292,8 @@ def test_cited_answer_with_clause_and_exclusion_together(pg, llm):
     assert state['insurance_result'] == 'evidence_backed_explanation'
     assert f'documento {DOC}, versión {VER}, página 1' in reply and 'página 2' in reply
     _, switched = ask('¿Me cubre el daño por agua por rotura de tuberías el %s?' % date.today().isoformat(), 'Voice', 'CA0')
-    assert switched['insurance_result'] == 'human_case_required'  # verification is per channel
-    verify(pg, 'Voice')
+    assert switched['insurance_result'] == 'identity_not_verified'  # verification is per channel
+    verify(pg, 'Voice', session='CA1')
     again, state2 = ask('¿Me cubre el daño por agua por rotura de tuberías el %s?' % date.today().isoformat(), 'Voice', 'CA1')
     assert again == reply and state2 == state  # same domain and answer on Voice and WhatsApp
 
@@ -302,10 +302,10 @@ def test_unverified_identity_never_reads_policy(pg, llm, monkeypatch):
     register(pg)
     run_worker()
     monkeypatch.setattr(idialog.retrieval, 'retrieve', lambda *a, **k: pytest.fail('retrieved without identity'))
-    _, state = ask('¿Me cubre el daño por agua?')
-    assert state['insurance_result'] == 'human_case_required'
+    reply, state = ask('¿Me cubre el daño por agua?')
+    assert state['insurance_result'] == 'identity_not_verified' and 'DNI' in reply
     with pg() as conn:
-        assert conn.execute('SELECT latest_reason FROM insurance_cases').fetchone()['latest_reason'] == 'identity_not_verified'
+        assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
 
 
 def test_cross_business_and_cross_customer_isolation(pg, llm):
@@ -359,8 +359,8 @@ def test_llm_failure_escalates_with_evidence(pg, monkeypatch):
 
 
 def test_duplicate_webhook_keeps_single_case(pg):
-    _, a = ask('¿Me cubre el daño?', ext='SM-dup')
-    _, b = ask('¿Me cubre el daño?', ext='SM-dup')
+    _, a = ask('Tengo una inundación urgente', ext='SM-dup')
+    _, b = ask('Tengo una inundación urgente', ext='SM-dup')
     assert a['case_id'] == b['case_id']
     with pg() as conn:
         assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 1
@@ -490,7 +490,7 @@ def test_turns_stay_fast_while_admin_registrations_and_slow_bucket_worker_run(pg
         for i in range(30):
             channel = 'Voice' if i % 2 else 'WhatsApp'
             t = time.perf_counter()
-            reply, _ = ask('¿Qué cubre mi póliza?', channel, f'CA-conc-{i}')
+            reply, _ = ask('Tengo una inundación urgente', channel, f'CA-conc-{i}')
             lat.append(time.perf_counter() - t)
             assert 'He guardado' in reply
     finally:
@@ -524,5 +524,5 @@ def test_pg_lookup_ok_but_case_write_fails_does_not_confirm(pg, monkeypatch):
         return real()
 
     monkeypatch.setattr(cases, 'db', flaky)
-    reply, state = ask('¿Me cubre el daño por agua?')
+    reply, state = ask('Tengo una inundación urgente')
     assert state['insurance_result'] == 'case_persistence_failed' and 'He guardado' not in reply

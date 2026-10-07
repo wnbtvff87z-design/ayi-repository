@@ -13,17 +13,20 @@ Message "He guardado tu consulta para revisión humana…" is produced only at t
 | No verified customer | `_answer` skips retrieval and returns `reason=identity_not_verified` → the quoted message. |
 | Later stages (authorization, version, document, pages, evidence, LLM) | Only reachable after identity is verified. |
 
-**Demonstrated by code/tests:** unless a verification row exists, the escalation happens at the identity stage, before any policy/document lookup. This is the only stage that can produce it for a caller with no verification row.
+(Historical, before migration 007.) **Demonstrated by code/tests:** unless a verification row exists, the escalation happens at the identity stage, before any policy/document lookup. This is the only stage that can produce it for a caller with no verification row.
 **Needs Railway/PostgreSQL to confirm:** whether `insurance_identity_verifications` has any row for the test number; whether customers/policies/authorizations/versions/documents/pages exist for `INS-BIZ-001`/`POL-000123`/`DOC-000456`. Queries (read-only, no PII selected): counts per table filtered by `business_id`, and `SELECT status FROM insurance_documents WHERE document_id='DOC-000456'`, `count(*)` of `insurance_document_pages` with `indexed`.
 Retrieval and the LLM prompt were NOT changed (failing stage is upstream of them); they now emit per-stage diagnostics so the next call shows which stage fails.
 
 ## 2. Behaviour implemented
 
-* A. Locate (`identity.locate_candidate`): exact HMAC of DNI/NIE (+ optional exact normalized name HMAC) → *candidate*. DNI with an incompatible name is not linked. Plaintext DNI is never stored (HMAC + last 3 chars).
-* B. Verify: unchanged and closed. **Missing: an approved verification mechanism** (e.g. one-time code to a phone registered by the insurer, callback, or authenticated portal) that writes `insurance_identity_verifications`. DNI + name + policy number never verify.
+* Decision: **no OTP, signed links or extra codes.** A caller is verified by giving name + surnames + DNI/NIE, which must match **exactly one active** `insurance_customers` row of the business resolved from the dialled number (the caller can never change `business_id`). Matching is exact on normalized values (HMAC): spaces/case/accents (á é í ó ú ü; `ñ` kept), hyphens in compound names, dots/spaces/hyphens in the DNI/NIE. No contains/fuzzy/name-only matching; the check letter is normalized but not validated. Zero or several matches do not verify, and the reply is one generic text that never says which datum failed.
+* Missing data (name, surnames or DNI/NIE) asks for them and consumes no attempt. Data, and the pending question, are kept in `insurance_conversation_state` (PG) so nothing has to be repeated; data given all in one message (including the policy number) is processed in that turn. Name and surnames must be sent together in one message.
+* On success: `insurance_identity_verifications` row (method `name_surname_document`, verified_by `system:exact-match`, business, customer, channel, session, expiry; no full DNI) plus an `insurance_audit_log` row. TTL `INSURANCE_VERIFICATION_TTL_SECONDS` (default 1800 s). Verification is per business and per channel; Voice is bound to the CallSid, WhatsApp to the phone. It is not reused across Voice/WhatsApp.
+* Attempts: failed matches per conversation/channel in a window (`INSURANCE_IDENTITY_MAX_ATTEMPTS` default 5, `INSURANCE_IDENTITY_WINDOW_SECONDS` default 900). After the limit, further messages are blocked and a review case (`identity_attempts_exceeded`, `customer_unknown`, no customer link) is created only if PostgreSQL confirms the write. Values entered are never logged.
+* After verification: one authorized policy → continue; several → ask for the contract number (exact text, leading zeros kept, no listing before verification); a policy of another customer → `policy_not_authorized`. Then version → ready document → usable pages → evidence → answer with version and page. Missing evidence escalates (`no_evidence`), never "not covered".
+* Escalation causes (`diagnostic_code`): `identity_data_missing`, `identity_no_match`, `identity_ambiguous`, `identity_attempts_exceeded`, `policy_number_required`, `policy_not_authorized`, `document_not_ready`, `no_evidence`, `human_interpretation` (finer retrieval code in context `detail`).
 * C. Authorize: `insurance_authorizations` (unchanged); retrieval pins business → customer → authorized policy → applicable version.
 * Contract number: new `insurance_policies.contract_number` (text, leading zeros preserved, unique per business). `policy_id` is the internal key and is NOT derived from `DOC-…`. Matching is exact on token boundaries (`POL-12` does not match `POL-123`).
-* Verified + several policies + no number → asks for the number (lists nothing). Unverified → case with candidate lead; asks for DNI/name only as a locating hint.
 * Retrieval reason codes: `no_authorized_policy`, `version_not_applicable`, `policy_not_matched`, `multiple_policies`, `document_not_registered`, `document_not_ready`, `ready_without_usable_pages`, `no_matching_pages`, `ok`. No-match is never "not covered".
 * Diagnostics: log `insurance_diag correlation_id stage identity_state reason_code authorization_status document_status usable_pages retrieval_status evidence_count llm_result decision` (whitelist; no PII). `correlation_id` = hash of business/channel/message id, also stored in case context; `diagnostic_code` stored per question.
 * Customer message only claims saving after PostgreSQL confirmed; it never says a person has seen it (Airtable sync is async). PG failure → "No se ha creado un caso".
@@ -52,13 +55,13 @@ The field is sent only if `INSURANCE_AIRTABLE_ATTRIBUTION=true` (create the colu
 
 ## 6. Configuration
 
-`INSURANCE_DATABASE_URL`, `INSURANCE_MIGRATION_DATABASE_URL` (apply 006), `INSURANCE_CASE_HMAC_KEY` (≥32 bytes; also keys DNI/name HMACs: **rotating it invalidates customer lookup keys and verifications**), `INSURANCE_ADMIN_ENABLED=true`, `INSURANCE_ADMIN_TOKEN_KEY`, optional `INSURANCE_AIRTABLE_ATTRIBUTION`, `INSURANCE_HUMAN_SHARED_DETAIL_ENABLED` (default false).
+`INSURANCE_DATABASE_URL`, `INSURANCE_MIGRATION_DATABASE_URL` (apply 006 and 007), `INSURANCE_CASE_HMAC_KEY` (≥32 bytes; also keys DNI/name HMACs: **rotating it invalidates customer lookup keys and verifications**), `INSURANCE_ADMIN_ENABLED=true`, `INSURANCE_ADMIN_TOKEN_KEY`, `INSURANCE_IDENTITY_MAX_ATTEMPTS`, `INSURANCE_IDENTITY_WINDOW_SECONDS`, `INSURANCE_VERIFICATION_TTL_SECONDS`, optional `INSURANCE_AIRTABLE_ATTRIBUTION`, `INSURANCE_HUMAN_SHARED_DETAIL_ENABLED` (default false).
 
 ## 7. Repeating the controlled call (needs authorized access; not done here)
 
-1. Apply migration 006 with the migration DSN.
+1. Apply migrations 006 and 007 with the migration DSN.
 2. Provision (ops, controlled script using `identity.upsert_customer`) the customer with DNI/name HMACs, the policy with its `contract_number` (not derived from the object key), version `VER-001`, authorization, and the document row for the existing bucket key; run the document worker so it becomes `ready` with indexed pages. The PDF itself was not accessed or added to the repo.
-3. Write an `insurance_identity_verifications` row via the approved verifier (currently none exists), then call by voice/WhatsApp and read the `insurance_diag` logs by `correlation_id`.
+3. Call from the number of `INS-BIZ-001`, say name, surnames and DNI/NIE of the provisioned customer (and `POL-000123` if several policies); verification is created automatically. Read by voice/WhatsApp and read the `insurance_diag` logs by `correlation_id`.
 
 ## 8. Tests
 

@@ -23,7 +23,7 @@ def _mentions(question, ident):
                      question, re.I) is not None
 
 
-def retrieve(conn, business_id, customer_id, question, fact_date):
+def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=None):
     """Returns {'status','reason_code','evidence','policy_id','version_id','diagnostics'}.
 
     diagnostics holds only counters/enums (no PII, no document text)."""
@@ -53,9 +53,13 @@ def retrieve(conn, business_id, customer_id, question, fact_date):
         (business_id, [r['policy_id'] for r in authorized], fact_date, fact_date)).fetchall()
     if not rows:
         return out('no_policy', 'version_not_applicable')
+    hint = policy_hint or identity.extract_claims(question)['contract_number']
+    # Contract numbers are TEXT compared exactly (leading zeros matter); never a prefix/contains.
     mentioned = [r for r in rows if _mentions(question, r['policy_id'])
-                 or _mentions(question, r['contract_number'])]
-    if not mentioned and identity.extract_claims(question)['contract_number']:
+                 or _mentions(question, r['contract_number'])
+                 or (hint and hint.casefold() in {str(r['policy_id']).casefold(),
+                                                  str(r['contract_number'] or '').casefold()})]
+    if not mentioned and hint:
         return out('policy_not_matched', 'policy_not_matched')
     rows = mentioned or rows
     if len({r['policy_id'] for r in rows}) > 1:
