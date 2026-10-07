@@ -83,18 +83,27 @@ def test_insurance_is_disabled_by_default_and_unknown_sector_fails_closed(monkey
 
 def test_enabled_insurance_agent_returns_only_identity_boundary(monkeypatch):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
-    monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: 'case-test-1')
+    monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: pytest.fail('automatic case write'))
+    calls = []
+
+    def identity_boundary(business, state, text, channel, external_id, customer):
+        calls.append((text, channel, external_id, customer))
+        return insurance_dialog.ASK_IDENTITY, {'insurance_result': 'identity_not_verified'}
+
+    monkeypatch.setattr(insurance_dialog, '_answer', identity_boundary)
     reply, state = dialog.process(
         {'sector': 'seguros'}, {}, [], '¿me cubre?', 'Voice', 'CA1:turn:1', '+100'
     )
-    assert state == {'insurance_result': 'human_case_required', 'case_id': 'case-test-1'}
-    assert 'He guardado tu consulta' in reply
-    assert 'No puedo confirmar un plazo ni una resolución' in reply
+    assert state == {'insurance_result': 'identity_not_verified'}
+    assert 'nombre, apellidos y DNI' in reply and 'He guardado' not in reply
+    assert calls == [('¿me cubre?', 'Voice', 'CA1:turn:1', '+100')]
 
 
 def test_insurance_turn_does_not_use_shared_conversation_storage(monkeypatch):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
-    monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: 'case-test-1')
+    monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: pytest.fail('automatic case write'))
+    monkeypatch.setattr(insurance_dialog, '_answer', lambda *args: (
+        insurance_dialog.ASK_IDENTITY, {'insurance_result': 'identity_not_verified'}))
     monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
     reply, end_reason = main.converse(
         {'business_id': 'B1', 'sector': 'insurance'},
@@ -105,7 +114,7 @@ def test_insurance_turn_does_not_use_shared_conversation_storage(monkeypatch):
         include_end_reason=True,
     )
     assert end_reason is None
-    assert 'He guardado tu consulta' in reply
+    assert 'nombre, apellidos y DNI' in reply and 'He guardado' not in reply
 
 
 def test_insurance_conversations_cannot_be_mirrored_to_airtable(monkeypatch):

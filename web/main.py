@@ -240,9 +240,35 @@ def recent_history(c,bid,channel,customer,external_id):
    (bid,channel,customer),
   ).fetchall()
 
-def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None):
+def insurance_voice_transport(value):
+  if not isinstance(value,dict):return {}
+  safe={}
+  for key in ('last','last_present'):
+   if isinstance(value.get(key),bool):safe[key]=value[key]
+  for key in ('partial_count','fragment_count','final_count'):
+   count=value.get(key)
+   if isinstance(count,int) and not isinstance(count,bool):safe[key]=min(10000,max(0,count))
+  if value.get('event') in ('setup','disconnect','error'):safe['event']=value['event']
+  return safe
+
+def insurance_voice_error(stage,exc,external_id,business_id=None):
+  call_sid=str(external_id or '').split(':',1)[0]
+  correlation=hashlib.sha256(('insurance-voice:'+call_sid).encode()).hexdigest()
+  ref=correlation
+  if business_id and call_sid:
+   try:
+    from insurance.voice_trace import call_reference
+    ref=call_reference(business_id,call_sid)
+   except Exception:pass
+  log.error('insurance_voice stage=%s error_type=%s call_ref=%s correlation_id=%s',stage,type(exc).__name__,ref,correlation)
+
+def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None,voice_transport=None):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
   if (sector if sector is not None else sector_of(b))=='insurance':
+   if channel=='Voice' and not str(external_id).split(':',1)[0].strip():
+    raise BookingError('Falta el identificador técnico de la llamada')
+   if channel=='Voice' and voice_transport is not None:
+    b=dict(b);b['_insurance_voice_transport']=insurance_voice_transport(voice_transport)
    reply,_=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector)
    return (reply,None) if include_end_reason else reply
   init_schema();bid=b['business_id']
@@ -360,13 +386,48 @@ def internal_business():
 def internal_turn():
   if not authorized():return jsonify(success=False),401
   d=request.get_json(silent=True) or {}
+  sector=None
   try:
    channel=d.get('channel','Voice');b,sector=lookup(d.get('business_phone'),channel,with_sector=True)
    if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-   reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),include_end_reason=True,sector=sector)
+   if sector=='insurance' and channel=='Voice' and not str(d.get('external_id') or '').split(':',1)[0].strip():
+    insurance_voice_error('technical_call_id_missing',ValueError(),'',b['business_id'])
+    return jsonify(success=False),400
+   kwargs={'include_end_reason':True,'sector':sector}
+   if sector=='insurance' and channel=='Voice':kwargs['voice_transport']=d.get('voice_transport')
+   reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),**kwargs)
    end_reason=end_reason if end_reason in ('goodbye','cancelled','verification') else None
    return jsonify(success=True,reply=reply,end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
-  except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
+  except Exception as exc:
+   if sector=='insurance':insurance_voice_error('turn',exc,d.get('external_id'),b['business_id'])
+   else:log.exception('Turn failed')
+   return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
+@app.post('/internal/insurance/voice/transport')
+def internal_insurance_voice_transport():
+  if not authorized():return jsonify(success=False),401
+  d=request.get_json(silent=True) or {}
+  if not isinstance(d,dict) or d.get('channel')!='Voice':return jsonify(success=False),400
+  b=None
+  try:
+   b,sector=lookup(d.get('business_phone'),'Voice',with_sector=True)
+   if not b or sector!='insurance' or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
+   call_sid=d.get('CallSid');external_id=d.get('external_id')
+   if not isinstance(call_sid,str) or not call_sid.strip() or len(call_sid)>200 or not isinstance(external_id,str) or not external_id.startswith(call_sid+':') or len(external_id)>300:
+    return jsonify(success=False),400
+   diagnostic=d.get('diagnostic')
+   if diagnostic not in ('voice_transcription_missing','voice_transcription_partial'):return jsonify(success=False),400
+   from insurance.cases import db as insurance_db
+   from insurance.voice_trace import record_transport
+   correlation_id=d.get('correlation_id')
+   if not isinstance(correlation_id,str) or not re.fullmatch(r'[0-9a-f]{64}',correlation_id):correlation_id=None
+   with insurance_db() as conn:
+    conn.execute('SET LOCAL statement_timeout=3000')
+    conn.execute('SET LOCAL lock_timeout=3000')
+    record_transport(conn,b['business_id'],call_sid,external_id,str(d.get('text') or '')[:4000],diagnostic,insurance_voice_transport(d.get('transport')),correlation_id)
+   return jsonify(success=True)
+  except Exception as exc:
+   insurance_voice_error('transport',exc,d.get('CallSid'),b['business_id'] if b else None)
+   return jsonify(success=False),503
 @app.post('/internal/reconcile-pending')
 def internal_reconcile_pending():
   if not authorized():return jsonify(success=False),401

@@ -24,7 +24,7 @@ from insurance.documents import ID_RE, RegistrationError, register_existing_obje
 
 def provision(conn, *, actor, business_id, customer_id, display_name, document, policy_id, product,
               version_id, valid_from, valid_to=None, contract_number=None, full_name=None,
-              document_id=None, sha256=None):
+              document_id=None, sha256=None, given_name=None, first_surname=None):
     for label, v in (('business_id', business_id), ('customer_id', customer_id),
                      ('policy_id', policy_id), ('version_id', version_id)):
         if not isinstance(v, str) or not ID_RE.fullmatch(v):
@@ -36,7 +36,8 @@ def provision(conn, *, actor, business_id, customer_id, display_name, document, 
     if not identity.document_hmac(business_id, document) or not identity.name_hmac(
             business_id, full_name or display_name):
         raise ValueError('INSURANCE_CASE_HMAC_KEY (>=32 bytes), a document and name+surname are required')
-    identity.upsert_customer(conn, business_id, customer_id, display_name, document, full_name)
+    identity.upsert_customer(conn, business_id, customer_id, display_name, document, full_name,
+                             given_name, first_surname)
     conn.execute(
         'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) '
         'VALUES(%s,%s,%s,%s,%s) ON CONFLICT (business_id,policy_id) DO UPDATE SET '
@@ -73,6 +74,8 @@ def main(argv=None):
     p.add_argument('--document', default=os.getenv('INSURANCE_PROVISION_DOCUMENT', ''),
                    help='customer DNI/NIE (or env INSURANCE_PROVISION_DOCUMENT, avoids shell history)')
     p.add_argument('--full-name')
+    p.add_argument('--given-name', help='registered given name, including compound names')
+    p.add_argument('--first-surname', help='complete registered first surname; requires --given-name')
     p.add_argument('--contract-number')
     p.add_argument('--valid-from', required=True, type=date.fromisoformat)
     p.add_argument('--valid-to', type=date.fromisoformat)
@@ -105,7 +108,8 @@ def main(argv=None):
                     display_name=a.display_name, document=a.document, policy_id=a.policy_id,
                     product=a.product, version_id=a.version_id, valid_from=a.valid_from,
                     valid_to=a.valid_to, contract_number=a.contract_number, full_name=a.full_name,
-                    document_id=a.document_id, sha256=a.sha256)
+                    document_id=a.document_id, sha256=a.sha256,
+                    given_name=a.given_name, first_surname=a.first_surname)
             except (ValueError, RegistrationError) as exc:
                 conn.rollback()
                 print(f'error: {exc}', file=sys.stderr)
