@@ -122,6 +122,9 @@ the current authorization and applicable version are checked again before retrie
   confirmed policy/version, decision, reply linkage and document/page/section provenance.
   Identity-only declarations are not retained as conversational text; DNI/NIE is redacted.
   The unique webhook/role key and transaction-level locking prevent duplicate exchanges.
+  A retry does not confer authorization: an old private reply is replayed only while its customer
+  is currently verified. Expired/different-customer retries request verification without replaying
+  evidence or creating another turn, summary update or case.
 * **B — recent window:** configurable complete exchanges read from PostgreSQL, not a fixed JSON
   array. Only directly relevant recent pairs enter the prompt.
 * **C — summary:** incremental structured topics, prior answers, pending questions, user facts,
@@ -230,3 +233,49 @@ Local synthetic results demonstrate isolation and bounded candidate handling, **
 production performance**. They do not establish LLM contractual correctness, legal interpretation,
 OCR quality of actual PDFs, exact model-token accounting or infinite memory. A full trusted
 compound-name boundary cannot be inferred reliably from an ambiguous combined-name string.
+
+### Files and validation scope
+
+Production changes are confined to `web/insurance/dialog.py`, `identity.py`, `memory.py`,
+`references.py`, `retrieval.py`, `provision.py` and new additive migrations 009/010.
+Existing migrations 001–008 are not rewritten. `tests/test_insurance_identity.py`,
+`test_insurance_memory.py`, `test_insurance_conversation.py` and `test_insurance_scale.py`
+cover the new behavior; related attribution assertions are updated for partial-name success
+and consent instead of automatic escalation. The existing provisioning and attribution
+documentation is updated; no real PDF or customer data is added.
+
+The starting PostgreSQL suite had **365 passing tests and one existing failure**: the mismatch
+test expected `Ana Pérez` not to match `Ana Pérez López`, contradicting the already merged
+prefix matching from PR #26. The related test now treats that declaration as valid rather than
+preserving the inconsistent expectation. Standalone identity/provisioning/additive-session
+migration and question-preservation validation passed **33 tests** on local PostgreSQL.
+
+### SQL audit and scale experiment
+
+`retrieval.POLICY_SCOPE` authorizes in SQL with active customer, resolved business/customer and
+an unrevoked grant in its validity interval. Policy/version disambiguation reads at most two
+rows; it never builds an in-memory array of all authorized policies or versions.
+`retrieval.PAGE_SQL` joins pages to the exact ready document, selected policy and applicable
+version, and repeats the authorization scope **before** Python scores any text. A named
+server cursor reads 128 pages per batch, retaining only the best hits/support candidates,
+and returns at most five evidence pages. All eligible pages of that scope can be considered,
+including late clauses; other customers' identical words are never candidates.
+
+The representative synthetic dataset contains **12,000 policies, 24,000 versions, 48,000
+documents and 97,025 pages**, across businesses and customers with one/many policies. Tests
+instrument result materialization, batch sizes and scoring to detect massive client-side
+loads and cross-tenant text. This is a test size, not a hardcoded policy-capacity ceiling.
+
+Composite primary keys already cover business/policy/version and business/document/page;
+the customer→policy and document→policy/version foreign keys remain enforced. The new
+`010_retrieval_scope_indexes.sql` is additive and was justified by actual
+`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` before/after probes:
+
+* `insurance_authorizations_scope_idx (business_id, customer_id, policy_id) WHERE revoked_at IS NULL`.
+* `insurance_documents_scope_idx (business_id, policy_id, version_id, status, document_id)`.
+
+The unindexed authorization/document scopes sequentially discarded 11,999 / 47,999 rows.
+The scale test checks real `pg_indexes` and FK constraints, scopes pages before ranking, compares
+plans under transactionally removed/restored new indexes, and measures local retrieval rather
+than promising an external-host service level. Reproduce with the existing pytest suite and
+`INSURANCE_TEST_DATABASE_URL` pointed only at a disposable **local** PostgreSQL.

@@ -98,16 +98,16 @@ def set_user_kind(conn, turn_id, kind, content, normalized=None):
 
 
 def record_assistant(conn, sc, external_id, content, decision, reply_to, corr, kind='answer',
-                     policy_id=None, version_id=None, pages=None):
+                     policy_id=None, version_id=None, pages=None, event_date=None):
     _lock_scope(conn, sc)
     row = conn.execute(
         'INSERT INTO insurance_conversation_turns(business_id,channel,conversation_ref,session_ref,'
-        "customer_id,role,kind,external_id,reply_to,content,policy_id,version_id,decision,pages,correlation_id) "
-        "VALUES(%s,%s,%s,%s,%s,'assistant',%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s) "
+        "customer_id,role,kind,external_id,reply_to,content,policy_id,version_id,decision,pages,correlation_id,event_date) "
+        "VALUES(%s,%s,%s,%s,%s,'assistant',%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s) "
         'ON CONFLICT (business_id,channel,conversation_ref,session_ref,external_id,role) DO NOTHING '
         'RETURNING turn_id',
         (sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id, kind, external_id, reply_to,
-         redact(content), policy_id, version_id, decision, json.dumps(pages or []), corr)).fetchone()
+         redact(content), policy_id, version_id, decision, json.dumps(pages or []), corr, event_date)).fetchone()
     if row:
         _enforce_limits(conn, sc, row['turn_id'])
     return row['turn_id'] if row else None
@@ -123,11 +123,29 @@ def find_reply(conn, sc, external_id):
          cfg('INSURANCE_TURN_RETENTION_DAYS'))).fetchone()
 
 
-def claim_unverified(conn, sc):
-    """Turns said before verification (same session) now belong to the verified customer."""
-    conn.execute('UPDATE insurance_conversation_turns SET customer_id=%s WHERE business_id=%s AND channel=%s '
-                 'AND conversation_ref=%s AND session_ref=%s AND customer_id IS NULL',
-                 (sc.customer_id, sc.bid, sc.channel, sc.ref, sc.sess))
+def claim_unverified(conn, sc, *, turn_ids=()):
+    """Only explicitly identified turns of this authentication episode may acquire an owner."""
+    ids = set(turn_ids)
+    if len(ids) > 2 * cfg('INSURANCE_RECENT_TURNS') + 2:
+        raise ValueError('Too many authentication episode turns')
+    if any(isinstance(i, bool) or not isinstance(i, int) or i <= 0 for i in ids):
+        raise ValueError('Authentication episode turn ids must be positive integers')
+    return sum(bind_user(conn, sc, turn_id) for turn_id in sorted(ids))
+
+
+def bind_user(conn, sc, turn_id):
+    """Bind only the pending original user turn after verification; never transfer another identity."""
+    if not sc.customer_id:
+        return False
+    _lock_scope(conn, sc)
+    row = conn.execute(
+        'UPDATE insurance_conversation_turns SET customer_id=%s WHERE turn_id=%s AND business_id=%s '
+        'AND channel=%s AND conversation_ref=%s AND session_ref=%s '
+        "AND role='user' AND (customer_id IS NULL OR customer_id=%s) AND " + _WITHIN +
+        ' RETURNING turn_id',
+        (sc.customer_id, turn_id, sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id,
+         cfg('INSURANCE_TURN_RETENTION_DAYS'))).fetchone()
+    return bool(row)
 
 
 def recent(conn, sc, n=None):
@@ -135,7 +153,7 @@ def recent(conn, sc, n=None):
     n = min(cfg('INSURANCE_RECENT_TURNS'), max(1, int(n))) if n is not None else cfg('INSURANCE_RECENT_TURNS')
     rows = conn.execute(
         'SELECT q.turn_id AS q_id,q.content AS q,q.normalized,q.kind AS q_kind,'
-        'a.turn_id AS a_id,a.content AS a,a.kind AS a_kind,a.decision,a.policy_id,a.version_id,a.pages '
+        'a.turn_id AS a_id,a.content AS a,a.kind AS a_kind,a.decision,a.policy_id,a.version_id,a.pages,a.event_date '
         'FROM insurance_conversation_turns q JOIN insurance_conversation_turns a ON a.reply_to=q.turn_id '
         'AND a.business_id=q.business_id AND a.channel=q.channel AND a.conversation_ref=q.conversation_ref '
         'AND a.session_ref=q.session_ref AND a.customer_id=q.customer_id AND a.role=\'assistant\' '
@@ -151,13 +169,13 @@ def recent(conn, sc, n=None):
                     'normalized': r['normalized']})
         out.append({'turn_id': r['a_id'], 'role': 'assistant', 'kind': r['a_kind'], 'content': r['a'],
                     'decision': r['decision'], 'policy_id': r['policy_id'],
-                    'version_id': r['version_id'], 'pages': r['pages']})
+                    'version_id': r['version_id'], 'pages': r['pages'], 'event_date': r['event_date']})
     return out
 
 
 PAIR_SQL = (
     'SELECT q.turn_id AS q_id,q.content AS q,q.normalized,q.created_at,a.turn_id AS a_id,a.content AS a,'
-    'a.policy_id,a.version_id,a.pages,a.decision FROM insurance_conversation_turns q '
+    'a.policy_id,a.version_id,a.pages,a.decision,a.event_date FROM insurance_conversation_turns q '
     'LEFT JOIN insurance_conversation_turns a ON a.reply_to=q.turn_id AND a.business_id=q.business_id '
     'AND a.channel=q.channel AND a.conversation_ref=q.conversation_ref AND a.session_ref=q.session_ref '
     'AND a.customer_id=q.customer_id AND a.created_at >= q.created_at '
@@ -316,11 +334,11 @@ def _prune_summary(conn, sc, s):
     s['facts'] = [f for f in facts if f.get('turn') in valid]
     s['open_issues'] = [i for i in issues if i.get('turn') in valid]
     s['conclusions'] = [i for i in conclusions if i.get('turn') in valid and i.get('question_turn') in valid]
-    for name in ('active', 'event_date', 'pending'):
+    for name in ('active', 'event_date', 'event_context', 'pending'):
         if sources.get(name) not in valid:
             s.pop(name, None)
     s['_sources'] = {k: v for k, v in sources.items()
-                     if k in ('active', 'event_date', 'pending') and v in valid}
+                     if k in ('active', 'event_date', 'event_context', 'pending') and v in valid}
     return s
 
 
@@ -331,11 +349,27 @@ def _bounded_summary(s):
     for name in ('topics', 'conclusions', 'facts', 'open_issues', 'pending'):
         while len(json.dumps(s, ensure_ascii=False)) > cap and s.get(name):
             s[name].pop(0)
-    for name in ('event_date', 'active', '_sources', 'pending', 'topics', 'conclusions', 'facts', 'open_issues'):
+    for name in ('event_date', 'event_context', 'active', '_sources', 'pending', 'topics',
+                 'conclusions', 'facts', 'open_issues'):
         if len(json.dumps(s, ensure_ascii=False)) <= cap:
             break
         s.pop(name, None)
+    if len(json.dumps(s, ensure_ascii=False)) > cap:
+        s.clear()
     return s
+
+
+def user_facts(text):
+    """Short first-person declarations, not inferred coverage facts or questions."""
+    facts = []
+    for sentence in re.split(r'[.!;\n¿]', redact(text)):
+        sentence = sentence.strip()
+        if not sentence or '?' in sentence or len(sentence) > 160:
+            continue
+        if re.match(r'^(?:yo\s+)?(?:tengo|vivo|resido|trabajo|viajo|somos|he\s+tenido|'
+                    r'me\s+han\s+\w+|mi\s+\w+\s+(?:es|tiene|está|esta))\b', sentence, re.I):
+            facts.append(sentence)
+    return facts[:10]
 
 
 def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answer, decision, policy_id,
@@ -348,7 +382,8 @@ def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answe
     if assistant_turn_id <= last:
         return False
     finished = conn.execute(
-        'SELECT q.turn_id FROM insurance_conversation_turns q JOIN insurance_conversation_turns a '
+        'SELECT q.turn_id,q.content,a.event_date FROM insurance_conversation_turns q '
+        'JOIN insurance_conversation_turns a '
         'ON a.reply_to=q.turn_id AND a.business_id=q.business_id AND a.channel=q.channel '
         'AND a.conversation_ref=q.conversation_ref AND a.session_ref=q.session_ref '
         'AND a.customer_id=q.customer_id WHERE q.business_id=%s AND q.channel=%s AND q.conversation_ref=%s '
@@ -358,12 +393,14 @@ def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answe
         (*_pair_params(sc), user_turn_id, assistant_turn_id, cfg('INSURANCE_TURN_RETENTION_DAYS'))).fetchone()
     if not finished:
         return False
+    event_date = event_date or finished['event_date']
     topics = [t for t in s.get('topics', []) if t['id'] != user_turn_id]
     clean_answer = redact(answer)
     topics.append({'id': user_turn_id, 'q': redact(question)[:160], 'a_turn': assistant_turn_id,
                    'answer': clean_answer if decision == 'answer' and len(clean_answer) <= 200 else None,
                    'decision': decision,
                    'policy_id': policy_id, 'version_id': version_id,
+                   'event_date': str(event_date) if event_date else None,
                    'pages': [{'d': p.get('document_id'), 'p': p.get('page'), 'v': p.get('version_id', version_id),
                               's': p.get('section')} for p in (pages or [])][:5]})
     s['topics'] = topics[-cfg('INSURANCE_SUMMARY_MAX_TOPICS'):]
@@ -374,8 +411,13 @@ def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answe
     if event_date:
         s['event_date'] = redact(event_date)
         sources['event_date'] = user_turn_id
-    if fact:
-        s['facts'] = (s.get('facts', []) + [{'turn': user_turn_id, 'text': redact(fact)[:160]}])[-10:]
+        s['event_context'] = {'policy_id': policy_id, 'version_id': version_id}
+        sources['event_context'] = user_turn_id
+    facts = user_facts(finished['content'])
+    if fact and redact(fact) not in facts:
+        facts.append(redact(fact)[:160])
+    if facts:
+        s['facts'] = (s.get('facts', []) + [{'turn': user_turn_id, 'text': f} for f in facts])[-10:]
     s['pending'] = [redact(pending)[:160]] if pending else []
     sources['pending'] = user_turn_id
     issues = [i for i in s.get('open_issues', []) if i.get('turn') != user_turn_id]
@@ -403,13 +445,19 @@ def render_summary(s, limit):
     if a:
         lines.append(f"Póliza activa: {a.get('policy_id')} versión {a.get('version_id')}")
     if s.get('event_date'):
-        lines.append(f"Fecha del hecho indicada: {s['event_date']}")
+        context = s.get('event_context', {})
+        label = f"póliza={context.get('policy_id')}; versión={context.get('version_id')}"
+        lines.append(f"Fecha del hecho indicada [{label}]: {s['event_date']}")
     for f in s.get('facts', []):
         lines.append(f"Hecho indicado por el usuario: {f['text'] if isinstance(f, dict) else f}")
     for t in s.get('topics', [])[-12:]:
         ans = f" -> {t['answer']}" if t.get('answer') else f" ({t.get('decision')})"
-        pg = ','.join(f"{p['d']}:v{p.get('v')}:p{p['p']}" for p in t.get('pages', []))
-        lines.append(f"Tema #{t['id']}: {t['q']}{ans}" + (f' [evidencia {pg}]' if pg else ''))
+        pg = ','.join(f"{p['d']}:v{p.get('v') or t.get('version_id')}:p{p['p']}"
+                      for p in t.get('pages', []))
+        label = f"póliza={t.get('policy_id')}; versión={t.get('version_id')}"
+        if t.get('event_date'):
+            label += f"; fecha del hecho={t['event_date']}"
+        lines.append(f"Tema #{t['id']}: {t['q']}{ans} [{label}]" + (f' [evidencia {pg}]' if pg else ''))
     for p in s.get('pending', []):
         lines.append(f'Pendiente: {p}')
     for i in s.get('open_issues', []):
@@ -444,7 +492,14 @@ def _fmt_evidence(evidence):
 def _prior_refs(r):
     refs = ', '.join(f"documento={p.get('document_id')}; versión={p.get('version_id', r.get('version_id'))}; "
                      f"página={p.get('page')}" for p in r.get('pages', []))
-    return f" [póliza={r.get('policy_id')}; versión={r.get('version_id')}; {refs}]" if refs or r.get('policy_id') else ''
+    date = f"; fecha del hecho={r['event_date']}" if r.get('event_date') else ''
+    return (f" [póliza={r.get('policy_id')}; versión={r.get('version_id')}; {refs}{date}]"
+            if refs or r.get('policy_id') or date else '')
+
+
+def _normalized_note(r, original):
+    normalized = r.get('normalized')
+    return f" (consulta contextualizada: {normalized})" if normalized and normalized != original else ''
 
 
 def format_prompt(ctx):
@@ -460,10 +515,12 @@ def format_prompt(ctx):
         parts.append(f"RESUMEN DE LA CONVERSACIÓN (no contractual):\n{ctx['summary']}")
     if ctx.get('recalled'):
         parts.append('TURNOS ANTIGUOS RECUPERADOS (no contractual):\n' + '\n'.join(
-            f"- P: {r['q']}\n  R: {r['a']}{_prior_refs(r)}" for r in ctx['recalled']))
+            f"- P: {r['q']}{_normalized_note(r, r['q'])}\n  R: {r['a']}{_prior_refs(r)}"
+            for r in ctx['recalled']))
     if ctx.get('recent'):
         parts.append('TURNOS RECIENTES (no contractual):\n' + '\n'.join(
-            f"{'Usuario' if r['role'] == 'user' else 'Asistente'}: {r['text']}{_prior_refs(r)}"
+            f"{'Usuario' if r['role'] == 'user' else 'Asistente'}: {r['text']}"
+            f"{_normalized_note(r, r['text'])}{_prior_refs(r)}"
             for r in ctx['recent']))
     parts.append(f"PREGUNTA ACTUAL: {ctx['question']}")
     parts.append(f"CLÁUSULAS:\n{_fmt_evidence(ctx['evidence'])}")

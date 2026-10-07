@@ -110,6 +110,18 @@ def test_ambiguous_old_reference_clarifies_then_resumes(pg, grounded):
     assert not rows(pg, 'SELECT * FROM insurance_cases')
 
 
+def test_named_old_reference_scans_past_recall_batch_limit(pg, grounded, monkeypatch):
+    authenticate(pg)
+    monkeypatch.setenv('INSURANCE_MEMORY_SCAN_LIMIT', '2')
+    original = '¿Qué cobertura de agua tiene una tubería rota?'
+    say(original)
+    for n in range(12):
+        say(f'¿Qué exclusiones de robo tiene el supuesto {n}?')
+    reply, out = say('Volviendo a lo del agua')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert grounded[-1][2]['recalled'][0]['q'] == original
+
+
 def test_internal_y_is_not_a_reference_and_leading_y_is(pg, grounded):
     authenticate(pg)
     say('¿Cubre rotura de tuberías por agua?')
@@ -209,7 +221,8 @@ def test_policy_switch_return_failed_switch_and_topic_policy(pg, monkeypatch):
     reply, out = say('¿Cubre daños por agua? Póliza 123')
     assert 'número de póliza' in reply and 'DOC-' not in reply
     state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
-    assert 'policy_id' not in state and state['question'] == '¿Cubre daños por agua?'
+    assert 'policy_id' not in state and state['question'] == '¿Cubre daños por agua? Póliza 123'
+    assert '123' not in state['normalized_question']
     assert 'DOC-A' in say('000123')[0]
     assert not rows(pg, 'SELECT * FROM insurance_cases')
 
@@ -291,6 +304,66 @@ def test_database_outage_does_not_call_model_or_confirm_case(monkeypatch):
     reply, out = ask(TEXT)
     assert out['insurance_result'] == 'case_persistence_failed'
     assert 'No se ha creado un caso' in reply and 'He guardado' not in reply
+
+
+def test_failed_case_write_after_consent_keeps_offer_pending(pg, grounded, monkeypatch):
+    authenticate(pg)
+    say('¿Qué pasa con el zxqv?')
+
+    def unavailable(**kwargs):
+        raise cases.CasePersistenceError('write unavailable')
+
+    monkeypatch.setattr(dialog, 'create_or_update_case', unavailable)
+    reply, out = say('sí')
+    assert out['insurance_result'] == 'case_persistence_failed' and 'He guardado' not in reply
+    assert not rows(pg, 'SELECT * FROM insurance_cases')
+    assert rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']['pending_escalation']
+
+
+def test_question_without_punctuation_while_waiting_identity_is_not_a_name(pg, grounded):
+    say('Hola')
+    question = 'Daños por agua en tuberías rotas'
+    say(question)
+    say(LUIS)
+    assert grounded[-1][0] == question
+
+
+def test_old_customer_retry_cannot_replay_answer_or_modify_new_customer_auth(pg, grounded):
+    authenticate(pg)
+    say(TEXT, ext='old-customer-message')
+    say(ANA, ext='change-customer')
+    count = len(grounded)
+    reply, out = say(TEXT, ext='old-customer-message')
+    assert 'DOC-900' not in reply and len(grounded) == count
+    with pg() as conn:
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) == 'C1'
+    turn = rows(pg, "SELECT customer_id,normalized FROM insurance_conversation_turns "
+                    "WHERE external_id='old-customer-message' AND role='user'")[0]
+    assert turn['customer_id'] == 'C2' and turn['normalized'] == TEXT
+
+
+def test_expired_pending_question_is_not_claimed_by_a_different_customer(pg, grounded):
+    authenticate(pg)
+    say(TEXT)
+    with pg() as conn:
+        conn.execute("UPDATE insurance_identity_verifications SET expires_at=now()-interval '1 second'")
+    question = '¿Qué exclusiones de robo hay?'
+    say(question, ext='expired-pending')
+    say(ANA)
+    turn = rows(pg, "SELECT customer_id FROM insurance_conversation_turns "
+                    "WHERE external_id='expired-pending' AND role='user'")[0]
+    assert turn['customer_id'] is None
+    assert not rows(pg, "SELECT * FROM insurance_session_summary WHERE customer_id='C1'")
+
+
+def test_review_decline_clears_pending_summary_and_identity_turns_are_empty(pg, grounded):
+    say(LUIS)
+    say('¿Qué pasa con el zxqv?')
+    say('no')
+    summary = rows(pg, 'SELECT summary FROM insurance_session_summary')[0]['summary']
+    assert not summary['pending'] and not summary['open_issues']
+    turns = rows(pg, "SELECT content FROM insurance_conversation_turns WHERE role='user' AND kind='identity'")
+    assert turns and all(turn['content'] == '' for turn in turns)
 
 
 def test_urgent_exception_requires_approved_protocol_and_business_incident(pg, grounded, monkeypatch):

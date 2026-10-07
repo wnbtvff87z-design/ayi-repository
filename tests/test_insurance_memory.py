@@ -46,10 +46,10 @@ def scope(channel='WhatsApp', session='', customer='C', business='B', ref='conve
 
 
 def exchange(conn, sc, ext, question='rotura de tubería', answer='Según documento D, página 3.',
-             normalized=None):
+             normalized=None, event_date=None):
     q, created = memory.record_user(conn, sc, ext, question, 'question', 'corr', normalized=normalized)
     a = memory.record_assistant(conn, sc, ext, answer, 'answer', q, 'corr',
-                                pages=[{'document_id': 'D', 'version_id': 'V', 'page': 3}])
+                                pages=[{'document_id': 'D', 'version_id': 'V', 'page': 3}], event_date=event_date)
     return q, a
 
 
@@ -110,6 +110,26 @@ def test_no_silent_choice_for_multiple_ordinals_or_empty_options():
     assert references.choose_option('primera o segunda', options) is None
     assert references.choose_option('segunda', options) == options[1]
     assert references.choose_option('primera', []) is None
+
+
+@pytest.mark.parametrize('text', ['sí', 'Sí, por favor.', 'vale', 'Registra la consulta',
+                                'sí, registra mi consulta', 'quiero que registres un caso', 'hazlo'])
+def test_case_confirmation_requires_complete_unqualified_acceptance(text):
+    assert references.confirmation(text) == 'yes'
+    assert references.YES_RE.match(text)
+
+
+@pytest.mark.parametrize('text', ['sí, pero no registres la consulta', 'vale, todavía no',
+                                'sí, si no cuesta dinero', 'sí, pero mañana', 'no, sí registra',
+                                'quizá', '¿sí?', 'ok no'])
+def test_qualified_confirmation_never_authorizes_a_case(text):
+    assert references.confirmation(text) == 'ambiguous'
+    assert not references.YES_RE.match(text)
+
+
+@pytest.mark.parametrize('text', ['no', 'No gracias.', 'déjalo', 'no registres la consulta'])
+def test_explicit_negative_case_confirmation(text):
+    assert references.confirmation(text) == 'no'
 
 
 @pytest.mark.parametrize('text,kind', [
@@ -178,6 +198,7 @@ def test_summary_cap_is_guaranteed_with_large_optional_fields(monkeypatch):
                '_sources': {'active': 1}, 'pending': ['x' * 500], 'open_issues': [],
                'conclusions': []}
     assert len(json.dumps(memory._bounded_summary(summary), ensure_ascii=False)) <= 70
+    assert memory._bounded_summary({'legacy_unknown': 'x' * 1000}) == {}
     monkeypatch.setenv('INSURANCE_SUMMARY_MAX_CHARS', '1')
     with pytest.raises(ValueError):
         memory._bounded_summary({})
@@ -188,6 +209,13 @@ def test_summary_render_zero_budget_and_no_partial_lines():
     assert memory.render_summary(summary, 0) == ''
     assert memory.render_summary(summary, 10) == ''
     assert 'No hay denuncia.' in memory.render_summary(summary, 100)
+
+
+def test_non_occurred_user_facts_are_declarations_not_inferred_questions():
+    assert memory.user_facts('Tengo dos hijos. Vivo en Sevilla. ¿Tengo cobertura?') == [
+        'Tengo dos hijos', 'Vivo en Sevilla']
+    assert memory.user_facts('Tengo dos hijos, ¿están cubiertos?') == ['Tengo dos hijos,']
+    assert memory.user_facts('¿Tengo dos hijos cubiertos?') == []
 
 
 def test_pg_idempotence_original_normalized_and_complete_recent(pg):
@@ -206,6 +234,47 @@ def test_pg_idempotence_original_normalized_and_complete_recent(pg):
         updated = memory.pair_by_question(conn, sc, q)
         assert updated['q'] == '¿Y fuera?'
         assert updated['normalized'] == 'robo en el extranjero'
+
+
+def test_pg_bind_pending_original_turn_never_transfers_other_customer_or_session(pg):
+    with pg() as conn:
+        unverified = scope('Voice', 'CA-one', customer=None)
+        q, _ = memory.record_user(conn, unverified, 'pending', '¿Está cubierto el robo?',
+                                  'question', 'corr', normalized='robo en vivienda')
+        another, _ = memory.record_user(conn, unverified, 'unrelated', 'equipaje perdido',
+                                        'question', 'corr')
+        verified = unverified._replace(customer_id='C')
+        for other in [verified._replace(sess='CA-two'), verified._replace(channel='WhatsApp'),
+                      verified._replace(bid='OTHER'), verified._replace(ref='different'), unverified]:
+            assert not memory.bind_user(conn, other, q)
+        assert memory.bind_user(conn, verified, q)
+        assert memory.bind_user(conn, verified, q)
+        assert not memory.bind_user(conn, verified._replace(customer_id='D'), q)
+        assert conn.execute('SELECT customer_id FROM insurance_conversation_turns WHERE turn_id=%s',
+                            (another,)).fetchone()['customer_id'] is None
+        pair = memory.pair_by_question(conn, verified, q)
+        assert pair['q'] == '¿Está cubierto el robo?' and pair['normalized'] == 'robo en vivienda'
+        conn.execute("UPDATE insurance_conversation_turns SET created_at=now()-interval '100 days' "
+                     'WHERE turn_id=%s', (another,))
+        assert not memory.bind_user(conn, verified, another)
+
+
+def test_pg_claim_unverified_requires_explicit_episode_turns(pg):
+    with pg() as conn:
+        sc = scope(customer=None)
+        old, _ = memory.record_user(conn, sc, 'older-caller', 'consulta antigua', 'question', 'corr')
+        pending, _ = memory.record_user(conn, sc, 'current-query', 'robo actual', 'question', 'corr')
+        current, _ = memory.record_user(conn, sc, 'current-identity', '', 'identity', 'corr')
+        verified = sc._replace(customer_id='C')
+        assert memory.claim_unverified(conn, verified) == 0
+        assert memory.claim_unverified(conn, verified, turn_ids=(pending, current)) == 2
+        owners = {r['turn_id']: r['customer_id'] for r in conn.execute(
+            'SELECT turn_id,customer_id FROM insurance_conversation_turns').fetchall()}
+        assert owners == {old: None, pending: 'C', current: 'C'}
+        assert memory.claim_unverified(conn, verified._replace(customer_id='D'),
+                                       turn_ids=(pending, current)) == 0
+        with pytest.raises(ValueError):
+            memory.claim_unverified(conn, verified, turn_ids=(-1,))
 
 
 def test_pg_every_read_is_business_customer_channel_and_call_scoped(pg):
@@ -258,6 +327,17 @@ def test_pg_exact_retained_turn_cap_on_every_write(pg, monkeypatch):
         assert len(memory.recent(conn, sc)) == 2
 
 
+def test_pg_recalled_exchange_preserves_event_date(pg):
+    with pg() as conn:
+        sc = scope()
+        q, _ = exchange(conn, sc, 'dated', 'robo de equipaje', event_date='2026-01-02')
+        pair = memory.pair_by_question(conn, sc, q)
+        assert str(pair['event_date']) == '2026-01-02'
+        assert memory.recall(conn, sc, 'equipaje')[1]['event_date'] == pair['event_date']
+        ctx = memory.build_context(question='equipaje', evidence=evidence(), recalled=[pair])
+        assert 'fecha del hecho=2026-01-02' in memory.format_prompt(ctx)
+
+
 def test_pg_summary_incremental_idempotent_dates_facts_pending_and_pages(pg):
     with pg() as conn:
         sc = scope()
@@ -269,6 +349,7 @@ def test_pg_summary_incremental_idempotent_dates_facts_pending_and_pages(pg):
         after, last2 = memory.load_summary(conn, sc)
         assert before == after and last == last2 == a
         assert before['event_date'] == '2026-01-02'
+        assert before['topics'][0]['event_date'] == '2026-01-02'
         assert before['facts'][0]['text'] == 'DNI [documento]'
         assert before['pending'] == ['Aportar denuncia']
         assert before['open_issues'][0]['issue'] == 'Falta denuncia'
@@ -276,6 +357,29 @@ def test_pg_summary_incremental_idempotent_dates_facts_pending_and_pages(pg):
         q2, a2 = exchange(conn, sc, 'two', 'equipaje')
         assert summarize(conn, sc, q2, a2, question='equipaje')
         assert [t['id'] for t in memory.load_summary(conn, sc)[0]['topics']] == [q, q2]
+
+
+def test_pg_user_facts_and_exchange_date_persist_until_source_expires(pg):
+    with pg() as conn:
+        sc = scope()
+        q, a = exchange(conn, sc, 'fact', 'Tengo dos hijos. Vivo en Sevilla. ¿Qué cobertura hay?',
+                        event_date='2026-01-02')
+        summarize(conn, sc, q, a, event_date='2026-01-02')
+        q2, a2 = exchange(conn, sc, 'other', '¿Y el equipaje?')
+        summarize(conn, sc, q2, a2)
+        summary, _ = memory.load_summary(conn, sc)
+        assert [f['text'] for f in summary['facts']] == ['Tengo dos hijos', 'Vivo en Sevilla']
+        assert all(f['turn'] == q for f in summary['facts'])
+        assert summary['event_date'] == '2026-01-02'
+        assert summary['topics'][0]['event_date'] == '2026-01-02'
+        assert summary['topics'][1]['event_date'] is None
+        assert 'fecha del hecho=2026-01-02' in memory.render_summary(summary, 6000)
+        conn.execute("UPDATE insurance_conversation_turns SET created_at=now()-interval '100 days' "
+                     'WHERE turn_id=ANY(%s)', ([q, a],))
+        summary, _ = memory.load_summary(conn, sc)
+        assert summary['facts'] == []
+        assert 'event_date' not in summary
+        assert 'event_context' not in summary
 
 
 @pytest.mark.parametrize('removed', ['expired', 'deleted'])

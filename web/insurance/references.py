@@ -22,8 +22,14 @@ BACK_RE = re.compile(
     r'la\s+primera\s+pregunta|al\s+principio)', re.I)
 ANSWER_WORDS = re.compile(r'dijiste|comentaste|explicaste|respondiste|mencionaste|exclusion|clausula|anterior', re.I)
 THEME_RE = re.compile(r'^(la|el|lo)\s+(del|de\s+la|de\s+los|de\s+las)\s+(.+)$', re.I)
-YES_RE = re.compile(r'^\W*(s[ií]|vale|ok|claro|por\s+favor|adelante|de\s+acuerdo|correcto|afirmativo|'
-                    r'registra(la|lo)?|reg[ií]stra(la|lo)?|hazlo|perfecto)\b', re.I)
+_YES = r'(?:s[ií]|vale|ok|claro|por\s+favor|adelante|de\s+acuerdo|correcto|afirmativo|hazlo|perfecto)'
+_OBJECT = r'(?:(?:la|mi|esta)\s+consulta|(?:el|un)\s+caso)'
+_ACCEPT = (r'(?:reg[ií]stra(?:la|lo)?(?:\s+' + _OBJECT + r')?|'
+           r'quiero\s+(?:registrar\s+' + _OBJECT + r'|que\s+registres(?:\s+' + _OBJECT + r')?))')
+YES_RE = re.compile(
+    r'^\s*(?:' + _YES + r'(?:\s*[,!]\s*|\s+)por\s+favor|'
+    + _YES + r'|(?:' + _YES + r'\s*[,! ]\s*)?' + _ACCEPT +
+    r'(?:\s*[,!]\s*|\s+)?(?:por\s+favor)?)\s*[.!]*\s*$', re.I)
 NO_RE = re.compile(r'^\W*(no\b|no\s+gracias|d[eé]jalo|olv[ií]dalo|cancela|mejor\s+no)', re.I)
 ORDINALS = {'1': 0, 'primera': 0, 'primero': 0, 'uno': 0, '2': 1, 'segunda': 1, 'segundo': 1, 'dos': 1,
             '3': 2, 'tercera': 2, 'tercero': 2, 'tres': 2}
@@ -36,6 +42,18 @@ def fold(text):
 
 def _strip(text):
     return re.sub(r'^[\W_]+', '', fold(text)).strip()
+
+
+def confirmation(text):
+    """Only an unqualified, complete affirmative authorizes creation of a human-review case."""
+    if YES_RE.fullmatch(text or ''):
+        return 'yes'
+    f = _strip(text)
+    if re.fullmatch(r'(?:no(?:\s+gracias)?|dejalo|olvidalo|cancela(?:\s+' + _OBJECT +
+                    r')?|mejor\s+no|no\s+(?:quiero\s+registrar|registres)(?:\s+' + _OBJECT +
+                    r')?)\s*[.!]*', f):
+        return 'no'
+    return 'ambiguous'
 
 
 def classify(text, *, has_last_answer, has_recent):
@@ -87,7 +105,8 @@ def pick(pairs_, topic_text, *, about_answer=False, recent_bias=False):
         if score > best:
             best, cands = score, {}
         # Identical questions answered under different policies/versions are not interchangeable.
-        key = (fold(p['q']), p.get('policy_id'), p.get('version_id'), p.get('decision'),
+        key = (fold(p['q']), fold(p.get('normalized')), str(p.get('event_date') or ''),
+               p.get('policy_id'), p.get('version_id'), p.get('decision'),
                p.get('a'), json.dumps(p.get('pages') or [], sort_keys=True))
         if key in cands:
             if p['q_id'] > cands[key]['q_id']:

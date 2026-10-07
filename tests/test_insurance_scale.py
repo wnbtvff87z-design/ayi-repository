@@ -6,6 +6,7 @@ import time
 import uuid
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -13,7 +14,7 @@ from psycopg.rows import dict_row
 
 WEB = Path(__file__).resolve().parents[1] / 'web'
 sys.path.insert(0, str(WEB))
-from insurance import retrieval  # noqa: E402
+from insurance import identity, memory, retrieval  # noqa: E402
 
 MIGRATIONS = sorted((WEB / 'insurance' / 'migrations').glob('*.sql'))
 TODAY = date(2026, 10, 7)
@@ -76,6 +77,46 @@ def scale_db():
                 ANALYZE insurance_policy_versions;
                 ANALYZE insurance_documents;
                 ANALYZE insurance_document_pages;
+            """)
+            conn.execute("""
+                INSERT INTO insurance_conversation_turns
+                    (business_id,channel,conversation_ref,session_ref,customer_id,role,kind,external_id,content)
+                SELECT b,'Voice','synthetic-thread','CALL-' || s,c,'user','question',
+                       c || '-Q-' || n,b || ' ' || c || ' CALL-' || s || ' pregunta agua ' || n
+                FROM unnest(ARRAY['SCALE-A','SCALE-B']) b
+                CROSS JOIN unnest(ARRAY['ONE','MANY','OTHER']) c
+                CROSS JOIN generate_series(0,19) s CROSS JOIN generate_series(1,100) n;
+                INSERT INTO insurance_conversation_turns
+                    (business_id,channel,conversation_ref,session_ref,customer_id,role,kind,
+                     external_id,reply_to,content)
+                SELECT business_id,channel,conversation_ref,session_ref,customer_id,'assistant','answer',
+                       external_id,turn_id,content || ' respuesta contractual'
+                FROM insurance_conversation_turns WHERE role='user';
+                INSERT INTO insurance_session_summary
+                    (business_id,channel,conversation_ref,session_ref,customer_id,summary)
+                SELECT b,'Voice','synthetic-thread','CALL-' || s,c,'{}'::jsonb
+                FROM unnest(ARRAY['SCALE-A','SCALE-B']) b
+                CROSS JOIN unnest(ARRAY['ONE','MANY','OTHER']) c CROSS JOIN generate_series(0,1999) s;
+                INSERT INTO insurance_identity_verifications
+                    (business_id,channel,conversation_ref,session_ref,customer_id,method,verified_by,expires_at)
+                VALUES('SCALE-A','Voice','synthetic-verification-target','CALL-0','ONE',
+                       'synthetic','synthetic',now()+interval '1 hour');
+                INSERT INTO insurance_identity_verifications
+                    (business_id,channel,conversation_ref,session_ref,customer_id,method,verified_by,
+                     expires_at,revoked_at)
+                SELECT CASE WHEN n<=500 OR n%2=0 THEN 'SCALE-A' ELSE 'SCALE-B' END,
+                       'Voice',
+                       CASE WHEN n<=500 THEN 'synthetic-verification-target' ELSE 'thread-' || n%100 END,
+                       CASE WHEN n<=500 THEN 'CALL-0' ELSE 'CALL-' || n%20 END,
+                       CASE n%3 WHEN 0 THEN 'ONE' WHEN 1 THEN 'MANY' ELSE 'OTHER' END,
+                       'synthetic','synthetic',
+                       CASE WHEN n<=500 OR n%5=0 THEN now()-interval '1 hour'
+                            ELSE now()+interval '1 hour' END,
+                       CASE WHEN n>500 AND n%7=0 THEN now() ELSE NULL END
+                FROM generate_series(1,12000) n;
+                ANALYZE insurance_conversation_turns;
+                ANALYZE insurance_session_summary;
+                ANALYZE insurance_identity_verifications;
             """)
         yield dsn, schema
     finally:
@@ -230,6 +271,20 @@ def test_scale_duplicate_grants_and_all_existing_statuses(conn):
         'reason_code'] == 'document_not_registered'
 
 
+def test_selected_page_keeps_late_contractual_negation(conn):
+    body = ('Texto contractual sin recortar. ' * 100 +
+            'Daños por agua en tuberías: no cubre roturas por falta de mantenimiento.')
+    assert body.index('no cubre') > 1500
+    conn.execute(
+        "UPDATE insurance_document_pages SET body=%s "
+        "WHERE business_id='SCALE-A' AND document_id='POL-000001-CURRENT-ready' AND page_number=1027",
+        (body,))
+    result = retrieval.retrieve(conn, 'SCALE-A', 'ONE', 'agua tuberías mantenimiento', TODAY)
+    page = next(e for e in result['evidence'] if e['page'] == 1027)
+    assert result['status'] == 'ok' and page['text'] == body
+    assert 'no cubre roturas por falta de mantenimiento.' in page['text']
+
+
 def test_scale_autocommit_cursor_transaction(scale_db):
     dsn, schema = scale_db
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as conn:
@@ -271,7 +326,7 @@ def test_scale_local_plans_indexes_and_latency(conn, capsys):
         'explicit_policy': (
             'SELECT p.policy_id,p.contract_number ' + retrieval.POLICY_SCOPE + retrieval.APPLICABLE +
             'AND (' + retrieval._mention_sql('p.policy_id') + ' OR ' +
-            retrieval._mention_sql("NULLIF(p.contract_number, '')") +
+            retrieval._mention_sql('p.contract_number') +
             ' OR lower(p.policy_id)=%s OR lower(p.contract_number)=%s) LIMIT 2',
             ('SCALE-A', 'MANY', TODAY, TODAY, 'agua póliza 006000', 'agua póliza 006000',
              '006000', '006000')),
@@ -282,12 +337,15 @@ def test_scale_local_plans_indexes_and_latency(conn, capsys):
     plans_before = {name: _explain(conn, *query) for name, query in queries.items()}
 
     def latency():
-        timings = []
-        for _ in range(5):
-            start = time.perf_counter()
-            assert retrieval.retrieve(conn, 'SCALE-A', 'ONE', 'agua tuberías rotura', TODAY)['status'] == 'ok'
-            timings.append((time.perf_counter() - start) * 1000)
-        return {'median_ms': statistics.median(timings), 'max_ms': max(timings)}
+        results = {}
+        for customer, question in [('ONE', 'agua tuberías rotura'), ('MANY', 'agua póliza 006000')]:
+            timings = []
+            for _ in range(5):
+                start = time.perf_counter()
+                assert retrieval.retrieve(conn, 'SCALE-A', customer, question, TODAY)['status'] == 'ok'
+                timings.append((time.perf_counter() - start) * 1000)
+            results[customer] = {'median_ms': statistics.median(timings), 'max_ms': max(timings)}
+        return results
 
     latency_before = latency()
     conn.execute(
@@ -318,3 +376,73 @@ def test_scale_local_plans_indexes_and_latency(conn, capsys):
                 print('LOCAL EXPLAIN', phase + '_' + name, plan)
         print('LOCAL retrieval ms before/after:', latency_before, latency_after)
     assert len(constraints) >= 10
+
+
+def test_scale_memory_identity_sql_plans_and_scope(conn, monkeypatch, capsys):
+    """Measure complete historical scope and answer joins, not merely the latest-row happy path."""
+    scope = SimpleNamespace(bid='SCALE-A', channel='Voice', ref='synthetic-thread',
+                            sess='CALL-0', customer_id='ONE')
+    assert conn.execute('SELECT count(*) AS n FROM insurance_conversation_turns').fetchone()['n'] == 24000
+    assert conn.execute('SELECT count(*) AS n FROM insurance_identity_verifications').fetchone()['n'] == 12001
+    monkeypatch.setattr(identity, 'conversation_ref', lambda *args: 'synthetic-verification-target')
+    verification_sql = (
+        'SELECT v.customer_id FROM insurance_identity_verifications v '
+        'JOIN insurance_customers c ON c.business_id=v.business_id AND c.customer_id=v.customer_id '
+        'WHERE v.business_id=%s AND v.channel=%s AND v.conversation_ref=%s AND v.session_ref=%s '
+        'AND c.active AND v.revoked_at IS NULL AND v.expires_at>now() '
+        'ORDER BY v.verification_id DESC LIMIT 1')
+    queries = {
+        'memory_pairs': (memory.PAIR_SQL + 'ORDER BY q.turn_id DESC LIMIT %s',
+                         (*memory._pair_params(scope), 500)),
+        'historical_verification': (verification_sql,
+                                    ('SCALE-A', 'Voice', 'synthetic-verification-target', 'CALL-0')),
+        'session_summary': (
+            'SELECT summary,last_turn_id FROM insurance_session_summary WHERE business_id=%s AND '
+            'channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s '
+            'AND updated_at>now()-make_interval(days=>%s) FOR UPDATE', memory._pair_params(scope)),
+    }
+    proposed = {
+        'insurance_turns_reply_idx': (
+            'ON insurance_conversation_turns (reply_to) '
+            "WHERE role='assistant' AND kind='answer'"),
+        'insurance_turns_session_scope_idx': (
+            'ON insurance_conversation_turns '
+            '(business_id,channel,conversation_ref,session_ref,customer_id,turn_id DESC)'),
+        'insurance_verifications_scope_idx': (
+            'ON insurance_identity_verifications '
+            '(business_id,channel,conversation_ref,session_ref,verification_id DESC) '
+            'WHERE revoked_at IS NULL'),
+    }
+    indexes = conn.execute(
+        "SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname=current_schema() "
+        "AND tablename IN ('insurance_conversation_turns','insurance_identity_verifications',"
+        "'insurance_session_summary') ORDER BY tablename,indexname").fetchall()
+    constraints = conn.execute(
+        "SELECT conrelid::regclass::text AS table_name,contype,pg_get_constraintdef(oid) AS definition "
+        "FROM pg_constraint WHERE connamespace=current_schema()::regnamespace AND "
+        "conrelid::regclass::text IN ('insurance_conversation_turns','insurance_identity_verifications',"
+        "'insurance_session_summary') AND contype IN ('p','u','f')").fetchall()
+    for name in proposed:
+        conn.execute('DROP INDEX IF EXISTS ' + name)
+    before = {name: _explain(conn, *query) for name, query in queries.items()}
+    for name, definition in proposed.items():
+        conn.execute('CREATE INDEX ' + name + ' ' + definition)
+    conn.execute('ANALYZE insurance_conversation_turns')
+    conn.execute('ANALYZE insurance_identity_verifications')
+    after = {name: _explain(conn, *query) for name, query in queries.items()}
+    pairs = memory.pairs(conn, scope)
+    assert len(pairs) == 100
+    assert all(p['a_id'] is not None and 'SCALE-A ONE CALL-0 ' in p['a'] for p in pairs)
+    assert identity.verified_customer(conn, 'SCALE-A', 'Voice', 'synthetic', 'CALL-0') == 'ONE'
+    assert identity.verified_customer(conn, 'SCALE-B', 'Voice', 'synthetic', 'CALL-0') is None
+    assert identity.verified_customer(conn, 'SCALE-A', 'WhatsApp', 'synthetic', 'CALL-0') is None
+    assert identity.verified_customer(conn, 'SCALE-A', 'Voice', 'synthetic', 'CALL-1') is None
+    conn.execute("UPDATE insurance_customers SET active=false "
+                 "WHERE business_id='SCALE-A' AND customer_id='ONE'")
+    assert identity.verified_customer(conn, 'SCALE-A', 'Voice', 'synthetic', 'CALL-0') is None
+    with capsys.disabled():
+        print('\nLOCAL memory/identity indexes:', indexes)
+        print('LOCAL memory/identity constraints:', constraints)
+        for phase, plans in [('before', before), ('after', after)]:
+            for name, plan in plans.items():
+                print('LOCAL EXPLAIN', phase + '_' + name, plan)

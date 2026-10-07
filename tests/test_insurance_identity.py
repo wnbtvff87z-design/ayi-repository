@@ -150,6 +150,17 @@ def test_state_ttl_is_separate_from_verification_ttl(pg, monkeypatch):
     assert identity.load_state(pg, 'A', 'WhatsApp', 'ref', '') == {}
 
 
+def test_policy_extraction_keeps_the_business_question_and_original():
+    original = '¿Cubre agua en mi póliza 000123 y fuego cuando hay exclusiones?'
+    declaration = identity.parse_declaration(original)
+    assert declaration['original'] == original
+    assert declaration['contract_number'] == '000123'
+    assert declaration['question'] == original
+    assert declaration['normalized_question'] == '¿Cubre agua en mi póliza seleccionada y fuego cuando hay exclusiones?'
+    assert identity.parse_declaration('agua ' * 500 + 'póliza 000123')['contract_number'] == '000123'
+    assert identity.parse_declaration('póliza 000123 o póliza 000124')['contract_numbers'] == ['000123', '000124']
+
+
 def test_provision_accepts_trusted_name_components(pg):
     result = provision.provision(
         pg, actor='ops', business_id='A', customer_id='P', display_name='José María de la Cruz Gil',

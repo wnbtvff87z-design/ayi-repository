@@ -571,8 +571,10 @@ def test_multi_turn_conversation_reuses_identity_policy_and_references(pg, monke
     assert out['insurance_result'] == 'evidence_backed_explanation' and 'joyas' in seen[-1]
     # return to the earlier topic
     reply, out = say('Volviendo a lo de los daños por agua, ¿hay límite de importe?', ext='M5')
+    assert out['insurance_result'] == 'contradiction_or_ambiguity'
+    reply, out = say('segunda', ext='M6')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'agua' in seen[-1]
+    assert 'agua' in seen[-1] and 'limite' in seen[-1]
     # nothing repeated, nothing escalated, identity verified once
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     assert rows(pg, "SELECT count(*) AS n FROM insurance_audit_log WHERE action='identity_verified'")[0]['n'] == 1

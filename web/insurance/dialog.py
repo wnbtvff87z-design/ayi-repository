@@ -9,7 +9,7 @@ from enum import Enum
 
 from insurance import cases as _cases, identity, memory, references, retrieval
 
-from insurance.cases import CasePersistenceError, REASONS, create_or_update_case
+from insurance.cases import CasePersistenceError, create_or_update_case
 
 
 class ResultKind(str, Enum):
@@ -178,7 +178,7 @@ def _business_question(text, declaration, awaiting=None):
 def _drop_customer_state(st):
     for key in ('policy_id', 'contract_number', 'question', 'normalized_question', 'question_turn_id',
                 'event_date', 'pending_escalation', 'reference_options', 'recalled', 'awaiting',
-                'verified', 'customer_id', 'resume_customer_id'):
+                'reference_remainder', 'verified', 'customer_id', 'resume_customer_id'):
         st.pop(key, None)
 
 
@@ -210,10 +210,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 if _business_question(text, independent):
                     decl = independent
             # A declaration is a new authentication attempt, not permission to reuse the phone's identity.
-            if customer_id and (decl.get('name') or decl.get('document')):
-                conn.execute('UPDATE insurance_identity_verifications SET revoked_at=now() WHERE '
-                             'business_id=%s AND conversation_ref=%s AND channel=%s AND session_ref=%s '
-                             'AND revoked_at IS NULL', (bid, ref, channel, sess))
+            new_declaration = bool(customer_id and (decl.get('name') or decl.get('document')))
+            if new_declaration:
                 st['resume_customer_id'] = customer_id
                 customer_id = None
             elif not customer_id and st.get('customer_id'):
@@ -222,12 +220,18 @@ def _answer(business, state, text, channel, external_id, customer):
                 st.pop('verified', None)
             _merge_declaration(st, decl, bid)
             is_query = _business_question(text, decl, st.get('awaiting'))
-            turn_id, _ = memory.record_user(
+            turn_id, created = memory.record_user(
                 conn, sc._replace(customer_id=customer_id), external_id,
                 decl.get('question') if is_query else text,
                 'question' if is_query else 'identity' if decl.get('name') or decl.get('document') else
                 'clarification' if st.get('awaiting') else 'other', corr,
-                normalized=decl.get('question') if is_query else None)
+                normalized=(decl.get('normalized_question') or decl.get('question')) if is_query else None)
+            if not created:
+                return NOT_SAVED, {'insurance_result': 'case_persistence_failed'}
+            if new_declaration:
+                conn.execute('UPDATE insurance_identity_verifications SET revoked_at=now() WHERE '
+                             'business_id=%s AND conversation_ref=%s AND channel=%s AND session_ref=%s '
+                             'AND revoked_at IS NULL', (bid, ref, channel, sess))
 
             def finish(reply, out, *, decision=None, evidence=None, policy_id=None, version_id=None,
                        answer=False):
@@ -237,15 +241,17 @@ def _answer(business, state, text, channel, external_id, customer):
                 assistant_id = memory.record_assistant(
                     conn, active_sc, external_id, reply, out['insurance_result'], original_turn, corr,
                     kind='answer' if answer else 'clarification', policy_id=policy_id,
-                    version_id=version_id, pages=pages)
+                    version_id=version_id, pages=pages, event_date=st.get('event_date'))
                 if customer_id and st.get('question'):
                     memory.update_summary(
                         conn, active_sc, user_turn_id=original_turn, assistant_turn_id=assistant_id,
-                        question=st['question'], answer=reply, decision=decision or ('answer' if answer else 'clarify'),
+                        question=st['question'], answer=reply.split('\nFuente:', 1)[0],
+                        decision=decision or ('answer' if answer else 'clarify'),
                         policy_id=policy_id, version_id=version_id, pages=pages,
                         event_date=st.get('event_date'),
                         fact=st['question'] if OCCURRED_RE.search(st['question']) else None,
-                        pending=st['question'] if st.get('awaiting') else None,
+                        pending=st['question'] if st.get('awaiting') and
+                        decision not in ('accepted', 'declined', 'technical_case') else None,
                         open_issue=(st.get('pending_escalation') or {}).get('reason'))
                 if answer or decision in ('accepted', 'declined', 'technical_case'):
                     for key in ('question', 'normalized_question', 'question_turn_id', 'awaiting',
@@ -260,7 +266,7 @@ def _answer(business, state, text, channel, external_id, customer):
 
             if is_query and st.get('awaiting') not in ('policy', 'date', 'reference'):
                 st['question'] = memory.redact(decl.get('question') or text)
-                st['normalized_question'] = st['question']
+                st['normalized_question'] = memory.redact(decl.get('normalized_question') or st['question'])
                 st['question_turn_id'] = turn_id
                 st.pop('pending_escalation', None)
                 st.pop('event_date', None)
@@ -274,6 +280,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 if outcome[0] == 'reply':
                     return finish(outcome[1], {'insurance_result': ResultKind.IDENTITY_NOT_VERIFIED.value})
                 if outcome[0] == 'escalate':
+                    for key in ('doc_hmac', 'doc_tail', 'name'):
+                        st.pop(key, None)
                     st['awaiting'] = 'identity'
                     return finish(IDENTITY_FAILED, {'insurance_result': ResultKind.IDENTITY_NOT_VERIFIED.value})
                 customer_id = outcome[1]
@@ -283,11 +291,19 @@ def _answer(business, state, text, channel, external_id, customer):
                     _drop_customer_state(st)
                     if is_query:
                         st.update(question=memory.redact(decl.get('question') or text),
-                                  normalized_question=memory.redact(decl.get('question') or text),
+                                  normalized_question=memory.redact(decl.get('normalized_question') or
+                                                                   decl.get('question') or text),
                                   question_turn_id=turn_id)
                     if decl.get('contract_number'):
                         st['contract_number'] = decl['contract_number']
-                memory.claim_unverified(conn, sc._replace(customer_id=customer_id))
+                claimed_turns = [turn_id]
+                if st.get('question_turn_id'):
+                    claimed_turns.append(st['question_turn_id'])
+                conn.execute(
+                    'UPDATE insurance_conversation_turns SET customer_id=%s WHERE business_id=%s '
+                    'AND channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id IS NULL '
+                    'AND (turn_id=ANY(%s) OR reply_to=ANY(%s))',
+                    (customer_id, bid, channel, ref, sess, claimed_turns, claimed_turns))
             st['verified'] = True
             st['customer_id'] = customer_id
             sc = sc._replace(customer_id=customer_id)
@@ -319,27 +335,31 @@ def _answer(business, state, text, channel, external_id, customer):
                                   {'insurance_result': ResultKind.CONTRADICTION_OR_AMBIGUITY.value})
                 st.pop('reference_options', None)
                 st.pop('awaiting', None)
-                _use_pair(st, pair)
+                _use_pair(st, pair, st.pop('reference_remainder', ''))
             elif (is_query or just_verified) and st.get('question') and st.get('awaiting') not in ('policy', 'date'):
                 prior = [p for p in memory.pairs(conn, sc) if p['q_id'] != turn_id]
                 classified = references.classify(st['question'], has_last_answer=bool(prior and prior[0].get('a')),
                                                 has_recent=bool(prior))
                 kind = classified['kind']
+                if kind != 'independent':
+                    memory.set_user_kind(conn, st['question_turn_id'], 'clarification', st['question'])
                 pair = None
                 if kind in ('continuation', 'explain_prior'):
                     pair = next((p for p in prior if p.get('a')), None)
                 elif kind == 'recall':
                     if classified.get('first'):
-                        pair = prior[-1] if prior else None
+                        oldest = memory.pairs(conn, sc, oldest_first=True, limit=1)
+                        pair = oldest[0] if oldest and oldest[0]['q_id'] != turn_id else None
                     else:
-                        status, chosen = references.pick(
-                            prior, classified.get('topic', ''),
+                        status, chosen = memory.recall(
+                            conn, sc, classified.get('topic', ''),
                             about_answer=classified.get('about_answer', False),
                             recent_bias=classified.get('recent_bias', False))
                         if status == 'clear':
                             pair = chosen
                         elif status == 'ambiguous':
                             st['reference_options'] = [{'q_id': p['q_id'], 'q': p['q']} for p in chosen]
+                            st['reference_remainder'] = classified.get('remainder') or ''
                             st['awaiting'] = 'reference'
                             choices = ' '.join(f"{n}. {p['q'][:160]}" for n, p in enumerate(chosen, 1))
                             return finish('¿A cuál de las consultas anteriores te refieres? ' + choices,
@@ -429,7 +449,7 @@ def _use_pair(st, pair, continuation=''):
     st['recalled'] = [pair]
     if not st.get('contract_number') and pair.get('policy_id'):
         st['policy_id'] = pair['policy_id']
-    fact = _fact_date(pair.get('normalized') or pair['q'])
+    fact = _fact_date(str(pair.get('event_date') or '')) or _fact_date(pair.get('normalized') or pair['q'])
     if fact:
         st['event_date'] = fact.isoformat()
         if not _fact_date(query):

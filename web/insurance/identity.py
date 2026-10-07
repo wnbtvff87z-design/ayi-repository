@@ -59,7 +59,7 @@ NAME_TRIGGER_RE = re.compile(
 LABEL_RE = re.compile(r'\b(nombre|apellidos?)\s*[:=-]\s*', re.I)
 KEYWORD_RE = re.compile(r'\b(dni|nie|documento|n[úu]mero|nombre|apellidos?|y)\b', re.I)
 MAX_NAME_TOKENS = 7
-MAX_TEXT = 2000
+MAX_TEXT = 4000
 
 
 def normalize_document(value):
@@ -140,15 +140,17 @@ def parse_declaration(text, awaiting=None):
     if doc:
         rest = rest[:doc.start()] + ' ' + rest[doc.end():]
     contract = None
+    contracts = []
     for m in CONTRACT_RE.finditer(rest):
         if m.group(1).casefold() not in CONTRACT_STOP and re.search(r'\d', m.group(1)):
-            contract = m.group(1)
-            rest = rest[:m.start()] + ' ' + rest[m.end():]
-            break
+            contracts.append(m.group(1))
+    if contracts:
+        contract = contracts[0]
     if contract is None and awaiting == 'policy':
         bare = re.fullmatch(r'(?:(?:la|el) )?([A-Za-z0-9][A-Za-z0-9/-]{2,29})\.?', ' '.join(rest.split()), re.I)
         if bare and re.search(r'\d', bare.group(1)):
             contract, rest = bare.group(1), ''
+            contracts = [contract]
     name = None
     labelled, spans = {}, []
     for m in LABEL_RE.finditer(rest):
@@ -175,7 +177,10 @@ def parse_declaration(text, awaiting=None):
     # The case/question keeps the message WITHOUT the identity data that was in it.
     question = re.sub(r'\b(?:dni|nie)\b', ' ', LABEL_RE.sub(' ', rest), flags=re.I)
     question = re.sub(r'\s+', ' ', question).strip(' ,;.-:')
+    normalized_question = CONTRACT_RE.sub(
+        lambda m: 'póliza seleccionada' if m.group(1) in contracts else m.group(0), question)
     return {'document': document, 'name': name, 'contract_number': contract, 'original': text,
+            'contract_numbers': list(dict.fromkeys(contracts)), 'normalized_question': normalized_question,
             'has_question': len(remaining) >= 4, 'question': question}
 
 

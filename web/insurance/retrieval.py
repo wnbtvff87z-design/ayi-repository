@@ -85,7 +85,7 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
     # Contract numbers are TEXT compared exactly (leading zeros matter); never a prefix/contains.
     mentioned = conn.execute(
         policy_sql + 'AND (' + _mention_sql('p.policy_id') + ' OR ' +
-        _mention_sql('NULLIF(p.contract_number, \'\')') +
+        _mention_sql('p.contract_number') +
         ' OR lower(p.policy_id)=%s OR lower(p.contract_number)=%s) LIMIT 2',
         (*applicable_args, question, question, hint.casefold() if hint else None,
          hint.casefold() if hint else None)).fetchall()
@@ -144,5 +144,5 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
             chosen.append(extra)
     evidence = [{'document_id': p['document_id'], 'version_id': pol['version_id'],
                  'page': p['page_number'], 'section': p['section'], 'source': p['source'],
-                 'text': p['body'][:1500]} for p in sorted(chosen, key=lambda p: p['page_number'])]
+                 'text': p['body']} for p in sorted(chosen, key=lambda p: p['page_number'])]
     return out('ok', 'ok', evidence, **base)
