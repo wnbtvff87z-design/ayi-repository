@@ -273,8 +273,15 @@ the customer→policy and document→policy/version foreign keys remain enforced
 
 * `insurance_authorizations_scope_idx (business_id, customer_id, policy_id) WHERE revoked_at IS NULL`.
 * `insurance_documents_scope_idx (business_id, policy_id, version_id, status, document_id)`.
+* `insurance_turns_reply_idx (reply_to) WHERE role='assistant' AND kind='answer'`.
+* `insurance_verifications_scope_idx (business_id, channel, conversation_ref, session_ref, verification_id DESC)
+  WHERE revoked_at IS NULL`.
 
 The unindexed authorization/document scopes sequentially discarded 11,999 / 47,999 rows.
+Additional probes use **24,000 turns and 12,001 verifications**: point recall otherwise inspected
+300 scoped answers and a historical verification lookup discarded 12,000 rows using its primary
+key. An additional session-turn index was tested but not added when existing uniqueness already
+covered that session scope; the new summary primary key already covers its exact lookup.
 The scale test checks real `pg_indexes` and FK constraints, scopes pages before ranking, compares
 plans under transactionally removed/restored new indexes, and measures local retrieval rather
 than promising an external-host service level. Reproduce with the existing pytest suite and

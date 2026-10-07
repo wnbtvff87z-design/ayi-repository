@@ -176,7 +176,7 @@ def test_mismatches_get_one_identical_generic_reply_and_never_say_which_datum_fa
             'Me llamo Pedro Ruiz Soto, DNI 11111111H',      # both wrong
             'Me llamo Ana López Pérez, DNI 12345678Z',      # wrong surname order
             'Me llamo Ana Pérez López Gil, DNI 12345678Z']):  # extra surname
-        replies.append(say(declared, ext=f'M{n}')[0])
+        replies.append(say(declared, ext=f'M{n}', phone=f'+3460001000{n}')[0])
     assert set(replies) == {replies[0]} and GENERIC in replies[0]
     assert not any(w in replies[0].lower() for w in ('dni es', 'nombre es', 'incorrecto', 'no existe'))
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0

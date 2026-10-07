@@ -13,6 +13,7 @@ WEB = Path(__file__).resolve().parents[1] / 'web'
 sys.path.insert(0, str(WEB))
 
 import insurance.cases as cases
+import insurance.identity as identity
 import insurance.migrate as insurance_migrate
 import insurance_sync_outbox as outbox_worker
 import main
@@ -79,6 +80,20 @@ def submit_question(*, external_id='SM-1', reason='missing_information', **chang
     }
     values.update(changes)
     return cases.create_or_update_case(**values)
+
+
+def provision_case_caller(pg_schema):
+    with pg_schema() as conn:
+        identity.upsert_customer(conn, 'INS-BUSINESS', 'C1', 'Ana Pérez López', '99999999R')
+        conn.execute(
+            "INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number)"
+            " VALUES('INS-BUSINESS','POLICY-TEST','C1','hogar','000123')")
+        conn.execute(
+            "INSERT INTO insurance_policy_versions(business_id,policy_id,version_id,valid_from)"
+            " VALUES('INS-BUSINESS','POLICY-TEST','VERSION-TEST','2020-01-01')")
+        conn.execute(
+            "INSERT INTO insurance_authorizations(business_id,customer_id,policy_id,granted_by)"
+            " VALUES('INS-BUSINESS','C1','POLICY-TEST','test')")
 
 
 @pytest.mark.parametrize(
@@ -799,7 +814,6 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     pg_schema, monkeypatch
 ):
     monkeypatch.setenv('INSURANCE_HUMAN_SHARED_DETAIL_ENABLED', 'true')
-    monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
     human_key = 'k' * 40
@@ -813,6 +827,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
         'sector': 'insurance',
         'insurance_product': 'hogar',
     }
+    provision_case_caller(pg_schema)
     monkeypatch.setattr(main, 'lookup', lambda *args, **kwargs: (business, 'insurance'))
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
     monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
@@ -859,6 +874,14 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
             },
         )
         assert response.status_code == 200
+        assert '¿Quieres que registre la consulta' in response.get_data(as_text=True)
+        response = client.post('/webhook-whatsapp', data={
+            'To': 'whatsapp:+34600111222',
+            'From': 'whatsapp:+34600999888',
+            'Body': 'Sí',
+            'MessageSid': sid + '-consent',
+        })
+        assert response.status_code == 200
         assert 'He guardado tu consulta para revisión humana.' in response.get_data(as_text=True)
 
     incoming('SM-integrated-1', '¿La póliza cubre esta filtración?')
@@ -872,7 +895,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
         )
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     record['fields']['Status'] = 'resolved'
-    incoming('SM-integrated-2', '¿Y si el daño ocurrió antes de la vigencia?')
+    incoming('SM-integrated-2', '¿La póliza cubre otra filtración?')
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     assert record['fields']['Status'] == 'Pendiente'
     assert set(record['fields']) == {
@@ -894,7 +917,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     assert details.status_code == 200
     assert [row['question'] for row in details.json['questions']] == [
         '¿La póliza cubre esta filtración?',
-        '¿Y si el daño ocurrió antes de la vigencia?',
+        '¿La póliza cubre otra filtración?',
     ]
     resolved = client.post(
         path + '/resolve',
@@ -927,6 +950,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
 def test_successful_escalation_persists_before_customer_confirmation(pg_schema, monkeypatch, channel):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    provision_case_caller(pg_schema)
     business = {
         'business_id': 'INS-BUSINESS',
         'sector': 'insurance',
@@ -938,7 +962,6 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
     monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared conversation database accessed'))
     monkeypatch.setattr(main.requests, 'post', lambda *args, **kwargs: pytest.fail('Airtable was written in request path'))
     client = main.app.test_client()
-    monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
     question = '¿La póliza cubre esta filtración?'
     declared = ' Me llamo Ana Pérez López, DNI 99999999R.'
 
@@ -950,6 +973,13 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
             'Body': question + declared,
             'MessageSid': 'SM-case-confirmation',
         })
+        assert '¿Quieres que registre la consulta' in response.get_data(as_text=True)
+        response = client.post('/webhook-whatsapp', data={
+            'To': 'whatsapp:+34600111222',
+            'From': 'whatsapp:+34600999888',
+            'Body': 'Sí',
+            'MessageSid': 'SM-case-consent',
+        })
         reply = response.get_data(as_text=True)
     else:
         monkeypatch.setattr(main, 'authorized', lambda: True)
@@ -960,6 +990,15 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
             'customer_phone': '+34600999888',
             'external_id': 'CA-case-confirmation:turn:1',
             'text': question + declared,
+        })
+        assert '¿Quieres que registre la consulta' in response.json['reply']
+        response = client.post('/internal/turn', json={
+            'business_id': 'INS-BUSINESS',
+            'business_phone': '+34600111222',
+            'channel': 'Voice',
+            'customer_phone': '+34600999888',
+            'external_id': 'CA-case-confirmation:turn:2',
+            'text': 'Sí',
         })
         reply = response.json['reply']
 

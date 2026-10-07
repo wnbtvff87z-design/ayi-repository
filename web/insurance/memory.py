@@ -60,7 +60,11 @@ def redact(text):
 def toks(text):
     out = set()
     for w in retrieval._tokens(text or ''):
-        out.add(w[:-1] if len(w) > 4 and w.endswith('s') else w)
+        if w.endswith('iones'):
+            w = w[:-2]
+        elif len(w) > 4 and w.endswith('s'):
+            w = w[:-1]
+        out.add(w)
     return out
 
 
@@ -231,9 +235,10 @@ def iter_pairs(conn, sc, oldest_first=False):
         cursor = batch[-1]['q_id']
 
 
-def recall(conn, sc, topic, *, about_answer=False, recent_bias=False):
+def recall(conn, sc, topic, *, about_answer=False, recent_bias=False, exclude_q_id=None):
     from insurance import references
-    return references.pick(iter_pairs(conn, sc), topic, about_answer=about_answer, recent_bias=recent_bias)
+    prior = (p for p in iter_pairs(conn, sc) if p['q_id'] != exclude_q_id)
+    return references.pick(prior, topic, about_answer=about_answer, recent_bias=recent_bias)
 
 
 # ---- Retention ------------------------------------------------------------------------------

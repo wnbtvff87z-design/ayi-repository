@@ -285,6 +285,36 @@ def test_selected_page_keeps_late_contractual_negation(conn):
     assert 'no cubre roturas por falta de mantenimiento.' in page['text']
 
 
+def test_exact_candidate_selection_preserves_conflicting_declarations(conn):
+    for question, hint in [
+        ('agua POL-006000 POL-005999', None),
+        ('agua póliza 006000 y POL-005999', None),
+        ('agua POL-005999', 'POL-006000'),
+    ]:
+        result = retrieval.retrieve(conn, 'SCALE-A', 'MANY', question, TODAY, policy_hint=hint)
+        assert result['reason_code'] == 'multiple_policies' and not result['evidence']
+    result = retrieval.retrieve(conn, 'SCALE-A', 'MANY', 'agua', TODAY, policy_hint='pol-006000')
+    assert result['status'] == 'ok' and result['policy_id'] == 'POL-006000'
+
+
+def test_unusual_legacy_identifiers_keep_literal_boundary_matching(conn):
+    conn.execute(
+        "INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) "
+        "VALUES('SCALE-A','POL.special(1)','MANY','hogar','P[1].(2)+')")
+    conn.execute(
+        "INSERT INTO insurance_policy_versions(business_id,policy_id,version_id,valid_from) "
+        "VALUES('SCALE-A','POL.special(1)','CURRENT','2025-01-01')")
+    conn.execute(
+        "INSERT INTO insurance_authorizations(business_id,customer_id,policy_id,granted_by) "
+        "VALUES('SCALE-A','MANY','POL.special(1)','synthetic')")
+    for question in ['agua POL.special(1)', 'agua P[1].(2)+']:
+        result = retrieval.retrieve(conn, 'SCALE-A', 'MANY', question, TODAY)
+        assert result['policy_id'] == 'POL.special(1)'
+        assert result['reason_code'] == 'document_not_registered'
+    result = retrieval.retrieve(conn, 'SCALE-A', 'MANY', 'agua P[1].(2)+ POL-006000', TODAY)
+    assert result['reason_code'] == 'multiple_policies'
+
+
 def test_scale_autocommit_cursor_transaction(scale_db):
     dsn, schema = scale_db
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as conn:
@@ -324,6 +354,13 @@ def test_scale_local_plans_indexes_and_latency(conn, capsys):
         'ready_pages': (retrieval.PAGE_SQL,
                         ('SCALE-A', 'POL-000001', 'CURRENT', 'ready', TODAY, TODAY, 'SCALE-A', 'ONE')),
         'explicit_policy': (
+            'SELECT p.policy_id,p.contract_number ' + retrieval.POLICY_SCOPE + retrieval.APPLICABLE +
+            retrieval.POLICY_MATCH + 'LIMIT 2',
+            ('SCALE-A', 'MANY', TODAY, TODAY,
+             retrieval._identifier_candidates('agua póliza 006000', '006000'),
+             retrieval._identifier_candidates('agua póliza 006000', '006000'),
+             'agua póliza 006000', 'agua póliza 006000')),
+        'explicit_policy_legacy_regex': (
             'SELECT p.policy_id,p.contract_number ' + retrieval.POLICY_SCOPE + retrieval.APPLICABLE +
             'AND (' + retrieval._mention_sql('p.policy_id') + ' OR ' +
             retrieval._mention_sql('p.contract_number') +
@@ -371,6 +408,8 @@ def test_scale_local_plans_indexes_and_latency(conn, capsys):
     with capsys.disabled():
         print('\nLOCAL scale indexes:', indexes)
         print('LOCAL scale constraints:', constraints)
+        for name, (sql, args) in queries.items():
+            print('LOCAL SQL', name, sql, args)
         for phase, plans in [('before', plans_before), ('after', plans_after)]:
             for name, plan in plans.items():
                 print('LOCAL EXPLAIN', phase + '_' + name, plan)
@@ -391,9 +430,17 @@ def test_scale_memory_identity_sql_plans_and_scope(conn, monkeypatch, capsys):
         'WHERE v.business_id=%s AND v.channel=%s AND v.conversation_ref=%s AND v.session_ref=%s '
         'AND c.active AND v.revoked_at IS NULL AND v.expires_at>now() '
         'ORDER BY v.verification_id DESC LIMIT 1')
+    q_id = conn.execute(
+        "SELECT turn_id FROM insurance_conversation_turns WHERE business_id='SCALE-A' "
+        "AND channel='Voice' AND conversation_ref='synthetic-thread' AND session_ref='CALL-0' "
+        "AND customer_id='ONE' AND role='user' ORDER BY turn_id LIMIT 1").fetchone()['turn_id']
     queries = {
         'memory_pairs': (memory.PAIR_SQL + 'ORDER BY q.turn_id DESC LIMIT %s',
                          (*memory._pair_params(scope), 500)),
+        'memory_exact_pair': (memory.PAIR_SQL + 'AND q.turn_id=%s',
+                              (*memory._pair_params(scope), q_id)),
+        'memory_last_answered': (memory.PAIR_SQL + 'AND a.turn_id IS NOT NULL '
+                                 'ORDER BY q.turn_id DESC LIMIT 1', memory._pair_params(scope)),
         'historical_verification': (verification_sql,
                                     ('SCALE-A', 'Voice', 'synthetic-verification-target', 'CALL-0')),
         'session_summary': (
@@ -405,9 +452,6 @@ def test_scale_memory_identity_sql_plans_and_scope(conn, monkeypatch, capsys):
         'insurance_turns_reply_idx': (
             'ON insurance_conversation_turns (reply_to) '
             "WHERE role='assistant' AND kind='answer'"),
-        'insurance_turns_session_scope_idx': (
-            'ON insurance_conversation_turns '
-            '(business_id,channel,conversation_ref,session_ref,customer_id,turn_id DESC)'),
         'insurance_verifications_scope_idx': (
             'ON insurance_identity_verifications '
             '(business_id,channel,conversation_ref,session_ref,verification_id DESC) '
@@ -430,6 +474,19 @@ def test_scale_memory_identity_sql_plans_and_scope(conn, monkeypatch, capsys):
     conn.execute('ANALYZE insurance_conversation_turns')
     conn.execute('ANALYZE insurance_identity_verifications')
     after = {name: _explain(conn, *query) for name, query in queries.items()}
+
+    def nodes(plan):
+        yield plan
+        for child in plan.get('Plans', []):
+            yield from nodes(child)
+
+    assert any(n.get('Index Name') == 'insurance_turns_reply_idx'
+               for n in nodes(after['memory_exact_pair']['Plan']))
+    assert any(n.get('Index Name') == 'insurance_verifications_scope_idx'
+               for n in nodes(after['historical_verification']['Plan']))
+    assert any(n.get('Index Name') == 'insurance_session_summary_pkey'
+               for n in nodes(after['session_summary']['Plan']))
+    assert len(constraints) >= 8
     pairs = memory.pairs(conn, scope)
     assert len(pairs) == 100
     assert all(p['a_id'] is not None and 'SCALE-A ONE CALL-0 ' in p['a'] for p in pairs)
@@ -443,6 +500,8 @@ def test_scale_memory_identity_sql_plans_and_scope(conn, monkeypatch, capsys):
     with capsys.disabled():
         print('\nLOCAL memory/identity indexes:', indexes)
         print('LOCAL memory/identity constraints:', constraints)
+        for name, (sql, args) in queries.items():
+            print('LOCAL SQL', name, sql, args)
         for phase, plans in [('before', before), ('after', after)]:
             for name, plan in plans.items():
                 print('LOCAL EXPLAIN', phase + '_' + name, plan)

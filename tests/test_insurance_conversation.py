@@ -142,6 +142,15 @@ def test_prior_answer_explanation_uses_recalled_answer_and_new_evidence(pg, grou
     assert ctx['evidence'][0]['document_id'] == 'DOC-900'
 
 
+@pytest.mark.parametrize('reference', ['eso', '¿Y la franquicia?', '¿Dónde lo dice?'])
+def test_reference_without_an_earlier_answer_only_asks_clarification(pg, grounded, reference):
+    authenticate(pg)
+    reply, out = say(reference)
+    assert out['insurance_result'] == 'contradiction_or_ambiguity'
+    assert 'anteriores' in reply and not grounded
+    assert not rows(pg, 'SELECT * FROM insurance_cases')
+
+
 def test_fact_date_survives_policy_and_identity_clarifications(pg, monkeypatch):
     add_document(pg, 'POL-000123', 'DOC-A')
     add_document(pg, 'POL-000124', 'DOC-B')
@@ -164,6 +173,10 @@ def test_fact_date_survives_policy_and_identity_clarifications(pg, monkeypatch):
     assert captured[-1] == captured[-2] == date.today() - timedelta(days=3)
     summary = rows(pg, 'SELECT summary FROM insurance_session_summary')[0]['summary']
     assert summary['event_date'] == str(captured[-1]) and summary['facts']
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['event_date'] == str(captured[-1])
+    say('¿Y la franquicia?')
+    assert captured[-1] == date.today() - timedelta(days=3)
 
 
 def test_expiry_does_not_extend_auth_and_resumes_only_same_customer(pg, grounded):
@@ -227,6 +240,22 @@ def test_policy_switch_return_failed_switch_and_topic_policy(pg, monkeypatch):
     assert not rows(pg, 'SELECT * FROM insurance_cases')
 
 
+def test_failed_switch_on_single_policy_stays_pending_without_silent_fallback(pg, grounded):
+    authenticate(pg)
+    say(TEXT)
+    reply, out = say('¿Cubre daños por agua? Póliza 999')
+    assert 'número de póliza' in reply
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['requested_policy'] == '999' and state['policy_change_pending'] is True
+    assert 'policy_id' not in state
+    count = len(grounded)
+    reply, out = say('No conozco el número')
+    assert 'número de póliza' in reply and len(grounded) == count
+    assert 'DOC-900' in say('900')[0]
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['policy_id'] == 'POL-900' and not state.get('policy_change_pending')
+
+
 def test_voice_memory_is_per_call_and_whatsapp_is_separate(pg, grounded):
     say(TEXT, channel='Voice', ext='CALL1:turn:1')
     say(LUIS, channel='Voice', ext='CALL1:turn:2')
@@ -249,6 +278,19 @@ def test_context_budget_sheds_memory_before_evidence(pg, grounded, monkeypatch):
     assert ctx['evidence'][0]['text'] == grounded[-1][1][0]['text']
     assert 'recent' in ctx['report']['dropped'] or 'summary' in ctx['report']['dropped']
     assert 'CLÁUSULAS:' in memory.format_prompt(ctx)
+
+
+def test_impossible_context_budget_offers_review_without_calling_model(pg, grounded, monkeypatch):
+    authenticate(pg)
+    monkeypatch.setenv('INSURANCE_LLM_CONTEXT_CHARS', '10')
+    reply, out = say(TEXT)
+    assert reply == dialog.OFFER_REVIEW and not grounded
+    assert not rows(pg, 'SELECT * FROM insurance_cases')
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['pending_escalation']['context']['detail'] == 'context_budget_exceeded'
+    say('sí')
+    question = rows(pg, 'SELECT question,evidence FROM insurance_case_questions')[0]
+    assert question['question'] == TEXT and question['evidence'][0]['document_id'] == 'DOC-900'
 
 
 @pytest.mark.parametrize('answer', ['sí', 'no'])
@@ -293,6 +335,25 @@ def test_llm_outage_can_create_case_for_real_question_only(pg, grounded, monkeyp
     reply, out = say(TEXT)
     assert 'He guardado' in reply and out['case_id']
     assert rows(pg, 'SELECT diagnostic_code FROM insurance_case_questions')[0]['diagnostic_code'] == 'human_interpretation'
+
+
+def test_concurrent_technical_failure_retries_create_one_case_and_replay_result(pg, grounded, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    authenticate(pg)
+    calls = []
+
+    def unavailable(*args):
+        calls.append(True)
+        raise RuntimeError('provider unavailable')
+
+    monkeypatch.setattr(dialog, 'llm_explain', unavailable)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: ask(TEXT, ext='concurrent-technical'), range(4)))
+    assert all(result == results[0] for result in results)
+    assert len(calls) == 1 and results[0][1]['case_id']
+    assert len(rows(pg, 'SELECT * FROM insurance_cases')) == 1
+    assert len(rows(pg, 'SELECT * FROM insurance_case_questions')) == 1
+    assert len(rows(pg, 'SELECT * FROM insurance_conversation_turns')) == 2
 
 
 def test_database_outage_does_not_call_model_or_confirm_case(monkeypatch):

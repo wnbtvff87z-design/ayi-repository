@@ -33,6 +33,23 @@ def _mention_sql(column):
         "|| '($|[^a-z0-9/-])')")
 
 
+def _identifier_candidates(question, hint):
+    values = set(re.findall(r'[A-Za-z0-9/-]+', question.lower()))
+    if hint:
+        values.add(hint.casefold())
+    return sorted(values)
+
+
+# Ordinary identifiers use exact text equality, not one dynamically compiled regex per policy.
+# Unusual legacy identifiers retain literal boundary matching (including spaces/punctuation).
+POLICY_MATCH = (
+    'AND (lower(p.policy_id)=ANY(%s::text[]) OR lower(p.contract_number)=ANY(%s::text[]) '
+    "OR (translate(p.policy_id, '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-', '')<>'' "
+    'AND ' + _mention_sql('p.policy_id') + ') '
+    "OR (translate(p.contract_number, '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-', '')<>'' "
+    'AND ' + _mention_sql('p.contract_number') + ')) ')
+
+
 PAGE_SQL = (
     'SELECT pg.document_id,pg.page_number,pg.section,pg.source,pg.body '
     'FROM insurance_document_pages pg '
@@ -83,12 +100,10 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
         return out('no_policy', 'version_not_applicable')
     hint = policy_hint or identity.extract_claims(question)['contract_number']
     # Contract numbers are TEXT compared exactly (leading zeros matter); never a prefix/contains.
+    candidates = _identifier_candidates(question, hint)
     mentioned = conn.execute(
-        policy_sql + 'AND (' + _mention_sql('p.policy_id') + ' OR ' +
-        _mention_sql('p.contract_number') +
-        ' OR lower(p.policy_id)=%s OR lower(p.contract_number)=%s) LIMIT 2',
-        (*applicable_args, question, question, hint.casefold() if hint else None,
-         hint.casefold() if hint else None)).fetchall()
+        policy_sql + POLICY_MATCH + 'LIMIT 2',
+        (*applicable_args, candidates, candidates, question, question)).fetchall()
     if not mentioned and hint:
         return out('policy_not_matched', 'policy_not_matched')
     rows = mentioned or rows

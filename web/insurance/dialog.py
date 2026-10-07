@@ -145,6 +145,8 @@ def _merge_declaration(state, decl, business_id):
         state['name'] = decl['name'][:160]
     if decl['contract_number']:
         state['contract_number'] = decl['contract_number'][:40]
+        state['requested_policy'] = decl['contract_number'][:40]
+        state['policy_change_pending'] = True
 
 
 def _escalate(cause, *, reason, customer_id=None, claim=None, question=None, ctx=None, **extra):
@@ -176,9 +178,10 @@ def _business_question(text, declaration, awaiting=None):
 
 
 def _drop_customer_state(st):
-    for key in ('policy_id', 'contract_number', 'question', 'normalized_question', 'question_turn_id',
+    for key in ('policy_id', 'contract_number', 'requested_policy', 'policy_change_pending',
+                'question', 'normalized_question', 'question_turn_id',
                 'event_date', 'pending_escalation', 'reference_options', 'recalled', 'awaiting',
-                'reference_remainder', 'verified', 'customer_id', 'resume_customer_id'):
+                'reference_remainder', 'reply_outputs', 'verified', 'customer_id', 'resume_customer_id'):
         st.pop(key, None)
 
 
@@ -255,7 +258,7 @@ def _answer(business, state, text, channel, external_id, customer):
                         open_issue=(st.get('pending_escalation') or {}).get('reason'))
                 if answer or decision in ('accepted', 'declined', 'technical_case'):
                     for key in ('question', 'normalized_question', 'question_turn_id', 'awaiting',
-                                'recalled', 'event_date'):
+                                'recalled'):
                         st.pop(key, None)
                 outputs = st.setdefault('reply_outputs', {})
                 outputs[str(external_id)] = out
@@ -296,6 +299,8 @@ def _answer(business, state, text, channel, external_id, customer):
                                   question_turn_id=turn_id)
                     if decl.get('contract_number'):
                         st['contract_number'] = decl['contract_number']
+                        st['requested_policy'] = decl['contract_number']
+                        st['policy_change_pending'] = True
                 claimed_turns = [turn_id]
                 if st.get('question_turn_id'):
                     claimed_turns.append(st['question_turn_id'])
@@ -340,6 +345,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 prior = [p for p in memory.pairs(conn, sc) if p['q_id'] != turn_id]
                 classified = references.classify(st['question'], has_last_answer=bool(prior and prior[0].get('a')),
                                                 has_recent=bool(prior))
+                if not prior and classified['kind'] == 'independent':
+                    classified = references.classify(st['question'], has_last_answer=False, has_recent=True)
                 kind = classified['kind']
                 if kind != 'independent':
                     memory.set_user_kind(conn, st['question_turn_id'], 'clarification', st['question'])
@@ -447,7 +454,7 @@ def _urgent(business, customer, text, channel, external_id, corr, customer_id, c
 def _use_pair(st, pair, continuation=''):
     st['normalized_question'] = f"{pair.get('normalized') or pair['q']} {continuation}".strip()[:4000]
     st['recalled'] = [pair]
-    if not st.get('contract_number') and pair.get('policy_id'):
+    if not st.get('policy_change_pending') and pair.get('policy_id'):
         st['policy_id'] = pair['policy_id']
     fact = _fact_date(str(pair.get('event_date') or '')) or _fact_date(pair.get('normalized') or pair['q'])
     if fact:
@@ -470,7 +477,8 @@ def _documental(conn, business, bid, channel, ref, sess, st, text, question, cus
     if fact:
         st['event_date'] = fact.isoformat()
     result = retrieval.retrieve(conn, bid, customer_id, query, fact or date.today(),
-                               policy_hint=st.get('contract_number') or st.get('policy_id'))
+                               policy_hint=st.get('requested_policy') if st.get('policy_change_pending') else
+                               st.get('contract_number') or st.get('policy_id'))
     d = result.get('diagnostics', {})
     _diag(corr, 'retrieval', bid, reason_code=result.get('reason_code'), identity_verified=True,
           policy_found=result.get('policy_id') is not None, document_ready=d.get('document_status') == 'ready',
@@ -488,25 +496,31 @@ def _documental(conn, business, bid, channel, ref, sess, st, text, question, cus
     if result.get('policy_id'):
         st['policy_id'] = result['policy_id']
         st.pop('contract_number', None)
+        st.pop('requested_policy', None)
+        st.pop('policy_change_pending', None)
     st.pop('awaiting', None)
     if result['status'] == 'ok':
         ev = result['evidence']
         summary, _ = memory.load_summary(conn, sc)
-        context = memory.build_context(
-            question=query, evidence=ev, policy=result.get('policy_id'), version=result.get('version_id'),
-            pending=question if st.get('awaiting') else None, recent_turns=memory.recent(conn, sc),
-            summary_text=memory.render_summary(summary, memory.cfg('INSURANCE_SUMMARY_MAX_CHARS')),
-            recalled=st.get('recalled') or [])
         try:
+            context = memory.build_context(
+                question=query, evidence=ev, policy=result.get('policy_id'), version=result.get('version_id'),
+                pending=question if st.get('awaiting') else None, recent_turns=memory.recent(conn, sc),
+                summary_text=memory.render_summary(summary, memory.cfg('INSURANCE_SUMMARY_MAX_CHARS')),
+                recalled=st.get('recalled') or [])
+        except ValueError:
+            text_out, fine = 'ESCALAR', 'context_budget_exceeded'
+        else:
             try:
-                inspect.signature(llm_explain).bind(query, context['evidence'], context)
-            except TypeError:
-                text_out = llm_explain(query, context['evidence'])
-            else:
-                text_out = llm_explain(query, context['evidence'], context)
-        except Exception as exc:
-            log.error('insurance_llm_failed correlation_id=%s error_type=%s', corr, type(exc).__name__)
-            text_out, fine = 'ESCALAR', 'llm_error'
+                try:
+                    inspect.signature(llm_explain).bind(query, context['evidence'], context)
+                except TypeError:
+                    text_out = llm_explain(query, context['evidence'])
+                else:
+                    text_out = llm_explain(query, context['evidence'], context)
+            except Exception as exc:
+                log.error('insurance_llm_failed correlation_id=%s error_type=%s', corr, type(exc).__name__)
+                text_out, fine = 'ESCALAR', 'llm_error'
         if text_out and 'ESCALAR' not in text_out:
             _diag(corr, 'decision', bid, identity_verified=True, policy_found=True, document_ready=True,
                   retrieval_status='ok', evidence_count=len(ev), decision='answer')
@@ -515,7 +529,7 @@ def _documental(conn, business, bid, channel, ref, sess, st, text, question, cus
                           {'insurance_result': ResultKind.EVIDENCE_BACKED_EXPLANATION.value},
                           answer=True, evidence=ev, policy_id=result.get('policy_id'),
                           version_id=result.get('version_id'))
-        fine = fine if fine == 'llm_error' else 'llm_escalated'
+        fine = fine if fine in ('llm_error', 'context_budget_exceeded') else 'llm_escalated'
         reason, extra['evidence'] = 'human_interpretation', ev
     else:
         reason = CASE_ONLY_REASONS.get(result['status'], 'human_interpretation')

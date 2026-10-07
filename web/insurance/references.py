@@ -66,15 +66,21 @@ def classify(text, *, has_last_answer, has_recent):
         rest = f[m.end():]
         theme = re.split(r'[,;?¿!]', rest, 1)
         topic = theme[0].strip()
+        consumed_concept = re.search(r'\b(exclusion|condicion|limite|clausula|pagina|cobertura)\b',
+                                     m.group(0))
+        if not topic and consumed_concept:
+            topic = consumed_concept.group(1)
         remainder = theme[1].strip(' ,;¿?') if len(theme) > 1 else ''
         first = bool(re.search(r'primero|primera|principio', f))
         return {'kind': 'recall', 'topic': topic if not first else '', 'first': first, 'remainder': remainder,
-                'about_answer': bool(ANSWER_WORDS.search(f)),
+                'about_answer': bool(consumed_concept or ANSWER_WORDS.search(f)),
                 'recent_bias': bool(re.search(r'anterior|ultim', f))}
     t = THEME_RE.match(f.rstrip('?! '))
     if t and len(memory.toks(t.group(3))) >= 1 and len(f.split()) <= 8:
         return {'kind': 'recall', 'topic': t.group(3), 'first': False, 'remainder': '',
                 'about_answer': False, 'recent_bias': False}
+    if not has_recent and re.search(r'\b(?:eso|esto|ello|esa|ese|esos|esas|aquello)\b', f):
+        return {'kind': 'ambiguous'}
     words = f.split()
     if words and words[0] == 'y' and has_recent:
         content = {w for w in memory.toks(' '.join(words[1:])) if w not in STOPS}

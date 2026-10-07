@@ -105,6 +105,15 @@ def test_identical_question_different_version_is_ambiguous():
     assert references.pick([candidate(1), candidate(2)], 'joyas')[1]['q_id'] == 2
 
 
+@pytest.mark.parametrize('different', [{'policy_id': 'OTHER'}, {'version_id': 'OLD'},
+                                      {'event_date': '2025-01-01'}])
+def test_identical_theme_different_contract_or_event_is_never_silently_deduplicated(different):
+    status, options = references.pick([candidate(1, 'daños por agua'),
+                                       candidate(2, 'daños por agua', **different)], 'agua')
+    assert status == 'ambiguous'
+    assert len(options) == 2
+
+
 def test_no_silent_choice_for_multiple_ordinals_or_empty_options():
     options = [candidate(1), candidate(2, 'rotura de tubería')]
     assert references.choose_option('primera o segunda', options) is None
@@ -139,6 +148,28 @@ def test_explicit_negative_case_confirmation(text):
     ('Hay daños por agua en mi casa', 'independent')])
 def test_reference_classification(text, kind):
     assert references.classify(text, has_last_answer=True, has_recent=True)['kind'] == kind
+
+
+@pytest.mark.parametrize('text', ['¿y eso?', '¿Y esto?', '¿Está eso cubierto?', '¿Y ese incendio?'])
+def test_deictic_without_antecedent_always_requests_clarification(text):
+    assert references.classify(text, has_last_answer=False, has_recent=False)['kind'] == 'ambiguous'
+
+
+def test_prior_exclusion_reference_targets_named_concept_not_arbitrary_previous_answer():
+    classified = references.classify('sobre la exclusión anterior',
+                                     has_last_answer=True, has_recent=True)
+    assert classified['kind'] == 'recall'
+    assert classified['topic'] == 'exclusion' and classified['about_answer']
+    relevant = candidate(1, 'daños por agua', a='La exclusión se aplica al desgaste.')
+    unrelated = candidate(2, 'equipaje', a='Se exige denuncia.')
+    assert references.pick([unrelated, relevant], classified['topic'], about_answer=True) == (
+        'clear', relevant)
+    competing = candidate(3, 'robo', a='La exclusión es la falta de denuncia.')
+    assert references.pick([competing, unrelated, relevant], classified['topic'],
+                           about_answer=True, recent_bias=True)[0] == 'ambiguous'
+    assert references.pick([unrelated], classified['topic'], about_answer=True) == ('none', None)
+    plural = candidate(4, 'daños por agua', a='Exclusiones por desgaste.')
+    assert references.pick([plural], classified['topic'], about_answer=True) == ('clear', plural)
 
 
 def evidence():
@@ -314,6 +345,37 @@ def test_pg_recall_streams_entire_retained_history_and_excludes_expired(pg, monk
                      'WHERE turn_id=%s', (pair['q_id'],))
         assert memory.recall(conn, sc, 'equipaje') == ('none', None)
         assert len(list(memory.iter_pairs(conn, sc))) == 619
+
+
+def test_pg_recall_can_exclude_current_reference_question(pg):
+    with pg() as conn:
+        sc = scope()
+        previous, _ = exchange(conn, sc, 'previous', 'daños por agua')
+        current, _ = memory.record_user(conn, sc, 'current', 'volviendo al agua', 'question', 'corr')
+        assert memory.recall(conn, sc, 'agua')[0] == 'ambiguous'
+        status, pair = memory.recall(conn, sc, 'agua', exclude_q_id=current)
+        assert status == 'clear' and pair['q_id'] == previous
+
+
+def test_pg_prior_exclusion_searches_entire_history_and_preserves_source_ambiguity(pg, monkeypatch):
+    monkeypatch.setenv('INSURANCE_MEMORY_SCAN_LIMIT', '13')
+    with pg() as conn:
+        sc = scope()
+        old, _ = exchange(conn, sc, 'old-exclusion', 'daños por agua',
+                          answer='La exclusión se aplica al desgaste.')
+        with conn.cursor() as cur:
+            cur.executemany(
+                'INSERT INTO insurance_conversation_turns(business_id,channel,conversation_ref,customer_id,'
+                "role,kind,external_id,content) VALUES('B','WhatsApp','conversation','C','user','question',%s,%s)",
+                [('neutral-' + str(n), 'consulta sobre equipaje') for n in range(520)])
+        classified = references.classify('sobre la exclusión anterior',
+                                         has_last_answer=True, has_recent=True)
+        status, pair = memory.recall(conn, sc, classified['topic'], about_answer=classified['about_answer'])
+        assert status == 'clear' and pair['q_id'] == old
+        exchange(conn, sc, 'competing-exclusion', 'robo de joyas',
+                 answer='La exclusión es la falta de denuncia.')
+        assert memory.recall(conn, sc, classified['topic'], about_answer=True,
+                             recent_bias=classified['recent_bias'])[0] == 'ambiguous'
 
 
 def test_pg_exact_retained_turn_cap_on_every_write(pg, monkeypatch):

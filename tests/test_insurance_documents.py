@@ -109,8 +109,8 @@ def verify(pg, channel='WhatsApp', customer='C1', business=BIZ, session=''):
     with pg() as conn:
         conn.execute(
             "INSERT INTO insurance_identity_verifications(business_id,conversation_ref,customer_id,method,"
-            "verified_by,expires_at,session_ref) VALUES(%s,%s,%s,'external-test','verifier-1',now()+interval '1 hour',%s)",
-            (business, identity.conversation_ref(business, channel, PHONE), customer, session))
+            "verified_by,expires_at,channel,session_ref) VALUES(%s,%s,%s,'external-test','verifier-1',now()+interval '1 hour',%s,%s)",
+            (business, identity.conversation_ref(business, channel, PHONE), customer, channel, session))
 
 
 def ask(text, channel='WhatsApp', ext='SM1'):
@@ -334,12 +334,16 @@ def test_no_match_and_unready_document_escalate_not_denied(pg, llm):
     reply, state = ask('¿Cubre los daños por agua?')  # no document yet
     assert 'no cubre' not in reply.lower() and state['insurance_result'] == 'human_case_required'
     with pg() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
+    ask('Sí', ext='SM-consent-1')
+    with pg() as conn:
         assert conn.execute('SELECT latest_reason FROM insurance_cases').fetchone()['latest_reason'] == 'unreadable_document'
     register(pg)
     run_worker()
     _, state = ask('¿Puedo viajar a la luna con mascotas?', ext='SM2')
+    ask('Sí', ext='SM-consent-2')
     with pg() as conn:
-        assert conn.execute('SELECT latest_reason FROM insurance_cases').fetchone()['latest_reason'] == 'insufficient_evidence'
+        assert conn.execute('SELECT latest_reason FROM insurance_cases ORDER BY updated_at DESC LIMIT 1').fetchone()['latest_reason'] == 'insufficient_evidence'
 
 
 def test_llm_failure_escalates_with_evidence(pg, monkeypatch):
@@ -358,7 +362,8 @@ def test_llm_failure_escalates_with_evidence(pg, monkeypatch):
     assert q['reason'] == 'human_interpretation' and len(q['evidence']) >= 1
 
 
-def test_duplicate_webhook_keeps_single_case(pg):
+def test_duplicate_webhook_keeps_single_case(pg, monkeypatch):
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Sigue el protocolo aprobado.')
     _, a = ask('Tengo una inundación urgente', ext='SM-dup')
     _, b = ask('Tengo una inundación urgente', ext='SM-dup')
     assert a['case_id'] == b['case_id']
@@ -369,10 +374,10 @@ def test_duplicate_webhook_keeps_single_case(pg):
 def test_urgency_without_approved_protocol_invents_no_contact(pg, monkeypatch):
     monkeypatch.delenv('INSURANCE_URGENT_PROTOCOL_TEXT', raising=False)
     reply, state = ask('Tengo una inundación urgente en casa')
-    assert state['insurance_result'] == 'urgent'
+    assert state['insurance_result'] == 'identity_not_verified'
     assert not any(ch.isdigit() for ch in reply)
     with pg() as conn:
-        assert conn.execute('SELECT urgency FROM insurance_cases').fetchone()['urgency'] == 'critical'
+        assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
     monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Sigue el protocolo aprobado X.')
     reply, _ = ask('Tengo una inundación urgente en casa', ext='SM9')
     assert reply.startswith('Sigue el protocolo aprobado X.')
@@ -456,6 +461,7 @@ def test_turns_stay_fast_while_admin_registrations_and_slow_bucket_worker_run(pg
     """Concurrent admin registrations + a worker stuck on a very slow bucket vs Voice/WhatsApp turns."""
     import threading
     import time
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Sigue el protocolo aprobado.')
     monkeypatch.setenv('INSURANCE_ADMIN_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_ADMIN_TOKEN_KEY', 'k' * 40)
     with pg() as conn:
@@ -514,6 +520,7 @@ def test_pg_down_never_confirms_a_case(monkeypatch, channel, text):
 
 
 def test_pg_lookup_ok_but_case_write_fails_does_not_confirm(pg, monkeypatch):
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Sigue el protocolo aprobado.')
     calls = {'n': 0}
     real = cases.db
 
