@@ -644,6 +644,7 @@ def test_deleted_airtable_mirror_is_recreated_on_next_revision(pg_schema, monkey
 
 
 def test_human_can_read_and_resolve_case_only_with_dedicated_key(pg_schema, monkeypatch):
+    monkeypatch.setenv('INSURANCE_HUMAN_SHARED_DETAIL_ENABLED', 'true')
     case_id = submit_question(external_id='SM-human')
     submit_question(external_id='SM-human-second', question='¿Qué documentos hacen falta?')
     human_key = 'k' * 40
@@ -797,6 +798,7 @@ def test_worker_imports_without_secrets_and_run_rejects_missing_config(monkeypat
 def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     pg_schema, monkeypatch
 ):
+    monkeypatch.setenv('INSURANCE_HUMAN_SHARED_DETAIL_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
     human_key = 'k' * 40

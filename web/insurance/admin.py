@@ -67,3 +67,37 @@ def register_document():
     except Exception as exc:
         log.error('insurance_admin_failed error_type=%s', type(exc).__name__)
         return jsonify(error='unavailable'), 503
+
+
+@bp.get('/insurance/admin/cases/<uuid:case_id>')
+def read_case(case_id):
+    """Operator case detail: individual token, business-scoped, every read audited (fail closed)."""
+    if os.getenv('INSURANCE_ADMIN_ENABLED', 'false').strip().lower() != 'true':
+        return jsonify(error='not_found'), 404
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.startswith('Bearer ') else ''
+    digest = token_hmac(token) if token and len(token) <= 256 else None
+    if not digest:
+        return jsonify(error='unauthorized'), 401
+    try:
+        with _cases.db() as conn:
+            conn.execute(f'SET statement_timeout={PG_STATEMENT_TIMEOUT_MS}')
+            admin = conn.execute(
+                'SELECT actor_id,business_id,can_read_cases FROM insurance_admin_users '
+                'WHERE token_hmac=%s AND active', (digest,)).fetchone()
+            if not admin:
+                return jsonify(error='unauthorized'), 401
+            if not admin['can_read_cases']:
+                outcome, body, code = 'forbidden', {'error': 'forbidden'}, 403
+            else:
+                case = _cases.get_case_for_operator(case_id, admin['business_id'])
+                outcome, body, code = (('ok', case, 200) if case else ('not_found', {'error': 'not_found'}, 404))
+            # The audit row is committed with the read; if it cannot be written nothing is returned.
+            conn.execute(
+                'INSERT INTO insurance_audit_log(actor_id,business_id,action,target,outcome) '
+                "VALUES(%s,%s,'case_read',%s,%s)",
+                (admin['actor_id'], admin['business_id'], str(case_id), outcome))
+        return jsonify(body), code
+    except Exception as exc:
+        log.error('insurance_case_read_failed error_type=%s', type(exc).__name__)
+        return jsonify(error='unavailable'), 503

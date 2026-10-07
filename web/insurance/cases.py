@@ -46,6 +46,14 @@ AIRTABLE_FIELDS = {
     'next_action': 'Next Action',
     'revision': 'Revision',
 }
+# Only sent when INSURANCE_AIRTABLE_ATTRIBUTION=true (the Airtable column must exist first).
+AIRTABLE_ATTRIBUTION_FIELDS = {'attribution_state': 'Attribution State'}
+ATTRIBUTION_STATES = {
+    'verified_authorized': 'Identidad verificada',
+    'candidate_pending_identity': 'Candidato, identidad pendiente',
+    'customer_unknown': 'Cliente desconocido',
+    'policy_pending_confirmation': 'Póliza pendiente de confirmar',
+}
 
 
 AIRTABLE_PRODUCTS = {'vida': 'Vida', 'hogar': 'Hogar', 'auto': 'Auto', 'coche': 'Auto'}
@@ -59,6 +67,8 @@ def airtable_value(key, value):
         return AIRTABLE_PRODUCTS.get(str(value or '').strip().casefold(), 'Otro')
     if key == 'urgency':
         return AIRTABLE_URGENCIES.get(str(value or '').strip().casefold(), 'Normal')
+    if key == 'attribution_state':
+        return ATTRIBUTION_STATES.get(str(value or ''), ATTRIBUTION_STATES['customer_unknown'])
     if key == 'status':
         return AIRTABLE_STATUSES.get(str(value or '').strip().casefold(), 'Pendiente')
     return value
@@ -102,16 +112,19 @@ def _customer_ref(business_id, customer):
     ).hexdigest()
 
 
-def _thread_key(policy_id, product):
+def _thread_key(policy_id, product, customer_id=None):
     value = (
         f'policy:{str(policy_id).strip()}'
         if policy_id
         else f'product:{str(product or "unknown").strip().casefold()}'
     )
+    if customer_id:  # a verified customer's cases never merge with an unverified phone thread
+        value += f'|customer:{customer_id}'
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
-def _payload(case_id, customer_ref, product, urgency, reason, status, revision):
+def _payload(case_id, customer_ref, product, urgency, reason, status, revision,
+             attribution_state='customer_unknown'):
     return {
         'case_id': str(case_id),
         'customer_ref': customer_ref,
@@ -125,7 +138,22 @@ def _payload(case_id, customer_ref, product, urgency, reason, status, revision):
         ),
         'next_action': 'Abrir el caso en el sistema seguro y seguir el protocolo aprobado.',
         'revision': revision,
+        'attribution_state': attribution_state,
     }
+
+
+def _refresh_attribution(conn, case_id):
+    """Derive the case attribution state from PG facts. Returns the new state."""
+    row = conn.execute(
+        'SELECT c.customer_id,c.policy_id,EXISTS(SELECT 1 FROM insurance_case_claims k '
+        "WHERE k.case_id=c.case_id AND k.match_status='candidate_found') AS has_candidate "
+        'FROM insurance_cases c WHERE c.case_id=%s', (case_id,)).fetchone()
+    if row['customer_id']:
+        state = 'verified_authorized' if row['policy_id'] else 'policy_pending_confirmation'
+    else:
+        state = 'candidate_pending_identity' if row['has_candidate'] else 'customer_unknown'
+    conn.execute('UPDATE insurance_cases SET attribution_state=%s WHERE case_id=%s', (state, case_id))
+    return state
 
 
 def _record_case_revision(
@@ -156,7 +184,7 @@ def _record_case_revision(
     ).fetchone()
     payload = _payload(
         case_id, customer_ref, product, urgency_value, reason, 'pending',
-        updated['revision'],
+        updated['revision'], _refresh_attribution(conn, case_id),
     )
     conn.execute(
         'INSERT INTO insurance_case_events(case_id,event_type,actor,details) '
@@ -187,6 +215,9 @@ def create_or_update_case(
     urgency='normal',
     next_action='Revisar la consulta y verificar identidad antes de acceder a la póliza.',
     context=None,
+    customer_id=None,
+    claim=None,
+    diagnostic_code=None,
 ):
     """Persist an unresolved question and its outbox entry in one PG transaction."""
     question = str(question or '').strip()
@@ -205,7 +236,8 @@ def create_or_update_case(
     context_json = _json_object(context or {}, 'context', MAX_CONTEXT_BYTES)
     evidence_json = _json_object(evidence or [], 'evidence', MAX_EVIDENCE_BYTES)
     customer_ref = _customer_ref(business_id, customer)
-    thread_key = _thread_key(policy_id, product)
+    customer_id = str(customer_id or '').strip() or None
+    thread_key = _thread_key(policy_id, product, customer_id)
     update_snapshot = json.dumps(
         [
             {
@@ -307,24 +339,36 @@ def create_or_update_case(
                 case_customer_ref = customer_ref
                 conn.execute(
                     'INSERT INTO insurance_cases '
-                    '(case_id,business_id,customer_ref,thread_key,product,policy_id,policy_version_id,status,latest_reason,urgency,next_action) '
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s)",
+                    '(case_id,business_id,customer_ref,thread_key,product,policy_id,policy_version_id,status,latest_reason,urgency,next_action,customer_id) '
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s,%s)",
                     (
                         case_id, business_id, customer_ref, thread_key, product,
                         policy_id, policy_version_id, reason, urgency, next_action,
+                        customer_id,
                     ),
                 )
                 event_type = 'created'
             conn.execute(
                 'INSERT INTO insurance_case_questions '
-                '(case_id,business_id,channel,external_id,question,policy_id,policy_version_id,reason,urgency,next_action,context,evidence) '
-                'VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)',
+                '(case_id,business_id,channel,external_id,question,policy_id,policy_version_id,reason,urgency,next_action,context,evidence,diagnostic_code) '
+                'VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)',
                 (
                     case_id, business_id, channel, external_id, question, policy_id,
                     policy_version_id, reason, urgency, next_action, context_json,
-                    evidence_json,
+                    evidence_json, diagnostic_code,
                 ),
             )
+            if claim and not customer_id:
+                conn.execute(
+                    'INSERT INTO insurance_case_claims(case_id,business_id,channel,external_id,'
+                    'claimed_document_hmac,claimed_document_tail,claimed_name,claimed_contract_number,'
+                    'candidate_customer_id,match_status) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
+                    'ON CONFLICT (business_id,channel,external_id) DO NOTHING',
+                    (case_id, business_id, channel, external_id, claim.get('document_hmac'),
+                     claim.get('document_tail'), (claim.get('name') or '')[:160] or None,
+                     (claim.get('contract_number') or '')[:40] or None,
+                     claim.get('candidate_customer_id'), claim.get('match_status', 'no_claim')),
+                )
             _record_case_revision(
                 conn,
                 case_id=case_id,
@@ -357,7 +401,7 @@ def resolve_case(case_id, resolved_by, resolution):
     try:
         with db() as conn:
             row = conn.execute(
-                'SELECT case_id,customer_ref,product,urgency,latest_reason,revision FROM insurance_cases '
+                'SELECT case_id,customer_ref,product,urgency,latest_reason,revision,attribution_state FROM insurance_cases '
                 "WHERE case_id=%s AND status='pending' FOR UPDATE",
                 (case_id,),
             ).fetchone()
@@ -385,7 +429,7 @@ def resolve_case(case_id, resolved_by, resolution):
             )
             payload = _payload(
                 case_id, row['customer_ref'], row['product'], row['urgency'],
-                row['latest_reason'], 'resolved', updated['revision'],
+                row['latest_reason'], 'resolved', updated['revision'], row['attribution_state'],
             )
             conn.execute(
                 'INSERT INTO insurance_outbox(case_id,revision,payload) VALUES(%s,%s,%s::jsonb)',
@@ -426,6 +470,45 @@ def get_case(case_id):
         raise CasePersistenceError('Insurance case could not be retrieved') from exc
 
 
+def get_case_for_operator(case_id, business_id):
+    """Full operator view, pinned to the operator's business. None if absent or other business.
+
+    Contains customer display name and unverified declarations, so callers MUST authenticate an
+    individual, enforce can_read_cases and audit the read before returning it."""
+    try:
+        with db() as conn:
+            case = conn.execute(
+                'SELECT c.case_id,c.business_id,c.product,c.policy_id,c.policy_version_id,c.status,'
+                'c.latest_reason,c.urgency,c.next_action,c.attribution_state,c.customer_id,c.created_at,'
+                'c.updated_at,cu.display_name AS customer_display_name,p.contract_number '
+                'FROM insurance_cases c LEFT JOIN insurance_customers cu '
+                'ON cu.business_id=c.business_id AND cu.customer_id=c.customer_id '
+                'LEFT JOIN insurance_policies p ON p.business_id=c.business_id AND p.policy_id=c.policy_id '
+                'WHERE c.case_id=%s AND c.business_id=%s', (case_id, business_id)).fetchone()
+            if not case:
+                return None
+            questions = conn.execute(
+                'SELECT channel,question,reason,urgency,next_action,diagnostic_code,evidence,created_at '
+                'FROM insurance_case_questions WHERE case_id=%s ORDER BY created_at,question_id',
+                (case_id,)).fetchall()
+            claims = conn.execute(
+                'SELECT k.channel,k.claimed_document_tail,k.claimed_name,k.claimed_contract_number,'
+                'k.match_status,k.candidate_customer_id,cu.display_name AS candidate_display_name,'
+                'k.created_at FROM insurance_case_claims k LEFT JOIN insurance_customers cu '
+                'ON cu.business_id=k.business_id AND cu.customer_id=k.candidate_customer_id '
+                'WHERE k.case_id=%s ORDER BY k.claim_id', (case_id,)).fetchall()
+        view = {k: (str(v) if k == 'case_id' else v) for k, v in dict(case).items()}
+        verified = bool(case['customer_id'])
+        view['identity_verified'] = verified
+        if verified:
+            view['policy_confirmed'] = bool(case['policy_id'])
+        return {'case': view, 'questions': [dict(q) for q in questions],
+                'unverified_claims': [dict(c, verified=False) for c in claims]}
+    except Exception as exc:
+        log.error('insurance_case_retrieval_failed error_type=%s', type(exc).__name__)
+        raise CasePersistenceError('Insurance case could not be retrieved') from exc
+
+
 def _airtable_config():
     base = os.getenv('AIRTABLE_INSURANCE_BASE_ID', '').strip()
     token = os.getenv('AIRTABLE_INSURANCE_TOKEN', '').strip()
@@ -448,10 +531,13 @@ def _case_filter_formula(case_id):
 
 def _upsert_airtable(payload, existing_record):
     base_url, headers = _airtable_config()
+    mapping = dict(AIRTABLE_FIELDS)
+    if os.getenv('INSURANCE_AIRTABLE_ATTRIBUTION', 'false').strip().lower() == 'true':
+        mapping.update(AIRTABLE_ATTRIBUTION_FIELDS)
     fields = {
-        AIRTABLE_FIELDS[key]: airtable_value(key, value)
+        mapping[key]: airtable_value(key, value)
         for key, value in payload.items()
-        if key in AIRTABLE_FIELDS
+        if key in mapping
     }
     if existing_record:
         response = requests.patch(
