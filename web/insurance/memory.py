@@ -302,9 +302,10 @@ def erase_customer(conn, business_id, customer_id):
 
 
 # ---- Tier C: incremental structured summary -------------------------------------------------
-def load_summary(conn, sc):
+def load_summary(conn, sc, *, lock=True):
     r = conn.execute('SELECT summary,last_turn_id FROM insurance_conversation_summary WHERE business_id=%s AND '
-                     'channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s FOR UPDATE',
+                     'channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s' +
+                     (' FOR UPDATE' if lock else ''),
                      _scope(sc)).fetchone()
     return (_bound_summary(_prune_summary(conn, sc, dict(r['summary']))), r['last_turn_id']) if r else ({}, 0)
 

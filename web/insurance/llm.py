@@ -1,5 +1,6 @@
 """Bounded plain-text explanations through the OpenAI Chat Completions SDK."""
 import math
+import logging
 import os
 from urllib.parse import urlsplit
 
@@ -30,6 +31,18 @@ def _client(*, api_key, timeout):
     return openai.OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
 
 
+def _suppress_provider_logs():
+    # SDK/transport DEBUG logs contain prompts and INFO logs expose endpoint paths.
+    # Keep suppression permanent: temporarily restoring levels races concurrent requests.
+    namespaces = ('openai', 'httpx', 'httpcore')
+    for namespace in namespaces:
+        logging.getLogger(namespace).setLevel(logging.WARNING)
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(logger, logging.Logger) and any(
+                name.startswith(namespace + '.') for namespace in namespaces):
+            logger.setLevel(logging.WARNING)
+
+
 def _context(question, evidence):
     if not isinstance(question, dict):
         return memory.build_context(question=question, evidence=evidence)
@@ -52,6 +65,7 @@ def explain(question, evidence):
     an OpenAI-compatible endpoint. Timeout defaults to 15 seconds (1..120), and
     INSURANCE_LLM_MAX_TOKENS defaults to 512 (64..4096). Retries are disabled.
     """
+    _suppress_provider_logs()
     model = os.getenv('INSURANCE_LLM_MODEL', '').strip()
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
     if not model or not api_key:

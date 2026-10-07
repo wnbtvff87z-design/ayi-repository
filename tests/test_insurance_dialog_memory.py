@@ -96,11 +96,16 @@ def test_required_prompt_over_budget_does_not_truncate_evidence_or_call_llm(pg, 
     ready(pg)
     monkeypatch.setenv('INSURANCE_LLM_CONTEXT_CHARS', '100')
     reply, out = ask('¿Cubre agua y tuberías?', ext='budget-failure')
-    assert not explained and reply == dialog.OFFER_HUMAN and out['insurance_result'] == 'missing_information'
+    assert not explained and reply != dialog.OFFER_HUMAN
+    assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'context_budget_exceeded'}
     assert count(pg, 'insurance_cases') == 0
-    pending = state(pg)['pending_human']
-    assert pending['case']['context']['detail'] == 'context_budget_exceeded'
-    assert 'tuberías' in pending['case']['evidence'][0]['text']
+    assert not state(pg).get('pending_human')
+    last = state(pg)['last_retrieval']
+    assert last['llm_diagnostic'] == 'context_budget_exceeded'
+    with pg() as conn:
+        evidence = dialog.retrieval.prior_evidence(
+            conn, BIZ, 'C2', last['policy_id'], last['version_id'], last['pages'])
+    assert 'tuberías' in evidence[0]['text']
 
 
 def test_independent_y_inside_sentence_does_not_merge_prior_question(pg, explained):
@@ -611,11 +616,13 @@ def test_llm_technical_failure_records_only_a_real_question_after_consent(pg, mo
     ask('Gracias', ext='thanks')
     assert count(pg, 'insurance_cases') == 0
     reply, out = ask('¿Cubre agua?', ext='technical-question')
-    assert reply == dialog.OFFER_HUMAN and out['insurance_result'] == 'missing_information'
+    assert reply != dialog.OFFER_HUMAN
+    assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'llm_error'}
+    assert not state(pg).get('pending_human')
     assert count(pg, 'insurance_cases') == 0
     reply, out = ask('Sí', ext='technical-consent')
-    assert 'He guardado' in reply and out['insurance_result'] == 'human_case_required'
-    assert count(pg, 'insurance_cases') == 1
+    assert 'He guardado' not in reply and out['insurance_result'] == 'missing_information'
+    assert count(pg, 'insurance_cases') == 0
 
 
 def test_original_question_redacts_document_in_all_memory_tiers(pg, explained):
@@ -628,16 +635,28 @@ def test_original_question_redacts_document_in_all_memory_tiers(pg, explained):
 
 
 def test_selected_context_reaches_actual_system_and_user_messages(monkeypatch):
-    sent = []
+    import httpx
+    import openai
 
-    def create(**kwargs):
-        sent.append(kwargs)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='Respuesta'))])
+    sent = []
+    actual_openai = openai.OpenAI
+
+    def model_http(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            'id': 'chat-selected-memory', 'object': 'chat.completion', 'created': 1,
+            'model': 'synthetic-model', 'choices': [
+                {'index': 0, 'finish_reason': 'stop',
+                 'message': {'role': 'assistant', 'content': 'Respuesta'}}]})
+
+    def sdk_constructor(**kwargs):
+        return actual_openai(
+            **kwargs, http_client=httpx.Client(transport=httpx.MockTransport(model_http)))
 
     monkeypatch.setenv('INSURANCE_LLM_MODEL', 'synthetic-model')
     monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-test-value')
-    monkeypatch.setitem(sys.modules, 'openai', SimpleNamespace(
-        OpenAI=lambda **kw: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))))
+    monkeypatch.setenv('OPENAI_BASE_URL', 'https://controlled.invalid/v1')
+    monkeypatch.setattr(openai, 'OpenAI', sdk_constructor)
     evidence = [{'document_id': 'D', 'version_id': 'V', 'page': 2, 'text': 'Agua: condiciones.'}]
     context = memory.build_context(
         question='¿Cubre agua?', evidence=evidence, policy='P', version='V',

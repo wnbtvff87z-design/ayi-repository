@@ -21,11 +21,12 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
     correlation = uuid.uuid4().hex[:16]
     report = {'correlation_id': correlation, 'stage': 'selection', 'llm_invoked': False}
     fingerprint = conn.execute(
-        'SELECT current_database() AS database,current_schema() AS schema').fetchone()
+        'SELECT current_database() AS database,current_schema() AS schema,'
+        'inet_server_addr()::text AS server,inet_server_port() AS port').fetchone()
     report['connection_fingerprint'] = hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
     active = conn.execute(
-        'SELECT 1 FROM insurance_customers WHERE business_id=%s AND customer_id=%s AND active',
+        'SELECT display_name FROM insurance_customers WHERE business_id=%s AND customer_id=%s AND active',
         (business_id, customer_id)).fetchone()
     if not active:
         return {**report, 'reason_code': 'customer_not_found'}
@@ -61,8 +62,11 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
                 return {**report, 'stage': 'state', 'reason_code': 'state_invalid_date'}
     report['intent'] = intent
     if intent in ('policy_name', 'policy_validity'):
-        selected = policy_info.lookup(conn, business_id, customer_id, fact_date, hint=policy_id)
+        selected = policy_info.lookup(
+            conn, business_id, customer_id, fact_date, hint=policy_id,
+            selected_version=state.get('version_id') if policy_id == state.get('policy_id') else None)
         return {**report, 'stage': 'selection', 'reason_code': selected['reason_code'],
+                'policy_id': selected.get('policy_id'), 'version_id': selected.get('version_id'),
                 'decision': 'metadata_only', 'llm_invoked': False}
     if mode == 'question' and intent in ('summary', 'availability'):
         mode = intent
@@ -70,7 +74,8 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
         conn, business_id, customer_id, question, fact_date, policy_hint=policy_id,
         mode=mode, include_trace=True)
     report.update(stage='retrieval', reason_code=result['reason_code'],
-                  retrieval_status=result['status'], diagnostics=result['diagnostics'])
+                  retrieval_status=result['status'], diagnostics=result['diagnostics'],
+                  policy_id=result.get('policy_id'), version_id=result.get('version_id'))
     report['selected_pages'] = memory.pages_of(result['evidence'])
     if result['status'] != 'ok':
         if result['status'] not in ('no_match', 'available'):
@@ -79,13 +84,15 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
     report['stage'] = 'context'
     try:
         summary, recent = '', ()
+        private_name = active.get('display_name') or ''
         if conversation_ref:
-            summary_data, _ = memory.load_summary(conn, sc)
+            summary_data, _ = memory.load_summary(conn, sc, lock=False)
             summary = memory.render_summary(summary_data, memory.cfg('INSURANCE_SUMMARY_MAX_CHARS'))
             recent = memory.recent(conn, sc)
         package = memory.build_context(
             question=question, evidence=result['evidence'], policy=result['policy_id'],
-            version=result['version_id'], recent_turns=recent, summary_text=summary, intent=mode)
+            version=result['version_id'], recent_turns=recent, summary_text=summary, intent=mode,
+            private_names=[private_name, private_name.split()[0] if private_name.split() else ''])
     except memory.ContextBudgetExceeded:
         return {**report, 'reason_code': 'context_budget_exceeded'}
     report['context_chars'] = package['report']['used']
@@ -98,6 +105,8 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
     try:
         answer = llm.explain(package, package['evidence'])
     except llm.LLMError as exc:
+        if exc.code == 'llm_not_configured':
+            report['llm_invoked'] = False
         return {**report, 'reason_code': exc.code, 'decision': 'technical_failure'}
     insufficient = answer.strip().upper() == 'ESCALAR'
     return {**report, 'stage': 'decision',

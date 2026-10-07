@@ -5,9 +5,11 @@ import json
 import time
 import tracemalloc
 
+import httpx
 import pytest
 
-from test_insurance_attribution import BIZ, add_document, pg  # noqa: F401
+from test_insurance_attribution import BIZ, add_document, ask, pg, verify  # noqa: F401
+from test_insurance_llm_adapter import completion, provider  # noqa: F401
 from insurance import memory, retrieval
 
 
@@ -66,6 +68,84 @@ def test_support_alone_is_not_a_coverage_match(pg):
         sections(conn, 'SUPPORT', {1: 'exclusions'})
         result = retrieve(conn)
         assert result['status'] == 'no_match' and result['evidence'] == []
+
+
+def test_answer_explanation_and_duplicate_reload_keep_cited_standalone_support(pg):
+    add_document(pg, 'POL-900', 'COVERAGE', pages=('Agua: cubre tuberías rotas.',))
+    add_document(pg, 'POL-900', 'SUPPORT', pages=('No se cubre desgaste ni falta de mantenimiento.',))
+    with pg() as conn:
+        sections(conn, 'SUPPORT', {1: 'exclusions'})
+        answer = retrieve(conn)
+        refs = memory.pages_of(answer['evidence'])
+        assert {e['document_id'] for e in answer['evidence']} == {'COVERAGE', 'SUPPORT'}
+        explained = retrieval.prior_evidence(
+            conn, BIZ, 'C2', 'POL-900', 'VER-001', refs, question='agua')
+        assert explained == answer['evidence']
+        duplicate = retrieval.prior_evidence(
+            conn, BIZ, 'C2', 'POL-900', 'VER-001', memory.pages_of(explained), question='agua')
+        assert duplicate == explained
+        for invalid in (
+                [{**ref, 'section': 'coverage'} if ref['document_id'] == 'SUPPORT' else ref for ref in refs],
+                [{**ref, 'position_end': 999999} if ref['document_id'] == 'SUPPORT' else ref for ref in refs],
+                [{**ref, 'source': 'invalid'} if ref['document_id'] == 'SUPPORT' else ref for ref in refs]):
+            assert retrieval.prior_evidence(
+                conn, BIZ, 'C2', 'POL-900', 'VER-001', invalid, question='agua') == []
+        assert retrieval.prior_evidence(
+            conn, BIZ, 'C1', 'POL-900', 'VER-001', refs, question='agua') == []
+        assert retrieval.prior_evidence(
+            conn, BIZ, 'C2', 'POL-900', 'VER-001',
+            [*refs, {**refs[0], 'source': 'text'}], question='agua') == []
+        assert retrieval.prior_evidence(
+            conn, BIZ, 'C2', 'POL-900', 'VER-001',
+            [ref for ref in refs if ref['document_id'] == 'SUPPORT'], question='unrelated') == []
+        conn.execute("UPDATE insurance_documents SET status='needs_review' WHERE document_id='SUPPORT'")
+        assert retrieval.prior_evidence(
+            conn, BIZ, 'C2', 'POL-900', 'VER-001', refs, question='agua') == []
+
+
+def test_load_summary_without_lock_preserves_pruning_in_read_only_transaction(pg):
+    sc = memory.Scope(BIZ, 'WhatsApp', 'summary-read-only', '', 'C2')
+    with pg() as conn:
+        q, _ = memory.record_user(conn, sc, 'summary-ro', 'agua', 'question', 'synthetic')
+        a = memory.record_assistant(conn, sc, 'summary-ro', 'Respuesta.', 'answer', q, 'synthetic')
+        memory.update_summary(
+            conn, sc, user_turn_id=q, assistant_turn_id=a, question='agua',
+            answer='Respuesta.', decision='answer', policy_id='POL-900',
+            version_id='VER-001', pages=[])
+        conn.execute("UPDATE insurance_conversation_summary SET summary=summary || "
+                     """'{"facts":[{"turn":-1,"text":"private stale content"}]}'::jsonb""")
+    with pg() as conn:
+        conn.execute('SET TRANSACTION READ ONLY')
+        summary, last = memory.load_summary(conn, sc, lock=False)
+        assert last == a
+        assert summary['facts'] == []
+        assert summary['topics'][0]['q'] == 'agua'
+
+
+def test_real_sdk_dialog_answer_explanation_and_authorized_duplicate_keep_support(pg, provider):
+    add_document(pg, 'POL-900', 'COVERAGE', pages=('Agua: cubre tuberías rotas.',))
+    add_document(pg, 'POL-900', 'SUPPORT', pages=('No se cubre desgaste ni falta de mantenimiento.',))
+    with pg() as conn:
+        sections(conn, 'SUPPORT', {1: 'exclusions'})
+    verify(pg, customer='C2')
+
+    def grounded_http(request):
+        prompt = json.loads(request.content)['messages'][-1]['content'].split('CLÁUSULAS:\n', 1)[-1]
+        assert 'Agua: cubre tuberías rotas.' in prompt
+        assert 'No se cubre desgaste ni falta de mantenimiento.' in prompt
+        return httpx.Response(200, json=completion(
+            'La cláusula cubre tuberías rotas, salvo desgaste o falta de mantenimiento.'))
+
+    requests, _ = provider(grounded_http)
+    answer, out = ask('¿Cubre agua?', ext='standalone-answer')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'desgaste' in answer and len(requests) == 1
+    explanation, out = ask('¿Dónde lo dice?', ext='standalone-explain')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'SUPPORT' in explanation and len(requests) == 2
+    duplicate, out = ask('¿Dónde lo dice?', ext='standalone-explain')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert duplicate == explanation and len(requests) == 2
 
 
 def test_support_fallback_remains_customer_policy_version_ready_and_quality_scoped(pg):

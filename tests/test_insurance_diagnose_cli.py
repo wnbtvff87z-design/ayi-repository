@@ -7,7 +7,7 @@ import pytest
 from psycopg.errors import ReadOnlySqlTransaction
 
 from test_insurance_attribution import BIZ, add_document, pg  # noqa: F401
-from insurance import admin, diagnose
+from insurance import admin, diagnose, identity
 
 
 def operator(pg, monkeypatch):
@@ -91,3 +91,24 @@ def test_diagnostic_review_without_state_reports_state_failure(pg):
             fact_date=date.today())
         assert report['stage'] == 'state'
         assert report['reason_code'] == 'previous_query_unavailable'
+
+
+def test_cli_reads_conversation_context_without_locking_or_writing(pg, monkeypatch, capsys):
+    operator(pg, monkeypatch)
+    add_document(pg, 'POL-900', 'SYN-DIAG')
+    ref = 'b' * 64
+    with pg() as conn:
+        identity.save_state(conn, BIZ, 'WhatsApp', ref, '',
+                            {'customer_id': 'C2', 'policy_id': 'POL-900'})
+        before = conn.execute(
+            'SELECT state,updated_at FROM insurance_conversation_state').fetchone()
+    monkeypatch.setattr('sys.stdin', io.StringIO('agua'))
+    assert diagnose.main(['--business-id', BIZ, '--customer-id', 'C2',
+                          '--conversation-ref', ref]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['reason_code'] == 'context_ready'
+    assert report['state_status'] == 'loaded' and report['llm_invoked'] is False
+    with pg() as conn:
+        after = conn.execute(
+            'SELECT state,updated_at FROM insurance_conversation_state').fetchone()
+    assert after == before

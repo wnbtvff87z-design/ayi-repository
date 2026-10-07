@@ -104,7 +104,10 @@ y `relay/requirements.txt`; no se añadió una dependencia.
 La frase de recepción no está en Insurance: es un fallback compartido de Web.
 Sin logs privados del turno y SHA desplegado, **la causa exacta de ese saludo en
 WhatsApp real queda NO VERIFICADA**. Aquí se corrige el comportamiento local y
-se añade diagnóstico para distinguirlo. No se cambia el fallback de otros sectores.
+se añade diagnóstico para distinguirlo. Si falla la resolución del negocio antes
+del diálogo, Web ahora explica ese fallo sin hablar de un resultado de operación:
+no se llegó a ejecutar ninguna. Se conserva el fallback de errores operativos
+de los otros sectores ya resueltos y no se modifica su lógica.
 Disponibilidad, revisión y explicación de insuficiencia ya tenían rutas específicas
 en este develop. Que en el servicio real todas devolvieran la misma oferta puede
 obedecer a estado, código desplegado u otra ruta; no permite atribuirles a todas
@@ -145,7 +148,7 @@ de selección se calcula en zona del negocio, no con la fecha local del servidor
 ### Recuperación y contrato OpenAI
 
 `ready` no prueba que Web use la misma base. Comparar en la consola autorizada
-la huella de conexión/esquema, cliente autorizado, selección de versión,
+la huella de servidor/base/esquema, cliente autorizado, selección de versión,
 documentos y páginas utilizables. Una búsqueda SQL sobre `body` puede encontrar
 palabras fuera de `left(body,600)`; además ignora las decisiones conversacionales,
 autorizaciones, fechas, calidad, ranking y contexto. Una coincidencia de
@@ -248,3 +251,78 @@ cambio no modifica migraciones aplicadas ni requiere borrar datos. No tocar
 restaurantes, consultoras, Cron ni credenciales. Riesgos: interpretación del
 modelo, evidencia extensa que exceda presupuesto, terminología no encontrada,
 configuración de fecha/zona/modelo y diferencias de capacidad local/Railway.
+
+### Evidencia de pruebas y mediciones
+
+La reproducción firmada se ejecutó contra una copia archivada del SHA inicial,
+precargando sus módulos antes de pytest: **11 fallos conductuales, 5 pruebas
+pasadas** (reinicio excluido de esa comparación inicial). No fueron fallos de
+importación de módulos nuevos. Los grupos que fallaban eran los ocho estados/
+variantes de la secuencia, rechazo más pregunta sin puntuación y timeout/
+autenticación transformados en falta de evidencia. Los mismos grupos pasan
+con el cambio. La suite ampliada añade reinicios reales por subprocess,
+oferta persistida, conversación larga, fechas y urgencias.
+
+| Archivo | Qué comprueba |
+|---|---|
+| `tests/test_insurance_whatsapp_grounded.py` | Webhook Twilio firmado, resolución HTTP Numeros/Negocios, router real, DSN real con esquema aislado, identidad, estado, retrieval, SDK OpenAI real, respuesta/persistencia; no mocks de diálogo, retrieval ni `llm_explain`. El transporte exige cláusulas/posiciones y deriva respuestas de evidencia sintética; no responde siempre exitosamente. |
+| `tests/test_insurance_llm_adapter.py` | Mensajes exactos, modelo, temperatura, timeout, límite, reintentos, parsing HTTP/SDK, respuesta vacía/truncada, rechazo, 401/403/429/red, configuración y minimización de identidad. |
+| `tests/test_insurance_retrieval_quality.py` | Cláusula tardía, vecinos/encabezados/procedencia, apoyo en otra página sin repetir palabra, resumen sin cortar limitación final, FTS/normalización, límites de candidatos y presupuesto. |
+| `tests/test_insurance_dialog_regressions.py` | Transiciones, metadatos sin documentos/modelo, autorización revocada, inclusividad y zona horaria; pruebas unitarias complementarias, no la única demostración. |
+| `tests/test_insurance_diagnose_cli.py` | Autorización administrativa, transacción de solo lectura real, rechazo de escrituras, stdout sin texto sensible y etapas distintas. |
+| `tests/test_insurance_scale.py` y medición nueva de retrieval | 10.000 pólizas, dos negocios, 20.000 versiones, 40.000 documentos, 240.000 páginas, clientes multípóliza, índices/planes/candidatas y memoria Python. |
+
+Medición local adicional con `tracemalloc`: ámbito de una póliza **169.566 B /
+9,51 ms**; ambigüedad de cinco pólizas **13.690 B / 2,46 ms**; cliente con
+5.000 pólizas **101.636 B / 55,90 ms**; selección explícita **23.700 B / 5,78 ms**.
+Son picos de asignaciones Python instrumentadas, no RSS total ni memoria de
+PostgreSQL; tampoco p95 de tráfico concurrente ni garantía de Railway.
+Los planes JSON y métricas pueden reproducirse con pytest `-s` en la prueba
+de medición. No añaden GIN global ni embeddings. El caso sin coincidencias
+no llama al modelo; metadatos/disponibilidad tampoco, reduciendo coste y latencia.
+Entorno comprobado: Python 3.12, PostgreSQL 16, SDK OpenAI 2.54.0 y httpx 0.28.1.
+No se han cambiado los requisitos del proyecto; comprobar la versión instalada
+en el build desplegado, no asumir que coincide con esta instalación local.
+Los logs de depuración de OpenAI/httpx/httpcore se suprimen en el límite del
+adaptador, incluso con DEBUG, porque pueden incluir mensajes o rutas privadas.
+
+Validación local (solo DSN de prueba desechable, nunca producción):
+
+```sh
+INSURANCE_TEST_DATABASE_URL='<PostgreSQL local de pruebas>' python -m pytest -q
+INSURANCE_TEST_DATABASE_URL='<PostgreSQL local de pruebas>' python -m pytest -q -s \
+  tests/test_insurance_scale.py tests/test_insurance_retrieval_quality.py
+python -m compileall -q web relay tests
+git diff --check
+```
+
+Para repetir los once fallos originales sin cambiar la rama ni tocar datos
+existentes, desde la raíz del checkout y con PostgreSQL local desechable:
+
+```sh
+baseline=$(mktemp -d /tmp/insurance-baseline.XXXXXX)
+git archive 8b2a6455fa88df8ff50f907f457d906857d8e154 web | tar -x -C "$baseline"
+INSURANCE_TEST_DATABASE_URL='<PostgreSQL local de pruebas>' \
+INSURANCE_BASELINE_WEB="$baseline/web" python -c \
+"import os,sys; sys.path.insert(0,os.environ['INSURANCE_BASELINE_WEB']); import main; from insurance import cases,identity,dialog,retrieval,memory; import pytest; raise SystemExit(pytest.main(['-q',os.path.abspath('tests/test_insurance_whatsapp_grounded.py'),'--tb=line','--show-capture=no','-k','observed_spanish_sequence or refusal_with_new or technical_model_failure']))"
+rm -rf "$baseline"
+```
+
+Precargar los módulos archivados es necesario porque los tests actuales añaden
+la ruta Web del checkout. La copia temporal vive solo en `/tmp`; no contiene el
+PDF ni datos del propietario. Sin precarga se podría probar por error el código
+corregido y obtener una falsa demostración del antes.
+
+CI remoto: **NO EJECUTADO**, no se ha añadido ni cambiado un workflow. El fixture
+de integración falla si `CI=true`/`CI=1` carece de
+`INSURANCE_TEST_DATABASE_URL`; no puede declarar éxito saltándose PostgreSQL.
+Configurar una base exclusiva y desechable según el procedimiento existente,
+nunca la base de Web/producción. Fuera de CI, el modo offline puede saltar estas
+pruebas y **no cuenta** como validación integral.
+
+La revisión automática basada en `autofind` está **NO EJECUTADA** porque el
+binario no está disponible: el mensaje de éxito/sin comentarios del wrapper
+no equivale a revisión aprobada. Se solicita revisión independiente del cambio.
+CodeQL Python sí está disponible; la primera ejecución detectó un riesgo ReDoS
+en la clasificación de saludos, que debe quedar corregido y reanalizado antes
+de la entrega. El escaneo de secretos inicial no encontró secretos.

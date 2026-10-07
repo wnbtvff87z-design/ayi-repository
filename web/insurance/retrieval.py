@@ -122,17 +122,16 @@ def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages,
                                            or start < 0 or end <= start))):
             return []
         unique_pages.add((doc, number))
-        ref = (doc, number, start, end)
-        if ref in refs:
+        ref = (doc, number, start, end, page.get('section'), page.get('source'))
+        if any(previous[:4] == ref[:4] for previous in refs):
             return []
         refs.append(ref)
     if len(unique_pages) > MAX_PAGES:
         return []
     evidence = []
     reselected_pages = set()
-    for doc, number, start, end in refs:
-        if question is not None and (doc, number) in reselected_pages:
-            continue
+    matched_question = False
+    for doc, number, start, end, section, source in refs:
         row = conn.execute(
             'SELECT pp.document_id,pp.page_number,pp.section,pp.source,pp.body '
             'FROM insurance_policies p JOIN insurance_policy_versions v '
@@ -145,22 +144,32 @@ def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages,
             'AND pp.indexed AND pp.quality=\'ok\' AND pp.source IN (\'text\',\'ocr\') '
             'AND length(btrim(pp.body))>0',
             (business_id, customer_id, policy_id, version_id, doc, number)).fetchone()
-        if not row:
+        if (not row or (section is not None and section != row['section'])
+                or (source is not None and source != row['source'])):
             return []
+        if question is not None and (doc, number) in reselected_pages:
+            continue
         if question is not None:
-            reselected_pages.add((doc, number))
             ranges = _fragment_ranges(row['body'], _query_terms(question))
             if not ranges:
-                return []
-            evidence.extend(_evidence_fragment(row, version_id, left, right)
-                            for left, right in ranges)
+                # Standalone supporting sections were cited by metadata, not lexical overlap.
+                # Reload only their exact bounded, same-section source ranges; a matching
+                # primary clause is still required before any such support can be returned.
+                if (section not in SUPPORT or start is None or end > len(row['body'])):
+                    return []
+                evidence.append(_evidence_fragment(row, version_id, start, end))
+            else:
+                reselected_pages.add((doc, number))
+                matched_question = True
+                evidence.extend(_evidence_fragment(row, version_id, left, right)
+                                for left, right in ranges)
         elif start is None:
             evidence.append(_evidence(row, version_id))
         elif end <= len(row['body']):
             evidence.append(_evidence_fragment(row, version_id, start, end))
         else:
             return []
-    return evidence
+    return evidence if question is None or matched_question else []
 
 
 def _tokens(text):

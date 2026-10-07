@@ -11,27 +11,38 @@ TYPES = (
 )
 FOLLOWUP = re.compile(r'cobertura|cubr|exclusi|condici|l[ií]mit|franquicia|indemniz|d[oó]nde|por qu[eé]', re.I)
 OCCURRED = re.compile(r'se me|se produjo|prendi[oó]|tuve|tuvimos|ocurri[oó]|sufr[ií]|siniestro', re.I)
+HYPOTHETICAL_RE = re.compile(
+    r'\b(?:hipot[eé]tic[oa]|en\s+caso\s+de|si\s+(?:hubiera|ocurriera|tuviera|tuviese|'
+    r'tengo|tenemos|hay|ocurre|estoy|sufriera|sufro|se\s+me))\b', re.I)
+NEW_INCIDENT_RE = re.compile(
+    r'\b(?:otro|otra|nuevo|nueva)\s+(?:incendio|fuego|inundaci[oó]n|siniestro|rotura|'
+    r'accidente|robo|fuga)\b', re.I)
 
 
 def update(state, text, business):
     matches = [name for name, pattern in TYPES if re.search(pattern, text or '', re.I)]
     previous = state.get('active_topic')
     changed = bool(matches and (len(matches) > 1 or matches[0] != previous))
-    if changed:
+    hypothetical = bool(HYPOTHETICAL_RE.search(text or ''))
+    new_incident = bool(NEW_INCIDENT_RE.search(text or '') or (
+        OCCURRED.search(text or '') and re.search(r'\b(?:otro|otra|nuevo|nueva)\b', text or '', re.I)))
+    reset = changed or new_incident or hypothetical
+    if reset:
         for key in ('fact_date', 'incident_date', 'last_incident_type'):
             state.pop(key, None)
     if len(matches) == 1:
         state['active_topic'] = matches[0]
-        if OCCURRED.search(text or ''):
+        if not hypothetical and OCCURRED.search(text or ''):
             state['last_incident_type'] = matches[0]
     elif len(matches) > 1:
         state['active_topic'] = ' y '.join(matches)
-    span = incident_dates.parse(text, tz=business.get('timezone') or 'Europe/Madrid')
+    span = (None if hypothetical else
+            incident_dates.parse(text, tz=business.get('timezone') or 'Europe/Madrid'))
     if span:
         state['incident_date'] = span.as_state()
         if span.status == 'resolved':
             state['fact_date'] = span.start.isoformat()
-    state['_incident_reset'] = changed
+    state['_incident_reset'] = reset
     return span
 
 

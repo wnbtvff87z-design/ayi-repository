@@ -345,7 +345,9 @@ def whatsapp():
     tw.message('No pude procesar tu consulta de seguros ahora. No he confirmado ninguna operación.')
    else:
     log.error('WhatsApp error correlation_id=%s stage=%s error_type=%s',corr,stage,type(exc).__name__)
-    tw.message('No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
+    tw.message('No pude identificar el negocio para atender tu mensaje ahora. No he ejecutado ninguna operación.'
+               if stage=='tenant_lookup' else
+               'No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
   return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
 def voice():

@@ -167,7 +167,7 @@ def diagnose_retrieval():
                             code, response, outcome = 400, {'error': 'invalid_date'}, 'invalid_date'
                         else:
                             active = conn.execute(
-                                'SELECT 1 FROM insurance_customers WHERE business_id=%s '
+                                'SELECT display_name FROM insurance_customers WHERE business_id=%s '
                                 'AND customer_id=%s AND active',
                                 (business_id, customer_id.strip())).fetchone()
                             if not active:
@@ -181,7 +181,7 @@ def diagnose_retrieval():
                                 code, outcome, result_status = 200, result['status'], result['status']
                                 if body.get('run_llm', True) and result['status'] == 'ok':
                                     llm_request = (question.strip(), evidence, result.get('policy_id'),
-                                                   result.get('version_id'))
+                                                   result.get('version_id'), active.get('display_name'))
                                 response = {
                                     'correlation_id': corr, 'stage': 'retrieval',
                                     'retrieval_status': result['status'],
@@ -199,10 +199,12 @@ def diagnose_retrieval():
                   corr, type(exc).__name__)
     if llm_request:
         from insurance import dialog, llm, memory
-        question, evidence, policy_id, version_id = llm_request
+        question, evidence, policy_id, version_id, private_name = llm_request
+        private_name = private_name or ''
         try:
             package = memory.build_context(
-                question=question, evidence=evidence, policy=policy_id, version=version_id)
+                question=question, evidence=evidence, policy=policy_id, version=version_id,
+                private_names=[private_name, private_name.split()[0] if private_name.split() else ''])
             prompt = memory.format_prompt(package)
             response['text_chars_to_llm'] = len(memory.INSTRUCTIONS) + len(prompt)
             answer = dialog.llm_explain(package, evidence)

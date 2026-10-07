@@ -1,4 +1,5 @@
 """Synthetic PostgreSQL regressions for insurance dialogue intent and failure handling."""
+import logging
 from datetime import date, datetime, timezone
 
 import pytest
@@ -248,8 +249,418 @@ def test_ended_incident_and_followup_do_not_repeat_live_safety_protocol(ready, m
                      ext='ended-fire')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert 'aléjate' not in first and 'cuándo ocurrió' in first
-    dated, _ = ask('ayer', ext='ended-date')
-    assert 'aléjate' not in dated
+    dated, dated_out = ask('ayer', ext='ended-date')
+    assert 'aléjate' not in dated and dated_out['insurance_result'] == 'evidence_backed_explanation'
+    assert state(pg).get('fact_date')
     followup, _ = ask('¿Qué condiciones tiene?', ext='ended-conditions')
     assert 'aléjate' not in followup and state(pg)['incident_ended'] is True
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_hypothetical_se_me_does_not_request_an_incident_date(ready):
+    pg, calls = ready
+    reply, out = ask('si se me rompe una mesa de vidrio', ext='hypothetical-se-me')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert calls and 'Cuándo ocurrió' not in reply and 'cuándo ocurrió' not in reply
+    assert not state(pg).get('fact_date') and not state(pg).get('awaiting')
+
+
+def test_actual_breakage_requests_missing_date_and_uses_ayer(ready):
+    pg, calls = ready
+    reply, out = ask('se me rompió una mesa de vidrio', ext='actual-undated')
+    assert out['insurance_result'] == 'missing_information'
+    assert 'Cuándo ocurrió' in reply and not calls
+    dated, dated_out = ask('ayer', ext='actual-date')
+    assert dated_out['insurance_result'] == 'evidence_backed_explanation'
+    assert state(pg).get('fact_date') and 'Interpreto que ocurrió' in dated
+
+
+def test_actual_breakage_with_ayer_uses_declared_date_without_reasking(ready):
+    pg, _ = ready
+    reply, out = ask('se me rompió ayer una mesa de vidrio', ext='actual-dated')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'Interpreto que ocurrió' in reply and state(pg).get('fact_date')
+
+
+def test_metadata_does_not_invent_missing_product_or_contract_number(pg):
+    verify(pg, 'C2')
+    with pg() as conn:
+        conn.execute("UPDATE insurance_policies SET product='',contract_number=NULL "
+                     "WHERE business_id=%s AND policy_id='POL-900'", (BIZ,))
+    reply, out = ask('cómo se llama mi póliza', ext='missing-metadata')
+    assert out['insurance_result'] == 'policy_information'
+    assert 'No hay un producto registrado' in reply
+    assert 'No hay un número de contrato registrado' in reply
+    assert 'hogar' not in reply and '900' not in reply
+
+
+def test_diagnostics_log_counters_and_positions_without_question_or_evidence(ready, caplog):
+    pg, _ = ready
+    body = 'Introducción administrativa sintética. ' * 75 + 'Ventanas: condiciones sintéticas.'
+    add_document(pg, 'POL-900', 'DOC-LATE-SYNTHETIC', pages=(body,))
+    caplog.set_level(logging.INFO, logger='insurance.dialog')
+    ask('ventanas', ext='safe-diagnostics')
+    messages = '\n'.join(record.getMessage() for record in caplog.records
+                         if record.name == 'insurance.dialog')
+    assert 'policy_candidates=' in messages and 'page_candidates=' in messages
+    assert 'stage=retrieval_fragment' in messages and 'position_start=' in messages
+    assert 'context_chars=' in messages and 'llm_invoked=true' in messages
+    assert 'Introducción administrativa' not in messages and 'Ventanas: condiciones' not in messages
+    assert 'DOC-LATE-SYNTHETIC' not in messages and 'ventanas' not in messages
+
+
+@pytest.mark.parametrize('end', [date(2020, 1, 31), None])
+def test_version_dates_never_claim_renewal_and_expired_policy_metadata_remains_available(
+        pg, monkeypatch, end):
+    verify(pg, 'C2')
+    monkeypatch.setattr(dialog, '_business_date', lambda business: date(2020, 2, 1))
+    with pg() as conn:
+        conn.execute('UPDATE insurance_policy_versions SET valid_from=%s,valid_to=%s '
+                     'WHERE business_id=%s AND policy_id=%s',
+                     (date(2020, 1, 1), end, BIZ, 'POL-900'))
+    reply, out = ask('hasta cuándo está vigente mi póliza', ext='version-not-renewal')
+    assert out['insurance_result'] == 'policy_information'
+    assert 'hogar' in reply and '900' in reply
+    assert 'no hay una fecha de renovación confirmada' in reply
+    if end:
+        assert 'Hasta 2020-01-31, incluido' in reply and 'tuvo vigencia' in reply
+        assert 'No he podido confirmar una versión vigente' in reply
+    else:
+        assert 'No hay fecha de fin registrada' in reply
+        assert 'eso no permite afirmar una vigencia indefinida' in reply
+
+
+def test_cached_metadata_is_not_replayed_as_current_after_version_expiry(pg, monkeypatch):
+    verify(pg, 'C2')
+    today = {'value': date(2020, 1, 31)}
+    monkeypatch.setattr(dialog, '_business_date', lambda business: today['value'])
+    with pg() as conn:
+        conn.execute('UPDATE insurance_policy_versions SET valid_from=%s,valid_to=%s '
+                     'WHERE business_id=%s AND policy_id=%s',
+                     (date(2020, 1, 1), date(2020, 1, 31), BIZ, 'POL-900'))
+    original = ask('hasta cuándo está vigente mi póliza', ext='expiry-retry')[0]
+    assert ask('hasta cuándo está vigente mi póliza', ext='expiry-retry')[0] == original
+    today['value'] = date(2020, 2, 1)
+    replay, _ = ask('hasta cuándo está vigente mi póliza', ext='expiry-retry')
+    assert replay != original
+    fresh, _ = ask('hasta cuándo está vigente mi póliza', ext='expired-fresh')
+    assert 'tuvo vigencia' in fresh and '900' in fresh
+
+
+def test_future_authorized_version_dates_are_reported_without_current_force(pg, monkeypatch):
+    verify(pg, 'C2')
+    monkeypatch.setattr(dialog, '_business_date', lambda business: date(2020, 1, 1))
+    with pg() as conn:
+        conn.execute('UPDATE insurance_policy_versions SET valid_from=%s,valid_to=%s '
+                     'WHERE business_id=%s AND policy_id=%s',
+                     (date(2020, 2, 1), date(2020, 12, 31), BIZ, 'POL-900'))
+    reply, out = ask('hasta cuándo está vigente mi póliza', ext='future-metadata')
+    assert out['insurance_result'] == 'policy_information'
+    assert '2020-02-01' in reply and 'Hasta 2020-12-31, incluido' in reply
+    assert 'todavía no ha comenzado' in reply and 'renovación confirmada' in reply
+
+
+def test_metadata_keeps_known_selected_version_instead_of_silently_selecting_today(ready, monkeypatch):
+    pg, _ = ready
+    today = {'value': date(2020, 1, 31)}
+    monkeypatch.setattr(dialog, '_business_date', lambda business: today['value'])
+    with pg() as conn:
+        conn.execute('UPDATE insurance_policy_versions SET valid_from=%s,valid_to=%s '
+                     'WHERE business_id=%s AND policy_id=%s',
+                     (date(2020, 1, 1), date(2020, 1, 31), BIZ, 'POL-900'))
+        conn.execute('INSERT INTO insurance_policy_versions'
+                     '(business_id,policy_id,version_id,valid_from,valid_to) VALUES(%s,%s,%s,%s,%s)',
+                     (BIZ, 'POL-900', 'VER-002', date(2020, 2, 1), date(2020, 12, 31)))
+    assert ask('ventanas', ext='choose-version')[1]['insurance_result'] == 'evidence_backed_explanation'
+    today['value'] = date(2020, 2, 1)
+    reply, out = ask('hasta cuándo está vigente mi póliza', ext='selected-metadata')
+    assert out['insurance_result'] == 'policy_information'
+    assert 'Hasta 2020-01-31, incluido' in reply and 'tuvo vigencia' in reply
+    assert '2020-12-31' not in reply
+    assert state(pg)['version_id'] == 'VER-001'
+
+
+def test_ambiguous_future_versions_clarify_without_guessing_dates(pg, monkeypatch):
+    verify(pg, 'C2')
+    monkeypatch.setattr(dialog, '_business_date', lambda business: date(2020, 1, 1))
+    with pg() as conn:
+        conn.execute('UPDATE insurance_policy_versions SET valid_from=%s,valid_to=%s '
+                     'WHERE business_id=%s AND policy_id=%s',
+                     (date(2020, 2, 1), date(2020, 2, 29), BIZ, 'POL-900'))
+        conn.execute('INSERT INTO insurance_policy_versions'
+                     '(business_id,policy_id,version_id,valid_from,valid_to) VALUES(%s,%s,%s,%s,%s)',
+                     (BIZ, 'POL-900', 'VER-002', date(2020, 3, 1), date(2020, 12, 31)))
+    reply, out = ask('hasta cuándo está vigente mi póliza', ext='ambiguous-metadata')
+    assert out['insurance_result'] == 'missing_information'
+    assert 'varias versiones registradas' in reply and '2020-02-29' not in reply
+    assert 'Cuándo ocurrió' not in reply and not state(pg).get('pending_human')
+
+
+@pytest.mark.parametrize('text', [
+    'El incendio terminó pero hay una fuga de gas ahora.',
+    'Ya no hay peligro por el incendio, sin embargo hay una fuga de gas ahora mismo.',
+    'Hay una fuga de gas ahora, pero el incendio terminó.',
+])
+def test_new_explicit_live_hazard_outranks_a_different_ended_event(pg, monkeypatch, text):
+    monkeypatch.setattr(dialog.retrieval, 'retrieve', lambda *a, **kw:
+                        pytest.fail('live safety must precede retrieval'))
+    reply, out = ask(text, ext='new-danger')
+    assert out['insurance_result'] == 'urgent' and 'servicios de emergencia' in reply
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+@pytest.mark.parametrize('text', [
+    'Hay un incendio pero ya terminó y no hay peligro.',
+    'El incendio terminó pero si hubiera una fuga de gas qué cubriría.',
+    'El incendio terminó y no hay peligro.',
+    'Si tuviera un incendio en curso ahora mismo, qué cubriría.',
+    'Si se me prende fuego la casa ahora mismo, qué cubriría.',
+])
+def test_ended_same_event_and_hypothetical_hazards_stay_nonurgent(text):
+    assert not dialog._real_urgent(text)
+
+
+@pytest.mark.parametrize('question,expected', [
+    ('ventanas', 'sí recibió una explicación'),
+    ('puedes consultar mi póliza', 'confirmé la disponibilidad'),
+    ('cómo se llama mi póliza', 'datos registrados de la póliza'),
+    ('hasta cuándo está vigente mi póliza', 'datos registrados de la póliza'),
+])
+def test_missing_evidence_followup_never_falsely_marks_successful_consult_unresolved(
+        ready, question, expected):
+    pg, calls = ready
+    ask(question, ext='successful-consult')
+    previous_calls = len(calls)
+    reply, _ = ask('no encontraste evidencia de qué', ext='honest-followup')
+    assert expected in reply
+    assert 'Quedó sin resolver' not in reply and '¿Quieres que registre' not in reply
+    assert len(calls) == previous_calls
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_missing_evidence_after_failure_then_success_clarifies_which_consult(ready):
+    pg, _ = ready
+    ask('¿Cubre zyxwvut?', ext='earlier-failure')
+    ask('ventanas', ext='later-success')
+    reply, _ = ask('no encontraste evidencia de qué', ext='which-consult')
+    assert 'sí recibió una explicación' in reply and 'indica cuál' in reply
+    assert 'Quedó sin resolver' not in reply
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+@pytest.mark.parametrize('greeting', ['Hola Luis Gil', 'Hola Luis'])
+def test_registered_customer_name_in_legacy_history_is_removed_from_model_context(ready, greeting):
+    pg, calls = ready
+    ask('ventanas', ext='legacy-named-answer')
+    with pg() as conn:
+        conn.execute("UPDATE insurance_conversation_turns SET content=%s "
+                     "WHERE external_id='legacy-named-answer' AND role='assistant'",
+                     (greeting + ', las ventanas tienen condiciones.',))
+    ask('¿Qué condiciones tienen las ventanas?', ext='private-context')
+    assert 'Luis' not in str(calls[-1][0])
+    assert '[name]' in str(calls[-1][0])
+
+
+@pytest.mark.parametrize('question', [
+    'tuve otra rotura de vidrio', 'se me rompió otra mesa de vidrio',
+    'tuve una nueva rotura de cristal',
+])
+def test_explicit_new_same_topic_incident_does_not_inherit_previous_date(ready, question):
+    pg, _ = ready
+    ask('se me rompió ayer una mesa de vidrio', ext='old-incident')
+    old_date = state(pg)['fact_date']
+    reply, out = ask(question, ext='new-same-topic-incident')
+    assert out['insurance_result'] == 'missing_information'
+    assert 'Cuándo ocurrió' in reply
+    assert not state(pg).get('fact_date') and not state(pg).get('incident_date')
+    assert old_date not in (state(pg).get('normalized_question') or '')
+
+
+@pytest.mark.parametrize('question', [
+    'si se me rompe una mesa de vidrio', 'y si se me rompe otra mesa de vidrio',
+])
+def test_same_topic_hypothetical_does_not_inherit_actual_incident_context(ready, question):
+    pg, calls = ready
+    ask('se me rompió ayer una mesa de vidrio', ext='actual-before-hypothetical')
+    old_date = state(pg)['fact_date']
+    reply, out = ask(question, ext='same-topic-hypothetical')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'Cuándo ocurrió' not in reply
+    current = state(pg)
+    assert not current.get('fact_date') and not current.get('incident_date')
+    assert not current.get('last_incident_type')
+    assert old_date not in calls[-1][0]['question']
+    recalled, _ = ask('volviendo a la primera pregunta', ext='recall-actual')
+    assert old_date in state(pg)['fact_date'] and 'DOC-SYNTHETIC' in recalled
+
+
+def test_same_incident_clarification_keeps_date(ready):
+    pg, _ = ready
+    ask('se me rompió ayer una mesa de vidrio', ext='same-incident')
+    old_date = state(pg)['fact_date']
+    ask('¿Qué condiciones tiene la rotura de vidrio?', ext='same-clarification')
+    assert state(pg)['fact_date'] == old_date
+
+
+def test_another_fire_clears_previous_date_but_remains_provisional_until_dated(ready):
+    pg, _ = ready
+    add_document(pg, 'POL-900', 'DOC-FIRE', pages=('Incendio: cobertura y condiciones de vivienda.',))
+    ask('ayer se produjo un incendio, ¿qué me cubre?', ext='old-fire')
+    assert state(pg).get('fact_date')
+    reply, out = ask('tuve otro incendio, ¿qué me cubre?', ext='another-fire')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'cuándo ocurrió' in reply and not state(pg).get('fact_date')
+    assert state(pg)['awaiting'] == 'date'
+
+
+def test_bare_another_breakage_clears_same_topic_date_without_erasing_prior_turn(ready):
+    pg, calls = ready
+    ask('se me rompió ayer una mesa de vidrio', ext='previous-breakage')
+    old_date = state(pg)['fact_date']
+    ask('otra rotura de vidrio', ext='bare-new-breakage')
+    assert not state(pg).get('fact_date') and not state(pg).get('incident_date')
+    assert old_date not in calls[-1][0]['question']
+    stored = rows(pg, "SELECT normalized FROM insurance_conversation_turns "
+                  "WHERE external_id='previous-breakage' AND role='user'")[0]
+    assert old_date in stored['normalized']
+
+
+@pytest.mark.parametrize('text', [
+    'hola buenas', 'ventanas', 'cómo se llama mi póliza',
+    'puedes consultar mi póliza', 'no',
+])
+def test_every_verified_turn_logs_pending_persistence_and_final_decision(ready, caplog, text):
+    caplog.set_level(logging.INFO, logger='insurance.dialog')
+    _, out = ask(text, ext='complete-diagnostics')
+    messages = '\n'.join(record.getMessage() for record in caplog.records
+                         if record.name == 'insurance.dialog')
+    assert 'stage=persistence reason_code=write_pending_commit' in messages
+    assert 'stage=decision reason_code=write_pending_commit' in messages
+    assert f"decision={out['insurance_result']}" in messages
+    assert 'state_saved' not in messages and 'commit_confirmed' not in messages
+
+
+def test_identity_turn_and_cached_reply_log_persistence_without_false_confirmation(pg, caplog):
+    caplog.set_level(logging.INFO, logger='insurance.dialog')
+    ask('ventanas', ext='identity-diagnostics')
+    first = '\n'.join(record.getMessage() for record in caplog.records
+                      if record.name == 'insurance.dialog')
+    assert 'stage=persistence reason_code=write_pending_commit' in first
+    assert 'decision=identity_not_verified' in first
+    caplog.clear()
+    ask('ventanas', ext='identity-diagnostics')
+    cached = '\n'.join(record.getMessage() for record in caplog.records
+                       if record.name == 'insurance.dialog')
+    assert 'stage=persistence reason_code=read_only' in cached
+    assert 'stage=decision reason_code=read_only' in cached
+
+
+def test_human_refusal_logs_final_decision_and_pending_write(ready, caplog):
+    ask('¿Cubre zyxwvut?', ext='offer-before-refusal')
+    caplog.set_level(logging.INFO, logger='insurance.dialog')
+    caplog.clear()
+    reply, _ = ask('no', ext='logged-refusal')
+    assert 'No he creado ningún caso' in reply
+    messages = '\n'.join(record.getMessage() for record in caplog.records
+                         if record.name == 'insurance.dialog')
+    assert 'stage=persistence reason_code=write_pending_commit' in messages
+    assert 'stage=decision reason_code=write_pending_commit' in messages
+    assert 'decision=missing_information' in messages
+
+
+def test_failed_commit_logs_write_failure_not_confirmed_persistence(pg, monkeypatch, caplog):
+    class FailingCommit:
+        def __init__(self):
+            self.conn = pg()
+
+        def __enter__(self):
+            return self.conn
+
+        def __exit__(self, exc_type, exc, tb):
+            self.conn.rollback()
+            self.conn.close()
+            raise RuntimeError('synthetic commit failure')
+
+    monkeypatch.setattr(dialog._cases, 'db', FailingCommit)
+    caplog.set_level(logging.INFO, logger='insurance.dialog')
+    _, out = ask('hola buenas', ext='failed-commit')
+    assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'persistence_failed'}
+    messages = '\n'.join(record.getMessage() for record in caplog.records
+                         if record.name == 'insurance.dialog')
+    assert 'stage=persistence reason_code=write_pending_commit' in messages
+    assert 'stage=persistence reason_code=write_failed' in messages
+    assert 'stage=decision reason_code=write_failed' in messages
+    assert 'commit_confirmed' not in messages and 'state_saved' not in messages
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_conversation_turns')[0]['n'] == 0
+
+
+def test_committed_case_then_failed_conversation_commit_reports_unknown_and_retry_is_idempotent(
+        ready, monkeypatch):
+    pg, _ = ready
+    ask('¿Cubre zyxwvut?', ext='offer-before-commit-loss')
+    calls = {'n': 0}
+
+    class FailedConversationCommit:
+        def __init__(self):
+            self.conn = pg()
+
+        def __enter__(self):
+            return self.conn
+
+        def __exit__(self, exc_type, exc, tb):
+            self.conn.rollback()
+            self.conn.close()
+            raise RuntimeError('synthetic conversation commit failure')
+
+    def connect():
+        calls['n'] += 1
+        return FailedConversationCommit() if calls['n'] == 1 else pg()
+
+    monkeypatch.setattr(dialog._cases, 'db', connect)
+    reply, out = ask('sí', ext='consent-after-commit-loss')
+    assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'persistence_failed'}
+    assert 'No pude confirmar' in reply
+    assert 'No se ha creado' not in reply and 'He guardado' not in reply
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 1
+    assert state(pg).get('pending_human')
+    monkeypatch.setattr(dialog._cases, 'db', pg)
+    retry, retry_out = ask('sí', ext='consent-after-commit-loss')
+    assert retry_out['insurance_result'] == 'human_case_required' and 'He guardado' in retry
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 1
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 1
+
+
+def test_ambiguous_case_commit_is_neutral_and_same_message_retry_confirms_existing_case(ready, monkeypatch):
+    pg, _ = ready
+    ask('¿Cubre zyxwvut?', ext='offer-before-ambiguous-case')
+    calls = {'n': 0}
+
+    class AmbiguousCaseCommit:
+        def __init__(self):
+            self.conn = pg()
+
+        def __enter__(self):
+            return self.conn
+
+        def __exit__(self, exc_type, exc, tb):
+            self.conn.commit()
+            self.conn.close()
+            raise RuntimeError('synthetic lost case commit acknowledgement')
+
+    def connect():
+        calls['n'] += 1
+        return AmbiguousCaseCommit() if calls['n'] == 2 else pg()
+
+    monkeypatch.setattr(dialog._cases, 'db', connect)
+    reply, out = ask('sí', ext='ambiguous-case-consent')
+    assert out['insurance_result'] == 'case_persistence_failed'
+    assert 'No puedo confirmar si se creó' in reply and 'No se ha creado' not in reply
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 1
+    monkeypatch.setattr(dialog._cases, 'db', pg)
+    retry, retry_out = ask('sí', ext='ambiguous-case-consent')
+    assert retry_out['insurance_result'] == 'human_case_required' and 'He guardado' in retry
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 1
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 1
+    assert not state(pg).get('pending_human')
+    summary = rows(pg, 'SELECT summary FROM insurance_conversation_summary')[0]['summary']
+    assert not summary.get('pending')

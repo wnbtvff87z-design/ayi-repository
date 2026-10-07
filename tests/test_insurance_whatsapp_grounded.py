@@ -46,6 +46,16 @@ WATER = 'Daños por agua y tuberías en el techo: límite sintético de 401 euro
 PROTOCOL = 'Protocolo sintético de seguridad: aléjate del peligro y llama a emergencias.'
 
 
+def _test_database_url():
+    dsn = os.getenv('INSURANCE_TEST_DATABASE_URL', '').strip()
+    if dsn:
+        return dsn
+    if os.getenv('CI', '').strip().lower() in ('true', '1'):
+        pytest.fail('Configure INSURANCE_TEST_DATABASE_URL with a dedicated disposable PostgreSQL '
+                    'database for real integration tests; never use production.', pytrace=False)
+    pytest.skip('INSURANCE_TEST_DATABASE_URL is not configured')
+
+
 def _install_transports(monkeypatch, captures, mode):
     """Exercise registry parsing and SDK serialization, replacing HTTP only."""
     monkeypatch.setattr(main, 'MODE', 'new')
@@ -203,9 +213,7 @@ patch.undo()
 
 @pytest.fixture
 def grounded(monkeypatch):
-    dsn = os.getenv('INSURANCE_TEST_DATABASE_URL')
-    if not dsn:
-        pytest.skip('INSURANCE_TEST_DATABASE_URL is not configured')
+    dsn = _test_database_url()
     schema = 'ins_grounded_' + uuid.uuid4().hex
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute(f'CREATE SCHEMA "{schema}"')
@@ -256,6 +264,21 @@ def grounded(monkeypatch):
         main._lookup_cache.clear()
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+@pytest.mark.parametrize('ci', ['true', '1'])
+def test_ci_without_postgres_fails_instead_of_skipping(monkeypatch, ci):
+    monkeypatch.delenv('INSURANCE_TEST_DATABASE_URL', raising=False)
+    monkeypatch.setenv('CI', ci)
+    with pytest.raises(pytest.fail.Exception, match='dedicated disposable PostgreSQL'):
+        _test_database_url()
+
+
+def test_local_offline_without_postgres_can_skip(monkeypatch):
+    monkeypatch.delenv('INSURANCE_TEST_DATABASE_URL', raising=False)
+    monkeypatch.delenv('CI', raising=False)
+    with pytest.raises(pytest.skip.Exception, match='INSURANCE_TEST_DATABASE_URL'):
+        _test_database_url()
 
 
 @pytest.mark.parametrize('followup', ['no y ventanas?', 'no y ventanas'])
@@ -358,6 +381,25 @@ def test_bad_signature_never_reaches_registry_database_or_model(grounded, monkey
     assert not grounded.captures
 
 
+def test_signed_greeting_registry_failure_is_neutral_before_any_dialogue(grounded, monkeypatch):
+    def unavailable_registry(url, **kwargs):
+        assert url.endswith('/Numeros')
+        assert TO in kwargs['params']['filterByFormula']
+        return httpx.Response(503, json={'error': 'Synthetic registry outage'},
+                              request=httpx.Request('GET', url))
+
+    monkeypatch.setattr(main.requests, 'get', unavailable_registry)
+    reply = grounded.say('hola buenas')
+    assert 'No pude identificar el negocio' in reply
+    assert 'No he ejecutado ninguna operación' in reply
+    assert 'No repitas la operación' not in reply
+    assert 'verificar el resultado' not in reply
+    assert grounded.count('insurance_identity_verifications') == 0
+    assert grounded.count('insurance_conversation_turns') == 0
+    assert grounded.count('insurance_cases') == 0
+    assert not grounded.captures
+
+
 def test_database_down_does_not_confirm_identity(grounded, monkeypatch):
     monkeypatch.setenv('INSURANCE_DATABASE_URL', make_conninfo(
         grounded.dsn, host='127.0.0.1', port='1', connect_timeout=1))
@@ -366,6 +408,20 @@ def test_database_down_does_not_confirm_identity(grounded, monkeypatch):
     assert not grounded.captures
     monkeypatch.setenv('INSURANCE_DATABASE_URL', grounded.dsn)
     assert grounded.count('insurance_identity_verifications') == 0
+
+
+def test_live_emergency_with_real_postgres_down_still_returns_safety_first(grounded, monkeypatch):
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', PROTOCOL)
+    monkeypatch.setenv('INSURANCE_DATABASE_URL', make_conninfo(
+        grounded.dsn, host='127.0.0.1', port='1', connect_timeout=1))
+    reply = grounded.say('Hay un incendio en curso ahora mismo, estoy en peligro')
+    assert reply.startswith(PROTOCOL)
+    assert 'He verificado' not in reply and 'He guardado' not in reply
+    assert not grounded.captures
+    monkeypatch.setenv('INSURANCE_DATABASE_URL', grounded.dsn)
+    assert grounded.count('insurance_identity_verifications') == 0
+    assert grounded.count('insurance_conversation_turns') == 0
+    assert grounded.count('insurance_cases') == 0
 
 
 def test_commit_failure_rolls_back_identity_and_confirmation(grounded):

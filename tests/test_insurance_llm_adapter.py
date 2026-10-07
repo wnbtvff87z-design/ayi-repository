@@ -1,5 +1,6 @@
 """Exercise the real OpenAI SDK against a controlled, in-process HTTP transport."""
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -187,3 +188,22 @@ def test_verified_private_names_removed_from_unlabelled_history_and_all_context(
     prompt = json.loads(requests[0].content)['messages'][1]['content']
     assert name not in prompt and 'Hola Ana' not in prompt
     assert 'Agua: cubre tuberías rotas' in prompt
+
+
+def test_sdk_and_transport_debug_never_log_sensitive_messages_or_endpoint(provider, monkeypatch, caplog):
+    monkeypatch.setenv('OPENAI_LOG', 'debug')
+    monkeypatch.setenv('OPENAI_BASE_URL', 'https://controlled.invalid/private-customer/v1')
+    question = 'private-question-marker ¿Cubre agua?'
+    evidence = [{**EVIDENCE[0], 'text': 'private-contract-marker Agua: cubre tuberías rotas.'}]
+    provider(lambda request: httpx.Response(200, json=completion()))
+    caplog.set_level(logging.DEBUG)
+    for name in ('openai', 'openai._base_client', 'httpx', 'httpcore', 'httpcore.connection'):
+        caplog.set_level(logging.DEBUG, logger=name)
+    assert llm.explain(question, evidence)
+    logging.getLogger('insurance.dialog').info('insurance_diag diagnostic_code=answered')
+    assert 'insurance_diag diagnostic_code=answered' in caplog.text
+    for private in (question, 'private-question-marker', 'private-contract-marker',
+                    os.environ['OPENAI_API_KEY'], 'private-customer', 'Request options'):
+        assert private not in caplog.text
+    for name in ('openai', 'openai._base_client', 'httpx', 'httpcore', 'httpcore.connection'):
+        assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING
