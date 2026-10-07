@@ -19,7 +19,7 @@ def _mentions(question, ident):
     """Exact, boundary-delimited match: 'POL-12' must not match inside 'POL-123'."""
     if not ident:
         return False
-    return re.search(r'(?<![A-Za-z0-9-])' + re.escape(str(ident)) + r'(?![A-Za-z0-9-])',
+    return re.search(r'(?<![A-Za-z0-9/-])' + re.escape(str(ident)) + r'(?![A-Za-z0-9/-])',
                      question, re.I) is not None
 
 

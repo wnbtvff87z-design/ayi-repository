@@ -44,7 +44,8 @@ def verified_customer(conn, business_id, channel, phone, session_ref=''):
 DOC_RE = re.compile(r'(?<![A-Za-z0-9])((?:\d[\s.]?){7}\d[\s.-]?[A-Za-z]|[XYZxyz][\s.-]?(?:\d[\s.]?){6}\d[\s.-]?[A-Za-z])(?![A-Za-z0-9])')
 CONTRACT_RE = re.compile(
     r'p[óo]liza[ \t]{0,3}(?:n[úu]mero|n[ºo°.]{1,2}|num(?:ero)?\.?)?[ \t]{0,3}[:#]?[ \t]{0,3}'
-    r'([A-Za-z0-9][A-Za-z0-9-]{2,29})', re.I)
+    r'([A-Za-z0-9][A-Za-z0-9/-]{2,29})', re.I)
+CONTRACT_NUMBER_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9/-]{2,29}')
 CONTRACT_STOP = {'de', 'del', 'que', 'mi', 'la', 'el', 'por', 'para', 'con'}
 WORD = r"[^\W\d_]+(?:['’-][^\W\d_]+)*"
 WORD_RE = re.compile(WORD)
@@ -120,7 +121,7 @@ def parse_declaration(text, awaiting=None):
             rest = rest[:m.start()] + ' ' + rest[m.end():]
             break
     if contract is None and awaiting == 'policy':
-        bare = re.fullmatch(r'(?:(?:la|el) )?([A-Za-z0-9][A-Za-z0-9-]{2,29})\.?', ' '.join(rest.split()), re.I)
+        bare = re.fullmatch(r'(?:(?:la|el) )?([A-Za-z0-9][A-Za-z0-9/-]{2,29})\.?', ' '.join(rest.split()), re.I)
         if bare and re.search(r'\d', bare.group(1)):
             contract, rest = bare.group(1), ''
     name = None
