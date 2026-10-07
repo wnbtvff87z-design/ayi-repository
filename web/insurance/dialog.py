@@ -901,7 +901,8 @@ def _reload_pages(conn, sc, result, pair):
         return []
     pages = pair.get('pages') or []
     return retrieval.prior_evidence(conn, sc.bid, sc.customer_id, result['policy_id'],
-                                    result['version_id'], pages)
+                                    result['version_id'], pages,
+                                    question=(pair.get('normalized') or pair.get('q')))
 
 
 def _authorized_retry(conn, sc, cached):

@@ -101,7 +101,7 @@ def _evidence_fragment(page, version_id, start, end):
     return evidence
 
 
-def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages):
+def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages, question=None):
     """Reload bounded prior citations; fail closed on any invalid or mixed scope."""
     if not isinstance(pages, (list, tuple)) or not 0 < len(pages) <= MAX_EVIDENCE_REFS:
         return []
@@ -129,7 +129,10 @@ def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages)
     if len(unique_pages) > MAX_PAGES:
         return []
     evidence = []
+    reselected_pages = set()
     for doc, number, start, end in refs:
+        if question is not None and (doc, number) in reselected_pages:
+            continue
         row = conn.execute(
             'SELECT pp.document_id,pp.page_number,pp.section,pp.source,pp.body '
             'FROM insurance_policies p JOIN insurance_policy_versions v '
@@ -144,7 +147,14 @@ def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages)
             (business_id, customer_id, policy_id, version_id, doc, number)).fetchone()
         if not row:
             return []
-        if start is None:
+        if question is not None:
+            reselected_pages.add((doc, number))
+            ranges = _fragment_ranges(row['body'], _query_terms(question))
+            if not ranges:
+                return []
+            evidence.extend(_evidence_fragment(row, version_id, left, right)
+                            for left, right in ranges)
+        elif start is None:
             evidence.append(_evidence(row, version_id))
         elif end <= len(row['body']):
             evidence.append(_evidence_fragment(row, version_id, start, end))
