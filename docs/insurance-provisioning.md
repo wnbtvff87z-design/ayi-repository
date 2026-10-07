@@ -206,7 +206,8 @@ inmediato; una referencia sin objeto claro pide aclaración.
 Sin evidencia suficiente se conserva pregunta/motivo y se solicita consentimiento
 antes de registrar un caso. Un saludo, identidad incompleta, selección de póliza
 o referencia aclarable no generan casos. Las urgencias requieren protocolo aprobado;
-los fallos técnicos solo pueden confirmarse como casos después de persistirlos.
+también las urgencias y los fallos técnicos requieren confirmación explícita para
+crear un caso. Nunca se confirma su creación antes de persistirlo.
 PostgreSQL sigue siendo fuente de verdad y Airtable únicamente espejo posterior
 a través del outbox existente. Los workers, Cron, Relay, Twilio, restaurantes,
 consultoras, REST-001 y reservas no se modifican.
@@ -246,6 +247,7 @@ el default. No se modifica el entorno Railway.
 | `INSURANCE_VERIFICATION_TTL_SECONDS` | 1800 | Verificación absoluta; puede solicitar identidad otra vez |
 | `INSURANCE_IDENTITY_MAX_ATTEMPTS` | 5 | Intentos fallidos por conversación |
 | `INSURANCE_IDENTITY_WINDOW_SECONDS` | 900 | Ventana de bloqueo por intentos fallidos |
+| `INSURANCE_TIMEZONE` | `Europe/Madrid` | Calendario local para fechas naturales de incidentes |
 
 La limpieza oportunista usa las escrituras de Insurance, no modifica Cron.
 En ausencia de tráfico, los registros vencidos pueden permanecer físicamente:
@@ -261,3 +263,104 @@ La recuperación temática es léxica/determinista, no semántica universal: sin
 no reconocidos o varias coincidencias pueden requerir aclaración. Los textos largos
 y evidencias de páginas siguen sujetos a sus límites explícitos; no se promete
 lectura de todo el contrato en una única llamada.
+
+### Conversar primero sobre el siniestro
+
+El requisito adicional se aplica a este trabajo, no a modificar un PR anterior.
+`incident_dates.py` es independiente del parser de reservas: las reservas miran
+fechas futuras; los incidentes se interpretan en pasado cuando no se indica año.
+Se aceptan hoy, ayer, anteayer, hace dos días, días de la semana, día/mes escrito,
+fecha ISO y `06/10/2026`. Un día de la semana sin calificador se interpreta como
+su ocurrencia más reciente, incluido hoy; un día/mes sin año usa la ocurrencia
+pasada más reciente. Esa convención no modifica restaurantes.
+
+«Esta semana» conserva el intervalo lunes–hoy; «la semana pasada», lunes–domingo.
+Un mes con año conserva el intervalo completo del mes. No se inventa un día:
+solo se utiliza una versión que abarque todo el intervalo; si el intervalo cruza
+versiones aplicables o las fechas declaradas se contradicen, se pide aclaración.
+
+«Ayer se me prendió fuego la casa» es un incidente pasado, no automáticamente una
+urgencia en curso. Se busca evidencia de incendio/fuego y se explican las cláusulas,
+condiciones y exclusiones disponibles, con las fuentes y la advertencia de que no
+se aprueba ni deniega un siniestro. La oferta de ayuda humana va al final y es
+opcional. No se registra un caso por esa oferta sin aceptación explícita.
+
+El estado conserva tema activo, fecha/intervalo del incidente, póliza y versión,
+último tipo de siniestro y preguntas pendientes. En la secuencia incidente →
+cobertura → exclusiones → límites se reutiliza la fecha ya declarada; un incidente
+nuevo no hereda silenciosamente la fecha del anterior.
+
+### Migraciones, consultas e índices comprobados
+
+`009_session_memory.sql` añade la sesión a la clave del resumen y claves/FK
+compuestas para impedir enlaces entre clientes o conversaciones. Conserva los
+resúmenes Voice antiguos bajo `legacy-unscoped-summary`, inaccesible desde una
+llamada real; no borra turnos ni reescribe enlaces históricos.
+Las FK nuevas están `NOT VALID`: protegen las escrituras nuevas sin alterar
+historial existente. La validación de enlaces heredados queda para una auditoría
+administrativa posterior. Un trigger diferido cubre también los clientes NULL,
+que las FK de PostgreSQL con `MATCH SIMPLE` no comprobarían.
+
+`010_retrieval_indexes.sql` añade exclusivamente índices cuya necesidad se midió
+mediante `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` sin desactivar sequential scans:
+
+| Consulta real | Restricción previa | Índice |
+|---|---|---|
+| Cliente | negocio + documento HMAC + activo + prefijo HMAC | `insurance_customers_document_idx` existente |
+| Autorización | negocio + cliente + póliza + no revocada + vigencia | `insurance_authorizations_active_retrieval_idx` |
+| Número/ID solicitado | negocio + cliente + igualdad exacta sin distinguir mayúsculas | `insurance_policies_hint_contract_retrieval_idx`, `insurance_policies_hint_id_retrieval_idx` |
+| Versión | negocio + póliza + fecha o intervalo completo | PK existente de `insurance_policy_versions` |
+| Documentos | negocio + póliza + versión, `ready` antes de páginas | `insurance_documents_version_retrieval_idx` |
+| Páginas | negocio + documento `ready`, indexada y utilizable | PK existente de `insurance_document_pages` |
+| Verificación | negocio + canal + conversación + sesión + no revocada + vencimiento | `insurance_identity_verifications_scope_idx` |
+| Turnos/resumen | ámbito completo de conversación/sesión/cliente | índice de ámbito existente y PK del resumen ampliada |
+
+Las SQL reproducibles están en `retrieval.AUTHORIZED`, `POLICIES_SQL`,
+`DOCUMENTS_SQL`, `PAGES_SQL`, `prior_evidence`, `identity.verified_customer`
+y los lectores de `memory`. Se utilizan parámetros, no interpolación de datos
+del usuario. La selección explícita restringe el SQL antes de transferir candidatos;
+sin selección se usan cursores de servidor por lotes de 128, nunca listas de
+10.000 IDs/documentos en Python.
+
+Las páginas se puntúan solo después de seleccionar negocio, cliente autorizado,
+póliza, versión y documentos `ready`. El cliente retiene como máximo 18 candidatos
+de puntuación y entrega como máximo cinco páginas con condiciones/exclusiones.
+Se conservan completas las páginas seleccionadas: si exceden el presupuesto,
+se pide acotar la consulta o aceptar revisión, sin mutilar cláusulas.
+
+Prueba sintética representativa: **10.000 pólizas, dos negocios, múltiples clientes,
+20.000 versiones, 40.000 documentos y 240.000 páginas**, con términos idénticos
+en clientes ajenos, clientes con una y varias pólizas y un cliente con 5.000
+pólizas. Los tests comprueban el SQL real y planes de índices naturales,
+autorizaciones, versiones superpuestas, documentos vacíos, páginas cruzadas,
+relectura de varios documentos, límites de candidatos y exclusiones al final
+de páginas largas.
+
+Mediciones de una ejecución local PostgreSQL 16; no son percentiles ni promesas
+de rendimiento Railway. No incluyen OpenAI, red, Bucket ni procesamiento PDF:
+
+| Plan/consulta | Antes (ms) | Después (ms) |
+|---|---:|---:|
+| Autorización | 0,839 | 0,051 |
+| Selección de una póliza | 0,854 | 0,044 |
+| Selección de varias pólizas | 0,977 | 0,085 |
+| Documentos | 4,027 | 0,098 |
+| Páginas | 5,246 | 0,052 |
+| Número contractual explícito | 2,100 | 0,069 |
+| ID de póliza explícito | 2,061 | 0,060 |
+| Verificación entre 10.000 filas | 1,314 | 0,037 |
+
+Planes: los `Seq Scan` de autorizaciones/documentos se sustituyen por
+`Index Scan` de ámbito; los hints pasan a `Bitmap Heap Scan → BitmapOr →
+Bitmap Index Scan`; las PK de versiones/páginas se siguen utilizando.
+La verificación deja de recorrer hacia atrás la PK descartando 9.999 filas.
+Retrieval local observado: **3,48 ms**, con **una póliza y 12 páginas candidatas
+antes de puntuar**, cinco páginas entregadas. Con selección explícita dentro
+del cliente de 5.000 pólizas se transfiere un candidato: **3,00 ms**.
+Sin selección explícita se mantiene memoria acotada, pero recorrer miles de
+pólizas autorizadas puede ser sustancialmente más lento; no se promete latencia
+constante.
+
+`tests/test_insurance_scale.py` imprime los planes JSON completos antes/después
+y contadores al ejecutar con `pytest -s`. No se guardan PDFs reales, datos de
+clientes ni informes temporales dentro del repositorio.

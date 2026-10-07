@@ -1,12 +1,12 @@
 """Synthetic local PostgreSQL scope, exact scoring, bounded-memory and index measurements."""
 import json
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
 from test_insurance_attribution import BIZ, WEB, add_document, pg  # noqa: F401
-from insurance import identity, retrieval
+from insurance import identity, memory, retrieval
 
 
 def _seed_scale(conn):
@@ -41,18 +41,21 @@ def _seed_scale(conn):
         INSERT INTO insurance_documents(business_id,policy_id,version_id,document_id,
                                         object_key,sha256,registered_by,status)
         SELECT business_id,policy_id,version_id,
-               business_id || '-' || policy_id || '-' || version_id,
-               business_id || '/' || policy_id || '/' || version_id,
+               business_id || '-' || policy_id || '-' || version_id || '-' || kind,
+               business_id || '/' || policy_id || '/' || version_id || '/' || kind,
                repeat('0',64),'synthetic','ready'
-        FROM insurance_policy_versions WHERE business_id LIKE 'S-%'
+        FROM insurance_policy_versions,unnest(ARRAY['coverage','exclusions']) kind
+        WHERE business_id LIKE 'S-%'
     """)
     conn.execute("""
         INSERT INTO insurance_document_pages(business_id,document_id,page_number,
                                              section,source,quality,body,indexed)
         SELECT business_id,document_id,n,
-               CASE n WHEN 4 THEN 'exclusions' WHEN 5 THEN 'general_conditions'
-                      WHEN 6 THEN 'particular' ELSE 'coverage' END,
+               CASE WHEN document_id LIKE '%-exclusions' AND n<=3 THEN 'exclusions'
+                    WHEN n=4 THEN 'exclusions' WHEN n=5 THEN 'general_conditions'
+                    WHEN n=6 THEN 'particular' ELSE 'coverage' END,
                'text','ok',CASE WHEN n>=4 THEN 'desgaste mantenimiento'
+                               WHEN document_id LIKE '%-exclusions' THEN 'agua exclusiones desgaste'
                                ELSE 'agua tuberias cobertura' END,true
         FROM insurance_documents,generate_series(1,6) n WHERE business_id LIKE 'S-%'
     """)
@@ -170,7 +173,7 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
         original_tokens = retrieval._tokens
 
         def checked_tokens(text):
-            assert observed.usable == 6  # SQL candidate count precedes even question scoring.
+            assert observed.usable == 12  # SQL candidate count precedes even question scoring.
             return original_tokens(text)
 
         monkeypatch.setattr(retrieval, '_tokens', checked_tokens)
@@ -179,11 +182,15 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
         elapsed = (time.perf_counter() - start) * 1000
         assert result['status'] == 'ok'
         assert result['policy_id'] == 'S-P1' and result['version_id'] == 'S-V2'
-        assert {e['document_id'] for e in result['evidence']} == {'S-BIZ-S-P1-S-V2'}
-        assert [e['page'] for e in result['evidence']] == [1, 2, 3, 4, 5]
-        assert result['diagnostics']['page_candidates'] == 6
-        assert result['diagnostics']['scored_pages'] == 6
+        assert {(e['document_id'], e['page']) for e in result['evidence']} == {
+            ('S-BIZ-S-P1-S-V2-coverage', 1), ('S-BIZ-S-P1-S-V2-coverage', 2),
+            ('S-BIZ-S-P1-S-V2-coverage', 3), ('S-BIZ-S-P1-S-V2-coverage', 5),
+            ('S-BIZ-S-P1-S-V2-exclusions', 1)}
+        assert result['diagnostics']['page_candidates'] == 12
+        assert result['diagnostics']['scored_pages'] == 12
         assert result['diagnostics']['policy_candidates'] == 1
+        assert retrieval.prior_evidence(conn, 'S-BIZ', 'S-single', 'S-P1', 'S-V2',
+                                        result['evidence']) == result['evidence']
         start = time.perf_counter()
         assert retrieval.retrieve(conn, 'S-BIZ', 'S-2', 'agua', date.today())['status'] == 'ambiguity'
         ambiguity_elapsed = (time.perf_counter() - start) * 1000
@@ -266,7 +273,8 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
         """)
         assert retrieval.retrieve(conn, 'S-BIZ', 'S-single', 'agua', date.today())[
             'reason_code'] == 'multiple_versions'
-        print(json.dumps({'synthetic_policies': 10000, 'versions': 20000, 'pages': 120000,
+        print(json.dumps({'synthetic_policies': 10000, 'versions': 20000,
+                          'documents': 40000, 'pages': 240000,
                           'candidate_counts_before_scoring': result['diagnostics'],
                           'multiple_policy_candidates': explicit['diagnostics']['policy_candidates'],
                           'large_customer_candidates': many['diagnostics']['policy_candidates'],
@@ -319,27 +327,104 @@ def test_each_ready_document_requires_usable_pages(pg):
         assert retrieval.retrieve(conn, BIZ, 'C2', 'agua', date.today())['status'] == 'ok'
 
 
+@pytest.mark.parametrize('quality,source', [
+    ('failed', 'text'), ('empty', 'text'), ('illegible', 'ocr'), ('ok', 'none'),
+])
+def test_misflagged_indexed_page_is_not_usable_in_any_ready_document(pg, quality, source):
+    add_document(pg, 'POL-900', 'S-USABLE')
+    add_document(pg, 'POL-900', 'S-MISFLAGGED')
+    with pg() as conn:
+        conn.execute(
+            'UPDATE insurance_document_pages SET quality=%s,source=%s '
+            "WHERE business_id=%s AND document_id='S-MISFLAGGED'",
+            (quality, source, BIZ))
+        result = retrieval.retrieve(conn, BIZ, 'C2', 'agua', date.today())
+        assert result['status'] == 'ready_without_pages'
+        assert result['diagnostics']['usable_pages'] == 1 and result['evidence'] == []
+        assert retrieval.prior_evidence(
+            conn, BIZ, 'C2', 'POL-900', 'VER-001',
+            [{'document_id': 'S-MISFLAGGED', 'page': 1}]) == []
+        # Unusable pages must not enter the scoring stream, even when indexed=true.
+        candidates = list(retrieval._stream(conn, retrieval.PAGES_SQL, (BIZ, 'POL-900', 'VER-001')))
+        assert [p['document_id'] for p in candidates] == ['S-USABLE']
+        conn.execute("UPDATE insurance_document_pages SET quality='ok',source='ocr' "
+                     "WHERE business_id=%s AND document_id='S-MISFLAGGED'", (BIZ,))
+        assert retrieval.retrieve(conn, BIZ, 'C2', 'agua', date.today())['status'] == 'ok'
+        assert retrieval.prior_evidence(
+            conn, BIZ, 'C2', 'POL-900', 'VER-001',
+            [{'document_id': 'S-MISFLAGGED', 'page': 1}])
+
+
+def test_incident_range_requires_one_version_covering_every_day(pg):
+    add_document(pg, 'POL-900', 'S-RANGE-OLD')
+    today = date.today()
+    with pg() as conn:
+        conn.execute(
+            'UPDATE insurance_policy_versions SET valid_from=%s,valid_to=%s '
+            "WHERE business_id=%s AND policy_id='POL-900' AND version_id='VER-001'",
+            (today - timedelta(days=100), today - timedelta(days=5), BIZ))
+        conn.execute(
+            'INSERT INTO insurance_policy_versions(business_id,policy_id,version_id,valid_from) '
+            "VALUES (%s,'POL-900','S-NEW',%s)", (BIZ, today - timedelta(days=4)))
+        conn.execute(
+            'INSERT INTO insurance_documents(document_id,business_id,policy_id,version_id,object_key,'
+            'sha256,registered_by,status) '
+            "VALUES ('S-RANGE-NEW',%s,'POL-900','S-NEW','synthetic/range-new',%s,'synthetic','ready')",
+            (BIZ, '0' * 64))
+        conn.execute(
+            'INSERT INTO insurance_document_pages(business_id,document_id,page_number,section,'
+            'source,quality,body,indexed) '
+            "VALUES (%s,'S-RANGE-NEW',1,'coverage','text','ok','Agua e incendio cobertura nueva',true)",
+            (BIZ,))
+        for start, end, expected_version in ((8, 5, 'VER-001'), (4, 0, 'S-NEW'), (8, 8, 'VER-001')):
+            result = retrieval.retrieve(conn, BIZ, 'C2', 'agua', today - timedelta(days=start),
+                                        policy_hint='900', fact_end=today - timedelta(days=end))
+            assert result['status'] == 'ok' and result['version_id'] == expected_version
+            assert {e['version_id'] for e in result['evidence']} == {expected_version}
+        crossing = retrieval.retrieve(conn, BIZ, 'C2', 'agua', today - timedelta(days=8),
+                                      policy_hint='900', fact_end=today - timedelta(days=1))
+        assert crossing['status'] == 'date_clarification_needed'
+        assert crossing['reason_code'] == 'version_not_applicable_to_date_range'
+        assert crossing['evidence'] == []
+        # Omitting the optional end retains the original single-day version selection.
+        single = retrieval.retrieve(conn, BIZ, 'C2', 'agua', today - timedelta(days=8),
+                                    policy_hint='900')
+        assert single['status'] == 'ok' and single['version_id'] == 'VER-001'
+        invalid = retrieval.retrieve(conn, BIZ, 'C2', 'agua', today, fact_end=today - timedelta(days=1))
+        assert invalid['reason_code'] == 'invalid_fact_date_range' and invalid['evidence'] == []
+        assert retrieval.retrieve(conn, BIZ, 'C2', 'agua', today - timedelta(days=8),
+                                  policy_hint='POL-000123', fact_end=today)['status'] == 'policy_not_matched'
+        assert retrieval.retrieve(conn, 'OTHER', 'C2', 'agua', today - timedelta(days=8),
+                                  fact_end=today)['status'] == 'no_policy'
+
+
 def test_prior_evidence_reloads_exact_authorized_ready_scope(pg):
-    add_document(pg, 'POL-900', 'S-PRIOR', pages=('Texto real agua',))
+    full_page = 'Texto real agua. ' + 'x' * 2000 + ' No cubre filtraciones previas.'
+    add_document(pg, 'POL-900', 'S-PRIOR', pages=(full_page,))
     add_document(pg, 'POL-900', 'S-EXCLUSION', pages=('Desgaste excluido',))
     add_document(pg, 'POL-000123', 'S-FOREIGN', pages=('Texto de otro cliente',))
     refs = [{'document_id': 'S-PRIOR', 'page': 1, 'version_id': 'VER-001', 'text': 'forged'}]
     with pg() as conn:
         result = retrieval.prior_evidence(conn, BIZ, 'C2', 'POL-900', 'VER-001', refs)
-        assert result[0]['text'] == 'Texto real agua'
+        assert result[0]['text'] == full_page
         conn.execute("UPDATE insurance_document_pages SET section='exclusions' "
                      "WHERE document_id='S-EXCLUSION'")
         multi = retrieval.retrieve(conn, BIZ, 'C2', 'agua', date.today())
         assert {p['document_id'] for p in multi['evidence']} == {'S-PRIOR', 'S-EXCLUSION'}
         prior = retrieval.prior_evidence(conn, BIZ, 'C2', 'POL-900', 'VER-001', multi['evidence'])
         assert prior == multi['evidence']
+        assert next(e['text'] for e in prior if e['document_id'] == 'S-PRIOR') == full_page
+        with pytest.raises(memory.ContextBudgetExceeded):
+            memory.build_context(question='agua', evidence=prior, policy='POL-900',
+                                 version='VER-001', budget=1000)
         for biz, customer, policy, version in (
                 ('OTHER', 'C2', 'POL-900', 'VER-001'), (BIZ, 'C1', 'POL-900', 'VER-001'),
                 (BIZ, 'C2', 'POL-000123', 'VER-001'), (BIZ, 'C2', 'POL-900', 'unknown')):
             assert retrieval.prior_evidence(conn, biz, customer, policy, version, refs) == []
         assert retrieval.prior_evidence(conn, BIZ, 'C2', 'POL-900', 'VER-001',
                                        refs + [{'document_id': 'S-FOREIGN', 'page': 1}]) == []
-        for column, value in (('indexed', False), ('body', ' ')):
+        for column, value in (('indexed', False), ('body', ' '),
+                              ('quality', 'failed'), ('source', 'none')):
             conn.execute('SAVEPOINT unusable')
             conn.execute(f'UPDATE insurance_document_pages SET {column}=%s WHERE document_id=%s',
                          (value, 'S-PRIOR'))
@@ -372,11 +457,19 @@ def test_prior_evidence_rejects_invalid_references_without_query(refs):
     assert retrieval.prior_evidence(None, 'B', 'C', 'P', 'V', refs) == []
 
 
-def test_citation_excerpt_preserves_full_stored_page():
+def test_selected_page_is_whole_and_budget_overflow_never_truncates_clause():
+    full_page = 'Cobertura agua. ' + 'a' * 2000 + ' No cubre falta de mantenimiento.'
     page = {'document_id': 'D', 'page_number': 1, 'section': 'coverage', 'source': 'text',
-            'body': 'a' * 2000}
-    assert len(retrieval._evidence(page, 'V')['text']) == 1500
-    assert len(page['body']) == 2000
+            'body': full_page}
+    evidence = [retrieval._evidence(page, 'V')]
+    assert evidence[0]['text'] == full_page
+    context = memory.build_context(question='agua', evidence=evidence, policy='P',
+                                   version='V', budget=10000)
+    assert full_page in memory.format_prompt(context)
+    with pytest.raises(memory.ContextBudgetExceeded):
+        memory.build_context(question='agua', evidence=evidence, policy='P',
+                             version='V', budget=1500)
+    assert evidence[0]['text'] == page['body'] == full_page
 
 
 @pytest.mark.parametrize('question,identifier,expected', [
@@ -427,11 +520,7 @@ def test_ten_thousand_verifications_actual_identity_lookup_plan_and_ttl(pg):
         baseline_ms = (time.perf_counter() - start) * 1000
         # Capture the production SQL rather than measuring a simplified test-only lookup.
         before = _explain(conn, captured.query, captured.params)
-        conn.execute(
-            'CREATE INDEX insurance_identity_verifications_scope_idx '
-            'ON insurance_identity_verifications '
-            '(business_id,channel,conversation_ref,session_ref,verification_id DESC) '
-            'WHERE revoked_at IS NULL')
+        conn.execute((WEB / 'insurance/migrations/010_retrieval_indexes.sql').read_text())
         after = _explain(conn, captured.query, captured.params)
         assert any(n.get('Relation Name') == 'insurance_identity_verifications'
                    and n.get('Index Name') != 'insurance_identity_verifications_scope_idx'

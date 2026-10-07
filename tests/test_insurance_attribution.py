@@ -137,6 +137,19 @@ def urgent_protocol(monkeypatch):
     return protocol
 
 
+def urgent_review(pg, urgent_protocol, *, text='Hay una inundación en curso ahora mismo', ext='urgent-review'):
+    before = rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n']
+    reply, out = say(text, ext=ext)
+    assert urgent_protocol in reply and 'He guardado' not in reply
+    assert out['insurance_result'] == 'urgent' and 'case_id' not in out
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == before
+    reply, out = say('Sí', ext=ext + '-consent')
+    assert 'He guardado' in reply and out.get('case_id')
+    assert out['insurance_result'] == 'human_case_required'
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == before + 1
+    return reply, out
+
+
 # ---- Verification by name + surnames + DNI/NIE -------------------------------------------
 def test_unknown_caller_is_asked_for_the_three_data_and_nothing_is_stored_as_a_case(pg, monkeypatch):
     monkeypatch.setattr(idialog.retrieval, 'retrieve', lambda *a, **k: pytest.fail('retrieved unverified'))
@@ -330,12 +343,12 @@ def test_document_not_ready_and_ready_without_pages_escalate_as_document_not_rea
     add_document(pg, 'POL-900', 'DOC-900', status='pending_verification')
     verify(pg, 'C2')
     reply, _ = say(TEXT, ext='D1')
-    assert '¿Quieres que guarde' in reply and 'He guardado' not in reply and 'no cubre' not in reply.lower()
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply and 'no cubre' not in reply.lower()
     consent_to_review(pg, ext='D1-consent')
     add_document(pg, 'POL-300', 'DOC-300', pages=())
     verify(pg, 'C3')
     reply, _ = say(TEXT, ext='D2')
-    assert '¿Quieres que guarde' in reply and 'He guardado' not in reply
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 1
     assert 'He guardado' in say('Sí', ext='D2-consent')[0]
     codes = {r['diagnostic_code'] for r in rows(pg, 'SELECT diagnostic_code FROM insurance_case_questions')}
@@ -348,7 +361,7 @@ def test_missing_evidence_escalates_with_no_evidence_and_never_says_not_covered(
     add_document(pg, 'POL-900', 'DOC-900', pages=('Texto sin relación alguna.',))
     verify(pg, 'C2')
     reply, _ = say('¿Qué pasa con el zxqv?')
-    assert '¿Quieres que guarde' in reply and 'He guardado' not in reply
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
     assert 'no cubre' not in reply.lower() and 'no está cubierto' not in reply.lower()
     consent_to_review(pg, ext='no-evidence-consent')
     q = rows(pg, 'SELECT diagnostic_code FROM insurance_case_questions')[0]
@@ -362,17 +375,35 @@ def test_llm_escalation_keeps_evidence_and_verified_attribution(pg, monkeypatch)
     add_document(pg, 'POL-900', 'DOC-900')
     verify(pg, 'C2')
     reply, _ = say(TEXT)
-    assert '¿Quieres que guarde' in reply and 'He guardado' not in reply
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
     consent_to_review(pg, ext='llm-consent')
     q = rows(pg, 'SELECT diagnostic_code,evidence FROM insurance_case_questions')[0]
     assert q['diagnostic_code'] == 'no_evidence' and q['evidence'][0]['page'] == 1
+
+
+def test_llm_technical_failure_requires_consent_and_preserves_evidence(pg, monkeypatch):
+    def unavailable(context, evidence):
+        raise RuntimeError('synthetic llm failure')
+
+    monkeypatch.setattr(idialog, 'llm_explain', unavailable)
+    add_document(pg, 'POL-900', 'DOC-900')
+    verify(pg, 'C2')
+    reply, out = say(TEXT, ext='technical-question')
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
+    assert out['insurance_result'] == 'missing_information'
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_outbox')[0]['n'] == 0
+    consent_to_review(pg, ext='technical-consent')
+    question = rows(pg, 'SELECT diagnostic_code,evidence,reason FROM insurance_case_questions')[0]
+    assert question['diagnostic_code'] == 'human_interpretation'
+    assert question['reason'] == 'human_interpretation' and question['evidence'][0]['page'] == 1
 
 
 def test_declining_review_never_creates_a_case_and_keeps_verified_identity(pg, llm):
     add_document(pg, 'POL-900', 'DOC-900')
     verify(pg, 'C2')
     reply, out = say('¿Qué pasa con el zxqv?', ext='decline-question')
-    assert '¿Quieres que guarde' in reply and out['insurance_result'] == 'missing_information'
+    assert '¿Quieres que registre' in reply and out['insurance_result'] == 'missing_information'
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     reply, _ = say('No', ext='decline-consent')
     assert 'No he creado ningún caso' in reply and 'He guardado' not in reply
@@ -385,7 +416,7 @@ def test_declining_review_never_creates_a_case_and_keeps_verified_identity(pg, l
 def test_consented_review_write_failure_never_confirms_a_case(pg, monkeypatch):
     verify(pg, 'C2')
     reply, _ = say(TEXT, ext='failed-review-question')
-    assert '¿Quieres que guarde' in reply
+    assert '¿Quieres que registre' in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
     def unavailable(**kwargs):
@@ -401,10 +432,9 @@ def test_consented_review_write_failure_never_confirms_a_case(pg, monkeypatch):
 
 def test_several_questions_are_kept_in_one_pending_case(pg, urgent_protocol):
     verify(pg, 'C2')
-    for text, ext in [('Tengo una inundación urgente en casa', 'S1'),
-                      ('Otro incendio urgente en la cocina', 'S2')]:
-        reply, out = say(text, ext=ext)
-        assert urgent_protocol in reply and out['insurance_result'] == 'urgent'
+    for text, ext in [('Hay una inundación en curso ahora mismo en casa', 'S1'),
+                      ('Hay un incendio en curso ahora mismo en la cocina', 'S2')]:
+        urgent_review(pg, urgent_protocol, text=text, ext=ext)
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 1
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 2
 
@@ -486,9 +516,9 @@ def test_operator_sees_whose_case_policy_state_questions_and_reads_are_audited(p
     monkeypatch.setattr(idialog, 'llm_explain', lambda q, ev: 'ESCALAR')
     add_document(pg, 'POL-900', 'DOC-900')
     verify(pg, 'C2')
-    assert '¿Quieres que guarde' in ask(TEXT, ext='SM1')[0]
+    assert '¿Quieres que registre' in ask(TEXT, ext='SM1')[0]
     consent_to_review(pg, ext='SM1-consent')
-    assert '¿Quieres que guarde' in ask('Otra duda', ext='SM2')[0]
+    assert '¿Quieres que registre' in ask('Otra duda', ext='SM2')[0]
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 1
     assert 'He guardado' in ask('Sí', ext='SM2-consent')[0]
     cid = rows(pg, 'SELECT case_id FROM insurance_cases')[0]['case_id']
@@ -518,7 +548,7 @@ def test_operator_shows_unverified_claims_as_unverified(pg, operator, monkeypatc
 
 
 def test_operator_without_permission_or_other_business_is_denied_and_audited(pg, operator, urgent_protocol):
-    ask('Tengo una inundación urgente')
+    urgent_review(pg, urgent_protocol)
     cid = rows(pg, 'SELECT case_id FROM insurance_cases')[0]['case_id']
     assert get(operator, cid, 'tok-noperm').status_code == 403
     assert get(operator, cid, 'tok-other').status_code == 404
@@ -528,7 +558,7 @@ def test_operator_without_permission_or_other_business_is_denied_and_audited(pg,
 
 
 def test_operator_read_fails_closed_when_audit_cannot_be_written(pg, operator, urgent_protocol):
-    ask('Tengo una inundación urgente')
+    urgent_review(pg, urgent_protocol)
     cid = rows(pg, 'SELECT case_id FROM insurance_cases')[0]['case_id']
     with pg() as conn:
         conn.execute('DROP TABLE insurance_audit_log')
@@ -574,7 +604,7 @@ def test_outbox_payload_carries_attribution_and_airtable_field_is_opt_in(pg, mon
 
 
 def test_mirror_is_idempotent_and_airtable_failure_keeps_pg_case(pg, monkeypatch, urgent_protocol):
-    reply, _ = ask('Tengo una inundación urgente')
+    reply, _ = urgent_review(pg, urgent_protocol)
     assert 'guardado' in reply  # PG confirmed; no claim that a person has seen it
     assert 'visto' not in reply and 'revisando' not in reply
     calls = []
@@ -650,7 +680,7 @@ def test_only_a_real_unanswerable_question_escalates_and_the_session_stays_verif
     add_document(pg, 'POL-900', 'DOC-900')
     say('Soy Luis Gil Mora, DNI 87654321X', ext='E1')
     reply, _ = say('¿Qué pasa con el zxqv?', ext='E2')
-    assert '¿Quieres que guarde' in reply and 'He guardado' not in reply
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
     consent_to_review(pg, ext='E2-consent')
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 1
     reply, out = say('¿Cubre los daños por agua en tuberías rotas?', ext='E3')   # no re-identification

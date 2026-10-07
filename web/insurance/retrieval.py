@@ -31,7 +31,8 @@ DOCUMENTS_SQL = (
     'coalesce(sum(u.n),0) AS usable FROM insurance_documents d '
     'LEFT JOIN LATERAL (SELECT count(*) AS n FROM insurance_document_pages pp '
     'WHERE d.status=\'ready\' AND pp.business_id=d.business_id '
-    'AND pp.document_id=d.document_id AND pp.indexed AND length(btrim(pp.body))>0) u ON true '
+    'AND pp.document_id=d.document_id AND pp.indexed AND pp.quality=\'ok\' '
+    'AND pp.source IN (\'text\',\'ocr\') AND length(btrim(pp.body))>0) u ON true '
     'WHERE d.business_id=%s AND d.policy_id=%s AND d.version_id=%s'
 )
 PAGES_SQL = (
@@ -39,7 +40,8 @@ PAGES_SQL = (
     'FROM insurance_documents d JOIN insurance_document_pages pp '
     'ON pp.business_id=d.business_id AND pp.document_id=d.document_id '
     'WHERE d.business_id=%s AND d.policy_id=%s AND d.version_id=%s AND d.status=\'ready\' '
-    'AND pp.indexed AND length(btrim(pp.body))>0 ORDER BY pp.document_id,pp.page_number'
+    'AND pp.indexed AND pp.quality=\'ok\' AND pp.source IN (\'text\',\'ocr\') '
+    'AND length(btrim(pp.body))>0 ORDER BY pp.document_id,pp.page_number'
 )
 
 
@@ -57,10 +59,9 @@ def _stream(conn, sql, params):
 
 
 def _evidence(page, version_id):
-    # Citation excerpts retain the existing 1,500-character limit; the stored page is unchanged.
     return {'document_id': page['document_id'], 'version_id': version_id,
             'page': page['page_number'], 'section': page['section'], 'source': page['source'],
-            'text': page['body'][:1500]}
+            'text': page['body']}
 
 
 def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages):
@@ -90,7 +91,8 @@ def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages)
             'ON pp.business_id=d.business_id AND pp.document_id=d.document_id '
             'WHERE ' + AUTHORIZED + ' AND p.policy_id=%s AND v.version_id=%s '
             'AND d.document_id=%s AND d.status=\'ready\' AND pp.page_number=%s '
-            'AND pp.indexed AND length(btrim(pp.body))>0',
+            'AND pp.indexed AND pp.quality=\'ok\' AND pp.source IN (\'text\',\'ocr\') '
+            'AND length(btrim(pp.body))>0',
             (business_id, customer_id, policy_id, version_id, doc, number)).fetchone()
         if not row:
             return []
@@ -117,9 +119,10 @@ def _mentions(question, ident):
                      question, re.I) is not None
 
 
-def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=None):
+def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=None, fact_end=None):
     """Returns {'status','reason_code','evidence','policy_id','version_id','diagnostics'}.
 
+    fact_end optionally requires one version to cover the entire inclusive incident range.
     diagnostics holds only counters/enums (no PII, no document text)."""
     diag = {'authorization_status': 'none', 'document_status': 'n/a', 'usable_pages': 0,
             'retrieval_status': 'not_run', 'evidence_count': 0}
@@ -133,13 +136,16 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
                        (business_id, customer_id)).fetchone():
         return out('no_policy', 'no_authorized_policy')
     diag['authorization_status'] = 'authorized'
+    if fact_end is not None and fact_end < fact_date:
+        return out('date_clarification_needed', 'invalid_fact_date_range')
+    range_end = fact_date if fact_end is None else fact_end
     hint = policy_hint or identity.extract_claims(question)['contract_number']
     # Contract numbers are TEXT compared exactly (leading zeros matter); never a prefix/contains.
     rows, mentioned = [], []
     multiple_policies = multiple_mentioned = False
     diag['policy_candidates'] = 0
     policy_sql = POLICY_HINT_SQL if policy_hint else POLICIES_SQL
-    policy_params = (business_id, customer_id, fact_date, fact_date)
+    policy_params = (business_id, customer_id, fact_date, range_end)
     if policy_hint:
         policy_params += (policy_hint, policy_hint)
     for row in _stream(conn, policy_sql, policy_params):
@@ -156,8 +162,15 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
             if len(mentioned) < 2:
                 mentioned.append(row)
     if not rows:
+        if fact_end is not None:
+            if policy_hint and not conn.execute(
+                    'SELECT 1 FROM insurance_policies p WHERE ' + AUTHORIZED +
+                    ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s)) LIMIT 1',
+                    (business_id, customer_id, policy_hint, policy_hint)).fetchone():
+                return out('policy_not_matched', 'policy_not_matched')
+            return out('date_clarification_needed', 'version_not_applicable_to_date_range')
         if policy_hint and conn.execute(POLICIES_SQL + ' LIMIT 1',
-                                        (business_id, customer_id, fact_date, fact_date)).fetchone():
+                                        (business_id, customer_id, fact_date, range_end)).fetchone():
             return out('policy_not_matched', 'policy_not_matched')
         return out('no_policy', 'version_not_applicable')
     if not mentioned and hint:

@@ -880,7 +880,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
             },
         )
         assert response.status_code == 200
-        assert '¿Quieres que guarde' in response.get_data(as_text=True)
+        assert '¿Quieres que registre' in response.get_data(as_text=True)
         assert 'He guardado' not in response.get_data(as_text=True)
         with pg_schema() as conn:
             before = conn.execute('SELECT count(*) AS n FROM insurance_case_questions').fetchone()['n']
@@ -991,7 +991,7 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
 
     response, reply = incoming(question, 1)
     assert response.status_code == 200
-    assert '¿Quieres que guarde' in reply and 'He guardado' not in reply
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
     with pg_schema() as conn:
         assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
         assert conn.execute('SELECT count(*) AS n FROM insurance_outbox').fetchone()['n'] == 0

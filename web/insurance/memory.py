@@ -13,6 +13,7 @@ import os
 import re
 import unicodedata
 from collections import namedtuple
+from itertools import islice
 
 from insurance import identity, retrieval
 
@@ -36,7 +37,8 @@ DEFAULTS = {
 
 def cfg(name):
     try:
-        return max(1, int(os.getenv(name, '')))
+        minimum = 2 if name == 'INSURANCE_MAX_TURNS_PER_CONVERSATION' else 1
+        return max(minimum, int(os.getenv(name, '')))
     except ValueError:
         return DEFAULTS[name]
 
@@ -79,7 +81,6 @@ def record_user(conn, sc, external_id, content, kind, corr, normalized=None):
          redact(content) if kind in ('question', 'clarification', 'confirmation') else '',
          redact(normalized) if normalized else None, corr)).fetchone()
     if row:
-        _enforce_limits(conn, sc, row['turn_id'])
         return row['turn_id'], True
     old = conn.execute(
         'SELECT turn_id FROM insurance_conversation_turns WHERE business_id=%s AND channel=%s AND '
@@ -216,14 +217,21 @@ def recall(conn, sc, topic, about_answer=False, recent_bias=False, exclude_quest
 
 # ---- Retention ------------------------------------------------------------------------------
 def _enforce_limits(conn, sc, turn_id):
-    """Cheap, bounded housekeeping on write: per-conversation cap always; global purge every 25th turn."""
+    """Bounded write housekeeping; cap retains at least one full exchange for retry idempotency."""
     cap = cfg('INSURANCE_MAX_TURNS_PER_CONVERSATION')
+    current = conn.execute(
+        'SELECT turn_id,reply_to FROM insurance_conversation_turns WHERE turn_id=%s AND business_id=%s '
+        'AND channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id IS NOT DISTINCT FROM %s',
+        (turn_id, *_scope(sc))).fetchone()
+    protected = [current['turn_id']] if current else []
+    if current and current['reply_to'] is not None:
+        protected.append(current['reply_to'])
     conn.execute(
         'DELETE FROM insurance_conversation_turns WHERE turn_id IN (SELECT turn_id FROM '
         'insurance_conversation_turns WHERE business_id=%s AND channel=%s AND conversation_ref=%s '
-        'AND session_ref=%s AND customer_id IS NOT DISTINCT FROM %s '
+        'AND session_ref=%s AND customer_id IS NOT DISTINCT FROM %s AND NOT (turn_id=ANY(%s)) '
         'ORDER BY turn_id DESC OFFSET %s LIMIT %s)',
-        (*_scope(sc), cap, cfg('INSURANCE_PURGE_BATCH')))
+        (*_scope(sc), protected, max(0, cap - len(protected)), cfg('INSURANCE_PURGE_BATCH')))
     if turn_id % 25 == 0:
         purge_expired(conn)
 
@@ -242,10 +250,6 @@ def purge_expired(conn):
                      'make_interval(days=>%s) ORDER BY updated_at LIMIT %s)', (days, batch)).rowcount
     st = conn.execute('DELETE FROM insurance_conversation_state WHERE ctid IN (SELECT st.ctid FROM '
                      'insurance_conversation_state st WHERE updated_at < now() - make_interval(secs=>%s) '
-                     "OR (state ? 'customer_id' AND NOT EXISTS (SELECT 1 FROM insurance_identity_verifications v "
-                     'WHERE v.business_id=st.business_id AND v.channel=st.channel AND '
-                     'v.conversation_ref=st.conversation_ref AND v.session_ref=st.session_ref '
-                     "AND v.customer_id=st.state->>'customer_id' AND v.revoked_at IS NULL AND v.expires_at>now())) "
                      'ORDER BY updated_at LIMIT %s)',
                      (cfg('INSURANCE_STATE_RETENTION_SECONDS'), batch)).rowcount
     v = conn.execute('DELETE FROM insurance_identity_verifications WHERE verification_id IN '
@@ -325,7 +329,8 @@ def _bound_summary(summary):
 
 
 def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answer, decision, policy_id,
-                   version_id, pages, event_date=None, fact=None, pending=None, open_issue=None):
+                   version_id, pages, event_date=None, fact=None, pending=None, open_issue=None,
+                   reset_incident=False):
     """Fold ONE finished exchange into the summary. Idempotent: an exchange whose assistant turn id is
     not newer than last_turn_id is ignored (webhook retry / double call). Never rebuilt from scratch."""
     if not assistant_turn_id:
@@ -335,6 +340,11 @@ def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answe
     s, last = load_summary(conn, sc)
     if assistant_turn_id <= last:
         return False
+    if reset_incident:
+        for key in ('event_date', 'event_date_turn', 'active'):
+            s.pop(key, None)
+        for key in ('facts', 'pending', 'open_issues'):
+            s[key] = []
     topics = [t for t in s.get('topics', []) if t['id'] != user_turn_id]
     topics.append({'id': user_turn_id, 'q': redact(question), 'a_turn': assistant_turn_id,
                    'answer': redact(answer, bounded=False) if decision == 'answer' else None, 'decision': decision,
@@ -466,7 +476,7 @@ def build_context(*, question, evidence, policy=None, version=None, pending=None
            'pending': pending or '', 'evidence': [dict(e) for e in evidence],
            'recent': [t for g in groups for t in g],
            'summary': summary_text or '', 'recalled': [{'q': r['q'], 'a': r.get('a') or '(sin respuesta)'}
-                                                        for r in recalled]}
+                                                        for r in islice(recalled, cfg('INSURANCE_RECALLED_TURNS'))]}
     dropped = []
 
     def size():

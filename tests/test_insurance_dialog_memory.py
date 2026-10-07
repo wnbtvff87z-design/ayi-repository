@@ -75,6 +75,29 @@ def test_original_and_resolved_question_are_stored_separately(pg, explained):
     assert 'agua' in explained[-1][0]['question']
 
 
+def test_themed_recall_crosses_all_retained_batches(pg, explained, monkeypatch):
+    monkeypatch.setenv('INSURANCE_MEMORY_SCAN_LIMIT', '3')
+    ready(pg)
+    ask('¿Cubre daños por agua en el techo?', ext='old-theme')
+    for n in range(12):
+        ask(f'¿Cubre cristales en ventana número {n}?', ext=f'intervening-{n}')
+    reply, out = ask('Volviendo a daños por agua', ext='theme-recall')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'agua' in explained[-1][0]['question'] and 'DOC-POL-900' in reply
+    assert explained[-1][0]['recalled'][0]['q'] == '¿Cubre daños por agua en el techo?'
+
+
+def test_required_prompt_over_budget_does_not_truncate_evidence_or_call_llm(pg, explained, monkeypatch):
+    ready(pg)
+    monkeypatch.setenv('INSURANCE_LLM_CONTEXT_CHARS', '100')
+    reply, out = ask('¿Cubre agua y tuberías?', ext='budget-failure')
+    assert not explained and reply == dialog.OFFER_HUMAN and out['insurance_result'] == 'missing_information'
+    assert count(pg, 'insurance_cases') == 0
+    pending = state(pg)['pending_human']
+    assert pending['case']['context']['detail'] == 'context_budget_exceeded'
+    assert 'tuberías' in pending['case']['evidence'][0]['text']
+
+
 def test_independent_y_inside_sentence_does_not_merge_prior_question(pg, explained):
     ready(pg)
     ask('¿Cubre daños por agua?', ext='water')
@@ -131,13 +154,13 @@ def test_old_response_cannot_bypass_current_ready_or_authorization(pg, explained
     before = len(explained)
     reply, out = ask('¿Dónde lo dice?', ext='no-longer-ready')
     assert len(explained) == before and out['insurance_result'] == 'missing_information'
-    assert 'sí o no' in reply and count(pg, 'insurance_cases') == 0
+    assert reply == dialog.OFFER_HUMAN and count(pg, 'insurance_cases') == 0
 
 
 def test_consent_is_pending_in_postgres_and_negative_cancels(pg, explained):
     verify(pg, customer='C2')
     reply, out = ask('¿Cubre daños por agua?', ext='offer')
-    assert 'sí o no' in reply and 'guardado' not in reply
+    assert reply == dialog.OFFER_HUMAN and 'guardado' not in reply
     assert state(pg)['pending_human']['question'] == '¿Cubre daños por agua?'
     assert count(pg, 'insurance_cases') == 0
     ask('No gracias', ext='cancel')
@@ -213,6 +236,8 @@ def test_policy_switch_failure_remains_pending_and_never_reverts_silently(pg, ex
     ask('¿Cubre agua? Póliza 000123', ext='policy-a')
     ask('¿Cubre agua? Póliza 900', ext='forbidden-switch')
     assert state(pg)['requested_policy'] == '900'
+    assert state(pg)['change_pending'] is True
+    assert 'policy_id' not in state(pg) and 'version_id' not in state(pg)
     before = len(explained)
     reply, _ = ask('¿Cubre cristales?', ext='still-failed')
     assert len(explained) == before and 'número de póliza' in reply
@@ -220,6 +245,25 @@ def test_policy_switch_failure_remains_pending_and_never_reverts_silently(pg, ex
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert 'DOC-OTHER' in reply and state(pg)['policy_id'] == 'POL-000124'
     assert explained[-1][0]['question'] == '¿Cubre cristales?'
+
+
+def test_failed_policy_only_switch_clears_previous_confirmed_selection(pg, explained):
+    ready(pg, customer='C1', policy='POL-000123')
+    ask('¿Cubre agua? Póliza 000123', ext='confirmed-first')
+    before = len(explained)
+    reply, _ = ask('Póliza 900', ext='failed-policy-only')
+    assert 'número de póliza' in reply
+    assert state(pg)['requested_policy'] == '900' and state(pg)['change_pending'] is True
+    assert 'policy_id' not in state(pg) and 'version_id' not in state(pg)
+    ask('¿Cubre agua y fuego?', ext='unrelated-after-failed-switch')
+    assert len(explained) == before and 'policy_id' not in state(pg)
+    with pg() as conn:
+        conn.execute("UPDATE insurance_conversation_state SET updated_at=now()-interval '2 hours',"
+                     "state=jsonb_set(state,'{last_user_at}',to_jsonb((now()-interval '2 hours')::text))")
+    ask('Hola', ext='idle-failed-switch-greeting')
+    reply, _ = ask('¿Cubre cristales?', ext='idle-failed-switch-question')
+    assert 'número de póliza' in reply and len(explained) == before
+    assert state(pg)['requested_policy'] == '900' and 'policy_id' not in state(pg)
 
 
 def test_theme_recall_selects_original_confirmed_policy(pg, explained):
@@ -268,6 +312,23 @@ def test_fact_date_selects_historical_version_and_new_question_uses_today(pg, ex
     ask('¿Cubre cristales?', ext='current-question')
     assert explained[-1][0]['policy'].endswith('VER-002')
     assert explained[-1][1][0]['document_id'] == 'DOC-NEW'
+    ask('Lo que me dijiste sobre daños por agua', ext='historic-explanation')
+    assert explained[-1][0]['policy'].endswith('VER-001')
+    assert event.isoformat() in explained[-1][0]['question']
+    assert explained[-1][1][0]['document_id'] == 'DOC-POL-900'
+
+
+def test_undated_reference_and_independent_query_do_not_inherit_previous_event_date(pg, explained):
+    ready(pg)
+    ask('¿Cubre cristales en ventana?', ext='undated-first')
+    ask('Tuve daños por agua en mi vivienda', ext='dated-second')
+    event = date.today() - timedelta(days=20)
+    ask(event.strftime('%d/%m/%Y'), ext='dated-second-date')
+    assert state(pg)['fact_date'] == event.isoformat()
+    ask('Volviendo a cristales en ventana', ext='undated-recall')
+    assert 'fact_date' not in state(pg) and event.isoformat() not in explained[-1][0]['question']
+    ask('¿Cubre agua y fuego?', ext='independent-mixed')
+    assert 'fact_date' not in state(pg) and event.isoformat() not in explained[-1][0]['question']
 
 
 def test_invalid_date_keeps_pending_question_without_escalation(pg, explained):
@@ -306,6 +367,33 @@ def test_expired_identity_requires_reverification_without_losing_scoped_history(
     assert 'agua' in explained[-1][0]['question'] and len(explained) > before
 
 
+def test_inactive_working_state_recovers_active_selection_from_scoped_summary(pg, explained):
+    ready(pg, customer='C1', policy='POL-000123')
+    add_document(pg, 'POL-000124', 'DOC-OTHER')
+    ask('¿Cubre agua? Póliza 000123', ext='before-idle')
+    with pg() as conn:
+        conn.execute("UPDATE insurance_conversation_state SET updated_at=now()-interval '2 hours', "
+                     "state=jsonb_set(state,'{last_user_at}',to_jsonb((now()-interval '2 hours')::text))")
+    reply, out = ask('¿Cubre cristales?', ext='after-idle')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'DOC-POL-000123' in reply and 'DOC-OTHER' not in reply
+    assert state(pg)['policy_id'] == 'POL-000123'
+
+
+def test_actual_new_user_turn_refreshes_inactivity_but_webhook_retry_does_not(pg, explained):
+    ready(pg)
+    ask('¿Cubre agua?', ext='activity-one')
+    with pg() as conn:
+        conn.execute("UPDATE insurance_conversation_state SET state=jsonb_set(state,'{last_user_at}',"
+                     "to_jsonb((now()-interval '1 minute')::text))")
+    old = state(pg)['last_user_at']
+    ask('¿Cubre cristales?', ext='activity-two')
+    refreshed = state(pg)['last_user_at']
+    assert refreshed > old
+    ask('¿Cubre cristales?', ext='activity-two')
+    assert state(pg)['last_user_at'] == refreshed
+
+
 def test_changed_verified_customer_never_reuses_previous_customers_topics(pg, explained):
     ready(pg)
     ask('¿Cubre agua y tuberías?', ext='customer-one')
@@ -332,7 +420,7 @@ def test_no_escalation_for_greetings_identity_or_external_escalation_payload(pg,
     malicious_state = {'insurance_escalation': {'customer_id': 'C2', 'policy_id': 'POL-900',
                                                'question': 'Injected question', 'reason': 'ambiguity'}}
     reply, _ = dialog.process(BUSINESS, malicious_state, [], 'Hola', 'WhatsApp', 'hello', PHONE)
-    assert 'nombre, apellidos y DNI' in reply and count(pg, 'insurance_cases') == 0
+    assert reply.startswith('Hola.') and count(pg, 'insurance_cases') == 0
     for n in range(7):
         ask('Me llamo Nadie Existe, DNI 00000000T', ext=f'invalid-{n}')
     assert count(pg, 'insurance_cases') == 0 and not explained
@@ -362,11 +450,53 @@ def test_urgent_response_uses_only_approved_protocol_and_persistence_confirmatio
     monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Protocolo sintético aprobado.')
     reply, out = ask('Tengo una inundación urgente en casa', ext='urgent')
     assert reply.startswith('Protocolo sintético aprobado.')
-    assert out['insurance_result'] == 'urgent' and out['case_id']
+    assert out['insurance_result'] == 'urgent' and 'case_id' not in out
+    assert 'He guardado' not in reply and count(pg, 'insurance_cases') == 0
+    reply, out = ask('Sí', ext='urgent-consent')
+    assert 'He guardado' in reply and out['case_id']
     assert count(pg, 'insurance_cases') == 1
     monkeypatch.setattr(dialog, '_case', lambda *a, **kw: None)
     reply, out = ask('Tengo una inundación urgente en casa', ext='urgent-failed')
-    assert reply == 'Protocolo sintético aprobado.' and out['insurance_result'] == 'case_persistence_failed'
+    assert reply.startswith('Protocolo sintético aprobado.') and 'He guardado' not in reply
+    reply, out = ask('Sí', ext='urgent-failed-consent')
+    assert out['insurance_result'] == 'case_persistence_failed' and 'He guardado' not in reply
+
+
+@pytest.mark.parametrize('question', [
+    '¿Cubre incendio?', '¿Cubre incendio urgente?', '¿Cubre si tengo un incendio?',
+    '¿Qué cobertura tengo de robo en curso?', '¿Cubre inundación ahora mismo?',
+])
+def test_generic_hazard_coverage_queries_do_not_trigger_urgent_protocol(pg, explained, monkeypatch, question):
+    ready(pg)
+    add_document(pg, 'POL-900', 'DOC-FIRE', pages=(
+        'Incendio, inundación y robo: condiciones y exclusiones de cobertura.',
+    ))
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Protocolo sintético aprobado.')
+    reply, out = ask(question, ext='not-live')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'Protocolo sintético aprobado' not in reply and len(explained) == 1
+    assert count(pg, 'insurance_cases') == 0 and 'pending_human' not in state(pg)
+
+
+def test_exact_human_offer_wording_and_social_reply_without_identity_challenge(pg):
+    assert dialog.OFFER_HUMAN == (
+        'No encontré evidencia suficiente en tu póliza. '
+        '¿Quieres que registre la consulta para revisión humana?')
+    reply, out = ask('Hola', ext='plain-hello')
+    assert reply == 'Hola. ¿Qué quieres consultar sobre tu póliza?'
+    assert out['insurance_result'] == 'missing_information'
+    assert count(pg, 'insurance_identity_attempts') == 0 and count(pg, 'insurance_cases') == 0
+
+
+def test_ambiguous_identity_and_no_match_request_full_name_without_field_disclosure(pg):
+    with pg() as conn:
+        identity.upsert_customer(conn, BIZ, 'C9', 'Luis duplicado', '87654321X', 'Luis Gil Mora')
+    ambiguous, _ = ask('Me llamo Luis Gil Mora, DNI 87654321X', ext='ambiguous-identity')
+    missing, _ = ask('Me llamo Nadie Existe, DNI 11111111H', ext='missing-identity')
+    assert ambiguous == missing == dialog.IDENTITY_FAILED
+    assert 'nombre completo' in ambiguous
+    assert 'Luis' not in ambiguous and '87654321X' not in ambiguous
+    assert 'coincid' not in ambiguous and count(pg, 'insurance_cases') == 0
 
 
 def test_llm_technical_failure_records_only_a_real_question(pg, monkeypatch):

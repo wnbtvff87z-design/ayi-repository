@@ -37,6 +37,25 @@ def _strip(text):
     return re.sub(r'^[\W_]+', '', fold(text)).strip()
 
 
+def confirmation(text):
+    """Explicit case consent only; any contradiction/negation fails closed."""
+    f = ' '.join(re.findall(r'\w+', fold(text)))
+    if not f:
+        return None
+    if re.search(r'\b(no|nunca|jamas|tampoco|cancel[a-z]*|dejalo|olvidalo)\b', f):
+        return 'no'
+    if re.search(r'\b(sin|antes|pero|aunque|todavia|quizas|tal vez)\b', f):
+        return None
+    action = (r'(?:registra(?:me)?|registrar|abre|abrir|crea|crear)\s+'
+              r'(?:(?:un|una|el|la|mi)\s+)?(?:caso|consulta|solicitud)')
+    intent = (rf'(?:{action}|(?:quiero|deseo|acepto|autorizo)\s+'
+              rf'(?:(?:que\s+)?(?:registres|abras|crees)\s+(?:(?:un|una|el|la|mi)\s+)?'
+              rf'(?:caso|consulta|solicitud)|(?:la\s+)?revision|{action}))')
+    if re.fullmatch(rf'(?:si(?:\s+(?:por favor|{intent}))?|{intent})(?:\s+por favor)?', f):
+        return 'yes'
+    return None
+
+
 def classify(text, *, has_last_answer, has_recent):
     """-> {'kind': independent|continuation|ambiguous|explain_prior|recall, ...}"""
     f = _strip(text)

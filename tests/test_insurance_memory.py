@@ -95,6 +95,14 @@ def test_optional_context_whole_relevant_exchanges():
                              {'role': 'assistant', 'text': 'No, salvo excepción.'}]
 
 
+def test_recalled_exchange_count_honors_config(monkeypatch):
+    monkeypatch.setenv('INSURANCE_RECALLED_TURNS', '2')
+    recalled = ({'q': f'question {n}', 'a': f'answer {n}'} for n in range(10))
+    ctx = memory.build_context(question='agua', evidence=[], recalled=recalled)
+    assert len(ctx['recalled']) == 2
+    assert ctx['recalled'][1]['q'] == 'question 1'
+
+
 def test_pick_policy_aware_streaming_and_no_guess():
     items = [{'q_id': n, 'q': 'cobertura agua', 'a': '', 'policy_id': str(n % 2),
               'version_id': 'V'} for n in range(1000)]
@@ -120,6 +128,25 @@ def test_y_does_not_imply_same_topic():
     assert references.classify('agua y fuego', has_last_answer=True, has_recent=True)['kind'] == 'independent'
     assert references.classify('y agua y fuego', has_last_answer=True, has_recent=True)['kind'] == 'independent'
     assert references.classify('y dónde lo dice?', has_last_answer=True, has_recent=True)['kind'] == 'explain_prior'
+
+
+@pytest.mark.parametrize('text', ['Sí', 'Sí.', 'Sí, por favor', 'Sí, registra la consulta',
+                                'Registra un caso', 'Quiero que registres un caso',
+                                'Sí, quiero la revisión'])
+def test_explicit_case_confirmation(text):
+    assert references.confirmation(text) == 'yes'
+
+
+@pytest.mark.parametrize('text', ['Sí, pero no registres un caso', 'Sí, aunque aún no quiero revisión',
+                                'No gracias', 'No quiero que abras un caso'])
+def test_negative_case_confirmation_never_creates(text):
+    assert references.confirmation(text) == 'no'
+
+
+@pytest.mark.parametrize('text', ['Perfecto', 'Gracias', 'OK', 'Sí, pero antes explica las exclusiones',
+                                'Si ocurre otra vez', 'Tal vez registra la consulta', ''])
+def test_ambiguous_case_confirmation_needs_clarification(text):
+    assert references.confirmation(text) is None
 
 
 def test_pg_scope_and_complete_recent(pg):
@@ -208,6 +235,7 @@ def test_pg_expiry_housekeeping_bounded_no_extension(pg, monkeypatch):
                    "now()-interval '1 minute','WhatsApp','')", (str(n),))
         pg.execute("INSERT INTO insurance_conversation_state(business_id,channel,conversation_ref,state) "
                    "VALUES('B','WhatsApp',%s,'{\"customer_id\":\"C\"}')", (str(n),))
+    pg.execute("UPDATE insurance_conversation_state SET updated_at=now()-interval '100 days'")
     result = memory.purge_expired(pg)
     assert result['states'] == result['verifications'] == 2
     assert pg.execute('SELECT count(*) AS n FROM insurance_identity_verifications WHERE expires_at>now()'
@@ -352,3 +380,72 @@ def test_pg_cap_runs_for_uninterrupted_alternating_user_assistant_ids(pg, monkey
         count = pg.execute('SELECT count(*) AS n FROM insurance_conversation_turns').fetchone()['n']
         assert count <= 4
     assert len(memory.pairs(pg, sc)) <= 2
+
+
+def test_pg_cap_minimum_two_preserves_latest_retry_exchange(pg, monkeypatch):
+    monkeypatch.setenv('INSURANCE_MAX_TURNS_PER_CONVERSATION', '1')
+    assert memory.cfg('INSURANCE_MAX_TURNS_PER_CONVERSATION') == 2
+    sc = memory.Scope('B', 'WhatsApp', 'ref', '', 'C')
+    exchange(pg, sc, external='first')
+    q, a = exchange(pg, sc, external='latest')
+    assert memory.record_user(pg, sc, 'latest', 'retry', 'question', 'test') == (q, False)
+    assert memory.find_reply(pg, sc, 'latest')['turn_id'] == a
+    assert memory.pairs(pg, sc)[0]['a_id'] == a
+    assert pg.execute('SELECT count(*) AS n FROM insurance_conversation_turns').fetchone()['n'] == 2
+
+
+def test_pg_small_cap_preserves_answer_linked_to_original_pending_question(pg, monkeypatch):
+    monkeypatch.setenv('INSURANCE_MAX_TURNS_PER_CONVERSATION', '2')
+    sc = memory.Scope('B', 'WhatsApp', 'ref', '', 'C')
+    original, _ = memory.record_user(pg, sc, 'original', '¿Cubre agua?', 'question', 'test')
+    memory.record_assistant(pg, sc, 'initial-clarification', '¿Qué fecha?', 'need_date', original, 'test',
+                            kind='clarification')
+    memory.record_user(pg, sc, 'clarification', 'Ayer', 'clarification', 'test')
+    latest = memory.record_assistant(pg, sc, 'clarification', 'No cubre sin mantenimiento.', 'answer',
+                                    original, 'test')
+    assert memory.pair_by_question(pg, sc, original)['a_id'] == latest
+    assert memory.find_reply(pg, sc, 'clarification')['turn_id'] == latest
+    assert len(memory.recent(pg, sc)) == 2
+    assert pg.execute('SELECT count(*) AS n FROM insurance_conversation_turns').fetchone()['n'] == 2
+
+
+def test_pg_verification_expiry_purge_preserves_pending_for_same_customer(pg):
+    sc = memory.Scope('B', 'WhatsApp', 'ref', '', 'C')
+    q, _ = memory.record_user(pg, sc, 'pending-original', '¿Cubre agua?', 'question', 'test')
+    state = {'customer_id': 'C', 'verified': True, 'question': '¿Cubre agua?', 'question_turn_id': q}
+    memory.identity.save_state(pg, sc.bid, sc.channel, sc.ref, sc.sess, state, user_activity=True)
+    pg.execute("INSERT INTO insurance_identity_verifications(business_id,conversation_ref,customer_id,"
+               "method,verified_by,expires_at,channel,session_ref) VALUES('B','ref','C','test','test',"
+               "now()-interval '1 minute','WhatsApp','')")
+    result = memory.purge_expired(pg)
+    assert result['verifications'] == 1
+    assert result['states'] == 0
+    resumed = memory.identity.load_state(pg, sc.bid, sc.channel, sc.ref, sc.sess)
+    assert resumed['question'] == '¿Cubre agua?'
+    assert resumed['question_turn_id'] == q
+    assert resumed['customer_id'] == 'C'
+    pg.execute("INSERT INTO insurance_identity_verifications(business_id,conversation_ref,customer_id,"
+               "method,verified_by,expires_at,channel,session_ref) VALUES('B','ref','C','test','test',"
+               "now()+interval '1 hour','WhatsApp','')")
+    a = memory.record_assistant(pg, sc, 'after-reverify', 'Respuesta.', 'answer', q, 'test')
+    assert memory.pair_by_question(pg, sc, q)['a_id'] == a
+    assert memory.pair_by_question(pg, sc._replace(customer_id='OTHER'), q) is None
+
+
+def test_pg_new_incident_clears_current_date_facts_but_keeps_retained_history(pg):
+    sc = memory.Scope('B', 'WhatsApp', 'ref', '', 'C')
+    q, a = exchange(pg, sc, 'incendio ayer')
+    summarize(pg, sc, q, a, event_date='2026-10-06', fact='incendio de la vivienda',
+              pending='límites', open_issue='revisión incendio')
+    q2, a2 = exchange(pg, sc, '¿Qué exclusiones tiene?')
+    summarize(pg, sc, q2, a2)
+    summary, _ = memory.load_summary(pg, sc)
+    assert summary['event_date'] == '2026-10-06'
+    assert summary['facts']
+    q3, a3 = exchange(pg, sc, 'nuevo robo sin fecha')
+    summarize(pg, sc, q3, a3, reset_incident=True, fact='robo')
+    summary, _ = memory.load_summary(pg, sc)
+    assert 'event_date' not in summary
+    assert [f['text'] for f in summary['facts']] == ['robo']
+    assert not summary['open_issues']
+    assert [t['id'] for t in summary['topics']] == [q, q2, q3]
