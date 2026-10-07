@@ -243,8 +243,17 @@ def _answer(business, state, text, channel, external_id, customer):
                          bid, sc.customer_id))
                 if is_query and normalized:
                     memory.set_user_kind(conn, user_id, 'question', incoming, normalized)
+                reply_to = st.get('question_turn_id') or user_id
+                if reply_to != user_id:
+                    owned = conn.execute(
+                        'SELECT 1 FROM insurance_conversation_turns WHERE turn_id=%s AND business_id=%s '
+                        'AND channel=%s AND conversation_ref=%s AND session_ref=%s '
+                        'AND customer_id IS NOT DISTINCT FROM %s',
+                        (reply_to, sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id)).fetchone()
+                    if not owned:
+                        reply_to = user_id
                 assistant_id = memory.record_assistant(
-                    conn, sc, external_id, reply, decision, st.get('question_turn_id') or user_id, corr,
+                    conn, sc, external_id, reply, decision, reply_to, corr,
                     kind=kind or ('answer' if decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value
                                  else 'clarification'),
                     policy_id=policy, version_id=version, pages=list(pages))
@@ -764,21 +773,8 @@ def _reload_pages(conn, sc, result, pair):
     if not pair or pair.get('policy_id') != result.get('policy_id') or pair.get('version_id') != result.get('version_id'):
         return []
     pages = pair.get('pages') or []
-    if not isinstance(pages, list) or not 0 < len(pages) <= retrieval.MAX_PAGES:
-        return []
-    documents = {}
-    for page in pages:
-        if not isinstance(page, dict) or not isinstance(page.get('document_id'), str):
-            return []
-        documents.setdefault(page['document_id'], []).append(page)
-    evidence = []
-    for refs in documents.values():
-        loaded = retrieval.prior_evidence(conn, sc.bid, sc.customer_id, result['policy_id'],
-                                          result['version_id'], refs)
-        if not loaded:
-            return []
-        evidence.extend(loaded)
-    return evidence
+    return retrieval.prior_evidence(conn, sc.bid, sc.customer_id, result['policy_id'],
+                                    result['version_id'], pages)
 
 
 def _authorized_retry(conn, sc, cached):

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import unicodedata
+from datetime import date
 
 from insurance.cases import MIN_KEY_BYTES, CasePersistenceError
 
@@ -58,6 +59,31 @@ def _mask(text, *, awaiting=None):
     text = unicodedata.normalize('NFKC', str(text or ''))
     text = re.sub(r'(?i)\b(?:bearer\s+|(?:token|api[_ -]?key|authorization)\s*[:=]\s*)'
                   r'[A-Za-z0-9._~+/\-]+=*', '[token]', text)
+    # Unsupported cardinal identity declarations are still sensitive, even
+    # when the identity parser deliberately refuses to interpret them.
+    cardinals = (
+        'cero uno una un dos tres cuatro cinco seis siete ocho nueve diez once doce trece '
+        'catorce quince dieciseis dieciséis diecisiete dieciocho diecinueve veinte veintiuno '
+        'veintidos veintidós veintitres veintitrés veinticuatro veinticinco veintiseis '
+        'veintiséis veintisiete veintiocho veintinueve treinta cuarenta cincuenta sesenta '
+        'setenta ochenta noventa cien ciento cientos doscientos trescientos cuatrocientos '
+        'quinientos seiscientos setecientos ochocientos novecientos mil millon millón millones y'
+    )
+    text = re.sub(
+        r'(?i)\b(dni|nie|documento)(\s*[:=]?\s+)(?:(?:' + '|'.join(cardinals.split()) +
+        r')\b[\s,]*)+', r'\1\2[documento]', text)
+    dates = {}
+    if awaiting != 'identity' and not re.search(r'(?i)\b(?:dni|nie|documento)\b', text):
+        def protect_date(match):
+            try:
+                date.fromisoformat(match[0].replace('.', '-'))
+            except ValueError:
+                return match[0]
+            marker = '[' + chr(0xE000 + len(dates)) + ']'
+            dates[marker] = match[0]
+            return marker
+        # Do not let an ISO date followed by "y" resemble a separated DNI+Y.
+        text = re.sub(r'\b(?:19|20)\d{2}[.\-]\d{2}[.\-]\d{2}\b', protect_date, text)
     try:
         from insurance.voice_identity import mask_transcript
     except ImportError:
@@ -81,6 +107,8 @@ def _mask(text, *, awaiting=None):
                   r'(?!\d{4}[.\-]\d{2}[.\-]\d{2})(?!\d{2}[.\-]\d{2}[.\-]\d{4})'
                   r'\d(?:[\s.\-‐‑–—]*\d){7})[\s.\-‐‑–—]*[A-Za-z](?!\w)',
                   '[documento]', text)
+    for marker, original in dates.items():
+        text = text.replace(marker, original)
     return text[:MAX_CHARS]
 
 

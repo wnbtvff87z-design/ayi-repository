@@ -449,6 +449,24 @@ def test_expired_identity_requires_reverification_without_losing_scoped_history(
     assert 'agua' in explained[-1][0]['question'] and len(explained) > before
 
 
+def test_expired_partial_reverification_never_links_unverified_reply_to_verified_question(pg, explained):
+    ready(pg)
+    ask('Tuve daños por agua en mi vivienda', ext='pending-before-expiry')
+    with pg() as conn:
+        conn.execute("UPDATE insurance_identity_verifications SET expires_at=now()-interval '1 second'")
+    reply, out = ask('Me llamo Luis Gil Mora', ext='partial-reverification')
+    assert out['insurance_result'] == 'identity_not_verified' and 'DNI' in reply
+    joined = rows(pg, "SELECT a.customer_id AS assistant_customer,q.customer_id AS user_customer "
+                     "FROM insurance_conversation_turns a JOIN insurance_conversation_turns q "
+                     "ON q.turn_id=a.reply_to WHERE a.external_id='partial-reverification' AND a.role='assistant'")[0]
+    assert joined['assistant_customer'] is None and joined['user_customer'] is None
+    reply, out = ask('87654321X', ext='complete-reverification')
+    assert out['insurance_result'] == 'missing_information' and 'ocurrió' in reply
+    reply, out = ask(date.today().isoformat(), ext='resumed-pending-date')
+    assert out['insurance_result'] == 'evidence_backed_explanation' and len(explained) == 1
+    assert 'Tuve daños por agua' in explained[-1][0]['question']
+
+
 def test_inactive_working_state_recovers_active_selection_from_scoped_summary(pg, explained):
     ready(pg, customer='C1', policy='POL-000123')
     add_document(pg, 'POL-000124', 'DOC-OTHER')
