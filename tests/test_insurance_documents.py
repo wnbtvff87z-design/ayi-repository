@@ -389,13 +389,16 @@ def test_duplicate_webhook_keeps_single_case(pg, monkeypatch):
 def test_urgency_without_approved_protocol_invents_no_contact(pg, monkeypatch):
     monkeypatch.delenv('INSURANCE_URGENT_PROTOCOL_TEXT', raising=False)
     reply, state = ask('Tengo una inundación urgente en casa')
-    assert state['insurance_result'] not in ('urgent', 'human_case_required')
+    assert state['insurance_result'] == 'urgent'
+    assert 'servicios de emergencia locales' in reply
+    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
     assert not any(ch.isdigit() for ch in reply)
     with pg() as conn:
         assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
     monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Sigue el protocolo aprobado X.')
     reply, _ = ask('Tengo una inundación urgente en casa', ext='SM9')
     assert reply.startswith('Sigue el protocolo aprobado X.')
+    assert 'He guardado' not in reply
     with pg() as conn:
         assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
     reply, state = ask('Sí', ext='SM9-consent')
@@ -518,7 +521,8 @@ def test_turns_stay_fast_while_admin_registrations_and_slow_bucket_worker_run(pg
             t = time.perf_counter()
             reply, _ = ask('Tengo una inundación urgente', channel, f'CA-conc-{i}')
             lat.append(time.perf_counter() - t)
-            assert 'He guardado' in reply
+            assert 'No esperes a revisar la póliza' in reply
+            assert '¿Quieres que registre' in reply and 'He guardado' not in reply
     finally:
         stop.set()
         [t.join(30) for t in threads]
@@ -539,7 +543,7 @@ def test_pg_down_never_confirms_a_case(monkeypatch, channel, text):
         assert forbidden not in reply
 
 
-def test_pg_lookup_ok_but_case_write_fails_does_not_confirm(pg, monkeypatch):
+def test_urgent_safety_does_not_claim_a_case_when_postgres_fails_on_consent(pg, monkeypatch):
     calls = {'n': 0}
     real = cases.db
 
@@ -550,5 +554,8 @@ def test_pg_lookup_ok_but_case_write_fails_does_not_confirm(pg, monkeypatch):
         return real()
 
     monkeypatch.setattr(cases, 'db', flaky)
-    reply, state = ask('Tengo una inundación urgente')
+    reply, state = ask('Tengo una inundación urgente', ext='urgent-pg-available')
+    assert state['insurance_result'] == 'urgent'
+    assert 'No esperes a revisar la póliza' in reply and 'He guardado' not in reply
+    reply, state = ask('Sí', ext='urgent-pg-fails-on-consent')
     assert state['insurance_result'] == 'case_persistence_failed' and 'He guardado' not in reply

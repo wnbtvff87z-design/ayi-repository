@@ -46,13 +46,25 @@ PAGES_SQL = (
     'AND pp.indexed AND pp.quality=\'ok\' AND pp.source IN (\'text\',\'ocr\') '
     'AND length(btrim(pp.body))>0 ORDER BY pp.document_id,pp.page_number'
 )
+SCOPED_PAGES_SQL = (
+    'SELECT pp.document_id,pp.page_number,pp.section,pp.source,pp.body '
+    'FROM insurance_documents d JOIN insurance_document_pages pp '
+    'ON pp.business_id=d.business_id AND pp.document_id=d.document_id '
+    'JOIN insurance_policies p ON p.business_id=d.business_id AND p.policy_id=d.policy_id '
+    'WHERE ' + AUTHORIZED + ' AND d.business_id=%s AND d.policy_id=%s AND d.version_id=%s '
+    'AND d.status=\'ready\' AND pp.indexed AND pp.quality=\'ok\' '
+    'AND pp.source IN (\'text\',\'ocr\') AND length(btrim(pp.body))>0 '
+    'ORDER BY pp.document_id,pp.page_number'
+)
 FTS_VECTOR = "to_tsvector('simple',translate(lower(pp.body),'áéíóúüñ','aeiouun'))"
 MATCHING_PAGES_SQL = (
     'SELECT pp.document_id,pp.page_number,pp.section,pp.source,pp.body,'
     f'ts_rank_cd({FTS_VECTOR},to_tsquery(\'simple\',%s)) AS fts_rank '
     'FROM insurance_documents d JOIN insurance_document_pages pp '
     'ON pp.business_id=d.business_id AND pp.document_id=d.document_id '
-    'WHERE d.business_id=%s AND d.policy_id=%s AND d.version_id=%s AND d.status=\'ready\' '
+    'JOIN insurance_policies p ON p.business_id=d.business_id AND p.policy_id=d.policy_id '
+    'WHERE ' + AUTHORIZED + ' AND d.business_id=%s AND d.policy_id=%s AND d.version_id=%s '
+    'AND d.status=\'ready\' '
     'AND pp.indexed AND pp.quality=\'ok\' AND pp.source IN (\'text\',\'ocr\') '
     'AND length(btrim(pp.body))>0 '
     f'AND {FTS_VECTOR} @@ to_tsquery(\'simple\',%s) '
@@ -111,8 +123,9 @@ def prior_evidence(conn, business_id, customer_id, policy_id, version_id, pages)
             return []
         unique_pages.add((doc, number))
         ref = (doc, number, start, end)
-        if ref not in refs:
-            refs.append(ref)
+        if ref in refs:
+            return []
+        refs.append(ref)
     if len(unique_pages) > MAX_PAGES:
         return []
     evidence = []
@@ -320,7 +333,12 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
         return out('available', 'authorized_documents_ready', **base)
     if mode == 'summary':
         selected = {}
-        for page in _stream(conn, PAGES_SQL, params):
+        summary_candidates = []
+        page_params = (business_id, customer_id, *params)
+        for page in _stream(conn, SCOPED_PAGES_SQL, page_params):
+            if include_trace and len(summary_candidates) < MAX_TRACE_CANDIDATES:
+                summary_candidates.append({k: page[k] for k in
+                                            ('document_id', 'page_number', 'section')})
             if page['section'] not in selected:
                 selected[page['section']] = page
         chosen = [selected[section] for section in SUMMARY_SECTION_ORDER if section in selected][:MAX_PAGES]
@@ -331,6 +349,14 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
             sentences = [part for part in SENTENCE_SPLIT.split(page['body']) if part.strip()]
             end = len(page['body']) if len(sentences) <= 3 else page['body'].find(sentences[3])
             evidence.append(_evidence_fragment(page, pol['version_id'], 0, end))
+        if include_trace:
+            selected_refs = {(p['document_id'], p['page_number']) for p in chosen}
+            diag['fts_candidate_pages'] = diag['page_candidates']
+            for candidate in summary_candidates:
+                is_selected = (candidate['document_id'], candidate['page_number']) in selected_refs
+                trace.append(_trace_page(
+                    candidate, score=0, fts_rank=0, selected=is_selected,
+                    reason=None if is_selected else 'summary_section_not_selected'))
         return out('ok', 'summary_sections_selected', evidence, **base)
     terms = _query_terms(question)
     query = _fts_query(terms)
@@ -341,7 +367,8 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
     diag['normalized_candidate_pages'] = 0
     diag['fts_candidate_pages'] = 0
     diag['retained_page_candidates'] = 0
-    matching_params = (query, *params, query)
+    trace_candidates = []
+    matching_params = (query, business_id, customer_id, *params, query)
     for page in _stream(conn, MATCHING_PAGES_SQL, matching_params):
         fts_rank = float(page['fts_rank'] or 0)
         score = len(terms & _tokens(page['body']))
@@ -351,6 +378,14 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
             diag['normalized_candidate_pages'] += 1
         if score or fts_rank:
             candidate = (score, fts_rank, page)
+            if include_trace:
+                trace_candidates.append((score, fts_rank, {
+                    'document_id': page['document_id'], 'page_number': page['page_number'],
+                    'section': page['section']}))
+                trace_candidates.sort(key=lambda item: (-item[0], -item[1],
+                                                        item[2]['document_id'],
+                                                        item[2]['page_number']))
+                del trace_candidates[MAX_TRACE_CANDIDATES:]
             hits.append(candidate)
             hits.sort(key=lambda item: (-item[0], -item[1], item[2]['document_id'],
                                         item[2]['page_number']))
@@ -392,20 +427,22 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
     diag['text_chars'] = sum(len(item['text']) for item in evidence)
     if include_trace:
         selected_refs = {(page['document_id'], page['page_number']) for page in chosen}
-        candidates = {}
-        for score, rank, page in hits:
-            candidates[(page['document_id'], page['page_number'])] = (
-                score, rank, page)
-        for section in SUPPORT:
-            for score, rank, page in support[section]:
-                candidates[(page['document_id'], page['page_number'])] = (
-                    score, rank, page)
-        for score, rank, page in sorted(candidates.values(),
-                                        key=lambda item: (-item[0], -item[1],
-                                                          item[2]['document_id'],
-                                                          item[2]['page_number'])):
-            selected = (page['document_id'], page['page_number']) in selected_refs
-            ranges = fragment_map.get((page['document_id'], page['page_number']), ())
+        selected_scores = {(page['document_id'], page['page_number']): (score, rank, page)
+                           for section in SUPPORT for score, rank, page in support[section]}
+        selected_scores.update({(page['document_id'], page['page_number']): (score, rank, page)
+                                for score, rank, page in hits})
+        trace_map = {(meta['document_id'], meta['page_number']): (score, rank, meta)
+                     for score, rank, meta in trace_candidates}
+        for (document_id, page_number), (score, rank, page) in selected_scores.items():
+            if (document_id, page_number) not in trace_map:
+                trace_map[(document_id, page_number)] = (score, rank, {
+                    'document_id': document_id, 'page_number': page_number,
+                    'section': page['section']})
+        for (document_id, page_number), (score, rank, page) in sorted(
+                trace_map.items(), key=lambda item: (-item[1][0], -item[1][1],
+                                                      item[0][0], item[0][1])):
+            selected = (document_id, page_number) in selected_refs
+            ranges = fragment_map.get((document_id, page_number), ())
             trace.append(_trace_page(
                 page, score=score, fts_rank=rank, selected=selected,
                 reason=None if selected else 'rank_below_page_limit', fragments=ranges))

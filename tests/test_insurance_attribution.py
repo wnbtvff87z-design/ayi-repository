@@ -222,10 +222,16 @@ def test_mismatches_get_one_identical_generic_reply_and_never_say_which_datum_fa
 
 
 def test_partial_or_missing_data_is_not_a_match_and_does_not_burn_attempts(pg):
-    for n, declared in enumerate(['Me llamo Ana Pérez López', 'DNI 12345678Z', 'Me llamo Ana, DNI 12345678Z',
-                                  'Me llamo Ana Pérez López, DNI 1234567Z']):
+    declarations = [
+        ('Me llamo Ana Pérez López', 'Me falta el DNI o NIE.'),
+        ('DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
+        ('Me llamo Ana, DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
+        ('Me llamo Ana Pérez López, DNI 1234567Z',
+         'No comprendí el documento de forma inequívoca. Repite solo ese dato.'),
+    ]
+    for n, (declared, expected) in enumerate(declarations):
         reply, _ = say(declared, ext=f'P{n}', phone=f'+3460000000{n}')  # separate conversations: no merging
-        assert 'nombre, apellidos y DNI' in reply
+        assert expected in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_attempts')[0]['n'] == 0
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
 
@@ -566,7 +572,7 @@ def test_operator_retrieval_diagnostic_is_scoped_audited_and_read_only(
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_documents')[0]['n'] == before_documents
     audit = rows(pg, "SELECT target,outcome FROM insurance_audit_log "
                      "WHERE action='retrieval_diagnose'")[0]
-    assert audit['target'] == body['correlation_id'] and audit['outcome'] == 'ok'
+    assert audit['target'] == body['correlation_id'] and audit['outcome'] == 'ok:answered'
     assert '¿Cubre daños por agua?' not in '\n'.join(
         record.getMessage() for record in caplog.records)
 
@@ -674,7 +680,7 @@ def test_identity_only_message_never_triggers_retrieval_or_a_case(pg, llm, monke
     monkeypatch.setattr(idialog.retrieval, 'retrieve', lambda *a, **k: pytest.fail('retrieval after identity'))
     say('Hola, quiero consultar mi póliza', ext='I0')
     reply, _ = say('Luis Gil Mora', ext='I1')
-    assert 'nombre, apellidos y DNI' in reply
+    assert 'Me falta el DNI o NIE.' in reply
     reply, out = say('87654321X', ext='I2')
     assert 'qué quieres consultar' in reply.lower() and out['insurance_result'] == 'missing_information'
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0

@@ -1,4 +1,5 @@
 """End-to-end synthetic checks for the current conversational and Voice changes."""
+import json
 from datetime import date, timedelta
 
 import pytest
@@ -93,6 +94,51 @@ def test_voice_identity_connectors_confirm_once_and_resume_unpunctuated_question
     assert 'DOC-TABLE' in reply and 'página' in reply
     assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 1
     assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_persisted_identity_fragments_are_never_retrieved_until_exact_document_completes(
+        client, monkeypatch, channel):
+    add_document(client, 'POL-900', 'DOC-IDENTITY', pages=(
+        'Cobertura de cristales y daños por agua: condiciones y límites.',
+    ))
+    seen = []
+    real_retrieve = dialog.retrieval.retrieve
+
+    def track_retrieval(*args, **kwargs):
+        seen.append(args[3])
+        return real_retrieve(*args, **kwargs)
+
+    monkeypatch.setattr(dialog.retrieval, 'retrieve', track_retrieval)
+    monkeypatch.setattr(dialog, 'llm_explain', lambda context, evidence: 'La póliza tiene límites.')
+    assert 'nombre, apellidos y DNI' in say(
+        'si me cubre daños en mesas de vidrio', 1, channel=channel)[0]
+    assert 'DNI o NIE' in say('Celia Zorro Condes', 2, channel=channel)[0]
+    if channel == 'Voice':
+        first_fragment = 'DNI cincuenta y uno, noventa y cinco'
+        second_fragment = 'noventa y cinco, sesenta y seis, jota'
+    else:
+        first_fragment = 'DNI 5195'
+        second_fragment = '9566J'
+    assert 'DNI o NIE' in say(first_fragment, 3, channel=channel)[0]
+    stored = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert stored['awaiting_document'] is True
+    assert '5195' not in json.dumps(stored) and 'doc_hmac' not in stored
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
+    assert seen == []
+
+    assert 'DNI o NIE' in say('Póliza número 000123', 4, channel=channel)[0]
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
+    assert seen == []
+
+    reply, out = say(second_fragment, 5, channel=channel)
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert reply.startswith('Gracias. He verificado tus datos.')
+    assert reply.count('Gracias. He verificado tus datos.') == 1
+    assert len(seen) == 1 and 'mesas de vidrio' in seen[0]
+    assert 'Celia' not in seen[0] and '51959566' not in seen[0] and '000123' not in seen[0]
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 1
+    assert rows(client, 'SELECT customer_id FROM insurance_identity_verifications')[0]['customer_id'] == 'C2'
 
 
 def test_late_clause_is_retrieved_as_a_positioned_fragment(client, monkeypatch):

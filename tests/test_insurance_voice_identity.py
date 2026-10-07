@@ -33,6 +33,20 @@ def test_natural_complete_declarations(text):
     assert parsed['policy_only'] is False
 
 
+@pytest.mark.parametrize('document', [
+    'DNI cincuenta y uno, noventa y cinco, noventa y cinco, sesenta y seis, jota',
+    'DNI cinco uno nueve cinco nueve cinco seis seis jota',
+    'DNI 51 95 noventa y cinco, seis seis jota',
+])
+def test_spoken_cardinals_digits_and_mixed_document_forms(document):
+    state = {'awaiting': 'identity'}
+    parsed = prepare('Celia Zorro Condes, ' + document, state)
+    assert parsed['document'] == '51959566J'
+    assert identity.normalize_document(parsed['document']) == '51959566J'
+    assert parsed['name'] == 'Celia Zorro Condes'
+    assert '51959566' not in json.dumps(state)
+
+
 def test_name_before_document_allows_natural_spoken_connectors():
     parsed = prepare(
         'Celia Zorro Condes con su DNI cinco uno nueve cinco nueve cinco seis seis jota',
@@ -74,6 +88,39 @@ def test_fragments_are_authenticated_encrypted_and_never_hashed_before_complete(
         assert voice.BUFFER_KEY not in state
         assert identity.match_by_hashes(conn, BIZ, identity.document_hmac(BIZ, complete['document']),
                                         state['name_hmac']) == ['CELIA']
+
+
+def test_fragmented_document_waits_for_completion_and_ignores_dates_and_policy_numbers():
+        state = {'awaiting': 'identity'}
+        prepare('Celia Zorro Condes', state)
+        first = prepare('DNI cinco uno nueve cinco', state)
+        assert first['document'] is None and first['missing'] == 'document'
+        assert state['awaiting_document'] is True and 'doc_hmac' not in state
+        assert '5195' not in json.dumps(state)
+
+        date_turn = prepare('6 de octubre de 2026', state)
+        assert date_turn['document'] is None and date_turn['question'] == ''
+        assert voice.BUFFER_KEY in state and state['awaiting_document'] is True
+        assert '5195' not in json.dumps(state)
+        policy_turn = prepare('Póliza número 000123', state)
+        assert policy_turn['document'] is None and policy_turn['missing'] == 'document'
+        assert voice.BUFFER_KEY in state and 'doc_hmac' not in state
+
+        complete = prepare('nueve cinco seis seis jota', state)
+        assert complete['document'] == '51959566J'
+        assert voice.BUFFER_KEY not in state and 'awaiting_document' not in state
+
+
+def test_correction_discards_partial_and_requires_only_a_repeated_document():
+        state = {'awaiting': 'identity'}
+        prepare('Celia Zorro Condes', state)
+        prepare('DNI cinco uno nueve cinco', state)
+        corrected = prepare('No, me equivoqué', state)
+        assert corrected['document'] is None and corrected['missing'] == 'document'
+        assert corrected['diagnostic'] == 'identity_parse_failed'
+        assert voice.BUFFER_KEY not in state and state['awaiting_document'] is True
+        replacement = prepare('DNI 51959566J', state)
+        assert replacement['document'] == '51959566J'
 
 
 @pytest.mark.parametrize('change', ['business', 'channel', 'ref', 'session', 'key', 'tamper'])

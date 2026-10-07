@@ -126,6 +126,14 @@ class ObservedConnection:
 def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypatch):
     with pg() as conn:
         _seed_scale(conn)
+        conn.execute("""
+            UPDATE insurance_document_pages SET body=body || ' rareclause'
+            WHERE business_id='S-BIZ' AND document_id='S-BIZ-S-P1-S-V2-coverage'
+              AND page_number=5
+        """)
+        conn.execute('ANALYZE insurance_document_pages')
+        matching_params = ('rareclause', 'S-BIZ', 'S-single', 'S-BIZ',
+                           'S-P1', 'S-V2', 'rareclause')
         queries = {
             'authorization': ('SELECT 1 FROM insurance_policies p WHERE ' + retrieval.AUTHORIZED +
                               ' LIMIT 1', ('S-BIZ', 'S-single')),
@@ -135,6 +143,7 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
                               ('S-BIZ', 'S-2', date.today(), date.today(), 's-n2', 's-n2')),
             'documents': (retrieval.DOCUMENTS_SQL, ('S-BIZ', 'S-P1', 'S-V2')),
             'pages': (retrieval.PAGES_SQL, ('S-BIZ', 'S-P1', 'S-V2')),
+            'authorized_matching_pages': (retrieval.MATCHING_PAGES_SQL, matching_params),
         }
         migration = WEB / 'insurance/migrations/010_retrieval_indexes.sql'
         # Drop only this migration's indexes inside the fixture's isolated schema.
@@ -169,6 +178,10 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
             assert any(n.get('Index Name') == 'insurance_document_pages_pkey' for n in indexed)
             assert (after[name]['Plan']['Shared Hit Blocks'] + after[name]['Plan']['Shared Read Blocks']
                     < before[name]['Plan']['Shared Hit Blocks'])
+        matching_nodes = list(_nodes(after['authorized_matching_pages']['Plan']))
+        assert any(n.get('Index Name') == 'insurance_document_pages_pkey' for n in matching_nodes)
+        assert not any(n.get('Relation Name') == 'insurance_document_pages'
+                       and n['Node Type'] == 'Seq Scan' for n in matching_nodes)
         observed = ObservedConnection(conn)
         original_tokens = retrieval._tokens
 
@@ -184,10 +197,10 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
         assert result['policy_id'] == 'S-P1' and result['version_id'] == 'S-V2'
         assert {(e['document_id'], e['page']) for e in result['evidence']} == {
             ('S-BIZ-S-P1-S-V2-coverage', 1), ('S-BIZ-S-P1-S-V2-coverage', 2),
-            ('S-BIZ-S-P1-S-V2-coverage', 3), ('S-BIZ-S-P1-S-V2-coverage', 5),
-            ('S-BIZ-S-P1-S-V2-exclusions', 1)}
+            ('S-BIZ-S-P1-S-V2-coverage', 3), ('S-BIZ-S-P1-S-V2-exclusions', 1),
+            ('S-BIZ-S-P1-S-V2-exclusions', 2)}
         assert result['diagnostics']['page_candidates'] == 12
-        assert result['diagnostics']['scored_pages'] == 12
+        assert result['diagnostics']['scored_pages'] == 6
         assert result['diagnostics']['policy_candidates'] == 1
         assert retrieval.prior_evidence(conn, 'S-BIZ', 'S-single', 'S-P1', 'S-V2',
                                         result['evidence']) == result['evidence']
@@ -401,7 +414,7 @@ def test_incident_range_requires_one_version_covering_every_day(pg):
 def test_prior_evidence_reloads_exact_authorized_ready_scope(pg):
     full_page = 'Texto real agua. ' + 'x' * 2000 + ' No cubre filtraciones previas.'
     add_document(pg, 'POL-900', 'S-PRIOR', pages=(full_page,))
-    add_document(pg, 'POL-900', 'S-EXCLUSION', pages=('Desgaste excluido',))
+    add_document(pg, 'POL-900', 'S-EXCLUSION', pages=('Filtraciones previas excluidas',))
     add_document(pg, 'POL-000123', 'S-FOREIGN', pages=('Texto de otro cliente',))
     refs = [{'document_id': 'S-PRIOR', 'page': 1, 'version_id': 'VER-001', 'text': 'forged'}]
     with pg() as conn:
@@ -409,7 +422,7 @@ def test_prior_evidence_reloads_exact_authorized_ready_scope(pg):
         assert result[0]['text'] == full_page
         conn.execute("UPDATE insurance_document_pages SET section='exclusions' "
                      "WHERE document_id='S-EXCLUSION'")
-        multi = retrieval.retrieve(conn, BIZ, 'C2', 'agua', date.today())
+        multi = retrieval.retrieve(conn, BIZ, 'C2', 'filtraciones', date.today())
         assert {p['document_id'] for p in multi['evidence']} == {'S-PRIOR', 'S-EXCLUSION'}
         prior = retrieval.prior_evidence(conn, BIZ, 'C2', 'POL-900', 'VER-001', multi['evidence'])
         assert prior == multi['evidence']
@@ -552,10 +565,11 @@ def test_ten_thousand_verifications_actual_identity_lookup_plan_and_ttl(pg):
 
 
 @pytest.mark.parametrize('question', ['agua tuberias', 'desgaste', 'agua', 'inexistente'])
-def test_streamed_scoring_matches_original_full_sort_without_database(monkeypatch, question):
+def test_hybrid_streamed_scoring_only_selects_matching_pages_without_database(monkeypatch, question):
     pages = [{'document_id': 'D', 'page_number': n,
               'section': ('coverage', *retrieval.SUPPORT, 'general')[n % 5],
-              'source': 'text', 'body': ('agua tuberias', 'desgaste', 'agua', '', 'condiciones')[n % 5]}
+              'source': 'text', 'body': ('agua tuberias', 'desgaste', 'agua', '', 'condiciones')[n % 5],
+              'fts_rank': 0}
              for n in range(1, 501)]
     usable = [page for page in pages if page['body']]
 
@@ -582,16 +596,20 @@ def test_streamed_scoring_matches_original_full_sort_without_database(monkeypatc
     monkeypatch.setattr(retrieval.identity, 'extract_claims', lambda q: {'contract_number': None})
     result = retrieval.retrieve(Connection(), 'B', 'C', question, date.today())
     tokens = retrieval._tokens(question)
-    scored = sorted(((len(tokens & retrieval._tokens(p['body'])), p) for p in usable),
-                    key=lambda item: -item[0])
-    chosen = [p for score, p in scored if score > 0][:3]
-    if not chosen:
+    scored = [(len(tokens & retrieval._tokens(p['body'])), p) for p in usable]
+    ranked = sorted(((score, p) for score, p in scored if score),
+                    key=lambda item: (-item[0], item[1]['document_id'], item[1]['page_number']))
+    if not ranked:
         assert result['status'] == 'no_match' and result['evidence'] == []
         return
-    for section in retrieval.SUPPORT:
-        extra = next((p for score, p in scored if p['section'] == section and p not in chosen), None)
-        if extra and len(chosen) < retrieval.MAX_PAGES:
-            chosen.append(extra)
-    expected = [retrieval._evidence(p, 'V') for p in sorted(chosen, key=lambda p: p['page_number'])]
-    assert result['evidence'] == expected
+    evidence = result['evidence']
+    actual_refs = {(item['document_id'], item['page']) for item in evidence}
+    top_hits = {(page['document_id'], page['page_number']) for _, page in ranked[:3]}
+    assert top_hits <= actual_refs
+    by_ref = {(page['document_id'], page['page_number']): page for page in usable}
+    assert all(len(tokens & retrieval._tokens(by_ref[ref]['body'])) > 0 for ref in actual_refs)
+    assert len(actual_refs) <= retrieval.MAX_PAGES
+    assert [(item['document_id'], item['page']) for item in evidence] == sorted(actual_refs)
+    assert all(0 <= item['position_start'] < item['position_end'] <= len(by_ref[
+        (item['document_id'], item['page'])]['body']) for item in evidence)
     assert result['diagnostics']['retained_page_candidates'] <= 18

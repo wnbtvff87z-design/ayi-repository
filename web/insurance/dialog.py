@@ -49,9 +49,11 @@ AVAILABILITY_RE = re.compile(
     r'\b(?:ver|consultar|acceder|abrir|revisar)\b.{0,25}\bp[oó]liza\b|'
     r'\b(?:disponible|cargada|lista)\b.{0,35}\bp[oó]liza\b', re.I)
 SUMMARY_RE = re.compile(
-    r'\b(?:qu[eé]\s+me\s+cubre|qu[eé]\s+cubre|resumen|cobertura\s+general)\b'
-    r'.{0,50}\b(?:en\s+general|general|p[oó]liza|seguro)\b|'
-    r'\b(?:general|en\s+general)\b.{0,40}\b(?:cubre|cobertura|p[oó]liza)\b', re.I)
+    r'\b(?:resumen|cobertura\s+general)\b|'
+    r'\b(?:qu[eé]\s+me\s+cubre|qu[eé]\s+cubre)\b.{0,40}'
+    r'\b(?:en\s+general|a\s+grandes\s+rasgos)\b|'
+    r'\b(?:en\s+general|a\s+grandes\s+rasgos)\b.{0,40}'
+    r'\b(?:cubre|cobertura|p[oó]liza)\b', re.I)
 SOCIAL_RE = re.compile(
     r'\W*(?:hola|buenas|buenos días|buenas tardes|gracias|muchas gracias|gracias por (?:todo|tu ayuda))\W*',
     re.I)
@@ -210,12 +212,11 @@ def _answer(business, state, text, channel, external_id, customer):
             awaiting_at_start = st.get('awaiting')
             just_verified = False
             st.pop('_identity_diagnostic', None)
-            voice_declaration = channel == 'Voice' and (
-                not customer_id or identity.NAME_TRIGGER_RE.search(text) or
-                re.search(r'\b(?:dni|nie)\b', text, re.I))
-            if voice_declaration and not customer_id:
+            identity_declaration = (not customer_id or (channel == 'Voice' and (
+                identity.NAME_TRIGGER_RE.search(text) or re.search(r'\b(?:dni|nie)\b', text, re.I))))
+            if identity_declaration and not customer_id:
                 st.setdefault('awaiting', 'identity')
-            decl = (voice_identity.prepare(text, st, bid, channel, ref, sess) if voice_declaration
+            decl = (voice_identity.prepare(text, st, bid, channel, ref, sess) if identity_declaration
                     else identity.parse_declaration(text, st.get('awaiting')))
             _merge_declaration(st, decl, bid)
             incoming = decl['question'] if (decl['document'] or decl['name'] or decl['contract_number']) else text
@@ -645,7 +646,8 @@ def _verify(conn, bid, channel, ref, sess, st, corr):
     if len(found) == 1:
         st['_identity_diagnostic'] = 'identity_verified'
         identity.create_verification(conn, bid, channel, ref, sess, found[0])
-        for k in ('doc_hmac', 'doc_tail', 'name', 'awaiting', 'identity_buffer', 'name_hmac'):
+        for k in ('doc_hmac', 'doc_tail', 'name', 'awaiting', 'awaiting_document',
+                  'identity_buffer', 'name_hmac'):
             st.pop(k, None)
         _diag(corr, 'identity', bid, reason_code='identity_verified', match_count=1,
               identity_verified=True, decision='continue')
@@ -661,7 +663,7 @@ def _verify(conn, bid, channel, ref, sess, st, corr):
         return 'escalate', outcome
     # Same generic reply for no match and ambiguity: nothing reveals which datum failed or whether
     # a record exists. The wrong values are dropped so the caller re-enters them.
-    for k in ('doc_hmac', 'doc_tail', 'name'):
+    for k in ('doc_hmac', 'doc_tail', 'name', 'awaiting_document', 'identity_buffer'):
         st.pop(k, None)
     st['awaiting'] = 'identity'
     identity.save_state(conn, bid, channel, ref, sess, st)

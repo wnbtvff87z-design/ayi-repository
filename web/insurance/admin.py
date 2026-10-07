@@ -125,6 +125,8 @@ def diagnose_retrieval():
     actor_id = business_id = None
     code, response = 503, {'error': 'unavailable'}
     outcome = 'unavailable'
+    llm_request = None
+    result_status = None
     try:
         with _cases.db() as conn:
             conn.execute(f'SET statement_timeout={PG_STATEMENT_TIMEOUT_MS}')
@@ -176,29 +178,10 @@ def diagnose_retrieval():
                                     policy_hint=policy_hint, fact_end=fact_end, mode=mode,
                                     include_trace=True)
                                 evidence = result['evidence']
-                                llm_result = {'status': 'not_run'}
-                                prompt_chars = 0
+                                code, outcome, result_status = 200, result['status'], result['status']
                                 if body.get('run_llm', True) and result['status'] == 'ok':
-                                    from insurance import dialog
-                                    try:
-                                        package = memory.build_context(
-                                            question=question.strip(), evidence=evidence,
-                                            policy=result.get('policy_id'), version=result.get('version_id'))
-                                        prompt = memory.format_prompt(package)
-                                        prompt_chars = len(memory.INSTRUCTIONS) + len(prompt)
-                                        answer = dialog.llm_explain(package, evidence)
-                                        llm_result = {
-                                            'status': ('answered' if answer and
-                                                       'ESCALAR' not in answer.upper() else 'escalated'),
-                                            'text': answer,
-                                        }
-                                    except memory.ContextBudgetExceeded:
-                                        llm_result = {'status': 'context_budget_exceeded'}
-                                    except Exception as exc:
-                                        llm_result = {'status': 'error', 'error_type': type(exc).__name__}
-                                        log.error('insurance_retrieval_diagnostic_failed correlation_id=%s '
-                                                  'error_type=%s', corr, type(exc).__name__)
-                                code, outcome = 200, result['status']
+                                    llm_request = (question.strip(), evidence, result.get('policy_id'),
+                                                   result.get('version_id'))
                                 response = {
                                     'correlation_id': corr, 'stage': 'retrieval',
                                     'retrieval_status': result['status'],
@@ -208,12 +191,32 @@ def diagnose_retrieval():
                                     'diagnostics': result['diagnostics'],
                                     'candidates': result['diagnostics'].get('trace', {}).get('candidates', []),
                                     'selected': evidence,
-                                    'text_chars_to_llm': prompt_chars,
-                                    'llm_result': llm_result,
+                                    'text_chars_to_llm': 0,
+                                    'llm_result': {'status': 'not_run'},
                                 }
     except Exception as exc:
         log.error('insurance_retrieval_diagnostic_failed correlation_id=%s error_type=%s',
                   corr, type(exc).__name__)
+    if llm_request:
+        from insurance import dialog, memory
+        question, evidence, policy_id, version_id = llm_request
+        try:
+            package = memory.build_context(
+                question=question, evidence=evidence, policy=policy_id, version=version_id)
+            prompt = memory.format_prompt(package)
+            response['text_chars_to_llm'] = len(memory.INSTRUCTIONS) + len(prompt)
+            answer = dialog.llm_explain(package, evidence)
+            response['llm_result'] = {
+                'status': 'answered' if answer and 'ESCALAR' not in answer.upper() else 'escalated',
+                'text': answer,
+            }
+        except memory.ContextBudgetExceeded:
+            response['llm_result'] = {'status': 'context_budget_exceeded'}
+        except Exception as exc:
+            response['llm_result'] = {'status': 'error', 'error_type': type(exc).__name__}
+            log.error('insurance_retrieval_diagnostic_failed correlation_id=%s error_type=%s',
+                      corr, type(exc).__name__)
+        outcome = f"{result_status}:{response['llm_result']['status']}"
     if actor_id and business_id:
         try:
             with _cases.db() as conn:
