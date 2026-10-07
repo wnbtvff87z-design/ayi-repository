@@ -61,7 +61,10 @@ def classify(text, *, has_last_answer, has_recent):
         content = {w for w in memory.toks(' '.join(words[1:])) if w not in STOPS}
         if not content:
             return {'kind': 'ambiguous'}
-        if len(content) <= 3:
+        if any(w in STOPS for w in words[1:]) or re.match(r'^y\s+(si|por|con|sin)\b', f):
+            return {'kind': 'continuation'}
+        if (has_last_answer and len(words) <= 5 and 'y' not in words[1:]
+                and re.match(r'^y\s+(el|la|los|las)\s+', f)):
             return {'kind': 'continuation'}
         return {'kind': 'independent'}
     if has_recent and words and len(words) <= 3 and all(w in STOPS or w in {'y', 'es', 'esta', 'cubre', 'cubierto'}
@@ -76,18 +79,24 @@ def pick(pairs_, topic_text, *, about_answer=False, recent_bias=False):
     want = memory.toks(topic_text)
     if not want:
         return 'none', None
-    scored = []
+    best, uniq = 0, {}
     for p in pairs_:
         have = memory.toks(p['q'] + (' ' + (p.get('a') or '') if about_answer else ''))
-        scored.append((len(want & have), p))
-    best = max((s for s, _ in scored), default=0)
+        score = len(want & have)
+        if score == 0 or score < best:
+            continue
+        if score > best:
+            best, uniq = score, {}
+        # Identical wording on different contracts/versions is not the same topic.
+        key = (frozenset(memory.toks(p['q'])), p.get('policy_id'), p.get('version_id'))
+        if key not in uniq or p['q_id'] > uniq[key]['q_id']:
+            uniq[key] = p
+        if len(uniq) > 3:
+            newest = sorted(uniq, key=lambda k: -uniq[k]['q_id'])[:3]
+            uniq = {k: uniq[k] for k in newest}
     if best == 0:
         return 'none', None
-    top = [p for s, p in scored if s == best]
-    uniq = {}
-    for p in sorted(top, key=lambda x: -x['q_id']):       # newest first; same wording = same topic
-        uniq.setdefault(frozenset(memory.toks(p['q'])), p)
-    cands = list(uniq.values())
+    cands = sorted(uniq.values(), key=lambda p: -p['q_id'])
     if len(cands) == 1 or recent_bias:
         return 'clear', cands[0]
     return 'ambiguous', cands[:3]
@@ -96,11 +105,15 @@ def pick(pairs_, topic_text, *, about_answer=False, recent_bias=False):
 def choose_option(text, options):
     """Answer to 'which one?': an ordinal or words that single out ONE option."""
     f = _strip(text)
+    if not options:
+        return None
     for w in re.findall(r'\w+', f):
         if w in ORDINALS and ORDINALS[w] < len(options):
             return options[ORDINALS[w]]
     want = memory.toks(text)
-    scored = [(len(want & memory.toks(o['q'])), o) for o in options]
+    scored = [(len(want & memory.toks(' '.join(str(x or '') for x in
+                                              (o['q'], o.get('policy_id'), o.get('version_id'))))), o)
+              for o in options]
     best = max(s for s, _ in scored)
     top = [o for s, o in scored if s == best]
     return top[0] if best > 0 and len(top) == 1 else None

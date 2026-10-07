@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import date
 from pathlib import Path
 
 import psycopg
@@ -13,6 +14,7 @@ WEB = Path(__file__).resolve().parents[1] / 'web'
 sys.path.insert(0, str(WEB))
 
 import insurance.cases as cases
+import insurance.identity as identity
 import insurance.migrate as insurance_migrate
 import insurance_sync_outbox as outbox_worker
 import main
@@ -79,6 +81,24 @@ def submit_question(*, external_id='SM-1', reason='missing_information', **chang
     }
     values.update(changes)
     return cases.create_or_update_case(**values)
+
+
+def verified_dialog_customer(connect, channel, session=''):
+    with connect() as conn:
+        identity.upsert_customer(conn, 'INS-BUSINESS', 'C1', 'Ana Pérez',
+                                 '99999999R', 'Ana Pérez López')
+        conn.execute(
+            'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) '
+            "VALUES('INS-BUSINESS','POL-CONSENT','C1','hogar','000123')")
+        conn.execute(
+            'INSERT INTO insurance_policy_versions(business_id,policy_id,version_id,valid_from) '
+            "VALUES('INS-BUSINESS','POL-CONSENT','VER-CONSENT',%s)", (date(2020, 1, 1),))
+        conn.execute(
+            'INSERT INTO insurance_authorizations(business_id,customer_id,policy_id,granted_by) '
+            "VALUES('INS-BUSINESS','C1','POL-CONSENT','test-admin')")
+        identity.create_verification(
+            conn, 'INS-BUSINESS', channel,
+            identity.conversation_ref('INS-BUSINESS', channel, '+34600999888'), session, 'C1')
 
 
 @pytest.mark.parametrize(
@@ -847,6 +867,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     monkeypatch.setattr(cases.requests, 'post', post)
     monkeypatch.setattr(cases.requests, 'patch', patch)
     client = main.app.test_client()
+    verified_dialog_customer(pg_schema, 'WhatsApp')
 
     def incoming(sid, question):
         response = client.post(
@@ -854,12 +875,23 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
             data={
                 'To': 'whatsapp:+34600111222',
                 'From': 'whatsapp:+34600999888',
-                'Body': question + ' Me llamo Ana Pérez López, DNI 99999999R.',
+                'Body': question,
                 'MessageSid': sid,
             },
         )
         assert response.status_code == 200
+        assert '¿Quieres que guarde' in response.get_data(as_text=True)
+        assert 'He guardado' not in response.get_data(as_text=True)
+        with pg_schema() as conn:
+            before = conn.execute('SELECT count(*) AS n FROM insurance_case_questions').fetchone()['n']
+        response = client.post('/webhook-whatsapp', data={
+            'To': 'whatsapp:+34600111222', 'From': 'whatsapp:+34600999888',
+            'Body': 'Sí', 'MessageSid': sid + '-consent',
+        })
+        assert response.status_code == 200
         assert 'He guardado tu consulta para revisión humana.' in response.get_data(as_text=True)
+        with pg_schema() as conn:
+            assert conn.execute('SELECT count(*) AS n FROM insurance_case_questions').fetchone()['n'] == before + 1
 
     incoming('SM-integrated-1', '¿La póliza cubre esta filtración?')
     with pg_schema() as conn:
@@ -872,7 +904,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
         )
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     record['fields']['Status'] = 'resolved'
-    incoming('SM-integrated-2', '¿Y si el daño ocurrió antes de la vigencia?')
+    incoming('SM-integrated-2', '¿La póliza cubre daños anteriores a la vigencia?')
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     assert record['fields']['Status'] == 'Pendiente'
     assert set(record['fields']) == {
@@ -894,7 +926,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     assert details.status_code == 200
     assert [row['question'] for row in details.json['questions']] == [
         '¿La póliza cubre esta filtración?',
-        '¿Y si el daño ocurrió antes de la vigencia?',
+        '¿La póliza cubre daños anteriores a la vigencia?',
     ]
     resolved = client.post(
         path + '/resolve',
@@ -938,31 +970,32 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
     monkeypatch.setattr(main, 'db', lambda: pytest.fail('shared conversation database accessed'))
     monkeypatch.setattr(main.requests, 'post', lambda *args, **kwargs: pytest.fail('Airtable was written in request path'))
     client = main.app.test_client()
-    monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
+    verified_dialog_customer(pg_schema, channel, 'CA-case-confirmation' if channel == 'Voice' else '')
     question = '¿La póliza cubre esta filtración?'
-    declared = ' Me llamo Ana Pérez López, DNI 99999999R.'
 
-    if channel == 'WhatsApp':
-        monkeypatch.setattr(main, 'twilio_valid', lambda: True)
-        response = client.post('/webhook-whatsapp', data={
-            'To': 'whatsapp:+34600111222',
-            'From': 'whatsapp:+34600999888',
-            'Body': question + declared,
-            'MessageSid': 'SM-case-confirmation',
-        })
-        reply = response.get_data(as_text=True)
-    else:
+    def incoming(text, turn):
+        if channel == 'WhatsApp':
+            monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+            response = client.post('/webhook-whatsapp', data={
+                'To': 'whatsapp:+34600111222', 'From': 'whatsapp:+34600999888',
+                'Body': text, 'MessageSid': f'SM-case-confirmation-{turn}',
+            })
+            return response, response.get_data(as_text=True)
         monkeypatch.setattr(main, 'authorized', lambda: True)
         response = client.post('/internal/turn', json={
-            'business_id': 'INS-BUSINESS',
-            'business_phone': '+34600111222',
-            'channel': 'Voice',
-            'customer_phone': '+34600999888',
-            'external_id': 'CA-case-confirmation:turn:1',
-            'text': question + declared,
+            'business_id': 'INS-BUSINESS', 'business_phone': '+34600111222',
+            'channel': 'Voice', 'customer_phone': '+34600999888',
+            'external_id': f'CA-case-confirmation:turn:{turn}', 'text': text,
         })
-        reply = response.json['reply']
+        return response, response.json['reply']
 
+    response, reply = incoming(question, 1)
+    assert response.status_code == 200
+    assert '¿Quieres que guarde' in reply and 'He guardado' not in reply
+    with pg_schema() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
+        assert conn.execute('SELECT count(*) AS n FROM insurance_outbox').fetchone()['n'] == 0
+    response, reply = incoming('Sí', 2)
     assert response.status_code == 200
     assert 'He guardado tu consulta para revisión humana.' in reply
     assert 'plazo ni una resolución' in reply
@@ -977,6 +1010,11 @@ def test_successful_escalation_persists_before_customer_confirmation(pg_schema, 
     assert stored['question'] == question
     assert stored['channel'] == channel
     assert stored['sync_status'] == 'pending'
+    repeated, repeated_reply = incoming('Sí', 2)
+    assert repeated.status_code == 200 and repeated_reply == reply
+    with pg_schema() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_case_questions').fetchone()['n'] == 1
+        assert conn.execute('SELECT count(*) AS n FROM insurance_outbox').fetchone()['n'] == 1
 
 
 def test_persistence_failure_does_not_confirm_a_case(monkeypatch):

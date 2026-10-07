@@ -109,8 +109,9 @@ def verify(pg, channel='WhatsApp', customer='C1', business=BIZ, session=''):
     with pg() as conn:
         conn.execute(
             "INSERT INTO insurance_identity_verifications(business_id,conversation_ref,customer_id,method,"
-            "verified_by,expires_at,session_ref) VALUES(%s,%s,%s,'external-test','verifier-1',now()+interval '1 hour',%s)",
-            (business, identity.conversation_ref(business, channel, PHONE), customer, session))
+            "verified_by,expires_at,channel,session_ref) VALUES(%s,%s,%s,'external-test','verifier-1',"
+            "now()+interval '1 hour',%s,%s)",
+            (business, identity.conversation_ref(business, channel, PHONE), customer, channel, session))
 
 
 def ask(text, channel='WhatsApp', ext='SM1'):
@@ -332,12 +333,21 @@ def test_wrong_version_for_fact_date_and_overlap(pg):
 def test_no_match_and_unready_document_escalate_not_denied(pg, llm):
     verify(pg)
     reply, state = ask('¿Cubre los daños por agua?')  # no document yet
-    assert 'no cubre' not in reply.lower() and state['insurance_result'] == 'human_case_required'
+    assert 'no cubre' not in reply.lower() and state['insurance_result'] == 'missing_information'
+    with pg() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
+    _, state = ask('Sí', ext='SM-consent-1')
+    assert state['insurance_result'] == 'human_case_required'
     with pg() as conn:
         assert conn.execute('SELECT latest_reason FROM insurance_cases').fetchone()['latest_reason'] == 'unreadable_document'
     register(pg)
     run_worker()
     _, state = ask('¿Puedo viajar a la luna con mascotas?', ext='SM2')
+    assert state['insurance_result'] == 'missing_information'
+    with pg() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_case_questions').fetchone()['n'] == 1
+    _, state = ask('Sí', ext='SM-consent-2')
+    assert state['insurance_result'] == 'human_case_required'
     with pg() as conn:
         assert conn.execute('SELECT latest_reason FROM insurance_cases').fetchone()['latest_reason'] == 'insufficient_evidence'
 
@@ -358,7 +368,8 @@ def test_llm_failure_escalates_with_evidence(pg, monkeypatch):
     assert q['reason'] == 'human_interpretation' and len(q['evidence']) >= 1
 
 
-def test_duplicate_webhook_keeps_single_case(pg):
+def test_duplicate_webhook_keeps_single_case(pg, monkeypatch):
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Protocolo sintético aprobado.')
     _, a = ask('Tengo una inundación urgente', ext='SM-dup')
     _, b = ask('Tengo una inundación urgente', ext='SM-dup')
     assert a['case_id'] == b['case_id']
@@ -369,13 +380,15 @@ def test_duplicate_webhook_keeps_single_case(pg):
 def test_urgency_without_approved_protocol_invents_no_contact(pg, monkeypatch):
     monkeypatch.delenv('INSURANCE_URGENT_PROTOCOL_TEXT', raising=False)
     reply, state = ask('Tengo una inundación urgente en casa')
-    assert state['insurance_result'] == 'urgent'
+    assert state['insurance_result'] not in ('urgent', 'human_case_required')
     assert not any(ch.isdigit() for ch in reply)
     with pg() as conn:
-        assert conn.execute('SELECT urgency FROM insurance_cases').fetchone()['urgency'] == 'critical'
+        assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
     monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Sigue el protocolo aprobado X.')
     reply, _ = ask('Tengo una inundación urgente en casa', ext='SM9')
     assert reply.startswith('Sigue el protocolo aprobado X.')
+    with pg() as conn:
+        assert conn.execute('SELECT urgency FROM insurance_cases').fetchone()['urgency'] == 'critical'
 
 
 def test_claim_without_date_asks_clarification(pg, llm):

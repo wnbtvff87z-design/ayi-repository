@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from collections import namedtuple
 
 from insurance import identity, retrieval
@@ -23,7 +24,7 @@ DEFAULTS = {
     'INSURANCE_LLM_CONTEXT_CHARS': 12000,   # whole LLM prompt budget (~4 chars per token)
     'INSURANCE_TURN_RETENTION_DAYS': 90,
     'INSURANCE_MAX_TURNS_PER_CONVERSATION': 2000,
-    'INSURANCE_MEMORY_SCAN_LIMIT': 500,     # most recent questions inspected by recall
+    'INSURANCE_MEMORY_SCAN_LIMIT': 500,     # maximum rows per recall batch, not a history cutoff
     'INSURANCE_RECALLED_TURNS': 2,
     'INSURANCE_TURN_MAX_CHARS': 4000,
     'INSURANCE_SUMMARY_MAX_TOPICS': 30,
@@ -40,9 +41,20 @@ def cfg(name):
         return DEFAULTS[name]
 
 
-def redact(text):
+def redact(text, *, bounded=True):
     """No DNI/NIE in clear in stored text."""
-    return identity.DOC_RE.sub('[documento]', str(text or ''))[:cfg('INSURANCE_TURN_MAX_CHARS')]
+    text = unicodedata.normalize('NFKC', str(text or ''))
+    text = _DOCUMENT.sub('[documento]', identity.DOC_RE.sub('[documento]', text))
+    return text[:cfg('INSURANCE_TURN_MAX_CHARS')] if bounded else text
+
+
+_DOCUMENT = re.compile(
+    r'(?<!\w)(?:[0-9](?:[\s.\-‐‑–—]*[0-9]){7}|[XYZxyz](?:[\s.\-‐‑–—]*[0-9]){7})'
+    r'[\s.\-‐‑–—]*[A-Za-z](?!\w)')
+
+
+def _scope(sc):
+    return sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id
 
 
 def toks(text):
@@ -91,14 +103,17 @@ def record_assistant(conn, sc, external_id, content, decision, reply_to, corr, k
         'ON CONFLICT (business_id,channel,conversation_ref,session_ref,external_id,role) DO NOTHING '
         'RETURNING turn_id',
         (sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id, kind, external_id, reply_to,
-         redact(content), policy_id, version_id, decision, json.dumps(pages or []), corr)).fetchone()
+         redact(content, bounded=False), policy_id, version_id, decision, json.dumps(pages or []), corr)).fetchone()
+    if row:
+        _enforce_limits(conn, sc, row['turn_id'])
     return row['turn_id'] if row else None
 
 
 def find_reply(conn, sc, external_id):
-    """The assistant reply already stored for this webhook retry, if any."""
+    """Retry record with ownership/evidence metadata; caller must revalidate before disclosure."""
     return conn.execute(
-        'SELECT turn_id,content,decision FROM insurance_conversation_turns WHERE business_id=%s AND '
+        'SELECT turn_id,content,decision,customer_id,policy_id,version_id,pages '
+        'FROM insurance_conversation_turns WHERE business_id=%s AND '
         "channel=%s AND conversation_ref=%s AND session_ref=%s AND external_id=%s AND role='assistant'",
         (sc.bid, sc.channel, sc.ref, sc.sess, external_id)).fetchone()
 
@@ -113,11 +128,18 @@ def claim_unverified(conn, sc):
 def recent(conn, sc, n=None):
     n = n or cfg('INSURANCE_RECENT_TURNS')
     rows = conn.execute(
-        'SELECT turn_id,role,kind,content,decision,policy_id,pages FROM (SELECT * FROM insurance_conversation_turns '
-        "WHERE business_id=%s AND channel=%s AND conversation_ref=%s AND customer_id=%s AND kind IN "
-        f"('question','answer','clarification','confirmation') AND {_WITHIN} ORDER BY turn_id DESC LIMIT %s) t "
-        'ORDER BY turn_id', (sc.bid, sc.channel, sc.ref, sc.customer_id, cfg('INSURANCE_TURN_RETENTION_DAYS'),
-                             2 * n)).fetchall()
+        'WITH exchanges AS (SELECT q.turn_id AS q_id,a.turn_id AS a_id FROM insurance_conversation_turns q '
+        'JOIN insurance_conversation_turns a ON a.reply_to=q.turn_id AND a.business_id=q.business_id '
+        'AND a.channel=q.channel AND a.conversation_ref=q.conversation_ref AND a.session_ref=q.session_ref '
+        'AND a.customer_id=q.customer_id AND a.role=\'assistant\' '
+        'WHERE q.business_id=%s AND q.channel=%s AND q.conversation_ref=%s AND q.session_ref=%s '
+        "AND q.customer_id=%s AND q.role='user' AND q.kind IN ('question','clarification','confirmation') "
+        'AND q.created_at>now()-make_interval(days=>%s) AND a.created_at>now()-make_interval(days=>%s) '
+        'ORDER BY q.turn_id DESC LIMIT %s) '
+        'SELECT t.turn_id,t.reply_to,t.role,t.kind,t.content,t.decision,t.policy_id,t.version_id,t.pages '
+        'FROM insurance_conversation_turns t JOIN exchanges e ON t.turn_id=e.q_id OR t.turn_id=e.a_id '
+        'ORDER BY e.q_id,t.turn_id',
+        (*_scope(sc), cfg('INSURANCE_TURN_RETENTION_DAYS'), cfg('INSURANCE_TURN_RETENTION_DAYS'), n)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -125,43 +147,83 @@ PAIR_SQL = (
     'SELECT q.turn_id AS q_id,q.content AS q,q.normalized,q.created_at,a.turn_id AS a_id,a.content AS a,'
     'a.policy_id,a.version_id,a.pages,a.decision FROM insurance_conversation_turns q '
     'LEFT JOIN insurance_conversation_turns a ON a.reply_to=q.turn_id AND a.business_id=q.business_id '
+    'AND a.channel=q.channel AND a.conversation_ref=q.conversation_ref AND a.session_ref=q.session_ref '
+    'AND a.customer_id=q.customer_id AND a.created_at > now() - make_interval(days=>%s) '
     "AND a.role='assistant' AND a.kind='answer' "
-    "WHERE q.business_id=%s AND q.channel=%s AND q.conversation_ref=%s AND q.customer_id=%s AND q.role='user' "
+    "WHERE q.business_id=%s AND q.channel=%s AND q.conversation_ref=%s AND q.session_ref=%s AND q.customer_id=%s AND q.role='user' "
     "AND q.kind='question' AND q.created_at > now() - make_interval(days=>%s) ")
 
 
-def pairs(conn, sc, oldest_first=False, limit=None):
+def pairs(conn, sc, oldest_first=False, limit=None, exclude_question_id=None, answered_only=False):
     """Questions (with their stored answer and pages) inside the retention window; bounded scan."""
+    sql, params = PAIR_SQL, _pair_params(sc)
+    if exclude_question_id is not None:
+        sql += 'AND q.turn_id<>%s '
+        params += (exclude_question_id,)
+    if answered_only:
+        sql += 'AND a.turn_id IS NOT NULL '
     rows = conn.execute(
-        PAIR_SQL + f"ORDER BY q.turn_id {'ASC' if oldest_first else 'DESC'} LIMIT %s",
-        (sc.bid, sc.channel, sc.ref, sc.customer_id, cfg('INSURANCE_TURN_RETENTION_DAYS'),
-         limit or cfg('INSURANCE_MEMORY_SCAN_LIMIT'))).fetchall()
+        sql + f"ORDER BY q.turn_id {'ASC' if oldest_first else 'DESC'} LIMIT %s",
+        params + (
+         limit or cfg('INSURANCE_MEMORY_SCAN_LIMIT'),)).fetchall()
     return [dict(r) for r in rows]
 
 
 def pair_by_question(conn, sc, q_id):
-    r = conn.execute(PAIR_SQL + 'AND q.turn_id=%s', (sc.bid, sc.channel, sc.ref, sc.customer_id,
-                                                      cfg('INSURANCE_TURN_RETENTION_DAYS'), q_id)).fetchone()
+    r = conn.execute(PAIR_SQL + 'AND q.turn_id=%s', _pair_params(sc) + (q_id,)).fetchone()
     return dict(r) if r else None
 
 
 def last_answered(conn, sc):
     r = conn.execute(
         PAIR_SQL + 'AND a.turn_id IS NOT NULL ORDER BY q.turn_id DESC LIMIT 1',
-        (sc.bid, sc.channel, sc.ref, sc.customer_id, cfg('INSURANCE_TURN_RETENTION_DAYS'))).fetchone()
+        _pair_params(sc)).fetchone()
     return dict(r) if r else None
+
+
+def _pair_params(sc):
+    days = cfg('INSURANCE_TURN_RETENTION_DAYS')
+    return (days, *_scope(sc), days)
+
+
+def iter_pairs(conn, sc, exclude_question_id=None, answered_only=False):
+    """Keyset batches over every retained question; memory use is bounded by batch size."""
+    before = None
+    while True:
+        sql, params = PAIR_SQL, _pair_params(sc)
+        if exclude_question_id is not None:
+            sql += 'AND q.turn_id<>%s '
+            params += (exclude_question_id,)
+        if answered_only:
+            sql += 'AND a.turn_id IS NOT NULL '
+        if before is not None:
+            sql += 'AND q.turn_id < %s '
+            params += (before,)
+        rows = conn.execute(sql + 'ORDER BY q.turn_id DESC LIMIT %s',
+                            params + (cfg('INSURANCE_MEMORY_SCAN_LIMIT'),)).fetchall()
+        if not rows:
+            return
+        yield [dict(r) for r in rows]
+        before = rows[-1]['q_id']
+
+
+def recall(conn, sc, topic, about_answer=False, recent_bias=False, exclude_question_id=None):
+    from insurance import references
+    return references.pick((p for batch in iter_pairs(conn, sc, exclude_question_id, answered_only=True)
+                            for p in batch), topic,
+                           about_answer=about_answer, recent_bias=recent_bias)
 
 
 # ---- Retention ------------------------------------------------------------------------------
 def _enforce_limits(conn, sc, turn_id):
     """Cheap, bounded housekeeping on write: per-conversation cap always; global purge every 25th turn."""
     cap = cfg('INSURANCE_MAX_TURNS_PER_CONVERSATION')
-    if turn_id % 10 == 0:
-        conn.execute(
-            'DELETE FROM insurance_conversation_turns WHERE turn_id IN (SELECT turn_id FROM '
-            'insurance_conversation_turns WHERE business_id=%s AND channel=%s AND conversation_ref=%s '
-            'ORDER BY turn_id DESC OFFSET %s LIMIT %s)',
-            (sc.bid, sc.channel, sc.ref, cap, cfg('INSURANCE_PURGE_BATCH')))
+    conn.execute(
+        'DELETE FROM insurance_conversation_turns WHERE turn_id IN (SELECT turn_id FROM '
+        'insurance_conversation_turns WHERE business_id=%s AND channel=%s AND conversation_ref=%s '
+        'AND session_ref=%s AND customer_id IS NOT DISTINCT FROM %s '
+        'ORDER BY turn_id DESC OFFSET %s LIMIT %s)',
+        (*_scope(sc), cap, cfg('INSURANCE_PURGE_BATCH')))
     if turn_id % 25 == 0:
         purge_expired(conn)
 
@@ -175,28 +237,91 @@ def purge_expired(conn):
         'DELETE FROM insurance_conversation_turns WHERE turn_id IN (SELECT turn_id FROM '
         'insurance_conversation_turns WHERE created_at < now() - make_interval(days=>%s) '
         'ORDER BY created_at LIMIT %s)', (days, batch)).rowcount
-    s = conn.execute('DELETE FROM insurance_conversation_summary WHERE updated_at < now() - '
-                     'make_interval(days=>%s)', (days,)).rowcount
-    st = conn.execute('DELETE FROM insurance_conversation_state WHERE updated_at < now() - '
-                      'make_interval(secs=>%s)', (cfg('INSURANCE_STATE_RETENTION_SECONDS'),)).rowcount
-    return {'turns': t, 'summaries': s, 'states': st}
+    s = conn.execute('DELETE FROM insurance_conversation_summary WHERE ctid IN (SELECT ctid FROM '
+                     'insurance_conversation_summary WHERE updated_at < now() - '
+                     'make_interval(days=>%s) ORDER BY updated_at LIMIT %s)', (days, batch)).rowcount
+    st = conn.execute('DELETE FROM insurance_conversation_state WHERE ctid IN (SELECT st.ctid FROM '
+                     'insurance_conversation_state st WHERE updated_at < now() - make_interval(secs=>%s) '
+                     "OR (state ? 'customer_id' AND NOT EXISTS (SELECT 1 FROM insurance_identity_verifications v "
+                     'WHERE v.business_id=st.business_id AND v.channel=st.channel AND '
+                     'v.conversation_ref=st.conversation_ref AND v.session_ref=st.session_ref '
+                     "AND v.customer_id=st.state->>'customer_id' AND v.revoked_at IS NULL AND v.expires_at>now())) "
+                     'ORDER BY updated_at LIMIT %s)',
+                     (cfg('INSURANCE_STATE_RETENTION_SECONDS'), batch)).rowcount
+    v = conn.execute('DELETE FROM insurance_identity_verifications WHERE verification_id IN '
+                     '(SELECT verification_id FROM insurance_identity_verifications WHERE expires_at<=now() '
+                     'OR revoked_at IS NOT NULL ORDER BY verification_id LIMIT %s)', (batch,)).rowcount
+    return {'turns': t, 'summaries': s, 'states': st, 'verifications': v}
 
 
 def erase_customer(conn, business_id, customer_id):
     """Right-to-erasure helper: removes this customer's turns and summaries (not cases)."""
+    st = conn.execute(
+        'DELETE FROM insurance_conversation_state st WHERE st.business_id=%s AND '
+        "(st.state->>'customer_id'=%s OR EXISTS (SELECT 1 FROM insurance_identity_verifications v "
+        'WHERE v.business_id=st.business_id AND v.channel=st.channel AND v.conversation_ref=st.conversation_ref '
+        'AND v.session_ref=st.session_ref AND v.customer_id=%s) OR EXISTS '
+        '(SELECT 1 FROM insurance_conversation_turns t WHERE t.business_id=st.business_id AND '
+        't.channel=st.channel AND t.conversation_ref=st.conversation_ref AND t.session_ref=st.session_ref '
+        'AND t.customer_id=%s))', (business_id, customer_id, customer_id, customer_id)).rowcount
+    v = conn.execute('DELETE FROM insurance_identity_verifications WHERE business_id=%s AND customer_id=%s',
+                     (business_id, customer_id)).rowcount
     t = conn.execute('DELETE FROM insurance_conversation_turns WHERE business_id=%s AND customer_id=%s',
                      (business_id, customer_id)).rowcount
     s = conn.execute('DELETE FROM insurance_conversation_summary WHERE business_id=%s AND customer_id=%s',
                      (business_id, customer_id)).rowcount
-    return {'turns': t, 'summaries': s}
+    return {'turns': t, 'summaries': s, 'states': st, 'verifications': v}
 
 
 # ---- Tier C: incremental structured summary -------------------------------------------------
 def load_summary(conn, sc):
     r = conn.execute('SELECT summary,last_turn_id FROM insurance_conversation_summary WHERE business_id=%s AND '
-                     'channel=%s AND conversation_ref=%s AND customer_id=%s FOR UPDATE',
-                     (sc.bid, sc.channel, sc.ref, sc.customer_id)).fetchone()
-    return (dict(r['summary']), r['last_turn_id']) if r else ({}, 0)
+                     'channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s FOR UPDATE',
+                     _scope(sc)).fetchone()
+    return (_bound_summary(_prune_summary(conn, sc, dict(r['summary']))), r['last_turn_id']) if r else ({}, 0)
+
+
+def _prune_summary(conn, sc, summary):
+    """Every summary item needs a retained, same-scope source; legacy unanchored text is discarded."""
+    ids = set()
+    for key in ('topics', 'facts', 'pending', 'open_issues', 'conclusions'):
+        for entry in summary.get(key, []):
+            if isinstance(entry, dict):
+                ids.add(entry.get('turn', entry.get('id')))
+                if entry.get('a_turn'):
+                    ids.add(entry['a_turn'])
+    ids.add((summary.get('active') or {}).get('turn'))
+    ids.add(summary.get('event_date_turn'))
+    ids.discard(None)
+    rows = conn.execute(
+        'SELECT turn_id FROM insurance_conversation_turns WHERE business_id=%s AND channel=%s '
+        'AND conversation_ref=%s AND session_ref=%s AND customer_id=%s AND turn_id=ANY(%s) '
+        f'AND {_WITHIN}', (*_scope(sc), list(ids), cfg('INSURANCE_TURN_RETENTION_DAYS'))).fetchall() if ids else []
+    alive = {r['turn_id'] for r in rows}
+    for key in ('topics', 'facts', 'pending', 'open_issues', 'conclusions'):
+        summary[key] = [e for e in summary.get(key, []) if isinstance(e, dict)
+                       and e.get('turn', e.get('id')) in alive
+                       and (not e.get('a_turn') or e['a_turn'] in alive)]
+    if (summary.get('active') or {}).get('turn') not in alive:
+        summary.pop('active', None)
+    if summary.get('event_date_turn') not in alive:
+        summary.pop('event_date', None)
+        summary.pop('event_date_turn', None)
+    return summary
+
+
+def _bound_summary(summary):
+    """Shed whole low-priority entries, never a fragment of a contractual conclusion."""
+    maximum = cfg('INSURANCE_SUMMARY_MAX_CHARS')
+    if maximum < 2:
+        raise ContextBudgetExceeded('Summary budget cannot fit an empty JSON object')
+    for key in ('topics', 'conclusions', 'facts', 'open_issues', 'pending'):
+        while len(json.dumps(summary, ensure_ascii=False)) > maximum and summary.get(key):
+            summary[key].pop(0)
+    for key in ('active', 'event_date', 'event_date_turn'):
+        if len(json.dumps(summary, ensure_ascii=False)) > maximum:
+            summary.pop(key, None)
+    return summary if len(json.dumps(summary, ensure_ascii=False)) <= maximum else {}
 
 
 def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answer, decision, policy_id,
@@ -205,36 +330,41 @@ def update_summary(conn, sc, *, user_turn_id, assistant_turn_id, question, answe
     not newer than last_turn_id is ignored (webhook retry / double call). Never rebuilt from scratch."""
     if not assistant_turn_id:
         return False
+    conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
+                 (json.dumps(_scope(sc)),))
     s, last = load_summary(conn, sc)
     if assistant_turn_id <= last:
         return False
     topics = [t for t in s.get('topics', []) if t['id'] != user_turn_id]
-    topics.append({'id': user_turn_id, 'q': (question or '')[:160], 'a_turn': assistant_turn_id,
-                   'answer': (answer or '')[:200] if decision == 'answer' else None, 'decision': decision,
+    topics.append({'id': user_turn_id, 'q': redact(question), 'a_turn': assistant_turn_id,
+                   'answer': redact(answer, bounded=False) if decision == 'answer' else None, 'decision': decision,
                    'policy_id': policy_id, 'version_id': version_id,
-                   'pages': [{'d': p.get('document_id'), 'p': p.get('page')} for p in (pages or [])][:5]})
+                   'pages': [{'d': p.get('document_id'), 'p': p.get('page'),
+                              'v': p.get('version_id', version_id)} for p in (pages or [])]})
     s['topics'] = topics[-cfg('INSURANCE_SUMMARY_MAX_TOPICS'):]
     if policy_id:
-        s['active'] = {'policy_id': policy_id, 'version_id': version_id}
+        s['active'] = {'policy_id': policy_id, 'version_id': version_id, 'turn': user_turn_id}
     if event_date:
-        s['event_date'] = str(event_date)
+        s['event_date'] = redact(event_date)
+        s['event_date_turn'] = user_turn_id
     if fact:
-        s['facts'] = (s.get('facts', []) + [fact[:160]])[-10:]
-    s['pending'] = [pending[:160]] if pending else []
+        s['facts'] = (s.get('facts', []) + [{'turn': user_turn_id, 'text': redact(fact)}])[-10:]
+    s['pending'] = [{'turn': user_turn_id, 'text': redact(pending)}] if pending else []
     issues = [i for i in s.get('open_issues', []) if i.get('turn') != user_turn_id]
     if open_issue:
-        issues.append({'turn': user_turn_id, 'issue': open_issue[:160]})
+        issues.append({'turn': user_turn_id, 'issue': redact(open_issue)})
     s['open_issues'] = issues[-10:]
     if decision == 'answer':
         s['conclusions'] = (s.get('conclusions', []) + [{'turn': assistant_turn_id,
-                                                         'text': (answer or '')[:120]}])[-10:]
-    while len(json.dumps(s, ensure_ascii=False)) > cfg('INSURANCE_SUMMARY_MAX_CHARS') and len(s['topics']) > 1:
-        s['topics'].pop(0)
+                                                      'text': redact(answer, bounded=False), 'policy_id': policy_id,
+                                                      'version_id': version_id,
+                                                      'pages': topics[-1]['pages']}])[-10:]
+    s = _bound_summary(_prune_summary(conn, sc, s))
     conn.execute(
-        'INSERT INTO insurance_conversation_summary(business_id,channel,conversation_ref,customer_id,summary,'
-        'last_turn_id) VALUES(%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT (business_id,channel,conversation_ref,'
-        'customer_id) DO UPDATE SET summary=EXCLUDED.summary,last_turn_id=EXCLUDED.last_turn_id,updated_at=now()',
-        (sc.bid, sc.channel, sc.ref, sc.customer_id, json.dumps(s, ensure_ascii=False), assistant_turn_id))
+        'INSERT INTO insurance_conversation_summary(business_id,channel,conversation_ref,session_ref,customer_id,summary,'
+        'last_turn_id) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT (business_id,channel,conversation_ref,'
+        'session_ref,customer_id) DO UPDATE SET summary=EXCLUDED.summary,last_turn_id=EXCLUDED.last_turn_id,updated_at=now()',
+        (*_scope(sc), json.dumps(s, ensure_ascii=False), assistant_turn_id))
     return True
 
 
@@ -248,17 +378,26 @@ def render_summary(s, limit):
     if s.get('event_date'):
         lines.append(f"Fecha del hecho indicada: {s['event_date']}")
     for f in s.get('facts', []):
-        lines.append(f'Hecho indicado por el usuario: {f}')
+        lines.append(f"Hecho indicado por el usuario: {f['text']}")
     for t in s.get('topics', [])[-12:]:
         ans = f" -> {t['answer']}" if t.get('answer') else f" ({t.get('decision')})"
-        pg = ','.join(f"{p['d']}:p{p['p']}" for p in t.get('pages', []))
-        lines.append(f"Tema #{t['id']}: {t['q']}{ans}" + (f' [evidencia {pg}]' if pg else ''))
+        pg = ','.join(f"{p['d']}:p{p['p']}:v{p.get('v')}" for p in t.get('pages', []))
+        lines.append(f"Tema #{t['id']} póliza {t.get('policy_id')} versión {t.get('version_id')}: {t['q']}{ans}" +
+                     (f' [evidencia {pg}]' if pg else ''))
     for p in s.get('pending', []):
-        lines.append(f'Pendiente: {p}')
+        lines.append(f"Pendiente: {p['text']}")
     for i in s.get('open_issues', []):
         lines.append(f"Asunto abierto: {i['issue']}")
-    out = '\n'.join(lines)
-    return out[-limit:] if len(out) > limit else out
+    for c in s.get('conclusions', []):
+        pg = ','.join(f"{p['d']}:p{p['p']}:v{p.get('v')}" for p in c.get('pages', []))
+        lines.append(f"Conclusión anterior (no contractual), póliza {c.get('policy_id')} "
+                     f"versión {c.get('version_id')}: {c['text']}" +
+                     (f' [evidencia {pg}]' if pg else ''))
+    kept = []
+    for line in lines:
+        if len('\n'.join(kept + [line])) <= max(0, limit):
+            kept.append(line)
+    return '\n'.join(kept)
 
 
 # ---- LLM context package under a budget -----------------------------------------------------
@@ -272,7 +411,8 @@ INSTRUCTIONS = (
 
 
 def _fmt_evidence(evidence):
-    return '\n\n'.join(f"[p.{e['page']}] {e['text']}" for e in evidence)
+    return '\n\n'.join(f"[p.{e['page']}] [documento {e.get('document_id')} "
+                       f"versión {e.get('version_id')}] {e['text']}" for e in evidence)
 
 
 def format_prompt(ctx):
@@ -297,19 +437,35 @@ def format_prompt(ctx):
     return '\n\n'.join(parts)
 
 
+class ContextBudgetExceeded(ValueError):
+    """Mandatory contractual evidence/question/policy cannot fit the configured prompt budget."""
+
+
 def build_context(*, question, evidence, policy=None, version=None, pending=None, recent_turns=(),
                   summary_text='', recalled=(), identity_line='cliente verificado y autorizado sobre esta póliza',
                   budget=None):
     """Assemble the bounded package. Priority (kept first -> dropped last): 1 evidence, 2 question,
     3 policy/version, 4 pending clarification, 5 recent relevant turns, 6 summary, 7 recalled old turns.
     The returned ctx['report'] says what was cut so behaviour at the limit is observable."""
-    budget = budget or cfg('INSURANCE_LLM_CONTEXT_CHARS')
-    ctx = {'identity': identity_line, 'question': (question or '')[:1000],
+    budget = cfg('INSURANCE_LLM_CONTEXT_CHARS') if budget is None else budget
+    groups = []
+    for turn in recent_turns:
+        if not turn.get('content'):
+           continue
+        if turn['role'] == 'user':
+           groups.append([{'role': 'user', 'text': turn['content']}])
+        elif groups and groups[-1][-1]['role'] == 'user':
+           groups[-1].append({'role': 'assistant', 'text': turn['content']})
+    groups = [g for g in groups if len(g) == 2]
+    # Retain the most relevant exchanges first, recency breaking ties; each exchange stays whole.
+    wanted = toks(question)
+    ranked = sorted(enumerate(groups), key=lambda item:
+                   (len(wanted & toks(' '.join(t['text'] for t in item[1]))), item[0]))
+    ctx = {'identity': identity_line, 'question': question or '',
            'policy': f'{policy} versión {version}' if policy else '',
-           'pending': (pending or '')[:300], 'evidence': [dict(e) for e in evidence],
-           'recent': [{'role': t['role'], 'text': (t['content'] or '')[:400]} for t in recent_turns
-                      if t.get('content')],
-           'summary': summary_text or '', 'recalled': [{'q': r['q'][:300], 'a': (r.get('a') or '(sin respuesta)')[:400]}
+           'pending': pending or '', 'evidence': [dict(e) for e in evidence],
+           'recent': [t for g in groups for t in g],
+           'summary': summary_text or '', 'recalled': [{'q': r['q'], 'a': r.get('a') or '(sin respuesta)'}
                                                         for r in recalled]}
     dropped = []
 
@@ -320,24 +476,22 @@ def build_context(*, question, evidence, policy=None, version=None, pending=None
         ctx['recalled'].pop()
         dropped.append('recalled')
     if size() > budget and ctx['summary']:
-        over = size() - budget
-        ctx['summary'] = ctx['summary'][:max(0, len(ctx['summary']) - over)]
+        ctx['summary'] = ''
         dropped.append('summary')
-    while size() > budget and ctx['recent']:
-        ctx['recent'].pop(0)
+    while size() > budget and ranked:
+        index, _ = ranked.pop(0)
+        groups[index] = []
+        ctx['recent'] = [t for g in groups for t in g]
         if 'recent' not in dropped:
             dropped.append('recent')
     if size() > budget and ctx['pending']:
         ctx['pending'] = ''
         dropped.append('pending')
-    if size() > budget:  # evidence is trimmed last, evenly, keeping every page's head
-        over = size() - budget
-        total = sum(len(e['text']) for e in ctx['evidence']) or 1
-        for e in ctx['evidence']:
-            cut = min(len(e['text']) - 100, int(over * len(e['text']) / total) + 1) if len(e['text']) > 100 else 0
-            if cut > 0:
-                e['text'] = e['text'][:len(e['text']) - cut]
-        dropped.append('evidence_trimmed')
+    if size() > budget and ctx['identity']:
+        ctx['identity'] = ''
+        dropped.append('identity')
+    if size() > budget:
+        raise ContextBudgetExceeded(f'Mandatory context needs {size()} characters; budget is {budget}')
     ctx['report'] = {'budget': budget, 'used': size(), 'dropped': sorted(set(dropped))}
     return ctx
 

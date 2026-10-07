@@ -11,6 +11,7 @@ import hmac
 import os
 import re
 import unicodedata
+from datetime import datetime, timezone
 
 from insurance.cases import MIN_KEY_BYTES
 
@@ -34,20 +35,22 @@ def verified_customer(conn, business_id, channel, phone, session_ref=''):
     if not ref:
         return None
     row = conn.execute(
-        'SELECT customer_id FROM insurance_identity_verifications WHERE business_id=%s '
-        'AND conversation_ref=%s AND session_ref=%s AND revoked_at IS NULL AND expires_at>now() '
-        'ORDER BY verification_id DESC LIMIT 1', (business_id, ref, session_ref)).fetchone()
+        'SELECT v.customer_id FROM insurance_identity_verifications v JOIN insurance_customers c '
+        'ON c.business_id=v.business_id AND c.customer_id=v.customer_id AND c.active '
+        'WHERE v.business_id=%s AND v.channel=%s AND v.conversation_ref=%s AND v.session_ref=%s '
+        'AND v.revoked_at IS NULL AND v.expires_at>now() '
+        'ORDER BY v.verification_id DESC LIMIT 1', (business_id, channel, ref, session_ref)).fetchone()
     return row['customer_id'] if row else None
 
 
 # --- Parsing and normalization of what the caller declares ---------------------------------
-DOC_RE = re.compile(r'(?<![A-Za-z0-9])((?:\d[\s.]?){7}\d[\s.-]?[A-Za-z]|[XYZxyz][\s.-]?(?:\d[\s.]?){6}\d[\s.-]?[A-Za-z])(?![A-Za-z0-9])')
+DOC_RE = re.compile(r'(?<![A-Za-z0-9])((?:\d[\s.-]*){7}\d[\s.-]*[A-Za-z]|[XYZxyz][\s.-]*(?:\d[\s.-]*){6}\d[\s.-]*[A-Za-z])(?![A-Za-z0-9])')
 CONTRACT_RE = re.compile(
     r'p[óo]liza[ \t]{0,3}(?:n[úu]mero|n[ºo°.]{1,2}|num(?:ero)?\.?)?[ \t]{0,3}[:#]?[ \t]{0,3}'
     r'([A-Za-z0-9][A-Za-z0-9/-]{2,29})', re.I)
 CONTRACT_NUMBER_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9/-]{2,29}')
 CONTRACT_STOP = {'de', 'del', 'que', 'mi', 'la', 'el', 'por', 'para', 'con'}
-WORD = r"[^\W\d_]+(?:['’-][^\W\d_]+)*"
+WORD = r"[^\W\d_]+(?:[.'’\-][^\W\d_]+)*"
 WORD_RE = re.compile(WORD)
 NAME_STOP = {'dni', 'nie', 'con', 'mi', 'y', 'e', 'documento', 'numero', 'número', 'poliza', 'póliza',
              'tengo', 'quiero', 'necesito', 'para', 'que', 'cliente', 'vivo', 'tel', 'telefono', 'teléfono',
@@ -57,7 +60,7 @@ NAME_TRIGGER_RE = re.compile(
 LABEL_RE = re.compile(r'\b(nombre|apellidos?)\s*[:=-]\s*', re.I)
 KEYWORD_RE = re.compile(r'\b(dni|nie|documento|n[úu]mero|nombre|apellidos?|y)\b', re.I)
 MAX_NAME_TOKENS = 7
-MAX_TEXT = 2000
+MAX_TEXT = 4000
 
 
 def normalize_document(value):
@@ -94,11 +97,26 @@ def name_hmac(business_id, name):
     return _hmac('name', business_id, n) if len(n.split()) >= 2 else None
 
 
-def name_prefix_hmacs(business_id, name):
+def name_prefix_hmacs(business_id, name, given_name=None, first_surname=None):
     """HMACs of every leading run of >=2 words of the REGISTERED name (order kept): a caller who says
     the first name plus the first surname (or more) hits one of them. No fuzzy or phonetic matching."""
     words = normalize_name(name).split()
-    return [_hmac('name', business_id, ' '.join(words[:i])) for i in range(2, len(words) + 1)]
+    if bool(given_name) != bool(first_surname):
+        raise ValueError('given_name and first_surname must be supplied together')
+    if given_name:
+        required = normalize_name(f'{given_name} {first_surname}').split()
+        if len(required) < 2 or words[:len(required)] != required:
+            raise ValueError('registered name must start with given_name and first_surname')
+        minimum = len(required)
+    else:
+        # The full-name schema has no surname boundaries. Preserve an explicit hyphenated
+        # surname and its leading particles; multiword given names need provisioning metadata.
+        raw = str(name or '').replace('.', ' ').split()
+        end = 2
+        while end <= len(raw) and normalize_name(raw[end - 1]) in {'de', 'del', 'la', 'las', 'los'}:
+            end += 1
+        minimum = max(2, len(normalize_name(' '.join(raw[:end])).split()))
+    return [_hmac('name', business_id, ' '.join(words[:i])) for i in range(minimum, len(words) + 1)]
 
 
 def name_is_sufficient(name):
@@ -120,7 +138,7 @@ def _take_words(s):
 def parse_declaration(text, awaiting=None):
     """What the caller said (all UNVERIFIED). Returns document, name, contract_number (text,
     leading zeros kept) and has_question (the message carries more than identity data)."""
-    text = str(text or '')[:MAX_TEXT]
+    text = str(text or '')[:_int_env('INSURANCE_TURN_MAX_CHARS', MAX_TEXT)]
     rest = text
     doc = DOC_RE.search(rest)
     document = normalize_document(doc.group(1)) if doc else None
@@ -130,7 +148,6 @@ def parse_declaration(text, awaiting=None):
     for m in CONTRACT_RE.finditer(rest):
         if m.group(1).casefold() not in CONTRACT_STOP and re.search(r'\d', m.group(1)):
             contract = m.group(1)
-            rest = rest[:m.start()] + ' ' + rest[m.end():]
             break
     if contract is None and awaiting == 'policy':
         bare = re.fullmatch(r'(?:(?:la|el) )?([A-Za-z0-9][A-Za-z0-9/-]{2,29})\.?', ' '.join(rest.split()), re.I)
@@ -156,14 +173,17 @@ def parse_declaration(text, awaiting=None):
                 rest = rest[:t.start()] + ' ' + rest[t.end() + end:]
     if name is None and awaiting == 'identity' and '?' not in rest:
         words = WORD_RE.findall(KEYWORD_RE.sub(' ', rest))
-        if 2 <= len(words) <= MAX_NAME_TOKENS and not {w.casefold() for w in words} & NAME_STOP:
+        if (2 <= len(normalize_name(' '.join(words)).split()) <= MAX_NAME_TOKENS
+                and not {w.casefold() for w in words} & NAME_STOP):
             name, rest = ' '.join(words), ''
     remaining = WORD_RE.findall(KEYWORD_RE.sub(' ', rest))
     # The case/question keeps the message WITHOUT the identity data that was in it.
     question = re.sub(r'\b(?:dni|nie)\b', ' ', LABEL_RE.sub(' ', rest), flags=re.I)
     question = re.sub(r'\s+', ' ', question).strip(' ,;.-:')
     return {'document': document, 'name': name, 'contract_number': contract,
-            'has_question': len(remaining) >= 4, 'question': question}
+            'has_question': len(remaining) >= 4, 'question': question,
+            'policy_only': bool(contract and (not question or
+                                CONTRACT_RE.fullmatch(question.strip(' .,:;!?¿'))))}
 
 
 def extract_claims(text):
@@ -235,11 +255,25 @@ def load_state(conn, business_id, channel, ref, session_ref):
     row = conn.execute(
         'SELECT state FROM insurance_conversation_state WHERE business_id=%s AND channel=%s '
         'AND conversation_ref=%s AND session_ref=%s AND updated_at>now()-make_interval(secs=>%s)',
-        (business_id, channel, ref, session_ref, verification_ttl_seconds())).fetchone()
-    return dict(row['state']) if row else {}
+        (business_id, channel, ref, session_ref,
+         _int_env('INSURANCE_INACTIVITY_SECONDS', 1800))).fetchone()
+    if not row:
+        return {}
+    state = dict(row['state'])
+    last_user = state.get('last_user_at')
+    if last_user:
+        try:
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_user)).total_seconds()
+            if elapsed >= _int_env('INSURANCE_INACTIVITY_SECONDS', 1800):
+                return {}
+        except (ValueError, TypeError):
+            return {}
+    return state
 
 
-def save_state(conn, business_id, channel, ref, session_ref, state):
+def save_state(conn, business_id, channel, ref, session_ref, state, user_activity=False):
+    if user_activity or 'last_user_at' not in state:
+        state['last_user_at'] = datetime.now(timezone.utc).isoformat()
     conn.execute(
         'INSERT INTO insurance_conversation_state(business_id,channel,conversation_ref,session_ref,state) '
         'VALUES(%s,%s,%s,%s,%s::jsonb) ON CONFLICT (business_id,channel,conversation_ref,session_ref) '
@@ -252,7 +286,8 @@ def clear_state(conn, business_id, channel, ref, session_ref):
                  'AND conversation_ref=%s AND session_ref=%s', (business_id, channel, ref, session_ref))
 
 
-def upsert_customer(conn, business_id, customer_id, display_name, document, full_name=None):
+def upsert_customer(conn, business_id, customer_id, display_name, document, full_name=None,
+                    given_name=None, first_surname=None):
     """Controlled provisioning helper (ops/tests). No public endpoint calls this."""
     conn.execute(
         'INSERT INTO insurance_customers(business_id,customer_id,display_name,document_hmac,name_hmac,'
@@ -261,4 +296,5 @@ def upsert_customer(conn, business_id, customer_id, display_name, document, full
         'name_prefix_hmacs=EXCLUDED.name_prefix_hmacs',
         (business_id, customer_id, display_name, document_hmac(business_id, document),
          name_hmac(business_id, full_name or display_name),
-         [h for h in name_prefix_hmacs(business_id, full_name or display_name) if h]))
+         [h for h in name_prefix_hmacs(business_id, full_name or display_name,
+                                     given_name, first_surname) if h]))
