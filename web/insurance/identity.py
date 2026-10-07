@@ -1,6 +1,6 @@
 """Identity gate. An incoming phone only names a conversation.
 
-A caller is verified by giving name + surnames + DNI/NIE that match, exactly and after
+A caller is verified by giving name + first surname + DNI/NIE that match, exactly and after
 normalization, ONE active customer of the business resolved from the dialled number. Only then
 is a temporary row written to insurance_identity_verifications (bound to business, channel and
 session). Nothing declared by the caller can change the business.
@@ -34,14 +34,16 @@ def verified_customer(conn, business_id, channel, phone, session_ref=''):
     if not ref:
         return None
     row = conn.execute(
-        'SELECT customer_id FROM insurance_identity_verifications WHERE business_id=%s '
-        'AND conversation_ref=%s AND session_ref=%s AND revoked_at IS NULL AND expires_at>now() '
-        'ORDER BY verification_id DESC LIMIT 1', (business_id, ref, session_ref)).fetchone()
+        'SELECT v.customer_id FROM insurance_identity_verifications v '
+        'JOIN insurance_customers c ON c.business_id=v.business_id AND c.customer_id=v.customer_id '
+        'WHERE v.business_id=%s AND v.channel=%s AND v.conversation_ref=%s AND v.session_ref=%s '
+        'AND c.active AND v.revoked_at IS NULL AND v.expires_at>now() '
+        'ORDER BY v.verification_id DESC LIMIT 1', (business_id, channel, ref, session_ref)).fetchone()
     return row['customer_id'] if row else None
 
 
 # --- Parsing and normalization of what the caller declares ---------------------------------
-DOC_RE = re.compile(r'(?<![A-Za-z0-9])((?:\d[\s.]?){7}\d[\s.-]?[A-Za-z]|[XYZxyz][\s.-]?(?:\d[\s.]?){6}\d[\s.-]?[A-Za-z])(?![A-Za-z0-9])')
+DOC_RE = re.compile(r'(?<![A-Za-z0-9])((?:\d[\s.-]*){8}[A-Za-z]|[XYZxyz][\s.-]*(?:\d[\s.-]*){7}[A-Za-z])(?![A-Za-z0-9])')
 CONTRACT_RE = re.compile(
     r'p[óo]liza[ \t]{0,3}(?:n[úu]mero|n[ºo°.]{1,2}|num(?:ero)?\.?)?[ \t]{0,3}[:#]?[ \t]{0,3}'
     r'([A-Za-z0-9][A-Za-z0-9/-]{2,29})', re.I)
@@ -94,11 +96,22 @@ def name_hmac(business_id, name):
     return _hmac('name', business_id, n) if len(n.split()) >= 2 else None
 
 
-def name_prefix_hmacs(business_id, name):
+def name_prefix_hmacs(business_id, name, *, given_names=None, first_surname=None):
     """HMACs of every leading run of >=2 words of the REGISTERED name (order kept): a caller who says
     the first name plus the first surname (or more) hits one of them. No fuzzy or phonetic matching."""
     words = normalize_name(name).split()
-    return [_hmac('name', business_id, ' '.join(words[:i])) for i in range(2, len(words) + 1)]
+    if bool(given_names) != bool(first_surname):
+        raise ValueError('given_names and first_surname must be supplied together')
+    if given_names:
+        minimum = normalize_name(f'{given_names} {first_surname}').split()
+        if not normalize_name(given_names) or not normalize_name(first_surname) or words[:len(minimum)] != minimum:
+            raise ValueError('registered name components must be an ordered prefix of full_name')
+        start = len(minimum)
+    else:
+        # A hyphenated surname is one registered component, even though normalization folds its hyphen.
+        components = WORD_RE.findall(str(name or ''))
+        start = len(normalize_name(' '.join(components[:2])).split())
+    return [_hmac('name', business_id, ' '.join(words[:i])) for i in range(max(2, start), len(words) + 1)]
 
 
 def name_is_sufficient(name):
@@ -109,7 +122,7 @@ def name_is_sufficient(name):
 def _take_words(s):
     words, pos = [], 0
     while len(words) < MAX_NAME_TOKENS:
-        m = re.compile(r'\s*(' + WORD + ')').match(s, pos)
+        m = re.compile(r'[\s.]*(' + WORD + ')').match(s, pos)
         if not m or m.group(1).casefold() in NAME_STOP:
             break
         words.append(m.group(1))
@@ -162,7 +175,7 @@ def parse_declaration(text, awaiting=None):
     # The case/question keeps the message WITHOUT the identity data that was in it.
     question = re.sub(r'\b(?:dni|nie)\b', ' ', LABEL_RE.sub(' ', rest), flags=re.I)
     question = re.sub(r'\s+', ' ', question).strip(' ,;.-:')
-    return {'document': document, 'name': name, 'contract_number': contract,
+    return {'document': document, 'name': name, 'contract_number': contract, 'original': text,
             'has_question': len(remaining) >= 4, 'question': question}
 
 
@@ -177,10 +190,33 @@ def match_by_hashes(conn, business_id, doc_hash, name_hash):
     0 = no match, 1 = verified, >1 = ambiguous. The DNI index narrows to a handful of rows first."""
     if not doc_hash or not name_hash:
         return []
-    return [r['customer_id'] for r in conn.execute(
+    matches = [r['customer_id'] for r in conn.execute(
         'SELECT customer_id FROM insurance_customers WHERE business_id=%s AND active '
-        'AND document_hmac=%s AND (name_hmac=%s OR name_prefix_hmacs @> ARRAY[%s]::text[]) LIMIT 20',
+        'AND document_hmac=%s AND (name_hmac=%s OR name_prefix_hmacs @> ARRAY[%s]::text[]) LIMIT 2',
         (business_id, doc_hash, name_hash, name_hash)).fetchall()]
+    if len(matches) >= 2:
+        return matches
+    # Migration 008 cannot derive HMACs in SQL. Only use a legacy display name when its complete
+    # normalized value matches the trusted full-name HMAC; abbreviated display names never qualify.
+    with conn.cursor(name='insurance_legacy_identity') as cursor:
+        cursor.execute(
+            'SELECT customer_id,display_name,name_hmac FROM insurance_customers WHERE business_id=%s '
+            'AND active AND document_hmac=%s AND cardinality(name_prefix_hmacs)=0',
+            (business_id, doc_hash))
+        for row in cursor:
+            if row['customer_id'] in matches:
+                continue
+            full = row['display_name']
+            if _legacy_name_matches(business_id, full, row['name_hmac'], name_hash):
+                matches.append(row['customer_id'])
+                if len(matches) == 2:
+                    break
+    return matches
+
+
+def _legacy_name_matches(business_id, full, trusted_hash, declared_hash):
+    return (bool(trusted_hash) and name_hmac(business_id, full) == trusted_hash
+            and declared_hash in name_prefix_hmacs(business_id, full))
 
 
 def _int_env(name, default):
@@ -235,7 +271,7 @@ def load_state(conn, business_id, channel, ref, session_ref):
     row = conn.execute(
         'SELECT state FROM insurance_conversation_state WHERE business_id=%s AND channel=%s '
         'AND conversation_ref=%s AND session_ref=%s AND updated_at>now()-make_interval(secs=>%s)',
-        (business_id, channel, ref, session_ref, verification_ttl_seconds())).fetchone()
+        (business_id, channel, ref, session_ref, state_ttl_seconds())).fetchone()
     return dict(row['state']) if row else {}
 
 
@@ -252,8 +288,15 @@ def clear_state(conn, business_id, channel, ref, session_ref):
                  'AND conversation_ref=%s AND session_ref=%s', (business_id, channel, ref, session_ref))
 
 
-def upsert_customer(conn, business_id, customer_id, display_name, document, full_name=None):
+def state_ttl_seconds():
+    return _int_env('INSURANCE_STATE_TTL_SECONDS', 86400)
+
+
+def upsert_customer(conn, business_id, customer_id, display_name, document, full_name=None, *,
+                   given_names=None, first_surname=None):
     """Controlled provisioning helper (ops/tests). No public endpoint calls this."""
+    prefixes = name_prefix_hmacs(business_id, full_name or display_name,
+                                given_names=given_names, first_surname=first_surname)
     conn.execute(
         'INSERT INTO insurance_customers(business_id,customer_id,display_name,document_hmac,name_hmac,'
         'name_prefix_hmacs) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (business_id,customer_id) DO UPDATE SET '
@@ -261,4 +304,4 @@ def upsert_customer(conn, business_id, customer_id, display_name, document, full
         'name_prefix_hmacs=EXCLUDED.name_prefix_hmacs',
         (business_id, customer_id, display_name, document_hmac(business_id, document),
          name_hmac(business_id, full_name or display_name),
-         [h for h in name_prefix_hmacs(business_id, full_name or display_name) if h]))
+         [h for h in prefixes if h]))

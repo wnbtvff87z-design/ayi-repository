@@ -1,6 +1,7 @@
 """Classification of a message against the conversation. Deterministic, no model, no wide regex on
 the isolated word 'y'. Returns what the dialogue must do; the dialogue never merges silently when the
 reference is ambiguous."""
+import json
 import re
 import unicodedata
 
@@ -76,29 +77,42 @@ def pick(pairs_, topic_text, *, about_answer=False, recent_bias=False):
     want = memory.toks(topic_text)
     if not want:
         return 'none', None
-    scored = []
+    best, cands = 0, {}
     for p in pairs_:
-        have = memory.toks(p['q'] + (' ' + (p.get('a') or '') if about_answer else ''))
-        scored.append((len(want & have), p))
-    best = max((s for s, _ in scored), default=0)
-    if best == 0:
+        have = memory.toks(p['q'] + ' ' + (p.get('normalized') or '') +
+                           (' ' + (p.get('a') or '') if about_answer else ''))
+        score = len(want & have)
+        if score < best or score == 0:
+            continue
+        if score > best:
+            best, cands = score, {}
+        # Identical questions answered under different policies/versions are not interchangeable.
+        key = (fold(p['q']), p.get('policy_id'), p.get('version_id'), p.get('decision'),
+               p.get('a'), json.dumps(p.get('pages') or [], sort_keys=True))
+        if key in cands:
+            if p['q_id'] > cands[key]['q_id']:
+                cands[key] = p
+        elif len(cands) < 3:
+            cands[key] = p
+    if not cands:
         return 'none', None
-    top = [p for s, p in scored if s == best]
-    uniq = {}
-    for p in sorted(top, key=lambda x: -x['q_id']):       # newest first; same wording = same topic
-        uniq.setdefault(frozenset(memory.toks(p['q'])), p)
-    cands = list(uniq.values())
-    if len(cands) == 1 or recent_bias:
-        return 'clear', cands[0]
-    return 'ambiguous', cands[:3]
+    options = sorted(cands.values(), key=lambda p: -p['q_id'])
+    if len(options) == 1:
+        return 'clear', options[0]
+    return 'ambiguous', options
 
 
 def choose_option(text, options):
     """Answer to 'which one?': an ordinal or words that single out ONE option."""
     f = _strip(text)
-    for w in re.findall(r'\w+', f):
-        if w in ORDINALS and ORDINALS[w] < len(options):
-            return options[ORDINALS[w]]
+    if not options:
+        return None
+    ordinals = {ORDINALS[w] for w in re.findall(r'\w+', f)
+                if w in ORDINALS and ORDINALS[w] < len(options)}
+    if len(ordinals) > 1:
+        return None
+    if ordinals:
+        return options[ordinals.pop()]
     want = memory.toks(text)
     scored = [(len(want & memory.toks(o['q'])), o) for o in options]
     best = max(s for s, _ in scored)
