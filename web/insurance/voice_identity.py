@@ -6,10 +6,11 @@ import json
 import os
 import re
 import time
+import unicodedata
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from insurance import identity
+from insurance import identity, incident_dates
 
 
 DIGITS = dict(zip(('cero', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis',
@@ -21,9 +22,14 @@ LETTERS = {
     'ese': 'S', 'te': 'T', 'u': 'U', 'uve': 'V', 'equis': 'X',
     'ye': 'Y', 'zeta': 'Z',
 }
+CARDINALS = incident_dates.SPOKEN_NUMBERS
 LABEL = re.compile(r'\b(?:dni|nie|documento)\b\s*(?:(?:es|n[úu]mero)\b\s*)?[:=-]?\s*', re.I)
 TOKENS = re.compile(r'[^\W_]+|[/?¿,;]', re.UNICODE)
 BUFFER_KEY = 'identity_buffer'
+YEAR_RE = re.compile(r'^(?:19|20)\d{2}$')
+CORRECTION_RE = re.compile(
+    r'^\W*(?:no\b|perd[oó]n\b|me\s+equivoqu[eé]\b|corrige\b|correcci[oó]n\b|'
+    r'empiezo\s+de\s+nuevo\b)', re.I)
 
 
 def _scope(business_id, channel, ref, session):
@@ -69,31 +75,68 @@ def _save(state, scope, parts, now, started=None):
     return True
 
 
+def _fold_word(word):
+    return ''.join(c for c in unicodedata.normalize('NFD', word.casefold())
+                   if unicodedata.category(c) != 'Mn')
+
+
+def _spoken_number(matches, index):
+    word = _fold_word(matches[index].group())
+    if word in DIGITS:
+        return DIGITS[word], 1
+    value = CARDINALS.get(word)
+    if value is None or not 10 <= value <= 99:
+        return None, 0
+    consumed = 1
+    if (value % 10 == 0 and index + 2 < len(matches)
+            and _fold_word(matches[index + 1].group()) == 'y'):
+        unit = _fold_word(matches[index + 2].group())
+        if unit in DIGITS:
+            value += int(DIGITS[unit])
+            consumed = 3
+    return f'{value:02d}', consumed
+
+
+def _document_token(text, spoken):
+    word = _fold_word(text)
+    return (bool(re.fullmatch(r'\d+[a-z]?|[xyz]\d+[a-z]?', word, re.ASCII))
+            or len(word) == 1 and word.isascii() and word.isalpha()
+            or spoken and (word in DIGITS or word in LETTERS or word in CARDINALS))
+
+
 def _parts(text, spoken):
     """Return exact characters, consumed span, token count and invalidity."""
     matches = list(TOKENS.finditer(text))
     chars, end, count, bad = '', 0, 0, False
     i = 0
     while i < len(matches):
+        consumed = 1
         m = matches[i]
-        word = m.group().casefold()
-        if word in {',', ';', '?', '¿'}:
+        word = _fold_word(m.group())
+        if word == ',':
+            if i + 1 < len(matches) and _document_token(matches[i + 1].group(), spoken):
+                end = m.end()
+                count += 1
+                i += 1
+                continue
+            break
+        if word in {';', '?', '¿'}:
             break
         if word == '/' or (word in {'o', 'u'} and chars and
-                           len(chars) >= (9 if chars[0] not in 'XYZ' else 9)):
+                           len(chars) >= 9):
             bad = True
             break
         if word == 'y' and identity.normalize_document(chars) and (
                 i + 1 == len(matches) or
-                matches[i + 1].group().casefold() not in DIGITS and
+                _fold_word(matches[i + 1].group()) not in DIGITS and
                 not re.match(r'\d', matches[i + 1].group())):
             break
         if re.fullmatch(r'\d+[a-z]?|[xyz]\d+[a-z]?', word, re.ASCII):
             value = word.upper()
         elif len(word) == 1 and word.isascii() and word.isalpha():
             value = word.upper()
-        elif spoken and word in DIGITS:
-            value = DIGITS[word]
+        elif spoken and (number := _spoken_number(matches, i))[0] is not None:
+            value, consumed = number
         elif spoken and word in LETTERS:
             value = LETTERS[word]
         else:
@@ -102,15 +145,14 @@ def _parts(text, spoken):
             break
         # Multiword names must take priority over individual i/uve.
         if spoken and i + 1 < len(matches) and (
-                word, matches[i + 1].group().casefold()) in {
-                    ('i', 'griega'), ('uve', 'doble')}:
+                (word, _fold_word(matches[i + 1].group())) in {
+                    ('i', 'griega'), ('uve', 'doble')}):
             value = 'Y' if word == 'i' else 'W'
-            i += 1
-            count += 1
+            consumed = 2
         chars += value
-        end = matches[i].end()
-        count += 1
-        i += 1
+        end = matches[i + consumed - 1].end()
+        count += consumed
+        i += consumed
         if len(chars) > 9:
             bad = True
             break
@@ -121,6 +163,27 @@ def _valid_partial(parts):
     return bool(re.fullmatch(r'\d{1,8}|[XYZ]\d{0,7}', parts, re.ASCII))
 
 
+def _non_document_context(text):
+    if identity.CONTRACT_RE.search(text or '') or incident_dates.parse(text or ''):
+        return True
+    folded = _fold_word(str(text or '').strip())
+    return bool(YEAR_RE.fullmatch(folded))
+
+
+def _waiting_for_document(state, scope, saved, *, diagnostic='identity_data_partial'):
+    cipher = _cipher(scope)
+    if saved and cipher:
+        state[BUFFER_KEY] = cipher.encrypt_at_time(
+            json.dumps({'scope': scope, 'parts': saved['parts']},
+                       separators=(',', ':')).encode(), saved['started']).decode()
+    state['awaiting_document'] = True
+    decl = identity.parse_declaration('', None)
+    decl.update(document=None, name=None, question='', has_question=False,
+                identity_kind='partial', missing='document', diagnostic=diagnostic,
+                normalized_text='[documento pendiente]', token_count=0)
+    return decl
+
+
 def prepare(text, state, business_id, channel, ref, session):
     """Parse declarations; never expose incomplete documents to exact customer matching."""
     text = str(text or '')[:identity._int_env('INSURANCE_TURN_MAX_CHARS', identity.MAX_TEXT)]
@@ -128,13 +191,21 @@ def prepare(text, state, business_id, channel, ref, session):
     saved = _load(state, scope, now)
     labels = list(LABEL.finditer(text))
     spoken = channel == 'Voice'
+    explicitly_waiting = bool(state.get('awaiting_document') or saved)
+    if explicitly_waiting and CORRECTION_RE.search(text):
+        state.pop(BUFFER_KEY, None)
+        state['awaiting_document'] = True
+        return _waiting_for_document(state, scope, None, diagnostic='identity_parse_failed')
+    if explicitly_waiting and not labels and _non_document_context(text):
+        return _waiting_for_document(state, scope, saved)
     candidate = labels[0].end() if labels else None
-    if candidate is None and (state.get('awaiting') == 'identity' or saved or state.get('name')):
+    if candidate is None and (state.get('awaiting') == 'identity' or explicitly_waiting or state.get('name')):
         first = TOKENS.search(text)
-        if first and (first.group().casefold() in DIGITS or
-                      first.group().casefold() in LETTERS or
+        if first and (_document_token(first.group(), spoken) or
                       re.match(r'\d|[XYZxyz](?:\d|\b)', first.group())):
             candidate = first.start()
+    if explicitly_waiting and not labels and candidate is None:
+        return _waiting_for_document(state, scope, saved)
     parts, end, count, bad = ('', 0, 0, False)
     if candidate is not None:
         parts, end, count, bad = _parts(text[candidate:], spoken)
@@ -150,11 +221,17 @@ def prepare(text, state, business_id, channel, ref, session):
         cleaned, 'identity' if labels and candidate is not None else state.get('awaiting'))
     document = identity.normalize_document(parts)
     if saved and parts and not labels and not document and not bad:
-        parts = saved['parts'] + parts
-        document = identity.normalize_document(parts)
+        if explicitly_waiting and len(saved['parts']) + len(parts) <= 9:
+            parts = saved['parts'] + parts
+            document = identity.normalize_document(parts)
+        else:
+            bad = True
     if saved and not parts:
-        state[BUFFER_KEY] = _cipher(scope).encrypt_at_time(
-            json.dumps(saved, separators=(',', ':')).encode(), saved['started']).decode()
+        cipher = _cipher(scope)
+        if cipher:
+            state[BUFFER_KEY] = cipher.encrypt_at_time(
+                json.dumps({'scope': scope, 'parts': saved['parts']},
+                           separators=(',', ':')).encode(), saved['started']).decode()
     if candidate is not None:
         bad = bad or not (document or _valid_partial(parts))
         # One declaration containing two different numeric variants is never selected silently.
@@ -187,6 +264,10 @@ def prepare(text, state, business_id, channel, ref, session):
             'complete' if has_name and has_document else 'partial')
     missing = (None if kind == 'none' else 'document' if bad or has_partial else
                'name' if not has_name else 'document' if not has_document else None)
+    if missing == 'document':
+        state['awaiting_document'] = True
+    else:
+        state.pop('awaiting_document', None)
     decl.update(identity_kind=kind, missing=missing,
                 diagnostic={'failed': 'identity_parse_failed', 'partial': 'identity_data_partial',
                             'complete': 'identity_data_complete'}.get(kind),

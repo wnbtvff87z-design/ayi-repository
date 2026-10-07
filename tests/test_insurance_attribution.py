@@ -222,10 +222,16 @@ def test_mismatches_get_one_identical_generic_reply_and_never_say_which_datum_fa
 
 
 def test_partial_or_missing_data_is_not_a_match_and_does_not_burn_attempts(pg):
-    for n, declared in enumerate(['Me llamo Ana Pérez López', 'DNI 12345678Z', 'Me llamo Ana, DNI 12345678Z',
-                                  'Me llamo Ana Pérez López, DNI 1234567Z']):
+    declarations = [
+        ('Me llamo Ana Pérez López', 'Me falta el DNI o NIE.'),
+        ('DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
+        ('Me llamo Ana, DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
+        ('Me llamo Ana Pérez López, DNI 1234567Z',
+         'No comprendí el documento de forma inequívoca. Repite solo ese dato.'),
+    ]
+    for n, (declared, expected) in enumerate(declarations):
         reply, _ = say(declared, ext=f'P{n}', phone=f'+3460000000{n}')  # separate conversations: no merging
-        assert 'nombre, apellidos y DNI' in reply
+        assert expected in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_attempts')[0]['n'] == 0
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
 
@@ -541,6 +547,46 @@ def test_operator_sees_whose_case_policy_state_questions_and_reads_are_audited(p
     assert rows(pg, "SELECT outcome FROM insurance_audit_log WHERE action='case_read'")[0]['outcome'] == 'ok'
 
 
+def test_operator_retrieval_diagnostic_is_scoped_audited_and_read_only(
+        pg, operator, monkeypatch, caplog):
+    add_document(pg, 'POL-900', 'DOC-DIAG', pages=(
+        'Cobertura de daños por agua: cubre tuberías rotas.',
+        'Exclusiones de agua: falta de mantenimiento.',
+    ))
+    monkeypatch.setattr(idialog, 'llm_explain', lambda context, evidence: 'Respuesta de prueba.')
+    before_cases = rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n']
+    before_documents = rows(pg, 'SELECT count(*) AS n FROM insurance_documents')[0]['n']
+    with caplog.at_level(logging.INFO):
+        response = operator.post(
+            '/insurance/admin/retrieval/diagnose',
+            json={'customer_id': 'C2', 'policy_id': 'POL-900',
+                  'question': '¿Cubre daños por agua?', 'run_llm': True},
+            headers={'Authorization': 'Bearer ' + 'tok-ok'})
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body['correlation_id'] and body['stage'] == 'retrieval'
+    assert body['retrieval_status'] == 'ok' and body['diagnostics']['trace']['candidate_count'] >= 1
+    assert body['selected'] and body['selected'][0]['position_start'] >= 0
+    assert body['text_chars_to_llm'] > 0 and body['llm_result']['status'] == 'answered'
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == before_cases
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_documents')[0]['n'] == before_documents
+    audit = rows(pg, "SELECT target,outcome FROM insurance_audit_log "
+                     "WHERE action='retrieval_diagnose'")[0]
+    assert audit['target'] == body['correlation_id'] and audit['outcome'] == 'ok:answered'
+    assert '¿Cubre daños por agua?' not in '\n'.join(
+        record.getMessage() for record in caplog.records)
+
+
+def test_retrieval_diagnostic_requires_operator_permission(pg, operator):
+    response = operator.post(
+        '/insurance/admin/retrieval/diagnose',
+        json={'customer_id': 'C2', 'question': '¿Cubre agua?'},
+        headers={'Authorization': 'Bearer ' + 'tok-noperm'})
+    assert response.status_code == 403
+    assert rows(pg, "SELECT outcome FROM insurance_audit_log "
+                    "WHERE action='retrieval_diagnose'")[0]['outcome'] == 'forbidden'
+
+
 def test_operator_shows_unverified_claims_as_unverified(pg, operator, monkeypatch):
     monkeypatch.setenv('INSURANCE_IDENTITY_MAX_ATTEMPTS', '1')
     ask(f'{TEXT} Me llamo Ana Pérez Falsa, DNI {DNI}.')
@@ -634,7 +680,7 @@ def test_identity_only_message_never_triggers_retrieval_or_a_case(pg, llm, monke
     monkeypatch.setattr(idialog.retrieval, 'retrieve', lambda *a, **k: pytest.fail('retrieval after identity'))
     say('Hola, quiero consultar mi póliza', ext='I0')
     reply, _ = say('Luis Gil Mora', ext='I1')
-    assert 'nombre, apellidos y DNI' in reply
+    assert 'Me falta el DNI o NIE.' in reply
     reply, out = say('87654321X', ext='I2')
     assert 'qué quieres consultar' in reply.lower() and out['insurance_result'] == 'missing_information'
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0

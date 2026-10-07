@@ -443,13 +443,21 @@ INSTRUCTIONS = (
     'CLÁUSULAS, si la pregunta está tratada. Toda afirmación sobre cobertura, exclusiones, límites o '
     'condiciones debe apoyarse en esas cláusulas: el historial y el resumen solo sirven para entender '
     'referencias, nunca son fuente contractual. No inventes cobertura, importes ni contactos. No apruebes '
-    'ni denegues siniestros. Si las cláusulas no bastan, responde exactamente ESCALAR. Menciona condiciones '
-    'y exclusiones presentes. Máximo 120 palabras.')
+    'ni denegues siniestros. No infieras que cristal o vidrio cubre cualquier objeto (por ejemplo, una mesa) '
+    'si la cláusula no lo establece; pregunta qué objeto o daño quiere decir si eso cambia la respuesta. '
+    'Resume solo apartados que aparezcan en la evidencia. Si las cláusulas no bastan, responde exactamente '
+    'ESCALAR. Menciona condiciones y exclusiones presentes. Máximo 120 palabras.')
 
 
 def _fmt_evidence(evidence):
-    return '\n\n'.join(f"[p.{e['page']}] [documento {e.get('document_id')} "
-                       f"versión {e.get('version_id')}] {e['text']}" for e in evidence)
+    lines = []
+    for item in evidence:
+        position = ''
+        if 'position_start' in item and 'position_end' in item:
+            position = f"; caracteres {item['position_start']}-{item['position_end']}"
+        lines.append(f"[p.{item['page']}] [documento {item.get('document_id')} "
+                     f"versión {item.get('version_id')}{position}] {item['text']}")
+    return '\n\n'.join(lines)
 
 
 def format_prompt(ctx):
@@ -537,4 +545,7 @@ def build_context(*, question, evidence, policy=None, version=None, pending=None
 
 def pages_of(evidence):
     return [{'document_id': e['document_id'], 'page': e['page'], 'section': e.get('section'),
-             'version_id': e.get('version_id')} for e in evidence]
+             'version_id': e.get('version_id'),
+             **({'position_start': e['position_start'], 'position_end': e['position_end']}
+                if 'position_start' in e and 'position_end' in e else {})}
+            for e in evidence]
