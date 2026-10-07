@@ -94,6 +94,18 @@ def name_hmac(business_id, name):
     return _hmac('name', business_id, n) if len(n.split()) >= 2 else None
 
 
+def name_prefix_hmacs(business_id, name):
+    """HMACs of every leading run of >=2 words of the REGISTERED name (order kept): a caller who says
+    the first name plus the first surname (or more) hits one of them. No fuzzy or phonetic matching."""
+    words = normalize_name(name).split()
+    return [_hmac('name', business_id, ' '.join(words[:i])) for i in range(2, len(words) + 1)]
+
+
+def name_is_sufficient(name):
+    """First name + at least one surname. A single word is never enough."""
+    return len(normalize_name(name).split()) >= 2
+
+
 def _take_words(s):
     words, pos = [], 0
     while len(words) < MAX_NAME_TOKENS:
@@ -160,13 +172,15 @@ def extract_claims(text):
 
 
 def match_by_hashes(conn, business_id, doc_hash, name_hash):
-    """Exact match on the resolved business only: customer_ids of ACTIVE customers whose DNI/NIE
-    hash and full-name hash both equal. 0 = no match, 1 = verified, >1 = ambiguous."""
+    """Exact DNI/NIE hash AND declared name equal to the registered full name or to one of its leading
+    prefixes (first name + first surname at least), on the resolved business only, ACTIVE customers.
+    0 = no match, 1 = verified, >1 = ambiguous. The DNI index narrows to a handful of rows first."""
     if not doc_hash or not name_hash:
         return []
     return [r['customer_id'] for r in conn.execute(
         'SELECT customer_id FROM insurance_customers WHERE business_id=%s AND active '
-        'AND document_hmac=%s AND name_hmac=%s', (business_id, doc_hash, name_hash)).fetchall()]
+        'AND document_hmac=%s AND (name_hmac=%s OR name_prefix_hmacs @> ARRAY[%s]::text[]) LIMIT 20',
+        (business_id, doc_hash, name_hash, name_hash)).fetchall()]
 
 
 def _int_env(name, default):
@@ -241,8 +255,10 @@ def clear_state(conn, business_id, channel, ref, session_ref):
 def upsert_customer(conn, business_id, customer_id, display_name, document, full_name=None):
     """Controlled provisioning helper (ops/tests). No public endpoint calls this."""
     conn.execute(
-        'INSERT INTO insurance_customers(business_id,customer_id,display_name,document_hmac,name_hmac) '
-        'VALUES(%s,%s,%s,%s,%s) ON CONFLICT (business_id,customer_id) DO UPDATE SET '
-        'display_name=EXCLUDED.display_name,document_hmac=EXCLUDED.document_hmac,name_hmac=EXCLUDED.name_hmac',
+        'INSERT INTO insurance_customers(business_id,customer_id,display_name,document_hmac,name_hmac,'
+        'name_prefix_hmacs) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (business_id,customer_id) DO UPDATE SET '
+        'display_name=EXCLUDED.display_name,document_hmac=EXCLUDED.document_hmac,name_hmac=EXCLUDED.name_hmac,'
+        'name_prefix_hmacs=EXCLUDED.name_prefix_hmacs',
         (business_id, customer_id, display_name, document_hmac(business_id, document),
-         name_hmac(business_id, full_name or display_name)))
+         name_hmac(business_id, full_name or display_name),
+         [h for h in name_prefix_hmacs(business_id, full_name or display_name) if h]))

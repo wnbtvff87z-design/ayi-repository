@@ -130,7 +130,8 @@ def test_correct_data_in_following_turn_keeps_original_question_and_answers_with
     assert v['session_ref'] == '' and v['expires_at'] > v['created_at']
     assert '87654321X' not in str(dict(v)) and 'Luis' not in str(dict(v)) and PHONE not in str(dict(v))
     assert rows(pg, "SELECT count(*) AS n FROM insurance_audit_log WHERE action='identity_verified'")[0]['n'] == 1
-    assert rows(pg, 'SELECT count(*) AS n FROM insurance_conversation_state')[0]['n'] == 0  # state cleared
+    st = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']  # session context kept
+    assert st['verified'] is True and st['policy_id'] == 'POL-900' and 'question' not in st
 
 
 def test_all_data_and_policy_number_in_one_message_are_processed_in_that_turn(pg, llm):
@@ -285,8 +286,7 @@ def test_multiple_policies_ask_number_then_leading_zeros_are_kept(pg, llm):
     assert 'POL-' not in reply and '000124' not in reply
     reply, out = say('000124')                                          # a different policy, exact text
     assert 'DOC-X' in reply and 'DOC-000456' not in reply
-    say(TEXT)
-    assert 'DOC-000456' in say('La 000123')[0]
+    assert 'DOC-000456' in say(f'{TEXT} póliza 000123')[0]
     reply, out = say(f'{TEXT} póliza 123')                              # no partial / zero-stripped match
     assert out['insurance_result'] == 'human_case_required'
 
@@ -519,3 +519,76 @@ def test_mirror_is_idempotent_and_airtable_failure_keeps_pg_case(pg, monkeypatch
     cases.sync_outbox()
     cases.sync_outbox()
     assert len(calls) == 1 and rows(pg, 'SELECT status FROM insurance_outbox')[0]['status'] == 'done'
+
+
+# ---- Conversational agent: identify once, then free multi-turn questions ------------------
+def test_identity_only_message_never_triggers_retrieval_or_a_case(pg, llm, monkeypatch):
+    add_document(pg, 'POL-900', 'DOC-900')
+    monkeypatch.setattr(idialog.retrieval, 'retrieve', lambda *a, **k: pytest.fail('retrieval after identity'))
+    say('Hola, quiero consultar mi póliza', ext='I0')
+    reply, _ = say('Luis Gil Mora', ext='I1')
+    assert 'nombre, apellidos y DNI' in reply
+    reply, out = say('87654321X', ext='I2')
+    assert 'qué quieres consultar' in reply.lower() and out['insurance_result'] == 'missing_information'
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 0
+    st = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert st['verified'] is True and st['customer_id'] == 'C2' and 'question' not in st
+    assert 'doc_hmac' not in st and 'name' not in st
+    # a thanks/greeting after verification is not a question either
+    assert 'qué quieres consultar' in say('Gracias', ext='I3')[0].lower()
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_multi_turn_conversation_reuses_identity_policy_and_references(pg, monkeypatch):
+    seen = []
+
+    def explain(q, ev):
+        seen.append(q)
+        return 'Respuesta basada en la póliza.'
+    monkeypatch.setattr(idialog, 'llm_explain', explain)
+    add_document(pg, 'POL-900', 'DOC-900', pages=(
+        'Cobertura de daños por agua: cubre tuberías rotas.',
+        'Robo: cubre la sustracción de joyas con límite de importe.',
+        'Exclusiones: no cubre la falta de mantenimiento.'))
+    # identification (name and DNI in separate messages)
+    assert 'nombre, apellidos y DNI' in say('Quiero hacer una consulta', ext='M0')[0]
+    assert 'qué quieres consultar' in say('Luis Gil Mora y 87654321X', ext='M1')[0].lower()
+    # consultation
+    reply, out = say('¿Cubre los daños por agua si se rompe una tubería?', ext='M2')
+    assert out['insurance_result'] == 'evidence_backed_explanation' and 'DOC-900' in reply
+    # follow-up referencing the previous question: no identity or policy asked again
+    reply, out = say('¿Y eso tiene alguna exclusión?', ext='M3')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'tubería' in seen[-1]                      # earlier question travels with the follow-up
+    # topic change
+    reply, out = say('¿Qué cubre el seguro si me roban joyas?', ext='M4')
+    assert out['insurance_result'] == 'evidence_backed_explanation' and 'joyas' in seen[-1]
+    # return to the earlier topic
+    reply, out = say('Volviendo a lo de los daños por agua, ¿hay límite de importe?', ext='M5')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'agua' in seen[-1]
+    # nothing repeated, nothing escalated, identity verified once
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+    assert rows(pg, "SELECT count(*) AS n FROM insurance_audit_log WHERE action='identity_verified'")[0]['n'] == 1
+    st = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert st['policy_id'] == 'POL-900' and len(st['history']) == 4
+
+
+def test_only_a_real_unanswerable_question_escalates_and_the_session_stays_verified(pg, llm):
+    add_document(pg, 'POL-900', 'DOC-900')
+    say('Soy Luis Gil Mora, DNI 87654321X', ext='E1')
+    reply, _ = say('¿Qué pasa con el zxqv?', ext='E2')
+    assert 'He guardado' in reply
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 1
+    reply, out = say('¿Cubre los daños por agua en tuberías rotas?', ext='E3')   # no re-identification
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+
+
+def test_session_context_is_dropped_when_the_verified_customer_changes(pg, llm):
+    add_document(pg, 'POL-900', 'DOC-900')
+    add_document(pg, 'POL-300', 'DOC-300')
+    verify(pg, 'C2')
+    assert 'DOC-900' in say(TEXT, ext='X1')[0]
+    verify(pg, 'C3')
+    assert 'DOC-300' in say(TEXT, ext='X2')[0]

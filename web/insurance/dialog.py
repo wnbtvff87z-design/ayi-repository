@@ -53,6 +53,13 @@ IDENTITY_FAILED = ('No he podido verificar tus datos. Revisa nombre, apellidos y
                    'de nuevo.')
 ASK_POLICY = ('Para continuar necesito el número de póliza sobre el que preguntas. Indícalo tal como '
               'figura en tu contrato.')
+ASK_QUERY = ('Gracias, ya he verificado tu identidad. ¿Qué quieres consultar sobre tu póliza?')
+ASK_QUERY_AGAIN = ('¿Qué quieres consultar sobre tu póliza? Ya no necesito que repitas tus datos.')
+REFERENCE_RE = re.compile(
+    r'\b(y|eso|esto|esa|ese|esos|esas|lo\s+anterior|lo\s+mismo|antes|anterior|volviendo|sobre\s+lo|'
+    r'lo\s+de|ello|tambi[ée]n|entonces)\b', re.I)
+SMALLTALK_RE = re.compile(r'^\W*(hola|buenas|buenos|gracias|vale|ok|perfecto|adi[óo]s|hasta|s[ií]|no)\b', re.I)
+MAX_HISTORY = 5
 SAVED = ('He guardado tu consulta para revisión humana. No puedo confirmar un plazo ni una resolución.')
 NOT_SAVED = ('No pude guardar tu consulta. No se ha creado un caso y no puedo confirmarte una respuesta.')
 
@@ -163,13 +170,21 @@ def _answer(business, state, text, channel, external_id, customer):
             st = identity.load_state(conn, bid, channel, ref, sess)
             decl = identity.parse_declaration(text, st.get('awaiting'))
             _merge_declaration(st, decl, bid)
-            if decl['has_question'] or not st.get('question'):
+            is_query = '?' in (text or '')  # statements like 'quiero hacer una consulta' are not questions
+            if is_query:
                 st['question'] = (decl['question'] or text)[:4000]
-            question = st['question']
+            question = st.get('question')
+            if decl['contract_number']:
+                st.pop('policy_id', None)
             customer_id = identity.verified_customer(conn, bid, channel, customer, sess)
             if urgent:
                 return _urgent(business, customer, text, channel, external_id, corr, customer_id,
                                _claim_record(bid, st) if not customer_id else None, ctx)
+            if st.get('customer_id') not in (None, customer_id):
+                for k in ('policy_id', 'history', 'question', 'awaiting'):
+                    st.pop(k, None)
+                question = None
+            just_verified = False
             if not customer_id:
                 outcome = _verify(conn, bid, channel, ref, sess, st, corr)
                 if outcome[0] == 'reply':
@@ -180,8 +195,23 @@ def _answer(business, state, text, channel, external_id, customer):
                                      claim=_claim_record(bid, st), question=question,
                                      ctx={**ctx, 'last_outcome': outcome[1]})
                 customer_id = outcome[1]
+                just_verified = True
+            st['verified'] = True
+            st['customer_id'] = customer_id
+            if (not just_verified and not question and st.get('awaiting') not in ('policy', 'date')
+                    and not SMALLTALK_RE.match(text or '') and len(retrieval._tokens(text or '')) >= 2):
+                # Verified sessions accept short questions (voice transcripts carry no '?').
+                st['question'] = question = (decl['question'] or text)[:4000]
+                is_query = True
+            # Identity data is never a business question: once verified, wait for a real one.
+            if not question and st.get('awaiting') not in ('policy', 'date'):
+                st.pop('awaiting', None)
+                identity.save_state(conn, bid, channel, ref, sess, st)
+                _diag(corr, 'dialogue', bid, identity_verified=True, decision='ask_query')
+                return (ASK_QUERY if just_verified else ASK_QUERY_AGAIN,
+                        {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             return _documental(conn, business, bid, channel, ref, sess, st, text, question, customer_id,
-                               corr, ctx)
+                               corr, ctx, is_query)
     except Exception as exc:
         log.error('insurance_lookup_failed correlation_id=%s error_type=%s', corr, type(exc).__name__)
         _diag(corr, 'lookup', bid, reason_code='lookup_failed', identity_verified=False,
@@ -244,8 +274,31 @@ def _urgent(business, customer, text, channel, external_id, corr, customer_id, c
             'ni una resolución.', {'insurance_result': ResultKind.URGENT.value, 'case_id': case_id})
 
 
-def _documental(conn, business, bid, channel, ref, sess, st, text, question, customer_id, corr, ctx):
-    st.pop('awaiting', None)
+def _resolve_reference(st, text, question):
+    """A short follow-up ('¿y si es por rotura?', 'volviendo a lo del agua') is searched together with
+    the earlier question it refers to: the best overlapping one, else the most recent."""
+    hist = st.get('history') or []
+    if not hist or not REFERENCE_RE.search(text or ''):
+        return question
+    cur = retrieval._tokens(question)
+    best = max(reversed(hist), key=lambda h: len(cur & retrieval._tokens(h['q'])))
+    return f"{best['q']} {question}"[:4000]
+
+
+def _remember(st, question, result_kind, policy_id):
+    hist = (st.get('history') or []) + [{'q': (question or '')[:300], 'result': result_kind}]
+    st['history'] = hist[-MAX_HISTORY:]
+    if policy_id is not None:
+        st['policy_id'] = policy_id
+    for k in ('question', 'awaiting', 'contract_number'):
+        st.pop(k, None)
+
+
+def _documental(conn, business, bid, channel, ref, sess, st, text, question, customer_id, corr, ctx,
+                is_query=True):
+    awaiting = st.pop('awaiting', None)
+    if is_query and not awaiting:
+        question = _resolve_reference(st, text, question)
     fact = _fact_date(text) or _fact_date(question)
     if fact is None and OCCURRED_RE.search(question or ''):
         st['awaiting'] = 'date'
@@ -254,7 +307,7 @@ def _documental(conn, business, bid, channel, ref, sess, st, text, question, cus
         return ('¿En qué fecha ocurrió el hecho? Indícala como día/mes/año para comprobar la versión de póliza vigente.',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value})
     result = retrieval.retrieve(conn, bid, customer_id, question, fact or date.today(),
-                                policy_hint=st.get('contract_number'))
+                                policy_hint=st.get('contract_number') or st.get('policy_id'))
     d = result.get('diagnostics', {})
     _diag(corr, 'retrieval', bid, reason_code=result.get('reason_code'), identity_verified=True,
           policy_found=result.get('policy_id') is not None, document_ready=d.get('document_status') == 'ready',
@@ -275,7 +328,8 @@ def _documental(conn, business, bid, channel, ref, sess, st, text, question, cus
             log.error('insurance_llm_failed correlation_id=%s error_type=%s', corr, type(exc).__name__)
             text_out, fine = 'ESCALAR', 'llm_error'
         if text_out and 'ESCALAR' not in text_out:
-            identity.clear_state(conn, bid, channel, ref, sess)
+            _remember(st, question, ResultKind.EVIDENCE_BACKED_EXPLANATION.value, result.get('policy_id'))
+            identity.save_state(conn, bid, channel, ref, sess, st)
             _diag(corr, 'decision', bid, identity_verified=True, policy_found=True, document_ready=True,
                   retrieval_status='ok', evidence_count=len(ev), decision='answer')
             cites = '; '.join(f"documento {e['document_id']}, versión {e['version_id']}, página {e['page']}" for e in ev)
@@ -289,7 +343,8 @@ def _documental(conn, business, bid, channel, ref, sess, st, text, question, cus
     _diag(corr, 'decision', bid, reason_code=cause, identity_verified=True,
           policy_found=result.get('policy_id') is not None, document_ready=d.get('document_status') == 'ready',
           retrieval_status=result['status'], evidence_count=d.get('evidence_count'), decision='escalate')
-    identity.clear_state(conn, bid, channel, ref, sess)
+    _remember(st, question, ResultKind.HUMAN_CASE_REQUIRED.value, result.get('policy_id'))
+    identity.save_state(conn, bid, channel, ref, sess, st)
     return _escalate(cause, reason=reason, customer_id=customer_id, question=question,
                      ctx={**ctx, 'detail': fine}, **extra)
 
