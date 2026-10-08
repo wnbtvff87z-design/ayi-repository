@@ -189,6 +189,7 @@ def _name_datum(text, state):
     """Take literal guided name data, retaining surname particles and token order."""
     surname = re.match(r'^\s*(?:mi\s+)?apellidos?\s*(?:es|son|[:=-])\s*', text, re.I)
     given = re.match(r'^\s*(?:(?:mi\s+)?nombre\s*(?:es|[:=-])|me\s+llamo|soy)\s*', text, re.I)
+    given_only = re.match(r'^\s*(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', text, re.I)
     label = surname or given
     value = text[label.end():] if label else text
     value = value.strip(' ,;.-')
@@ -208,10 +209,15 @@ def _name_datum(text, state):
             return None
         state['identity_surname'] = ' '.join(words)
         return first + ' ' + state['identity_surname']
-    if not given and state.get('name') and not identity.name_is_sufficient(state['name']):
+    if not given and state.get('name') and (
+            _surname_pending(state) or not identity.name_is_sufficient(state['name'])):
         state['identity_given_name'] = state['name']
         state['identity_surname'] = ' '.join(words)
         return state['name'] + ' ' + state['identity_surname']
+    if given_only:
+        state['identity_given_name'] = ' '.join(words)
+        return (' '.join(words) + ' ' + state['identity_surname']
+                if state.get('identity_surname') else ' '.join(words))
     if len(words) == 1:
         state['identity_given_name'] = words[0]
         if given and state.get('identity_surname'):
@@ -224,6 +230,10 @@ def _name_datum(text, state):
             state.pop('identity_given_name', None)
             state.pop('identity_surname', None)
     return ' '.join(words)
+
+
+def _surname_pending(state):
+    return bool(state.get('identity_given_name') and not state.get('identity_surname'))
 
 
 def _replace_fragment(text, saved):
@@ -331,7 +341,7 @@ def prepare(text, state, business_id, channel, ref, session):
             state.get('awaiting') == 'identity' or explicitly_waiting or correction_document):
         first = TOKENS.search(text)
         surname_particles = (first and state.get('name') and
-                             not identity.name_is_sufficient(state['name']) and
+                             (_surname_pending(state) or not identity.name_is_sufficient(state['name'])) and
                              _fold_word(first.group()) in {'de', 'del', 'la', 'las', 'los'})
         if first and not surname_particles and (_document_token(first.group(), spoken) or
                       re.match(r'\d|[XYZxyz](?:\d|\b)', first.group())):
@@ -352,6 +362,7 @@ def prepare(text, state, business_id, channel, ref, session):
             cleaned = text[:start]
     decl = identity.parse_declaration(
         cleaned, 'identity' if labels and candidate is not None else state.get('awaiting'))
+    guided_name = None
     if candidate is not None and not bad:
         name_text = cleaned.strip(' ,;.-')
         if name_text.casefold().startswith('y '):
@@ -361,6 +372,17 @@ def prepare(text, state, business_id, channel, ref, session):
             decl.update(name=guided_name, question='', has_question=False)
     elif name_datum:
         decl.update(name=name_datum, question='', has_question=False)
+    if decl['name'] and not (name_datum or guided_name) and re.search(
+            r'\b(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', cleaned, re.I) and not re.search(
+            r'\bapellidos?\s*(?:es|son|[:=-])', cleaned, re.I):
+        declared_given = decl['name']
+        state['identity_given_name'] = declared_given
+        if state.get('identity_surname'):
+            decl['name'] = declared_given + ' ' + state['identity_surname']
+    elif decl['name'] and not (name_datum or guided_name) and re.search(
+            r'\b(?:me\s+llamo|soy)\s+', cleaned, re.I):
+        state.pop('identity_given_name', None)
+        state.pop('identity_surname', None)
     document = identity.normalize_document(parts)
     if saved and parts and not labels and not document and not bad:
         if explicitly_waiting and len(saved['parts']) + len(parts) <= 9:
@@ -397,8 +419,10 @@ def prepare(text, state, business_id, channel, ref, session):
     decl['document'] = document or (decl['document'] if candidate is None else None)
     if decl['name']:
         state['name'] = decl['name'][:160]
-        state['name_hmac'] = identity.name_hmac(business_id, decl['name'])
-    has_name = identity.name_is_sufficient(state.get('name') or decl['name'])
+        state['name_hmac'] = (None if _surname_pending(state)
+                              else identity.name_hmac(business_id, decl['name']))
+    has_name = (not _surname_pending(state)
+                and identity.name_is_sufficient(state.get('name') or decl['name']))
     has_document = bool(decl['document'] or state.get('doc_hmac'))
     has_partial = BUFFER_KEY in state
     active = bool(decl['name'] or decl['document'] or parts or has_partial)
@@ -427,6 +451,8 @@ def mask_declarations(text, mask_names=True):
     name_text = text[:labels[0].start()] if labels else text
     declared = identity.parse_declaration(name_text)
     for label in reversed(labels):
+        if re.match(r'documento [1-9]\d{0,3}, páginas? \d', text[label.start():], re.I):
+            continue
         parts, end, count, _ = _parts(text[label.end():], True)
         if end and (re.search(r'\d', parts) or parts in {'X', 'Y', 'Z'}):
             text = (text[:label.end()] + f'[identity:{count} tokens]' +

@@ -284,7 +284,7 @@ def _answer(business, state, text, channel, external_id, customer):
             identity_declaration = (not customer_id or (channel == 'Voice' and (
                 identity.NAME_TRIGGER_RE.search(text) or re.search(r'\b(?:dni|nie)\b', text, re.I))))
             if identity_declaration and not customer_id:
-                st.setdefault('awaiting', 'identity')
+                st['awaiting'] = 'identity'
             decl = (identity.parse_declaration('') if _is_social(text) else
                     voice_identity.prepare(text, st, bid, channel, ref, sess) if identity_declaration
                     else identity.parse_declaration(text, st.get('awaiting')))
@@ -390,7 +390,8 @@ def _answer(business, state, text, channel, external_id, customer):
                     'UPDATE insurance_conversation_turns SET policy_id=%s,version_id=%s,pages=%s::jsonb,'
                     'decision=%s WHERE turn_id=%s',
                     (policy, version, json.dumps(list(pages)), decision, user_id))
-                if pages and st.get('question_turn_id') and st['question_turn_id'] != user_id:
+                if (pages or decision == ResultKind.POLICY_INFORMATION.value) and st.get(
+                        'question_turn_id') and st['question_turn_id'] != user_id:
                     conn.execute(
                         'UPDATE insurance_conversation_turns SET policy_id=%s,version_id=%s,pages=%s::jsonb,'
                         'decision=%s WHERE turn_id=%s AND business_id=%s AND customer_id=%s',
@@ -436,6 +437,11 @@ def _answer(business, state, text, channel, external_id, customer):
                     if decl.get('diagnostic') == 'identity_parse_failed':
                         code = 'identity_parse_failed'
                     stage = code or ('answer' if pages else 'clarification')
+                    if decision == ResultKind.TECHNICAL_ERROR.value:
+                        stage = 'technical_error'
+                        code = out.get('diagnostic_code') or 'llm_error'
+                    elif kind == 'other':
+                        stage = 'closing'
                     voice_trace.record(conn, bid, sess, external_id, text,
                                        normalized or decl.get('normalized_text') or incoming,
                                        stage, code, reply, customer_id=sc.customer_id,
@@ -447,6 +453,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 return reply, out
 
             if decl['contract_number']:
+                st.pop('policy_switch_required', None)
                 st['requested_policy'] = decl['contract_number']
                 st['change_pending'] = True
                 for key in ('policy_id', 'version_id', 'reference_policy', 'reference_version_id',
@@ -506,10 +513,17 @@ def _answer(business, state, text, channel, external_id, customer):
                                   {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                 if only == {'policy_change'} and not decl['contract_number']:
                     st['awaiting'] = 'policy'
-                    for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent'):
+                    st['policy_switch_required'] = True
+                    st['change_pending'] = True
+                    for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent',
+                                'policy_id', 'version_id', 'requested_policy', 'contract_number',
+                                'reference_policy', 'reference_version_id', 'pending_human'):
                         st.pop(key, None)
                     is_query = False
                     return finish(ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            if customer_id and st.get('policy_switch_required'):
+                st['awaiting'] = 'policy'
+                return finish(ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if (st.get('pending_human') and not st['pending_human']['case'].get('customer_id')
                     and not is_query and not reviewing and not explaining_missing):
                 memory.set_user_kind(conn, user_id, 'confirmation', incoming)
@@ -523,8 +537,9 @@ def _answer(business, state, text, channel, external_id, customer):
                 if outcome[0] == 'reply':
                     reply = outcome[1]
                     if reply == ASK_IDENTITY:
-                        reply = ('Me falta el DNI o NIE.' if identity.name_is_sufficient(st.get('name'))
-                                 else 'Me falta tu apellido.' if st.get('name') and not st.get('doc_hmac')
+                        reply = ('Me falta tu apellido.' if decl.get('missing') == 'surname'
+                                 else 'Me falta el DNI o NIE.' if identity.name_is_sufficient(st.get('name'))
+                                 else 'Me falta tu apellido.' if st.get('name')
                                  else 'Me falta tu nombre y al menos un apellido.' if st.get('doc_hmac')
                                  else 'Para consultar tu póliza, dime tu nombre y apellido.')
                         if decl.get('diagnostic') == 'identity_parse_failed':
@@ -553,6 +568,38 @@ def _answer(business, state, text, channel, external_id, customer):
             memory.claim_unverified(conn, sc)
             st['verified'] = True
             st['customer_id'] = customer_id
+            if st.get('policy_switch_required'):
+                st['awaiting'] = 'policy'
+                return finish(ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            if just_verified and st.get('question') and not st.get('pending_human'):
+                try:
+                    interpretation = orchestrator.interpret(
+                        conn, sc, st, st['question'], identity.parse_declaration(''),
+                        st.get('question_intent', 'question'))
+                    semantic = interpretation['intents']
+                    pending_intent = next((i for i in semantic if i in (
+                        'availability', 'policy_name', 'policy_validity', 'summary')), None)
+                    if pending_intent:
+                        st['question_intent'] = 'question' if 'question' in semantic else pending_intent
+                    st['last_interpretation'] = interpretation
+                    st['interpretation_invoked'] = interpretation['source'] == 'llm'
+                    st['interpretation_diagnostic'] = None
+                except memory.ContextBudgetExceeded:
+                    st['interpretation_diagnostic'] = 'context_budget_exceeded'
+                except Exception as exc:
+                    code = getattr(exc, 'code', 'llm_error')
+                    st['interpretation_diagnostic'] = code if code in LLM_FAILURE_CODES else 'llm_error'
+                    st['interpretation_invoked'] = code != 'llm_not_configured'
+            if st.get('interpretation_diagnostic') in (
+                    'llm_auth_failed', 'llm_timeout', 'llm_rate_limited',
+                    'llm_invalid_response', 'llm_refusal', 'llm_error') and st.get('question'):
+                st['last_retrieval'] = {
+                    'question': st['question'], 'question_turn_id': st.get('question_turn_id'),
+                    'intent': st.get('question_intent', 'question'),
+                    'retrieval_status': 'interpretation_error'}
+                reply, out, _ = _technical_failure(
+                    st, st['interpretation_diagnostic'], corr, bid, [], True)
+                return finish(reply, out)
             if not st.get('policy_id') and not st.get('requested_policy'):
                 summary, _ = memory.load_summary(conn, sc)
                 pending_selection = next((
@@ -614,7 +661,8 @@ def _answer(business, state, text, channel, external_id, customer):
                              incoming if is_query else st['question'])
                 classification = references.classify(resolving, has_last_answer=bool(last),
                                                     has_recent=bool(memory.recent(conn, sc)))
-                if classification['kind'] == 'independent' and interpretation['source'] == 'llm':
+                if (not reviewing and classification['kind'] == 'independent'
+                        and interpretation['source'] == 'llm'):
                     proposed_reference = interpretation['reference']
                     if proposed_reference in ('continuation', 'explain_prior', 'ambiguous'):
                         classification = {'kind': proposed_reference}
@@ -869,6 +917,7 @@ def _use_reference(st, pair, remainder=''):
 def _verify(conn, bid, channel, ref, sess, st, corr, completed_this_turn=True):
     """Returns ('reply', text) | ('escalate', outcome) | ('verified', customer_id)."""
     if identity.failed_attempts(conn, bid, channel, ref) >= identity.max_attempts():
+        st['_identity_diagnostic'] = 'identity_attempts_exceeded'
         _diag(corr, 'identity', bid, reason_code='identity_attempts_exceeded', identity_verified=False,
               decision='ask_identity_data')
         return 'escalate', 'blocked'
@@ -880,8 +929,10 @@ def _verify(conn, bid, channel, ref, sess, st, corr, completed_this_turn=True):
         _diag(corr, 'identity', bid, reason_code='identity_data_missing', identity_verified=False,
               decision='ask_identity_data')
         return 'reply', ASK_IDENTITY
-    if st.get('identity_last_failure') and not completed_this_turn:
-        return 'reply', st['identity_last_failure']
+    if not completed_this_turn:
+        st['awaiting'] = 'identity'
+        st['_identity_diagnostic'] = 'identity_data_partial'
+        return 'reply', st.get('identity_last_failure') or ASK_IDENTITY
     found = identity.match_by_hashes(conn, bid, st['doc_hmac'], identity.name_hmac(bid, st['name']))
     if len(found) == 1:
         st['_identity_diagnostic'] = 'identity_verified'
@@ -899,6 +950,7 @@ def _verify(conn, bid, channel, ref, sess, st, corr, completed_this_turn=True):
     code = 'identity_ambiguous' if found else 'identity_no_match'
     _diag(corr, 'identity', bid, reason_code=code, match_count=len(found), identity_verified=False)
     if identity.failed_attempts(conn, bid, channel, ref) >= identity.max_attempts():
+        st['_identity_diagnostic'] = 'identity_attempts_exceeded'
         _diag(corr, 'identity', bid, reason_code='identity_attempts_exceeded', identity_verified=False,
               decision='ask_identity_data')
         return 'escalate', outcome
@@ -973,6 +1025,13 @@ def _policy_metadata(conn, business, sc, st, question, intent, corr):
                 'No puedo confirmar una única vigencia.',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
     st['policy_id'], st['version_id'] = policy['policy_id'], policy.get('version_id')
+    st['normalized_question'] = f'metadata:{intent}\n{memory.redact(question, bounded=False)}'
+    if st.get('question_turn_id'):
+        conn.execute(
+            'UPDATE insurance_conversation_turns SET normalized=%s WHERE turn_id=%s AND business_id=%s '
+            'AND channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s',
+            (st['normalized_question'], st['question_turn_id'],
+             sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id))
     for key in ('requested_policy', 'contract_number', 'change_pending', 'reference_policy',
                 'reference_version_id'):
         st.pop(key, None)
@@ -1245,8 +1304,10 @@ def _authorized_retry(conn, sc, cached, today=None):
     if cached['decision'] == ResultKind.POLICY_INFORMATION.value:
         policy = policy_info.lookup(conn, sc.bid, sc.customer_id, today or fact,
                                    cached.get('policy_id'), selected_version=cached.get('version_id'))
-        metadata_intent = _intent(
-            (question.get('normalized') or question['content']) if question else '')
+        normalized = (question.get('normalized') or question['content']) if question else ''
+        stored_intent = normalized.split('\n', 1)[0].removeprefix('metadata:')
+        metadata_intent = (stored_intent if normalized.startswith('metadata:') and stored_intent in (
+            'policy_name', 'policy_validity') else _intent(normalized))
         return bool(policy.get('policy_id') == cached.get('policy_id')
                     and policy.get('version_id') == cached.get('version_id')
                     and policy['reason_code'] in (

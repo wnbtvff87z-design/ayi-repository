@@ -5,6 +5,7 @@ nothing here touches Railway, Airtable, the Bucket, Twilio or any real PDF.
 """
 import logging
 import os
+import re
 import sys
 import uuid
 from datetime import date, timedelta
@@ -120,7 +121,10 @@ def evidence_markers(evidence):
 
 def assert_visible_sources(reply, *, number=None, pages=(1,)):
     assert 'Fuentes:' in reply
-    assert all(str(page) in reply.split('Fuentes:', 1)[1] for page in pages)
+    sources = reply.split('Fuentes:', 1)[1]
+    cited_pages = {int(page) for group in re.findall(r'páginas?\s+(\d+(?:,\s*\d+)*)', sources)
+                   for page in group.split(',')}
+    assert set(pages) <= cited_pages
     assert 'DOC-' not in reply and 'VER-' not in reply and 'POL-' not in reply
     if number:
         assert number in reply
@@ -249,7 +253,7 @@ def test_partial_or_missing_data_is_not_a_match_and_does_not_burn_attempts(pg):
     declarations = [
         ('Me llamo Ana Pérez López', 'Me falta el DNI o NIE.'),
         ('DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
-        ('Me llamo Ana, DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
+        ('Me llamo Ana, DNI 12345678Z', 'Me falta tu apellido.'),
         ('Me llamo Ana Pérez López, DNI 1234567Z',
          'No comprendí el documento de forma inequívoca. Repite solo ese dato.'),
     ]

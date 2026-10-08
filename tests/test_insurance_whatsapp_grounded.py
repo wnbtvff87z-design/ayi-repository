@@ -234,7 +234,7 @@ class Harness:
 
     def count(self, table):
         assert table in ('insurance_cases', 'insurance_identity_verifications',
-                         'insurance_conversation_turns')
+                         'insurance_conversation_turns', 'insurance_identity_attempts')
         return self.rows(f'SELECT count(*) AS n FROM {table}')[0]['n']
 
     def verify(self):
@@ -757,4 +757,34 @@ def test_signed_whatsapp_interpretation_roundtrip_uses_bounded_private_persisted
     assert all(secret not in json.dumps(request) for secret in (NAME, DNI, PHONE, 'Celia', 'Zorro'))
     assert sum(len(message['content']) for message in request['messages']) <= memory.cfg(
         'INSURANCE_LLM_CONTEXT_CHARS')
+    assert flow.count('insurance_cases') == 0
+
+
+@pytest.mark.parametrize('channel', ['WhatsApp', 'Voice'])
+@pytest.mark.parametrize('corrected_datum', ['name', 'document'])
+def test_real_endpoints_failed_identity_keeps_other_datum_and_unrelated_query_does_not_retry(
+        grounded, channel, corrected_datum):
+    flow = grounded
+    flow.turn(channel, QUESTION)
+    failed = (f'Me llamo Celia Zorro Falso, DNI {DNI}' if corrected_datum == 'name'
+              else f'Me llamo {NAME}, DNI 11111111H')
+    reply = flow.turn(channel, failed)['reply']
+    assert 'No he podido verificar tus datos' in reply and 'sin repetir el otro dato' in reply
+    assert flow.count('insurance_identity_attempts') == 1
+    assert flow.count('insurance_identity_verifications') == 0
+    assert not flow.explanations
+    preserved = flow.state()
+    assert preserved['name'] and preserved['doc_hmac']
+    assert DNI not in json.dumps(preserved) and '11111111H' not in json.dumps(preserved)
+    unrelated = flow.turn(channel, QUESTION)['reply']
+    assert 'He verificado' not in unrelated and not flow.explanations
+    assert flow.count('insurance_identity_attempts') == 1
+    correction = ('No, me llamo Celia Zorro Condes' if corrected_datum == 'name'
+                  else 'No, mi DNI es cinco uno nueve cinco nueve cinco seis seis jota')
+    completed = flow.turn(channel, correction)['reply']
+    assert completed.count('He verificado tus datos') == 1
+    assert 'excluy' in completed.lower() and 'página 2' in completed
+    assert flow.count('insurance_identity_attempts') == 1  # Failed attempts, not successful verifications.
+    assert flow.count('insurance_identity_verifications') == 1
+    assert len(flow.explanations) == 1
     assert flow.count('insurance_cases') == 0

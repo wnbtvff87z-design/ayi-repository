@@ -419,11 +419,11 @@ def internal_turn():
    if sector=='insurance' and channel=='Voice':kwargs['voice_transport']=d.get('voice_transport')
    reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),**kwargs)
    end_reason=end_reason if end_reason in ('goodbye','cancelled','verification') else None
-   voice_reply=reply
+   out=dict(success=True,reply=reply,end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
    if sector=='insurance' and channel=='Voice':
     from insurance.speech import render
-    voice_reply=render(reply)
-   return jsonify(success=True,reply=reply,voice_reply=voice_reply,should_end_call=sector=='insurance' and end_reason=='goodbye',end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
+    out.update(voice_reply=render(reply),should_end_call=end_reason=='goodbye')
+   return jsonify(out)
   except Exception as exc:
    if sector=='insurance':insurance_voice_error('turn',exc,d.get('external_id'),b['business_id'])
    else:log.exception('Turn failed')

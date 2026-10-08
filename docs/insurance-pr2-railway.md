@@ -103,6 +103,7 @@ recordada no sustituye páginas ready ni revalida por sí misma autorización/ve
 | `INSURANCE_TURN_RETENTION_DAYS`, `INSURANCE_MAX_TURNS_PER_CONVERSATION` | 90 días; 2000 turnos físicos como máximo por conversación |
 | `INSURANCE_MEMORY_SCAN_LIMIT`, `INSURANCE_PURGE_BATCH` | Lotes de 500, no límite absoluto de búsqueda histórica |
 | `INSURANCE_STATE_RETENTION_SECONDS`, `INSURANCE_INACTIVITY_SECONDS` | Limpieza física 604800 s; estado activo 1800 s |
+| `INSURANCE_VERIFICATION_TTL_SECONDS` | 1800 s; verificación por sesión/canal, nunca autorización indefinida |
 | `INSURANCE_IDENTITY_BUFFER_TTL_SECONDS` | 300 s; fragmentos cifrados con la clave existente y ligados a negocio/canal/sesión |
 | `INSURANCE_IDENTITY_MAX_ATTEMPTS`, `INSURANCE_IDENTITY_WINDOW_SECONDS` | 5 declaraciones completas fallidas por ventana de 900 s |
 

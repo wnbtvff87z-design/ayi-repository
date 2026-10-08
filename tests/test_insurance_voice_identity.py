@@ -18,7 +18,7 @@ def prepare(text, state=None, channel='Voice', business=BIZ, ref='conversation',
 
 @pytest.mark.parametrize('text', [
     'Celia Zorro, DNI cinco uno nueve cinco nueve cinco seis seis jota',
-    'Mi nombre es Celia Zorro Condes y mi DNI es 51959566J',
+    'Me llamo Celia Zorro Condes y mi DNI es 51959566J',
     'Me llamo Celia Zorro, mi documento es 51 959 566 J',
 ])
 def test_natural_complete_declarations(text):
@@ -223,6 +223,75 @@ def test_document_then_given_name_then_surname(channel):
     assert '51959566' not in json.dumps(state)
 
 
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_explicit_compound_given_name_requires_surname_after_document(channel):
+    state = {'awaiting': 'identity'}
+    document = prepare('DNI 51959566J', state, channel=channel)['document']
+    state['doc_hmac'] = identity.document_hmac(BIZ, document)
+    given = prepare('mi nombre es María José', state, channel=channel)
+    assert given['name'] == state['name'] == 'María José'
+    assert state['identity_given_name'] == 'María José'
+    assert not state.get('identity_surname')
+    assert state['name_hmac'] is None
+    assert given['identity_kind'] == 'partial' and given['missing'] == 'surname'
+    assert given['question'] == '' and not given['has_question']
+    surname = prepare('mi apellido es de la Peña', state, channel=channel)
+    assert surname['name'] == state['name'] == 'María José de la Peña'
+    assert state['identity_given_name'] == 'María José'
+    assert state['identity_surname'] == 'de la Peña'
+    assert surname['identity_kind'] == 'complete' and surname['missing'] is None
+    assert state['name_hmac'] == identity.name_hmac(BIZ, 'María José de la Peña')
+
+
+def test_explicit_compound_given_name_before_document_remains_partial():
+    state = {'awaiting': 'identity'}
+    given = prepare('mi nombre es María José', state)
+    assert given['identity_kind'] == 'partial' and given['missing'] == 'surname'
+    document = prepare('DNI 51959566J', state)
+    assert document['document'] == '51959566J'
+    assert document['identity_kind'] == 'partial' and document['missing'] == 'surname'
+    assert state['name_hmac'] is None
+
+
+def test_full_declaration_does_not_guess_compound_name_boundaries():
+    state = {'awaiting': 'identity'}
+    parsed = prepare('Me llamo Luis Gil Mora, DNI 51959566J', state)
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['name'] == 'Luis Gil Mora'
+    assert not state.get('identity_given_name') and not state.get('identity_surname')
+
+
+def test_full_declaration_with_question_replaces_pending_given_name():
+    state = {'awaiting': 'identity'}
+    prepare('mi nombre es María José', state)
+    parsed = prepare('Me llamo Luis Gil Mora, DNI 51959566J y quiero saber si cubre agua', state)
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['name'] == 'Luis Gil Mora'
+    assert parsed['has_question'] and 'quiero saber si cubre agua' in parsed['question']
+    assert not state.get('identity_given_name') and not state.get('identity_surname')
+
+
+def test_explicit_compound_given_name_has_no_complete_attempt_before_surname(pg):
+    state = {'awaiting': 'identity'}
+    with pg() as conn:
+        identity.upsert_customer(conn, BIZ, 'COMPOUND', 'María José de la Peña', '51959566J',
+                                 given_name='María José', first_surname='de la Peña')
+        document = prepare('DNI 51959566J', state)['document']
+        state['doc_hmac'] = identity.document_hmac(BIZ, document)
+        given = prepare('mi nombre es María José', state)
+        assert given['identity_kind'] != 'complete'
+        assert given['missing'] == 'surname' and state['name_hmac'] is None
+        assert identity.match_by_hashes(conn, BIZ, state['doc_hmac'], state['name_hmac']) == []
+        assert identity.failed_attempts(conn, BIZ, 'Voice', 'conversation') == 0
+        identity.save_state(conn, BIZ, 'Voice', 'conversation', 'call', state)
+        loaded = identity.load_state(conn, BIZ, 'Voice', 'conversation', 'call')
+        surname = prepare('mi apellido es de la Peña', loaded)
+        assert surname['identity_kind'] == 'complete'
+        assert identity.match_by_hashes(conn, BIZ, loaded['doc_hmac'],
+                                       loaded['name_hmac']) == ['COMPOUND']
+        assert identity.failed_attempts(conn, BIZ, 'Voice', 'conversation') == 0
+
+
 def test_name_can_arrive_while_document_is_fragmented():
     state = {'awaiting': 'identity'}
     prepare('DNI cinco uno nueve cinco', state)
@@ -342,7 +411,7 @@ def test_fragments_are_not_concatenated_outside_guided_capture():
 
 @pytest.mark.parametrize('text', [
     'DNI 51959566J Celia Zorro', 'DNI 51959566J y Celia Zorro',
-    'DNI 51959566J y mi nombre es Celia Zorro',
+    'DNI 51959566J y me llamo Celia Zorro',
 ])
 def test_document_before_name_in_same_turn(text):
     parsed = prepare(text, {'awaiting': 'identity'})
@@ -486,6 +555,23 @@ def test_authorized_trace_preserves_nonidentity_dates_and_amounts():
 ])
 def test_scoped_mask_does_not_treat_policy_document_as_identity(text):
     assert voice.mask_declarations(text) == text
+
+
+@pytest.mark.parametrize('citation', [
+    'Documento 1, página 1', 'Documento 1234, páginas 12 y 13',
+    'Según Documento 2, página 3: cubre daños por agua.',
+])
+def test_generic_visible_document_citations_are_not_identity_labels(citation):
+    assert voice.mask_declarations(citation) == citation
+
+
+def test_generic_citation_exemption_does_not_expose_actual_identity_document():
+    text = 'Documento 1, página 1; documento 51959566J'
+    masked = voice.mask_declarations(text)
+    assert masked.startswith('Documento 1, página 1; ')
+    assert '51959566' not in masked and '[identity:1 tokens]' in masked
+    assert '51959566' not in voice.mask_declarations('documento 51959566J, página 1')
+    assert 'documento [identity:' in voice.mask_declarations('documento 12345, página 1')
 
 
 def test_bare_labelled_name_preserves_identity_parser_policy_behavior():

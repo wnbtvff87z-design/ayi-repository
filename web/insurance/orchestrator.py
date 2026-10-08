@@ -35,6 +35,8 @@ _CLOSING = re.compile(r'\b(?:hasta luego|adios|chau|chao|nos vemos|eso era todo)
 
 def social(text):
     """Only whole social utterances take a local shortcut; mixed questions never do."""
+    if not text or len(text) > 256:
+        return None
     folded = ' '.join(re.findall(r'\w+', references.fold(text)))
     remainder = _SOCIAL.sub('', folded)
     if not folded or remainder.strip():
