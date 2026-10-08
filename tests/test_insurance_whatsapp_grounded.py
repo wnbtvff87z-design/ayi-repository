@@ -98,6 +98,12 @@ def _install_transports(monkeypatch, captures, mode):
                      'message': {'role': 'assistant', 'content': json.dumps({'terms': terms})}}]})
         interpreting = payload.get('response_format') == {'type': 'json_object'}
         if interpreting:
+            if mode['value'] == 'interpret_network':
+                raise httpx.ConnectError('Synthetic interpretation network failure', request=request)
+            if mode['value'] == 'interpret_context_limit':
+                return httpx.Response(400, json={'error': {
+                    'message': 'Synthetic interpretation context limit', 'type': 'invalid_request_error',
+                    'code': 'context_length_exceeded'}})
             assert payload['max_tokens'] == 256 and payload['temperature'] == 0
             package = json.loads(prompt)
             assert set(package) == {'context', 'stage', 'identity', 'capture'}
@@ -136,7 +142,8 @@ def _install_transports(monkeypatch, captures, mode):
                 intents = ['farewell', *intents]
             proposal = {'intents': intents, 'reference': reference, 'topic': ''}
             assert orchestrator.validate(proposal, current) == proposal
-            content = json.dumps(proposal, ensure_ascii=False)
+            content = ('' if mode['value'] == 'interpret_empty'
+                       else json.dumps(proposal, ensure_ascii=False))
             return httpx.Response(200, json={
                 'id': 'chatcmpl-synthetic-interpret', 'object': 'chat.completion', 'created': 1,
                 'model': payload['model'], 'choices': [

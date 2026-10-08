@@ -79,7 +79,9 @@ def selection(conn, scope, state, text, number=None):
         "OR translate(lower(p.product),'áéíóúüñ','aeiouun')=lower(%s)) "
         'ORDER BY p.policy_id LIMIT 2',
         (scope.bid, scope.customer_id, number or candidate, number or candidate, candidate)).fetchall()
-    return dict(rows[0]) if len(rows) == 1 else None
+    if len(rows) > 1:
+        return {'reason_code': 'multiple_policies'}
+    return dict(rows[0]) if rows else None
 
 
 def intent(text):

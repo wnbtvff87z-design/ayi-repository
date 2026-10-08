@@ -229,3 +229,50 @@ def test_cached_policy_disclosures_revalidate_current_authorization(grounded, pr
         conn.execute("UPDATE insurance_authorizations SET revoked_at=now() WHERE policy_id='POL-AUTO-010'")
     replay = flow.say(text, sid='SM-protected-selection')
     assert 'AUTO-010' not in replay and 'automóvil' not in replay
+
+
+def test_ambiguous_product_does_not_guess_or_consume_pending_question(grounded):
+    flow = grounded
+    add_policy('HOME-002', 'hogar')
+    flow.say(QUESTION)
+    flow.say(DECLARATION)
+    pending = flow.state()['normalized_question']
+    reply = flow.say('hogar')
+    assert 'HOME-002' in reply and 'SYN-0731' in reply
+    assert flow.state()['normalized_question'] == pending
+    assert not flow.state().get('policy_id') and not flow.explanations
+    response = flow.say('SYN-0731')
+    assert 'excluy' in response.lower() and 'página 2' in response
+
+
+def test_authorization_start_inclusive_end_exclusive_at_database_timestamp(grounded):
+    with cases.db() as conn:
+        conn.execute("UPDATE insurance_authorizations SET valid_from=now(),valid_to=now()")
+        rows, _ = policy_info.authorized_page(conn, BIZ, 'CUSTOMER-SYNTHETIC')
+        assert not rows
+        conn.execute("UPDATE insurance_authorizations SET valid_to=now()+interval '1 second'")
+        rows, _ = policy_info.authorized_page(conn, BIZ, 'CUSTOMER-SYNTHETIC')
+        assert rows[0]['policy_id'] == 'POL-SYNTHETIC'
+
+
+@pytest.mark.parametrize('mode,code', [
+    ('interpret_empty', 'llm_empty_response'), ('interpret_network', 'llm_network_error'),
+    ('interpret_context_limit', 'llm_context_limit'),
+])
+def test_classified_interpreter_failure_preserves_question_without_retrieval_and_recovers(
+        grounded, mode, code):
+    flow = grounded
+    flow.verify()
+    flow.mode['value'] = mode
+    response = flow.say(QUESTION)
+    assert 'técnico' in response and 'evidencia suficiente' not in response
+    state = flow.state()
+    assert state['awaiting'] == 'retry'
+    assert state['question'] == QUESTION and state['normalized_question'] == QUESTION
+    assert state['last_retrieval']['retrieval_status'] == 'interpretation_error'
+    assert state['last_retrieval']['llm_diagnostic'] == code
+    assert not flow.explanations and not flow.rewrites
+    assert flow.count('insurance_cases') == 0
+    recovered = flow.restart('Revisa de nuevo', 'SM-interpreter-recovery-' + mode)
+    assert 'excluy' in recovered['reply'].lower() and 'página 2' in recovered['reply']
+    assert flow.count('insurance_identity_verifications') == 1

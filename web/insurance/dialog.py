@@ -363,7 +363,14 @@ def _answer(business, state, text, channel, external_id, customer):
             selected_policy = (policy_info.selection(conn, sc, st, incoming, decl['contract_number'])
                                if customer_id and not decl.get('identity_kind') and not policy_action
                                else None)
-            selection_attempt = bool(decl.get('policy_only') or (
+            ambiguous_selection = bool(selected_policy and not selected_policy.get('policy_id'))
+            if ambiguous_selection:
+                selected_policy = None
+            bare_number = bool(
+                re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9/-]{2,39}', incoming)
+                and re.search(r'\d', incoming) and not DATE_RE.fullmatch(incoming))
+            selection_attempt = bool(decl.get('policy_only') or ambiguous_selection or (
+                customer_id and bare_number) or (
                 awaiting_at_start == 'policy' and len(incoming.split()) <= 3
                 and not any(mark in incoming for mark in ('?', '¿'))))
             pure_selection = bool(selected_policy and (
@@ -372,8 +379,10 @@ def _answer(business, state, text, channel, external_id, customer):
                 awaiting_at_start == 'policy_confirmation' and references.consent_only(incoming)))
             detail = bool(pending_question and awaiting_at_start in ('retry', 'human_consent') and
                           re.fullmatch(r'(?:(?:si|la|mesa|esta|es|de|material)\s+)*'
-                                       r'(?:declarad[ao]|vidrio|cristal)(?:\s+de\s+vidrio)?[?!]*',
-                                       references.fold(incoming)))
+                                       r'(?:declarad[ao]|vidrio|cristal)(?:\s+(?:'
+                                       r'en\s+(?:(?:mi|la|el)\s+)?(?:poliza|contrato)|'
+                                       r'de\s+(?:vidrio|cristal)|templado))?',
+                                       ' '.join(re.findall(r'\w+', references.fold(incoming)))))
             turn_intent = _intent(incoming)
             reviewing = turn_intent == 'review' and bool(st.get('question') or st.get('last_retrieval'))
             explaining_missing = turn_intent == 'explain_missing' and bool(st.get('last_retrieval'))
@@ -697,7 +706,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 confirmation = references.confirmation(incoming)
                 if confirmation == 'yes':
                     candidate = policy_info.selection(conn, sc, st, '', st.get('requested_policy'))
-                    if not candidate:
+                    if not candidate or not candidate.get('policy_id'):
                         st.pop('requested_policy', None)
                         st.pop('change_pending', None)
                         return finish(policy_info.offer(conn, sc, st),
