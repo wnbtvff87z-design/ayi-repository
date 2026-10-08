@@ -99,7 +99,7 @@ def validate_config(config):
             raise MasterSyncError('invalid_field_mapping')
         if ('given_name' in fields) != ('first_surname' in fields):
             raise MasterSyncError('name_boundaries_required_together')
-        if not isinstance(table['table'], str) or not table['table'].strip():
+        if not isinstance(table['table'], str) or not re.fullmatch(r'tbl[A-Za-z0-9]+', table['table']):
             raise MasterSyncError('invalid_table')
         names.append(table['table'])
     if len(set(names)) != 4:
@@ -223,6 +223,13 @@ def prepare_snapshot(config, snapshot):
             ids.add(internal)
             values.update(record_id=rid, internal_id=internal)
             if entity == 'customers':
+                if not isinstance(values['name'], str) or not 1 <= len(values['name']) <= 300 or \
+                        not isinstance(values['document'], str) or not 1 <= len(values['document']) <= 40:
+                    raise MasterSyncError('invalid_customer_identity')
+                if any(values.get(k) is not None and (
+                        not isinstance(values[k], str) or len(values[k]) > 300)
+                       for k in ('given_name', 'first_surname')):
+                    raise MasterSyncError('invalid_name_boundaries')
                 values['active'] = _boolean(values['active'])
                 values['document_hmac'] = identity.document_hmac(config['business_id'], values['document'])
                 values['name_hmac'] = identity.name_hmac(config['business_id'], values['name'])
@@ -326,6 +333,16 @@ def apply_snapshot(conn, config, snapshot, *, actor='insurance-master-sync'):
     policies = {r['internal_id']: r for r in rows['policies'].values()}
     with conn.transaction():
         ensure_hmac_key(conn, bid)
+        # Protect source ownership even when separate workers configure different tenants.
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                     ('insurance-master-base:' + config['base_id'],))
+        other_sources = conn.execute(
+            'SELECT tables FROM insurance_master_sources WHERE base_id=%s AND business_id<>%s',
+            (config['base_id'], bid)).fetchall()
+        table_names = {t['table'] for t in config['tables'].values()}
+        if any(table_names & {t['table'] for t in source['tables'].values()}
+               for source in other_sources):
+            raise MasterSyncError('cross_business_source_table')
         table_config = json.dumps(config['tables'], sort_keys=True)
         source = conn.execute(
             'SELECT source_id,base_id,tables FROM insurance_master_sources WHERE business_id=%s FOR UPDATE',

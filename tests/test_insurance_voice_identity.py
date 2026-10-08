@@ -33,6 +33,29 @@ def test_natural_complete_declarations(text):
     assert parsed['policy_only'] is False
 
 
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_long_compound_name_is_one_local_identity_datum_without_question_residue(channel):
+    name = 'José María de los Santos de la Torre'
+    state = {'awaiting': 'identity'}
+    parsed = prepare(f'Me llamo {name}, DNI 51959566J', state, channel=channel)
+    assert len(name.split()) == 8
+    assert parsed['name'] == name
+    assert parsed['document'] == '51959566J'
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['question'] == '' and not parsed['has_question']
+    assert name not in parsed['normalized_text']
+    prefixes = identity.name_prefix_hmacs(BIZ, name, 'José María', 'de los Santos')
+    assert identity.name_hmac(BIZ, 'Jose Maria de los') not in prefixes
+    assert identity.name_hmac(BIZ, 'Jose Maria de los Santos') in prefixes
+    assert identity.name_hmac(BIZ, name) in prefixes
+
+
+def test_long_compound_name_partial_digits_remain_masked_in_authorized_trace_detail():
+    name = 'José María de los Santos de la Torre'
+    masked = voice.mask_transcript(name + ' 5195', awaiting='identity', mask_names=False)
+    assert name in masked and '5195' not in masked
+
+
 @pytest.mark.parametrize('document', [
     'DNI cincuenta y uno, noventa y cinco, noventa y cinco, sesenta y seis, jota',
     'DNI cinco uno nueve cinco nueve cinco seis seis jota',

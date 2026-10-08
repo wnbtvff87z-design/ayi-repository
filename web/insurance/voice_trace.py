@@ -126,10 +126,6 @@ def _transport(value):
     for key in ('last', 'last_present'):
         if isinstance(value.get(key), bool):
             safe[key] = value[key]
-    if isinstance(value.get('identity_verified'), bool):
-        safe['identity_verified'] = value['identity_verified']
-    if isinstance(value.get('llm_diagnostic'), str) and value['llm_diagnostic'] in DIAGNOSTICS:
-        safe['llm_diagnostic'] = value['llm_diagnostic']
     if value.get('event') in ('setup', 'disconnect', 'error'):
         safe['event'] = value['event']
     return safe

@@ -67,7 +67,9 @@ def test_voice_identity_one_turn_does_not_retrieve_and_trace_is_masked(client, m
 
 
 @pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
-def test_reported_generic_query_then_identity_never_calls_provider(client, monkeypatch, channel):
+@pytest.mark.parametrize('legacy_pending', [False, True])
+def test_reported_generic_query_then_identity_never_calls_provider(
+        client, monkeypatch, channel, legacy_pending):
     def forbidden(*args, **kwargs):
         pytest.fail('Generic consultation and identity must not call LLM or retrieval')
 
@@ -79,6 +81,13 @@ def test_reported_generic_query_then_identity_never_calls_provider(client, monke
     say('Quería hacer una consulta de la póliza', 2, channel)
     state = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
     assert not state.get('question')
+    if legacy_pending:
+        state['question'] = state['normalized_question'] = 'Quería hacer una consulta de la póliza'
+        state['question_intent'] = 'question'
+        with client() as conn:
+            identity.save_state(
+                conn, BIZ, channel, identity.conversation_ref(BIZ, channel, PHONE),
+                'CA-SYNTHETIC' if channel == 'Voice' else '', state)
     reply, out = say('Mi nombre es Celia Zorro Condes y mi DNI es 51959566J', 3, channel)
     assert reply == dialog.ASK_QUERY
     assert out == {'insurance_result': 'missing_information'}

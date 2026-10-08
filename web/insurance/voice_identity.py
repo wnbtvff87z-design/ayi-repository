@@ -657,7 +657,8 @@ def mask_transcript(text, awaiting=None, mask_names=True):
         text = re.sub(r'\+\d(?:[\s().-]*\d){7,14}', '[phone]', text)
         text = re.sub(r'(?<!\w)[6789](?:[\s().-]*\d){8}(?!\w)', '[phone]', text)
         if awaiting == 'identity' and re.fullmatch(
-                r'(?:' + identity.WORD + r'\s+){2,7}\d{1,8}[A-Za-z]?', text.strip()):
+                r'(?:' + identity.WORD + r'\s+){2,' + str(identity.MAX_NAME_TOKENS)
+                + r'}\d{1,8}[A-Za-z]?', text.strip()):
             text = re.sub(r'\d{1,8}[A-Za-z]?\s*$', '[digits]', text)
         return text
     if awaiting == 'identity' and _name_datum(text, {'awaiting': awaiting}):

@@ -148,6 +148,19 @@ def _is_social(text):
     return orchestrator.social(text) is not None
 
 
+def _identity_reset(text):
+    folded = ' '.join(re.findall(r'\w+', references.fold(text)))
+    return bool(re.fullmatch(
+        r'(?:reinicia|reiniciar|reinicie|resetea)\s+(?:la\s+)?conversacion|'
+        r'quiero\s+(?:reiniciar|empezar\s+de\s+nuevo)\s+(?:la\s+)?conversacion', folded))
+
+
+def _identity_redeclaration(text):
+    return bool(re.match(
+        r'^\W*(?:(?:hola|buenas)[, ]+)?(?:me\s+llamo|mi\s+nombre\s+es|'
+        r'nombre\s+(?:y\s+apellidos?|completo)|(?:mi\s+)?(?:dni|nie)\b)', text, re.I))
+
+
 def _diag(corr, stage, business_id=None, **fields):
     """Structured stage log. Whitelisted enum/counter/boolean fields only: never name, DNI/NIE,
     phone, policy number, question text, PDF text, tokens or URLs."""
@@ -342,6 +355,13 @@ def _answer(business, state, text, channel, external_id, customer):
                         out['case_id'] = str(case['case_id'])
                 _turn_diag(corr, bid, decision, customer_id, 'read_only')
                 return cached['content'], out
+            explicit_reset = _identity_reset(text)
+            redeclaration = bool(customer_id and _identity_redeclaration(text))
+            if explicit_reset or redeclaration:
+                identity.revoke_verifications(conn, bid, channel, ref, sess)
+                st = {'awaiting': 'identity'}
+                customer_id = None
+                sc = memory.Scope(bid, channel, ref, sess, None)
             awaiting_at_start = st.get('awaiting')
             if orchestrator.generic_request(st.get('question')):
                 for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent'):
@@ -356,12 +376,14 @@ def _answer(business, state, text, channel, external_id, customer):
                 identity.NAME_TRIGGER_RE.search(text) or re.search(r'\b(?:dni|nie)\b', text, re.I))))
             if identity_declaration and not customer_id:
                 st['awaiting'] = 'identity'
-            decl = (identity.parse_declaration('') if _is_social(text) else
+            decl = (identity.parse_declaration('') if _is_social(text) or explicit_reset else
                     voice_identity.prepare(text, st, bid, channel, ref, sess) if identity_declaration
                     else identity.parse_declaration(text, st.get('awaiting')))
             _merge_declaration(st, decl, bid)
             incoming = decl['question'] if (decl['document'] or decl['name'] or decl['contract_number']) else text
             incoming = memory.redact(incoming).strip(' .,:;')
+            if explicit_reset:
+                incoming = ''
             policy_action = policy_info.list_action(incoming)
             selected_policy = (policy_info.selection(conn, sc, st, incoming, decl['contract_number'])
                                if customer_id and not decl.get('identity_kind') and not policy_action
@@ -441,7 +463,7 @@ def _answer(business, state, text, channel, external_id, customer):
                               'source': 'local'}
             try:
                 # No model call precedes the idempotency check or receives identity declarations.
-                if not _real_urgent(incoming) and not policy_control and not date_answer:
+                if not _real_urgent(incoming) and not policy_control and not date_answer and not explicit_reset:
                     interpretation = orchestrator.interpret(conn, sc, st, incoming, decl, turn_intent)
                 st['interpretation_diagnostic'] = None
             except memory.ContextBudgetExceeded:
@@ -637,6 +659,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 memory.set_user_kind(conn, user_id, 'confirmation', incoming)
                 reply, out = _consent(business, customer, channel, external_id, st, incoming)
                 return finish(reply, out)
+            if explicit_reset:
+                return finish(ASK_IDENTITY, {'insurance_result': ResultKind.IDENTITY_NOT_VERIFIED.value})
             if not customer_id:
                 outcome = _verify(conn, bid, channel, ref, sess, st, corr,
                                   completed_this_turn=bool(
@@ -773,8 +797,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 _diag(corr, 'interpretation', bid,
                       reason_code=st.get('interpretation_diagnostic') or interpretation['source'],
                       identity_verified=True, llm_invoked=st['interpretation_invoked'])
-            if st.get('interpretation_diagnostic') not in (
-                    None, 'llm_not_configured', 'context_budget_exceeded') and st.get('question'):
+            if st.get('interpretation_diagnostic') and st.get('question'):
                 if not orchestrator.safe_fallback(
                         st['question'], st.get('question_intent', 'question')):
                     if pending_fields:

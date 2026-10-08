@@ -1,10 +1,48 @@
 """Synthetic deterministic partial-name and inactivity tests."""
 from datetime import datetime, timedelta, timezone
+import uuid
 
 import pytest
 
 from test_insurance_attribution import pg, BIZ, PHONE
 from insurance import identity
+
+
+def test_conversation_lock_acquires_shared_master_before_conversation():
+    class Connection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params):
+            self.calls.append((statement, params))
+
+    conn = Connection()
+    identity.lock_conversation(conn, BIZ, 'WhatsApp', 'conversation')
+    assert conn.calls == [
+        ('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))',
+         (f'insurance-master:{BIZ}',)),
+        ('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
+         (f'idv:{BIZ}:WhatsApp:conversation',)),
+    ]
+
+
+def test_master_sync_waits_for_entire_turn_while_other_conversations_can_read(pg):
+    business = 'LOCK-SYNTHETIC-' + uuid.uuid4().hex
+    key = f'insurance-master:{business}'
+    with pg() as turn:
+        identity.lock_conversation(turn, business, 'WhatsApp', 'conversation')
+        with pg() as sync:
+            assert sync.execute(
+                'SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS acquired',
+                (key,)).fetchone()['acquired'] is False
+        with pg() as other_turn:
+            assert other_turn.execute(
+                'SELECT pg_try_advisory_xact_lock_shared(hashtextextended(%s,0)) AS acquired',
+                (key,)).fetchone()['acquired'] is True
+    with pg() as sync:
+        assert sync.execute(
+            'SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS acquired',
+            (key,)).fetchone()['acquired'] is True
 
 
 @pytest.mark.parametrize('declared,valid', [
@@ -207,10 +245,73 @@ def test_hmac_key_rotation_fails_closed_for_matches_and_reused_verification(pg, 
         assert identity.match_by_hashes(conn, BIZ, doc, name) == []
         assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
         diagnostic = identity.match_diagnostic(conn, BIZ, doc, name)
-        assert diagnostic['reason_code'] == 'hmac_key_mismatch'
+        assert diagnostic['reason_code'] == 'hmac_configuration_mismatch'
         assert diagnostic['candidate_count'] == 0
         with pytest.raises(ValueError):
             identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+
+
+@pytest.mark.parametrize('key', [None, 'short-synthetic-key'], ids=['missing', 'short'])
+def test_missing_and_short_hmac_keys_are_configuration_failures_not_identity_attempts(pg,
+                                                                                    monkeypatch,
+                                                                                    key):
+    with pg() as conn:
+        ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
+        doc = identity.document_hmac(BIZ, '12345678Z')
+        name = identity.name_hmac(BIZ, 'Ana Pérez')
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        if key is None:
+            monkeypatch.delenv('INSURANCE_CASE_HMAC_KEY')
+        else:
+            monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', key)
+        assert identity.hmac_key_agrees(conn, BIZ) is False
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        assert identity.match_by_hashes(conn, BIZ, doc, name) == []
+        diagnostic = identity.match_diagnostic(conn, BIZ, doc, name)
+        assert diagnostic['reason_code'] == 'hmac_configuration_mismatch'
+        assert diagnostic['candidate_count'] == 0
+        assert diagnostic['document_hmac_match'] is False
+        assert diagnostic['name_hmac_match'] is False
+        assert identity.match_diagnostic(
+            conn, 'EMPTY', None, None)['reason_code'] == 'hmac_configuration_mismatch'
+        assert identity.failed_attempts(conn, BIZ, 'WhatsApp', ref) == 0
+        with pytest.raises(ValueError):
+            identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+
+
+def test_missing_hmac_sentinel_migration_fails_closed_without_aborting_transaction(pg):
+    with pg() as conn:
+        ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        conn.execute('DROP TABLE insurance_hmac_keys')
+        doc = identity.document_hmac(BIZ, '12345678Z')
+        name = identity.name_hmac(BIZ, 'Ana Pérez')
+        assert identity.match_by_hashes(conn, BIZ, doc, name) == []
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        assert identity.match_diagnostic(conn, BIZ, doc, name)['reason_code'] == 'hmac_configuration_mismatch'
+        with pytest.raises(ValueError):
+            identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        assert conn.execute('SELECT 1 AS n').fetchone()['n'] == 1
+
+
+def test_controlled_customer_identity_update_revokes_but_display_update_does_not(pg):
+    with pg() as conn:
+        ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        identity.save_state(conn, BIZ, 'WhatsApp', ref, '', {'policy_id': 'POL-000123'})
+        identity.upsert_customer(conn, BIZ, 'C1', 'New display label', '12345678Z', 'Ana Pérez López')
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) == 'C1'
+        assert identity.load_state(conn, BIZ, 'WhatsApp', ref, '')['policy_id'] == 'POL-000123'
+        identity.upsert_customer(conn, BIZ, 'C1', 'New display label', '12345678Z', 'Ana Gil López')
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        assert identity.load_state(conn, BIZ, 'WhatsApp', ref, '') == {}
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        identity.upsert_customer(conn, BIZ, 'C1', 'New display label', '22222222Z', 'Ana Gil López')
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        identity.upsert_customer(conn, BIZ, 'C1', 'New display label', '22222222Z', 'Ana Gil López',
+                                 given_name='Ana Gil', first_surname='López')
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
 
 
 @pytest.mark.parametrize('registered,given,surname,declared,valid', [

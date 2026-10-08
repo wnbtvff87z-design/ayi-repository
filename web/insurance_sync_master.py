@@ -21,6 +21,10 @@ def load_config():
             validate_config(config)
         if len({c['business_id'] for c in configs}) != len(configs):
             raise ValueError()
+        locators = [(c['base_id'], table['table']) for c in configs
+                    for table in c['tables'].values()]
+        if len(set(locators)) != len(locators):
+            raise ValueError()
         interval = int(os.getenv('INSURANCE_MASTER_POLL_SECONDS', '60'))
         if not 15 <= interval <= 3600:
             raise ValueError()
@@ -34,13 +38,21 @@ def load_config():
 
 
 def run_once(configs, *, apply=False):
+    failure = None
     for config in configs:
-        snapshot = fetch_snapshot(config, os.environ['AIRTABLE_INSURANCE_TOKEN'])
-        with cases.db() as conn:
-            counts = apply_snapshot(conn, config, snapshot)
-            if not apply:
-                conn.rollback()
-        log.info('master_sync business=%s applied=%s counts=%s', config['business_id'], apply, counts)
+        try:
+            snapshot = fetch_snapshot(config, os.environ['AIRTABLE_INSURANCE_TOKEN'])
+            with cases.db() as conn:
+                counts = apply_snapshot(conn, config, snapshot)
+                if not apply:
+                    conn.rollback()
+            log.info('master_sync business=%s applied=%s counts=%s', config['business_id'], apply, counts)
+        except Exception as exc:
+            safe_error = exc if isinstance(exc, MasterSyncError) else MasterSyncError('database_or_provider_failure')
+            log.error('master_sync business=%s code=%s', config['business_id'], safe_error)
+            failure = failure or safe_error
+    if failure:
+        raise failure
 
 
 def main(argv=None):

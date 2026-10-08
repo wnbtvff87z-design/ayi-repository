@@ -38,6 +38,11 @@ def provision(conn, *, actor, business_id, customer_id, display_name, document, 
             business_id, full_name or display_name):
         raise ValueError('INSURANCE_CASE_HMAC_KEY (>=32 bytes), a document and name+surname are required')
     ensure_hmac_key(conn, business_id)
+    if conn.execute(
+            'SELECT 1 FROM insurance_customers WHERE business_id=%s AND document_hmac=%s '
+            'AND customer_id<>%s LIMIT 1',
+            (business_id, identity.document_hmac(business_id, document), customer_id)).fetchone():
+        raise ValueError('duplicate_customer_document')
     if document_id:
         old_document = conn.execute(
             'SELECT policy_id,version_id FROM insurance_documents WHERE business_id=%s AND document_id=%s FOR UPDATE',

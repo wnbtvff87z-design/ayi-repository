@@ -81,8 +81,8 @@ def pg(monkeypatch):
     with connect() as conn:
         for m in MIGRATIONS:
             conn.execute(m.read_text(encoding='utf-8'))
-        conn.execute("INSERT INTO insurance_customers VALUES(%s,'C1','Test')", (BIZ,))
-        conn.execute("INSERT INTO insurance_customers VALUES('OTHER','C1','Other')")
+        identity.upsert_customer(conn, BIZ, 'C1', 'Test Customer', '12345678Z')
+        identity.upsert_customer(conn, 'OTHER', 'C1', 'Other Customer', '12345678Z')
         conn.execute("INSERT INTO insurance_policies VALUES(%s,%s,'C1','hogar')", (BIZ, POL))
         conn.execute("INSERT INTO insurance_policy_versions(business_id,policy_id,version_id,valid_from) "
                      "VALUES(%s,%s,%s,%s)", (BIZ, POL, VER, date.today() - timedelta(days=100)))

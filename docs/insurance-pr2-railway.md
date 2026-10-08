@@ -4,6 +4,10 @@
 
 ## Lookup de negocio: indisponibilidad y revocación
 
+Para la sincronización de datos maestros y la nueva migración, seguir la sección
+vigente de `insurance-provisioning.md`. Las recetas y recuentos históricos más
+abajo no describen esta entrega y no deben sustituir esas instrucciones.
+
 El registro de números se consulta de nuevo en cada turno con
 `TENANT_LOOKUP_MODE=new` o `shadow`. `BUSINESS_CACHE_TTL_SECONDS` solo conserva
 la caché del lookup `legacy` de restaurantes; no mantiene asignaciones ni

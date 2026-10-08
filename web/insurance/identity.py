@@ -33,7 +33,7 @@ def session_key(channel, external_id):
 def verified_customer(conn, business_id, channel, phone, session_ref=''):
     if channel == 'Voice' and not session_ref:
         return None
-    if not _key_agrees(conn, business_id):
+    if not hmac_key_agrees(conn, business_id):
         return None
     ref = conversation_ref(business_id, channel, phone)
     if not ref:
@@ -66,7 +66,7 @@ NAME_TRIGGER_RE = re.compile(
     r'(?:me\s+llamo|mi\s+nombre\s+es|nombre\s+y\s+apellidos?|nombre\s+completo|soy)\s*[:,-]?\s*', re.I)
 LABEL_RE = re.compile(r'\b(nombre|apellidos?)\s*[:=-]\s*', re.I)
 KEYWORD_RE = re.compile(r'\b(dni|nie|documento|n[úu]mero|nombre|apellidos?|y)\b', re.I)
-MAX_NAME_TOKENS = 7
+MAX_NAME_TOKENS = 24
 MAX_TEXT = 4000
 
 
@@ -211,7 +211,8 @@ def match_by_hashes(conn, business_id, doc_hash, name_hash):
     even when only one registered name matches. The DNI index narrows the rows first."""
     if not doc_hash or not name_hash:
         return []
-    if not _key_agrees(conn, business_id):
+    _lock_master_shared(conn, business_id)
+    if not hmac_key_agrees(conn, business_id):
         return []
     rows = _document_candidates(conn, business_id, doc_hash, name_hash)
     active = [r for r in rows if r['active']]
@@ -227,11 +228,21 @@ def _document_candidates(conn, business_id, doc_hash, name_hash):
         (name_hash, name_hash, business_id, doc_hash)).fetchall()
 
 
-def _key_agrees(conn, business_id):
+def hmac_key_agrees(conn, business_id):
+    """Read-only provisioning-key agreement; absent key, sentinel or migration fails closed."""
     if len(os.getenv('INSURANCE_CASE_HMAC_KEY', '').encode()) < MIN_KEY_BYTES:
+        return False
+    if not conn.execute(
+            "SELECT to_regclass('insurance_hmac_keys') IS NOT NULL AS present", ()).fetchone()['present']:
         return False
     from insurance.master_sync import check_hmac_key
     return check_hmac_key(conn, business_id)
+
+
+def _lock_master_shared(conn, business_id):
+    conn.execute('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))',
+                 (f'insurance-master:{business_id}',))
+
 
 
 def match_diagnostic(conn, business_id, doc_hash, name_hash):
@@ -240,11 +251,14 @@ def match_diagnostic(conn, business_id, doc_hash, name_hash):
     Missing provisioning is distinguishable from a genuine mismatch without a runtime lookup
     of the external master. The caller-facing failure must remain generic.
     """
-    if not _key_agrees(conn, business_id):
+    if len(os.getenv('INSURANCE_CASE_HMAC_KEY', '').encode()) < MIN_KEY_BYTES:
+        return {'reason_code': 'hmac_configuration_mismatch', 'candidate_count': 0,
+                'document_hmac_match': False, 'name_hmac_match': False}
+    if not hmac_key_agrees(conn, business_id):
         provisioned = conn.execute(
             'SELECT EXISTS(SELECT 1 FROM insurance_customers WHERE business_id=%s '
             'AND document_hmac IS NOT NULL) AS present', (business_id,)).fetchone()['present']
-        return {'reason_code': 'hmac_key_mismatch' if provisioned else 'customer_not_provisioned',
+        return {'reason_code': 'hmac_configuration_mismatch' if provisioned else 'customer_not_provisioned',
                 'candidate_count': 0, 'document_hmac_match': False, 'name_hmac_match': False}
     rows = _document_candidates(conn, business_id, doc_hash, name_hash) if doc_hash else []
     active = [r for r in rows if r['active']]
@@ -303,6 +317,8 @@ def verification_ttl_seconds():
 
 
 def lock_conversation(conn, business_id, channel, ref):
+    # Hold the master snapshot through retrieval/LLM/commit; sync takes this key exclusively.
+    _lock_master_shared(conn, business_id)
     conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', (f'idv:{business_id}:{channel}:{ref}',))
 
 
@@ -321,7 +337,8 @@ def record_failed_attempt(conn, business_id, channel, ref, session_ref, outcome)
 def create_verification(conn, business_id, channel, ref, session_ref, customer_id):
     if not ref or (channel == 'Voice' and not session_ref):
         raise ValueError('verification requires a conversation and Voice call session')
-    if not _key_agrees(conn, business_id):
+    _lock_master_shared(conn, business_id)
+    if not hmac_key_agrees(conn, business_id):
         raise ValueError('identity HMAC key does not agree with provisioning')
     row = conn.execute(
         'INSERT INTO insurance_identity_verifications(business_id,conversation_ref,customer_id,method,'
@@ -377,14 +394,22 @@ def clear_state(conn, business_id, channel, ref, session_ref):
 def upsert_customer(conn, business_id, customer_id, display_name, document, full_name=None,
                     given_name=None, first_surname=None):
     """Controlled provisioning helper (ops/tests). No public endpoint calls this."""
-    from insurance.master_sync import ensure_hmac_key
+    from insurance.master_sync import ensure_hmac_key, revoke_customer
     ensure_hmac_key(conn, business_id)
+    doc_hash = document_hmac(business_id, document)
+    full_hash = name_hmac(business_id, full_name or display_name)
+    prefixes = [h for h in name_prefix_hmacs(
+        business_id, full_name or display_name, given_name, first_surname) if h]
+    changed = conn.execute(
+        'SELECT EXISTS(SELECT 1 FROM insurance_customers WHERE business_id=%s '
+        'AND customer_id=%s AND (document_hmac IS DISTINCT FROM %s '
+        'OR name_hmac IS DISTINCT FROM %s OR name_prefix_hmacs IS DISTINCT FROM %s::text[])) AS changed',
+        (business_id, customer_id, doc_hash, full_hash, prefixes)).fetchone()['changed']
+    if changed:
+        revoke_customer(conn, business_id, customer_id)
     conn.execute(
         'INSERT INTO insurance_customers(business_id,customer_id,display_name,document_hmac,name_hmac,'
         'name_prefix_hmacs) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (business_id,customer_id) DO UPDATE SET '
         'display_name=EXCLUDED.display_name,document_hmac=EXCLUDED.document_hmac,name_hmac=EXCLUDED.name_hmac,'
         'name_prefix_hmacs=EXCLUDED.name_prefix_hmacs',
-        (business_id, customer_id, display_name, document_hmac(business_id, document),
-         name_hmac(business_id, full_name or display_name),
-         [h for h in name_prefix_hmacs(business_id, full_name or display_name,
-                                     given_name, first_surname) if h]))
+        (business_id, customer_id, display_name, doc_hash, full_hash, prefixes))

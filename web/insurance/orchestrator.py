@@ -109,7 +109,8 @@ def interpret(conn, scope, state, text, declaration, fallback):
     base = {'intents': [local or ('identity' if identity_turn else fallback)],
             'reference': 'independent', 'topic': ''}
     if (local or identity_turn or generic_request(text) or references.consent_only(text)
-            or os.getenv('INSURANCE_DIALOG_LLM_ENABLED', 'true').lower() != 'true'):
+            or os.getenv('INSURANCE_DIALOG_LLM_ENABLED', 'true').lower() != 'true'
+            or not os.getenv('OPENAI_API_KEY', '').strip()):
         return {**base, 'source': 'local'}
     summary, _ = memory.load_summary(conn, scope) if scope.customer_id else ({}, None)
     recent = memory.recent(conn, scope) if scope.customer_id else []

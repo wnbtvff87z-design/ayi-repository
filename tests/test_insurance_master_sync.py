@@ -1,8 +1,10 @@
 """Synthetic source snapshots; integration tests use an isolated PostgreSQL schema."""
 import copy
+import json
 import os
 import sys
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 import psycopg
@@ -178,6 +180,14 @@ def test_worker_requires_explicit_apply(monkeypatch):
         worker.main(['--worker'])
 
 
+def test_worker_rejects_tables_shared_between_businesses(config, monkeypatch):
+    other = copy.deepcopy(config)
+    other['business_id'] = 'BIZ-2'
+    monkeypatch.setenv('INSURANCE_MASTER_SOURCES_JSON', json.dumps([config, other]))
+    with pytest.raises(sync.MasterSyncError, match='invalid_master_worker_config'):
+        worker.load_config()
+
+
 def test_import_idempotent_and_runtime_usable(conn, config, snapshot):
     for _ in range(2):
         assert sync.apply_snapshot(conn, config, snapshot) == dict.fromkeys(sync.ENTITIES, 1)
@@ -278,6 +288,8 @@ def test_business_isolation(conn, config, snapshot):
     sync.apply_snapshot(conn, config, snapshot)
     verify_and_state(conn)
     config['business_id'] = 'BIZ-2'
+    for table in config['tables'].values():
+        table['table'] += 'Other'
     sync.apply_snapshot(conn, config, snapshot)
     verify_and_state(conn, 'BIZ-2')
     snapshot['customers'][0]['fields']['Active'] = 'inactive'
@@ -287,6 +299,15 @@ def test_business_isolation(conn, config, snapshot):
                         "WHERE business_id='BIZ-1'").fetchone()['revoked_at'] is None
     assert conn.execute("SELECT count(*) AS n FROM insurance_conversation_state "
                         "WHERE business_id='BIZ-1'").fetchone()['n'] == 1
+
+
+def test_separate_workers_cannot_claim_same_source_tables(conn, config, snapshot):
+    sync.apply_snapshot(conn, config, snapshot)
+    config['business_id'] = 'BIZ-2'
+    with pytest.raises(sync.MasterSyncError, match='cross_business_source_table'):
+        sync.apply_snapshot(conn, config, snapshot)
+    assert conn.execute("SELECT count(*) AS n FROM insurance_customers WHERE business_id='BIZ-2'") \
+        .fetchone()['n'] == 0
 
 
 def test_hmac_fingerprint_agreement(conn, config, snapshot, monkeypatch):
@@ -367,3 +388,31 @@ def test_worker_fetch_failure_never_opens_database(config, monkeypatch):
     monkeypatch.setattr(worker.cases, 'db', lambda: pytest.fail('partial import attempted'))
     with pytest.raises(sync.MasterSyncError):
         worker.run_once([config], apply=True)
+
+
+def test_worker_failure_does_not_starve_other_business(conn, config, snapshot, monkeypatch):
+    other = copy.deepcopy(config)
+    other['business_id'] = 'BIZ-2'
+    monkeypatch.setenv('AIRTABLE_INSURANCE_TOKEN', 'synthetic')
+    def source(conf, token):
+        if conf['business_id'] == 'BIZ-1':
+            raise sync.MasterSyncError('airtable_unavailable')
+        return snapshot
+    monkeypatch.setattr(worker, 'fetch_snapshot', source)
+    monkeypatch.setattr(worker.cases, 'db', lambda: nullcontext(conn))
+    with pytest.raises(sync.MasterSyncError, match='airtable_unavailable'):
+        worker.run_once([config, other], apply=True)
+    assert conn.execute("SELECT customer_id FROM insurance_customers WHERE business_id='BIZ-2'") \
+        .fetchone()['customer_id'] == 'CUS-1'
+
+
+def test_manual_provision_cannot_create_duplicate_identity(conn, config, snapshot):
+    from insurance import provision
+    from datetime import date
+    sync.apply_snapshot(conn, config, snapshot)
+    with pytest.raises(ValueError, match='duplicate_customer_document'):
+        provision.provision(
+            conn, actor='ops', business_id='BIZ-1', customer_id='CUS-2', display_name='Other Customer',
+            document='12345678Z', policy_id='POL-2', product='hogar', version_id='VER-2',
+            valid_from=date(2025, 1, 1), contract_number='000123')
+    assert conn.execute('SELECT count(*) AS n FROM insurance_customers').fetchone()['n'] == 1

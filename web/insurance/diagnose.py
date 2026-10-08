@@ -178,11 +178,7 @@ def diagnose_identity(conn, *, business_id, conversation_ref, channel='WhatsApp'
             'identity', 'policy', 'date', 'reference', 'human_consent') else None,
         'awaiting_document': bool(state.get('awaiting_document')),
     }
-    from insurance.master_sync import MasterSyncError, check_hmac_key
-    try:
-        key_agrees = check_hmac_key(conn, business_id)
-    except MasterSyncError:
-        key_agrees = False
+    key_agrees = identity.hmac_key_agrees(conn, business_id)
     if not key_agrees:
         report.update(identity_verified=False, document_hmac_match=False,
                       name_hmac_match=False, candidate_count=0, stage='identity',

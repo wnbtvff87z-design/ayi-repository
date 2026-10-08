@@ -81,7 +81,9 @@ Each relationship is a single Airtable linked-record ID, not a name or internal
 ID. References must exist in the same business snapshot. Configure physically
 tenant-specific tables/bases: shared mixed-business tables are unsupported,
 because this importer does not guess a business from source fields.
-Use stable table IDs (`tbl…`) rather than renameable labels.
+Stable table IDs (`tbl…`) are required, rather than renameable labels.
+Reusing a base/table locator for another business is rejected both in the worker
+configuration and by a PostgreSQL-backed source ownership check across workers.
 Names and DNI/NIE are processed only in memory; imported customers store HMACs
 and NULL display_name. Optional `given_name` and `first_surname` mappings must be
 supplied together for compound-name boundaries.
@@ -162,7 +164,8 @@ Source omission preserves existing access until an explicit revocation; operator
 must not delete records as a substitute for revoking them. Configure only trusted,
 tenant-specific tables and least-privilege write roles. Failures across several
 configured businesses are independent transactions; a successful earlier tenant
-may commit before a later tenant fails.
+may commit before a later tenant fails. A failing tenant does not prevent the
+other configured tenants from being attempted in the same polling cycle.
 
 ```sql
 SELECT business_id,source_id,entity,record_id,internal_id,parent_id
@@ -247,11 +250,12 @@ SELECT EXISTS(SELECT 1 FROM insurance_customers WHERE business_id='INS-BIZ-001' 
 ## Risks / inconsistencies found
 - Contract numbers with `/` (`058342561/00000`) were truncated by the caller-declaration parser and then
   failed `policy_not_matched` in retrieval. Fixed here (identity.py, retrieval.py) with tests.
-- No new Railway variable is required by the tool; `INSURANCE_CASE_HMAC_KEY` must be the SAME on web and the
-  provisioning service, otherwise identity never matches (HMACs differ).
+- The manual tool reuses the existing Railway variables; `INSURANCE_CASE_HMAC_KEY` must be the SAME on web and
+  provisioning. The sentinel rejects differing keys; see legacy adoption above.
 - Name matching is exact (accents folded except ñ, order kept): store the name the caller will say.
 - Real data in PostgreSQL requires the separate insurance DB/role (docs/insurance-pr1-audit.md); verify it.
-- Airtable is not used by this flow (only the case outbox); bucket key must match
+- Airtable is not used by the manual provisioning flow; the separate master-input worker is described above.
+  The bucket key must match
   `insurance-policies/<business>/<policy>/<version>/<document>.pdf` exactly (case sensitive).
 - `INSURANCE_ENABLED` defaults to false; the web test call is only routed to insurance when true.
 

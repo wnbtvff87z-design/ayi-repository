@@ -300,10 +300,14 @@ def test_interpretation_provider_error_never_becomes_insufficient_contractual_ev
 
 
 @pytest.mark.parametrize('channel', ['WhatsApp', 'Voice'])
-@pytest.mark.parametrize('code', ['llm_timeout', 'llm_auth_failed', 'llm_invalid_response'])
+@pytest.mark.parametrize('code', [
+    'llm_timeout', 'llm_auth_failed', 'llm_invalid_response',
+    'llm_not_configured', 'context_budget_exceeded',
+])
 def test_unsafe_interpretation_failure_retains_pending_question_and_verified_diagnostic(
         pg, monkeypatch, channel, code, caplog):
     session = 'CA-fallback' if channel == 'Voice' else ''
+    monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-test-key')
     verify(pg, customer='C2', channel=channel, session=session)
     ref = identity.conversation_ref(BIZ, channel, PHONE)
     pending = '¿Cubre daños por agua?'
@@ -336,6 +340,7 @@ def test_unsafe_interpretation_failure_retains_pending_question_and_verified_dia
 
 @pytest.mark.parametrize('revoked', [False, True])
 def test_safe_fallback_only_routes_to_authorized_evidence_not_coverage(pg, monkeypatch, revoked):
+    monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-test-key')
     verify(pg, customer='C2')
     add_document(pg, 'POL-900', 'DOC-FALLBACK')
 

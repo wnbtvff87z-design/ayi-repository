@@ -6,13 +6,14 @@ Reproduces the reported sequence with SYNTHETIC data and the same linguistic str
 """
 import io
 import json
+import logging
 import re
 
 import pytest
 
 from test_insurance_whatsapp_grounded import BIZ, PHONE, grounded  # noqa: F401
 from test_insurance_voice_transport import flow, run_events  # noqa: F401
-from insurance import admin, cases, diagnose, identity, voice_identity
+from insurance import admin, cases, diagnose, identity, retrieval, voice_identity
 
 GIVEN, SURNAMES = 'Lucía', 'Fernández Ortega'
 FULL = f'{GIVEN} {SURNAMES}'
@@ -437,3 +438,65 @@ def test_shared_whatsapp_complete_new_identity_replaces_only_current_verificatio
             'SELECT revoked_at IS NOT NULL AS revoked FROM insurance_identity_verifications '
             'WHERE business_id=%s AND customer_id=%s', (BIZ, 'CUSTOMER-LFO')).fetchone()
     assert old['revoked']
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+def test_explicit_customer_switch_never_retrieves_previous_customers_policy(grounded, channel,
+                                                                         monkeypatch):
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'SWITCH-LUIS', 'Luis Gil Mora', '87654321X')
+    assert VERIFIED in _turn(grounded, channel, 'Me llamo Celia Zorro Condes, DNI 51959566J')
+    _turn(grounded, channel, '¿Qué cubre mi póliza sobre daños por agua?')
+    calls, original = [], retrieval.retrieve
+
+    def retrieve_for_current_customer(conn, business_id, customer_id, *args, **kwargs):
+        assert customer_id != 'CUSTOMER-SYNTHETIC'
+        calls.append(customer_id)
+        return original(conn, business_id, customer_id, *args, **kwargs)
+
+    monkeypatch.setattr(retrieval, 'retrieve', retrieve_for_current_customer)
+    reply = _turn(grounded, channel, 'Mi nombre es Luis Gil Mora')
+    assert VERIFIED not in reply and 'DNI o NIE' in reply
+    reply = _turn(grounded, channel, '¿Cuál es el límite por rotura de cristales?')
+    assert not calls
+    assert '731' not in reply and 'SYN-0731' not in reply
+    reply = _turn(grounded, channel, 'DNI 87654321X')
+    assert '731' not in reply and 'SYN-0731' not in reply
+    assert all(customer == 'SWITCH-LUIS' for customer in calls)
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+def test_long_compound_full_declaration_verifies_locally_without_llm_identity_residue(grounded,
+                                                                                   channel):
+    name = 'José María de los Santos de la Torre'
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'LONG-COMPOUND', name, DNI,
+                                 given_name='José María', first_surname='de los Santos')
+    _turn(grounded, channel, 'Hola')
+    before = len(grounded.captures)
+    reply = _turn(grounded, channel, f'Me llamo {name}, DNI {DNI}')
+    assert VERIFIED in reply
+    assert len(grounded.captures) == before
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+@pytest.mark.parametrize('key', [None, 'short', 'y' * 40], ids=['missing', 'short', 'changed'])
+def test_configuration_failure_never_reuses_identity_or_counts_failed_attempts(wa, channel, key,
+                                                                             monkeypatch, caplog):
+    assert VERIFIED in _turn(wa, channel, f'Me llamo {FULL}, DNI {DNI}')
+    before = len(wa.captures)
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger='insurance.dialog')
+    if key is None:
+        monkeypatch.delenv('INSURANCE_CASE_HMAC_KEY')
+    else:
+        monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', key)
+    reply = _turn(wa, channel, '¿Cubre daños por agua?')
+    assert VERIFIED not in reply
+    assert len(wa.captures) == before
+    assert wa.count('insurance_identity_attempts') == 0
+    log = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'hmac_configuration_mismatch' in log
+    assert DNI not in log and FULL not in log and PHONE not in log
+    if key:
+        assert key not in log
