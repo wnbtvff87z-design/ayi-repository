@@ -340,6 +340,49 @@ def test_switching_call_without_final_masks_only_latest_partial_on_old_close(flo
     assert turns[0]['voice_transport']['partial_count'] == 0
 
 
+@pytest.mark.parametrize('ending', ['disconnect', 'new_call'])
+def test_pending_partial_after_earlier_final_is_diagnosed_without_identity_processing(flow, ending):
+    new_call = CALL + '-second'
+    with flow[0].websocket_connect('/ws', headers={
+            'X-Twilio-Signature': signature(WS_URL, {})}) as ws:
+        ws.send_json(setup())
+        ws.send_json({'type': 'prompt', 'voicePrompt': 'hola', 'last': True})
+        assert ws.receive_json()['type'] == 'text'
+        ws.send_json({'type': 'prompt', 'voicePrompt': 'discarded older interim', 'last': False})
+        ws.send_json({'type': 'prompt',
+                      'voicePrompt': 'DNI uno dos tres cuatro cinco seis siete ocho zeta',
+                      'last': False})
+        ws.send_json(setup())
+        if ending == 'new_call':
+            ws.send_json({**setup(), 'callSid': new_call})
+            ws.send_json({'type': 'prompt', 'voicePrompt': 'hola', 'last': True})
+            assert ws.receive_json()['type'] == 'text'
+    turns = [data for path, data in flow[3] if path == '/internal/turn']
+    expected_ids = [CALL + ':turn:1']
+    if ending == 'new_call':
+        expected_ids.append(new_call + ':turn:1')
+    assert [data['external_id'] for data in turns] == expected_ids
+    assert all(data['text'] == 'hola' for data in turns)
+    assert all(data['voice_transport']['partial_count'] == 0 for data in turns)
+    old = [row for row in trace_rows(flow)
+           if row['call_ref'] == voice_trace.call_reference('INS', CALL)]
+    partials = [row for row in old if row['stage'] == 'voice_transcription_partial']
+    assert len(partials) == 1
+    assert old[-1] == partials[0]
+    assert partials[0]['transport']['event'] == 'disconnect'
+    assert partials[0]['transport']['final_count'] == 1
+    assert partials[0]['transport']['partial_count'] == 2
+    assert partials[0]['customer_id'] is None
+    assert 'uno dos tres cuatro' not in partials[0]['recognized']
+    assert 'discarded older interim' not in json.dumps(old, default=str)
+    with flow[2]() as conn:
+        assert conn.execute('SELECT count(*) AS n FROM insurance_identity_verifications').fetchone()['n'] == 0
+        assert conn.execute('SELECT count(*) AS n FROM insurance_identity_attempts').fetchone()['n'] == 0
+        states = conn.execute('SELECT state FROM insurance_conversation_state').fetchall()
+        assert all(not row['state'].get('doc_hmac') and
+                   not row['state'].get('identity_buffer') for row in states)
+
+
 def test_internal_insurance_voice_cannot_process_an_empty_technical_call_scope(flow, monkeypatch):
     monkeypatch.setattr(main, 'process', lambda *a, **k: pytest.fail('empty call entered dialogue'))
     data = {'business_id': 'INS', 'business_phone': TO, 'channel': 'Voice',

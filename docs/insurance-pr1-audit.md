@@ -166,7 +166,9 @@ La comprobación sucede en cada consulta del Web al registro, pero no controla l
   `last` no booleanos y tipos de transcripción inválidos. Web ahora rechaza un
   parcial explícito antes de modificar identidad. El identificador técnico de
   llamada no puede contener espacios ni `:`; se conserva aislamiento por llamada
-  e idempotencia por evento.
+  e idempotencia por evento. También se diagnostica un parcial pendiente al
+  desconectar o cambiar de llamada aunque ya hubiera un final anterior; nunca se
+  procesa ese parcial como identidad.
 - El parser local no reconocía correctamente ciertas expresiones de letra final
   (`la letra es jota`) ni correcciones parciales explícitas. La corrección conserva
   nombre/apellidos y fragmentos cifrados, distingue sufijos de fecha, teléfono e
@@ -217,6 +219,8 @@ del SDK (**55 pruebas**). Las siete suites focalizadas de identidad/transporte
 obtuvieron **417 pruebas aprobadas**, incluyendo nombre/documento/pregunta e
 importe sintético juntos, fragmento seguido de letra, corrección explícita,
 `last` no booleano, idempotencia y aislamiento por llamada.
+La ampliación posterior de transporte obtuvo **223 pruebas focalizadas aprobadas**,
+incluyendo parcial tras final previo, desconexión y cambio de llamada.
 Las advertencias base de ReportLab y Starlette son
 deprecaciones preexistentes; no se añadieron herramientas ni dependencias.
 

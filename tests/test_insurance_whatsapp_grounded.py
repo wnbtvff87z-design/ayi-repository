@@ -168,8 +168,16 @@ def _install_transports(monkeypatch, captures, mode):
         if mode['value'] == 'unauthorized':
             return httpx.Response(401, json={'error': {
                 'message': 'Synthetic authorization failure', 'type': 'authentication_error'}})
+        if mode['value'] == 'refusal':
+            return httpx.Response(200, json={
+                'id': 'chatcmpl-synthetic-refusal', 'object': 'chat.completion', 'created': 1,
+                'model': payload['model'], 'choices': [
+                    {'index': 0, 'finish_reason': 'stop', 'message': {
+                        'role': 'assistant', 'content': None, 'refusal': 'Synthetic refusal'}}]})
         if mode['value'] == 'empty':
             content = ''
+        elif mode['value'] == 'invalid':
+            content = 'Respuesta sintética sin referencias verificables.'
         elif mode['value'] == 'insufficient':
             content = 'ESCALAR'
         elif mode['value'] == 'detail' and 'mesa' in question.lower() and 'vidrio' not in question.lower():

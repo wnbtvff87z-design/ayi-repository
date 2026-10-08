@@ -276,3 +276,30 @@ def test_classified_interpreter_failure_preserves_question_without_retrieval_and
     recovered = flow.restart('Revisa de nuevo', 'SM-interpreter-recovery-' + mode)
     assert 'excluy' in recovered['reply'].lower() and 'página 2' in recovered['reply']
     assert flow.count('insurance_identity_verifications') == 1
+
+
+@pytest.mark.parametrize('failure,code', [
+    ('configuration', 'llm_not_configured'), ('unauthorized', 'llm_auth_failed'),
+    ('refusal', 'llm_refusal'), ('invalid', 'llm_invalid_response'), ('empty', 'llm_empty_response'),
+])
+def test_recovery_guidance_matches_provider_failure_even_on_repeated_questions(
+        grounded, monkeypatch, failure, code):
+    flow = grounded
+    flow.verify()
+    if failure == 'configuration':
+        monkeypatch.delenv('OPENAI_API_KEY')
+    else:
+        flow.mode['value'] = failure
+    for _ in range(2):
+        response = flow.say(QUESTION)
+        assert 'problema técnico' in response and 'Esto no indica falta de evidencia' in response
+        assert 'confirma o descarta cobertura' in response
+        assert 'minuto' not in response
+        if failure in ('configuration', 'unauthorized'):
+            assert 'operador' in response and 'no necesitas volver a enviar tus datos' in response
+        else:
+            assert 'revisión humana' in response and 'canal de atención autorizado' in response
+        state = flow.state()
+        assert state['awaiting'] == 'retry' and state['question'] == QUESTION
+        assert state['last_retrieval']['llm_diagnostic'] == code
+        assert not state.get('pending_human') and flow.count('insurance_cases') == 0

@@ -130,7 +130,7 @@ async def websocket(ws:WebSocket):
       insurance_error('technical_call_id_missing',ValueError(),state['call_sid'])
       await ws.close(code=1008);return
      if call_sid==state['call_sid']:continue
-     if not state['final_count']:
+     if not state['final_count'] or state['partial_count']:
       await insurance_transport(state,'disconnect','voice_transcription_partial' if state['partial_count'] else 'voice_transcription_missing',state['last_partial'])
      state['seq']=0;state['partial_count']=0;state['final_count']=0;state['last_partial']='';state['processed_ids']=set()
     state['call_sid']=event.get('callSid','')
@@ -201,5 +201,5 @@ async def websocket(ws:WebSocket):
   if state['insurance']:insurance_error('disconnect',exc,state['call_sid'])
   else:log.exception('Relay disconnected')
  finally:
-  if state['insurance'] and insurance_call_id_valid(state['call_sid']) and not state['final_count']:
+  if state['insurance'] and insurance_call_id_valid(state['call_sid']) and (not state['final_count'] or state['partial_count']):
    await insurance_transport(state,'disconnect','voice_transcription_partial' if state['partial_count'] else 'voice_transcription_missing',state['last_partial'])

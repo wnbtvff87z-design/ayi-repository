@@ -1232,11 +1232,28 @@ def _technical_failure(st, code, corr, bid, ev, invoked):
     st['awaiting'] = 'retry'
     _diag(corr, 'llm', bid, reason_code=code, identity_verified=True,
           llm_invoked=invoked, evidence_count=len(ev), decision='technical_error')
-    reply = ('No pude preparar la respuesta por un límite técnico de contexto. Inténtalo con una consulta más concreta.'
-             if code in ('context_budget_exceeded', 'llm_context_limit') else
-             TECHNICAL_RETRY + ' Esto no indica falta de evidencia ni confirma o descarta cobertura.')
+    reply = _technical_message(code)
     return (reply, {'insurance_result': ResultKind.TECHNICAL_ERROR.value, 'diagnostic_code': code},
             memory.pages_of(ev))
+
+
+def _technical_message(code, repeated=False):
+    if code in ('llm_not_configured', 'llm_auth_failed'):
+        reply = ('No pude consultarlo por un problema técnico de configuración o acceso del servicio. '
+                 'Necesita revisión del operador para restablecerlo; '
+                 'no necesitas volver a enviar tus datos.')
+    elif code in ('llm_refusal', 'llm_invalid_response', 'llm_empty_response'):
+        reply = ('No pude preparar una respuesta segura por un problema técnico del servicio. '
+                 'Puedes solicitar revisión humana por un canal de atención autorizado.')
+    elif code in ('context_budget_exceeded', 'llm_context_limit'):
+        reply = ('No pude preparar la respuesta por un problema técnico: límite técnico de contexto. '
+                 'Inténtalo con una consulta más concreta.')
+    elif code == 'llm_rate_limited':
+        reply = ('No pude consultarlo por un problema técnico: el servicio está temporalmente saturado. '
+                 'Espera un minuto antes de volver a intentarlo.')
+    else:
+        reply = TECHNICAL_REPEAT if repeated else TECHNICAL_RETRY
+    return reply + ' Esto no indica falta de evidencia ni confirma o descarta cobertura.'
 
 
 def _documental(conn, business, sc, st, text, question, corr, ctx, customer, external_id,
@@ -1490,7 +1507,8 @@ def _vary(st, reply, decision, incoming):
     required = ASK_POLICY in reply or st.get('awaiting') in ('policy', 'date', 'identity')
     if _digest(reply) == st.get('last_reply_digest') and not urgent and not required:
         if decision == ResultKind.TECHNICAL_ERROR.value:
-            reply = TECHNICAL_REPEAT
+            reply = _technical_message((st.get('last_retrieval') or {}).get('llm_diagnostic'),
+                                       repeated=True)
         elif decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value:
             reply = REPEAT_ANSWER_PREFIX + reply + ' ' + REPEAT_ANSWER_QUESTION
         elif decision == ResultKind.POLICY_INFORMATION.value:
