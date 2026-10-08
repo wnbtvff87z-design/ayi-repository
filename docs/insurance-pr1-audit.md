@@ -143,6 +143,71 @@ El TTL anterior podía servir un destino de seguros ya resuelto durante hasta 60
 
 La comprobación sucede en cada consulta del Web al registro, pero no controla la latencia de propagación/caché interna del proveedor Airtable ni una carrera ocurrida después de resolver y antes de responder. Si “revocación inmediata” exige garantía más estricta que consultar el estado actual en cada request, hace falta un mecanismo de revocación de emergencia con autoridad/propagación acordadas (por ejemplo, una denylist operativa independiente); no se afirma esa garantía en este PR.
 
+## Auditoría sintética de identidad y consulta documental (octubre de 2026)
+
+- Base inspeccionada: `develop` y la rama de trabajo coincidían en
+  `6ff939b7148d44848fe15cf243bb3aa24ff9dc63`, sin commits locales pendientes.
+  La suite ejecutada sobre un archivo Git inmutable de ese SHA obtuvo
+  **1271 passed, 58 subtests passed** con PostgreSQL 16 local.
+- No se usaron datos personales, PDF real ni servicios de producción. Las pruebas
+  sustituyen únicamente transportes externos: recorren los endpoints firmados de
+  WhatsApp, el endpoint Voice, PostgreSQL y la serialización del SDK OpenAI real.
+  Esto no certifica la precisión acústica del STT ni atribuye errores a OCR,
+  retrieval o a un proveedor real sin observar esa etapa.
+- Relay ya separaba los parciales de los finales; faltaba rechazar indicadores
+  `last` no booleanos y tipos de transcripción inválidos. Web ahora rechaza un
+  parcial explícito antes de modificar identidad. El identificador técnico de
+  llamada no puede contener espacios ni `:`; se conserva aislamiento por llamada
+  e idempotencia por evento.
+- El parser local no reconocía correctamente ciertas expresiones de letra final
+  (`la letra es jota`) ni correcciones parciales explícitas. La corrección conserva
+  nombre/apellidos y fragmentos cifrados, distingue sufijos de fecha, teléfono e
+  importe, y deja la verificación al checksum y las coincidencias HMAC exactas.
+  No se añade envío de identidad completa al modelo.
+- La selección conversacional usa exclusivamente pólizas autorizadas en PostgreSQL:
+  páginas de cinco opciones, producto/número exacto u ordinal de la página mostrada.
+  La selección y su confirmación vuelven a comprobar negocio, cliente y autorización;
+  la pregunta pendiente no se sustituye por la elección. Las versiones ambiguas
+  requieren fecha. Se mantienen `valid_to` inclusivo para versión y exclusivo para
+  autorización.
+
+### Errores: ubicación, condiciones y recuperación
+
+`web/insurance/llm.py` clasifica tanto interpretación como explicación sin registrar
+mensajes, prompts, respuestas ni cuerpos de excepciones del proveedor:
+
+| Código | Condición observada en la etapa concreta | Recuperación |
+|---|---|---|
+| `llm_not_configured` | Falta modelo/clave, endpoint o límites configurados inválidos | Restaurar configuración del servicio; conservar consulta |
+| `llm_auth_failed` | HTTP 401 o 403 | Restaurar credenciales/permisos; conservar consulta |
+| `llm_timeout` | Timeout del SDK | Reintento transitorio acotado; después seguimiento/reintento |
+| `llm_rate_limited` | HTTP 429 | Reintento posterior, sin bucle automático |
+| `llm_network_error` | Error de conexión/protocolo del SDK | Un reintento acotado por presupuesto; después reintento posterior |
+| `llm_empty_response` | Contenido nulo, vacío o solo espacios | No presentar respuesta; permitir reintento/seguimiento |
+| `llm_refusal` | Rechazo explícito o `content_filter` | No inferir cobertura ni ausencia de evidencia |
+| `llm_invalid_response` | Formato, rol, finalización, JSON o citas inválidos | No presentar salida contractual; permitir recuperación segura |
+| `llm_context_limit` | Código de proveedor `context_length_exceeded`, `context_window_exceeded` o `max_context_length_exceeded` | Concretar consulta sin perder evidencia obligatoria |
+| `context_budget_exceeded` | Presupuesto local insuficiente antes del envío | Concretar consulta; no afirmar invocación del modelo |
+| `llm_error` | Otros errores del proveedor | Diagnóstico seguro y consulta pendiente |
+
+Las cadenas se centralizan en `TECHNICAL_RETRY` y `_technical_failure` de
+`web/insurance/dialog.py`: «No pude consultarlo ahora por un problema técnico,
+inténtalo en un minuto.» no equivale a falta de
+evidencia; para contexto se usa exactamente «No pude preparar la respuesta por un
+límite técnico de contexto. Inténtalo con una consulta más concreta.»
+`_offer_for` y `_explain_insufficient` separan ausencia de páginas, documento no listo
+y necesidad de interpretación humana de esos errores técnicos. No se incluyen
+fuentes documentales en la respuesta técnica.
+
+Los fallos mantienen `question`, identidad verificada y diagnóstico en PostgreSQL
+con `awaiting=retry`. `tests/test_insurance_provider_failures.py` comprueba diez
+categorías en ambos endpoints (**20 pruebas**), sin reemplazar `llm_explain`, y
+reanuda tras reiniciar el proceso en WhatsApp. Comprueba que el detalle «Es de vidrio»
+se incorpora a la consulta de mesa pendiente y que se presentan citas verificadas.
+`tests/test_insurance_llm_adapter.py` valida los códigos en el transporte HTTP real
+del SDK (**55 pruebas**). Las advertencias base de ReportLab y Starlette son
+deprecaciones preexistentes; no se añadieron herramientas ni dependencias.
+
 ## Caso humano, persistencia y outbox (requisito prioritario)
 
 La ruta de seguros activa no consulta pólizas: el límite actual clasifica la consulta como `identity_not_verified` y crea un caso humano. `state['insurance_escalation']` acepta una clasificación estructurada futura con razón, producto, póliza/versión, contexto, evidencia, urgencia y próxima acción; razones admitidas: `insufficient_evidence`, `missing_information`, `ambiguity`, `contradiction`, `unreadable_document`, `human_interpretation`, `identity_not_verified`.

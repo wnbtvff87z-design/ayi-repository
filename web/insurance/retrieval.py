@@ -18,6 +18,8 @@ STREAM_CHUNK = 128
 
 AUTHORIZED = (
     'p.business_id=%s AND p.customer_id=%s AND EXISTS ('
+    'SELECT 1 FROM insurance_customers c WHERE c.business_id=p.business_id '
+    'AND c.customer_id=p.customer_id AND c.active) AND EXISTS ('
     'SELECT 1 FROM insurance_authorizations a WHERE a.business_id=p.business_id '
     'AND a.customer_id=p.customer_id AND a.policy_id=p.policy_id '
     'AND a.revoked_at IS NULL AND a.valid_from<=now() '

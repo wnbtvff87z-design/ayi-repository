@@ -157,6 +157,8 @@ def _install_transports(monkeypatch, captures, mode):
                 'message': 'Synthetic authorization failure', 'type': 'authentication_error'}})
         if mode['value'] == 'insufficient':
             content = 'ESCALAR'
+        elif mode['value'] == 'detail' and 'mesa' in question.lower() and 'vidrio' not in question.lower():
+            content = 'ESCALAR'
         elif 'incendio' in question.lower() or 'fuego' in question.lower():
             assert FIRE in evidence
             content = 'Las cláusulas de incendio establecen un límite de 947 euros ' + marker('DOC-FIRE', 1) + '.'
@@ -164,6 +166,8 @@ def _install_transports(monkeypatch, captures, mode):
             assert WATER in evidence or 'Daños por agua actualizados: límite de 615 euros.' in evidence
             limit = 615 if 'Daños por agua actualizados' in evidence else 401
             content = f'Las cláusulas de daños por agua establecen un límite de {limit} euros ' + marker('DOC-WATER', 1) + '.'
+        elif 'en qué página dice' in question.lower() and EXCLUSION in evidence:
+            content = 'La exclusión de tableros de mesa de vidrio figura en la cláusula citada [p.2].'
         elif 'mesa' in question.lower():
             assert GLASS in evidence, 'The late glass clause must reach the actual SDK request'
             assert EXCLUSION in evidence, 'Separate-page exclusions must reach the SDK'

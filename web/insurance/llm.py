@@ -51,6 +51,30 @@ def _retryable(exc):
     return isinstance(exc, (openai.APIConnectionError, openai.InternalServerError))
 
 
+def _status_code(exc):
+    """Classify only provider machine codes; never expose exception text or bodies."""
+    if getattr(exc, 'code', None) in (
+            'context_length_exceeded', 'context_window_exceeded', 'max_context_length_exceeded'):
+        return 'llm_context_limit'
+    return 'llm_error'
+
+
+def _content(response, max_chars):
+    if not response.choices or len(response.choices) != 1:
+        raise LLMError('llm_invalid_response')
+    choice = response.choices[0]
+    if choice.message.refusal or choice.finish_reason == 'content_filter':
+        raise LLMError('llm_refusal')
+    if choice.finish_reason != 'stop' or choice.message.role != 'assistant':
+        raise LLMError('llm_invalid_response')
+    text = choice.message.content
+    if text is None or isinstance(text, str) and not text.strip():
+        raise LLMError('llm_empty_response')
+    if not isinstance(text, str) or len(text) > max_chars:
+        raise LLMError('llm_invalid_response')
+    return text.strip()
+
+
 def _create(api_key, timeout, retry=True, **request):
     """One SDK request (SDK retries stay disabled) plus at most one own retry for transient
     timeouts, connection errors or 5xx, only while INSURANCE_LLM_BUDGET_SECONDS allows it."""
@@ -129,17 +153,7 @@ def explain(question, evidence):
             api_key, timeout, model=model, temperature=0, max_tokens=max_tokens,
             messages=[{'role': 'system', 'content': memory.INSTRUCTIONS},
                       {'role': 'user', 'content': memory.format_prompt(context)}])
-        if not response.choices or len(response.choices) != 1:
-            raise LLMError('llm_invalid_response')
-        choice = response.choices[0]
-        if choice.message.refusal or choice.finish_reason == 'content_filter':
-            raise LLMError('llm_refusal')
-        if choice.finish_reason != 'stop' or choice.message.role != 'assistant':
-            raise LLMError('llm_invalid_response')
-        text = choice.message.content
-        if not isinstance(text, str) or not text.strip() or len(text) > max_tokens * 16:
-            raise LLMError('llm_invalid_response')
-        return text.strip()
+        return _content(response, max_tokens * 16)
     except LLMError:
         raise
     except openai.APITimeoutError:
@@ -148,6 +162,10 @@ def explain(question, evidence):
         raise LLMError('llm_rate_limited') from None
     except (openai.AuthenticationError, openai.PermissionDeniedError):
         raise LLMError('llm_auth_failed') from None
+    except openai.APIConnectionError:
+        raise LLMError('llm_network_error') from None
+    except openai.APIStatusError as exc:
+        raise LLMError(_status_code(exc)) from None
     except openai.APIResponseValidationError:
         raise LLMError('llm_invalid_response') from None
     except (ValueError, TypeError, AttributeError, IndexError):
@@ -169,17 +187,7 @@ def interpret(messages):
         response = _create(
             api_key, timeout, model=model, temperature=0, max_tokens=256,
             response_format={'type': 'json_object'}, messages=messages)
-        if not response.choices or len(response.choices) != 1:
-            raise LLMError('llm_invalid_response')
-        choice = response.choices[0]
-        if choice.message.refusal or choice.finish_reason == 'content_filter':
-            raise LLMError('llm_refusal')
-        if choice.finish_reason != 'stop' or choice.message.role != 'assistant':
-            raise LLMError('llm_invalid_response')
-        raw = choice.message.content
-        if not isinstance(raw, str) or len(raw) > 4096:
-            raise LLMError('llm_invalid_response')
-        return json.loads(raw)
+        return json.loads(_content(response, 4096))
     except LLMError:
         raise
     except openai.APITimeoutError:
@@ -188,10 +196,10 @@ def interpret(messages):
         raise LLMError('llm_rate_limited') from None
     except (openai.AuthenticationError, openai.PermissionDeniedError):
         raise LLMError('llm_auth_failed') from None
-    except openai.APIStatusError:
-        raise LLMError('llm_error') from None
+    except openai.APIStatusError as exc:
+        raise LLMError(_status_code(exc)) from None
     except openai.APIConnectionError:
-        raise LLMError('llm_error') from None
+        raise LLMError('llm_network_error') from None
     except Exception:
         raise LLMError('llm_invalid_response') from None
 

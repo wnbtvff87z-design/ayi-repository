@@ -260,6 +260,10 @@ def insurance_voice_transport(value):
   if value.get('event') in ('setup','disconnect','error'):safe['event']=value['event']
   return safe
 
+def insurance_voice_call_id_valid(external_id):
+  return (isinstance(external_id,str) and
+          re.fullmatch(r'[^\s:]{1,200}',external_id.split(':',1)[0]) is not None)
+
 def insurance_voice_error(stage,exc,external_id,business_id=None):
   call_sid=str(external_id or '').split(':',1)[0]
   correlation=hashlib.sha256(('insurance-voice:'+call_sid).encode()).hexdigest()
@@ -274,7 +278,7 @@ def insurance_voice_error(stage,exc,external_id,business_id=None):
 def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None,voice_transport=None):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
   if (sector if sector is not None else sector_of(b))=='insurance':
-   if channel=='Voice' and not str(external_id).split(':',1)[0].strip():
+   if channel=='Voice' and not insurance_voice_call_id_valid(external_id):
     raise BookingError('Falta el identificador técnico de la llamada')
    if channel=='Voice' and voice_transport is not None:
     b=dict(b);b['_insurance_voice_transport']=insurance_voice_transport(voice_transport)
@@ -412,9 +416,14 @@ def internal_turn():
   try:
    channel=d.get('channel','Voice');b,sector=lookup(d.get('business_phone'),channel,with_sector=True)
    if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-   if sector=='insurance' and channel=='Voice' and not str(d.get('external_id') or '').split(':',1)[0].strip():
+   if sector=='insurance' and channel=='Voice' and not insurance_voice_call_id_valid(d.get('external_id')):
     insurance_voice_error('technical_call_id_missing',ValueError(),'',b['business_id'])
     return jsonify(success=False),400
+   if sector=='insurance' and channel=='Voice':
+    transport=d.get('voice_transport')
+    if (isinstance(transport,dict) and 'last' in transport and transport['last'] is not True
+        or d.get('text') is not None and not isinstance(d['text'],str)):
+     return jsonify(success=False),400
    kwargs={'include_end_reason':True,'sector':sector}
    if sector=='insurance' and channel=='Voice':kwargs['voice_transport']=d.get('voice_transport')
    reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),**kwargs)
@@ -438,7 +447,7 @@ def internal_insurance_voice_transport():
    b,sector=lookup(d.get('business_phone'),'Voice',with_sector=True)
    if not b or sector!='insurance' or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
    call_sid=d.get('CallSid');external_id=d.get('external_id')
-   if not isinstance(call_sid,str) or not call_sid.strip() or len(call_sid)>200 or not isinstance(external_id,str) or not external_id.startswith(call_sid+':') or len(external_id)>300:
+   if not isinstance(call_sid,str) or not re.fullmatch(r'[^\s:]{1,200}',call_sid) or not isinstance(external_id,str) or not external_id.startswith(call_sid+':') or len(external_id)>300:
     return jsonify(success=False),400
    diagnostic=d.get('diagnostic')
    if diagnostic not in ('voice_transcription_missing','voice_transcription_partial'):return jsonify(success=False),400

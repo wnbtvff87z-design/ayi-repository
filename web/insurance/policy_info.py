@@ -3,6 +3,79 @@ import re
 
 from insurance import references, retrieval
 
+PAGE_SIZE = 5
+
+
+def list_action(text):
+    folded = references.fold(text).strip(' .?!¿¡')
+    if folded in ('siguiente', 'siguientes', 'mas', 'mas polizas', 'ver mas'):
+        return 'next'
+    if folded in ('anterior', 'anteriores'):
+        return 'previous'
+    if re.fullmatch(r'(?:(?:ver|lista|listar|muestra|mostrar|mis|las|que|cuales|tengo|polizas|'
+                    r'autorizadas|seguros|disponibles)\s*)+', folded) and (
+            'polizas' in folded or 'seguros' in folded):
+        return 'list'
+    if re.fullmatch(r'(?:quiero\s+)?(?:cambiar|cambia)(?:\s+(?:de|la))?\s+poliza', folded):
+        return 'change'
+    return None
+
+
+def authorized_page(conn, bid, customer_id, offset=0):
+    rows = conn.execute(
+        'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+        + retrieval.AUTHORIZED + ' ORDER BY p.policy_id LIMIT %s OFFSET %s',
+        (bid, customer_id, PAGE_SIZE + 1, max(0, offset))).fetchall()
+    return [dict(row) for row in rows[:PAGE_SIZE]], len(rows) > PAGE_SIZE
+
+
+def offer(conn, scope, state, action='list'):
+    offset = state.get('policy_list_offset', 0)
+    if action == 'next' and state.get('policy_list_more'):
+        offset += PAGE_SIZE
+    elif action == 'previous':
+        offset = max(0, offset - PAGE_SIZE)
+    elif action in ('list', 'change'):
+        offset = 0
+    rows, more = authorized_page(conn, scope.bid, scope.customer_id, offset)
+    state.update(policy_options=[row['policy_id'] for row in rows],
+                 policy_list_offset=offset, policy_list_more=more, awaiting='policy')
+    if not rows:
+        return 'No he podido confirmar una póliza autorizada para esta consulta.'
+    lines = ['Puedes elegir una póliza autorizada por producto, número o posición de esta lista:']
+    lines += [f"{n}. {row.get('product') or 'Producto no registrado'} — "
+              f"{row.get('contract_number') or 'Número no registrado'}."
+              for n, row in enumerate(rows, 1)]
+    if more:
+        lines.append('Di «siguiente» para ver más pólizas.')
+    if offset:
+        lines.append('Di «anterior» para volver.')
+    return '\n'.join(lines)
+
+
+def selection(conn, scope, state, text, number=None):
+    """Resolve only exact identifiers/products or an ordinal from the displayed page."""
+    folded = references.fold(text).strip(' .?!¿¡')
+    candidate = re.sub(r'^(?:(?:quiero|elige|elijo|selecciona|selecciono|cambia|cambiar)'
+                       r'\s+(?:(?:a|la|el|de)\s+)?|(?:la|el)\s+)', '', folded)
+    ordinal = {'primera': 1, 'primero': 1, 'segunda': 2, 'segundo': 2,
+               'tercera': 3, 'tercero': 3, 'cuarta': 4, 'cuarto': 4,
+               'quinta': 5, 'quinto': 5}.get(candidate)
+    if re.fullmatch(r'[1-5]', candidate):
+        ordinal = int(candidate)
+    options = state.get('policy_options', [])
+    if ordinal:
+        if ordinal > len(options):
+            return None
+        number = options[ordinal - 1]
+    rows = conn.execute(
+        'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+        + retrieval.AUTHORIZED +
+        ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s) '
+        'OR lower(p.product)=lower(%s)) ORDER BY p.policy_id LIMIT 2',
+        (scope.bid, scope.customer_id, number or candidate, number or candidate, candidate)).fetchall()
+    return dict(rows[0]) if len(rows) == 1 else None
+
 
 def intent(text):
     folded = references.fold(text)

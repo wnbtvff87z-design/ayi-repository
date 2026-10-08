@@ -86,7 +86,8 @@ DIAG_FIELDS = ('business_id', 'stage', 'reason_code', 'match_count', 'identity_v
                'text_chars', 'fragment_index', 'page_number', 'position_start', 'position_end')
 LLM_FAILURE_CODES = frozenset((
     'llm_not_configured', 'llm_timeout', 'llm_rate_limited', 'llm_auth_failed',
-    'llm_invalid_response', 'llm_refusal', 'llm_error', 'context_budget_exceeded'))
+    'llm_invalid_response', 'llm_refusal', 'llm_error', 'context_budget_exceeded',
+    'llm_empty_response', 'llm_network_error', 'llm_context_limit'))
 FINAL_DECISIONS = frozenset(kind.value for kind in ResultKind) | {'case_persistence_failed'}
 UNVERIFIED_ACTION = ('Identidad NO verificada: los datos declarados no coincidieron con un único cliente. '
                      'No atribuir el caso a ningún cliente; revisar por un canal aprobado.')
@@ -340,6 +341,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 _turn_diag(corr, bid, decision, customer_id, 'read_only')
                 return cached['content'], out
             awaiting_at_start = st.get('awaiting')
+            pending_question = st.get('normalized_question') or st.get('question')
             just_verified = False
             st.pop('_identity_diagnostic', None)
             identity_declaration = (not customer_id or (channel == 'Voice' and (
@@ -352,6 +354,19 @@ def _answer(business, state, text, channel, external_id, customer):
             _merge_declaration(st, decl, bid)
             incoming = decl['question'] if (decl['document'] or decl['name'] or decl['contract_number']) else text
             incoming = memory.redact(incoming).strip(' .,:;')
+            policy_action = policy_info.list_action(incoming)
+            selected_policy = (policy_info.selection(conn, sc, st, incoming, decl['contract_number'])
+                               if customer_id and not decl.get('identity_kind') and not policy_action
+                               else None)
+            selection_attempt = bool(decl.get('policy_only') or (
+                awaiting_at_start == 'policy' and len(incoming.split()) <= 3
+                and not any(mark in incoming for mark in ('?', '¿'))))
+            policy_control = bool(policy_action or selected_policy or selection_attempt or (
+                awaiting_at_start == 'policy_confirmation' and references.consent_only(incoming)))
+            detail = bool(pending_question and awaiting_at_start in ('retry', 'human_consent') and
+                          re.fullmatch(r'(?:(?:si|la|mesa|esta|es|de|material)\s+)*'
+                                       r'(?:declarad[ao]|vidrio|cristal)(?:\s+de\s+vidrio)?[?!]*',
+                                       references.fold(incoming)))
             turn_intent = _intent(incoming)
             reviewing = turn_intent == 'review' and bool(st.get('question') or st.get('last_retrieval'))
             explaining_missing = turn_intent == 'explain_missing' and bool(st.get('last_retrieval'))
@@ -369,6 +384,8 @@ def _answer(business, state, text, channel, external_id, customer):
             is_query = (_is_question(incoming) and not decl.get('policy_only')
                         and turn_intent not in ('review', 'explain_missing'))
             if decl.get('identity_kind') and not decl.get('question'):
+                is_query = False
+            if policy_control:
                 is_query = False
             date_answer = (awaiting_at_start == 'date' and incident_dates.parse(
                 incoming, tz=business.get('timezone') or 'Europe/Madrid'))
@@ -402,7 +419,7 @@ def _answer(business, state, text, channel, external_id, customer):
                               'source': 'local'}
             try:
                 # No model call precedes the idempotency check or receives identity declarations.
-                if not _real_urgent(incoming):
+                if not _real_urgent(incoming) and not policy_control:
                     interpretation = orchestrator.interpret(conn, sc, st, incoming, decl, turn_intent)
                 st['interpretation_diagnostic'] = None
             except memory.ContextBudgetExceeded:
@@ -519,14 +536,13 @@ def _answer(business, state, text, channel, external_id, customer):
                 st.pop('policy_switch_required', None)
                 st['requested_policy'] = decl['contract_number']
                 st['change_pending'] = True
-                for key in ('policy_id', 'version_id', 'reference_policy', 'reference_version_id',
-                            'pending_human'):
+                for key in ('reference_policy', 'reference_version_id', 'pending_human'):
                     st.pop(key, None)
                 if st.get('awaiting') == 'human_consent':
                     st.pop('awaiting', None)
             if is_query:
-                st['question'] = incoming
-                st['normalized_question'] = incoming
+                st['question'] = f'{pending_question} {incoming}' if detail else incoming
+                st['normalized_question'] = f'{pending_question} {incoming}' if detail else incoming
                 st['question_turn_id'] = user_id
                 st['question_intent'] = turn_intent
             if _real_urgent(incoming):
@@ -578,13 +594,13 @@ def _answer(business, state, text, channel, external_id, customer):
                     st['awaiting'] = 'policy'
                     st['policy_switch_required'] = True
                     st['change_pending'] = True
-                    for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent',
-                                'policy_id', 'version_id', 'requested_policy', 'contract_number',
+                    for key in ('requested_policy', 'contract_number',
                                 'reference_policy', 'reference_version_id', 'pending_human'):
                         st.pop(key, None)
                     is_query = False
-                    return finish(ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-            if customer_id and st.get('policy_switch_required'):
+                    return finish(policy_info.offer(conn, sc, st, 'change'),
+                                  {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            if customer_id and st.get('policy_switch_required') and not policy_control:
                 st['awaiting'] = 'policy'
                 return finish(ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if (st.get('pending_human') and not st['pending_human']['case'].get('customer_id')
@@ -638,9 +654,69 @@ def _answer(business, state, text, channel, external_id, customer):
             memory.claim_unverified(conn, sc)
             st['verified'] = True
             st['customer_id'] = customer_id
+            if policy_action:
+                if policy_action == 'change':
+                    st['policy_switch_required'] = True
+                return finish(policy_info.offer(conn, sc, st, policy_action),
+                              {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            if selection_attempt and not selected_policy:
+                st.pop('requested_policy', None)
+                st.pop('contract_number', None)
+                return finish(policy_info.offer(conn, sc, st),
+                              {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            if selected_policy:
+                selected_id = selected_policy['policy_id']
+                if st.get('policy_id') and st['policy_id'] != selected_id:
+                    st['requested_policy'] = selected_id
+                    st['change_pending'] = True
+                    st['awaiting'] = 'policy_confirmation'
+                    return finish(
+                        f"Cambiar a {selected_policy.get('product') or 'la póliza'} "
+                        f"{selected_policy.get('contract_number') or ''}. ¿Confirmas el cambio? Responde sí o no.",
+                        {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                st['policy_id'] = selected_id
+                for key in ('requested_policy', 'contract_number', 'change_pending',
+                            'policy_switch_required', 'awaiting', 'version_id', 'pending_human',
+                            'reference_policy', 'reference_version_id'):
+                    st.pop(key, None)
+            elif awaiting_at_start == 'policy_confirmation' and policy_control:
+                confirmation = references.confirmation(incoming)
+                if confirmation == 'yes':
+                    candidate = policy_info.selection(conn, sc, st, '', st.get('requested_policy'))
+                    if not candidate:
+                        st.pop('requested_policy', None)
+                        st.pop('change_pending', None)
+                        return finish(policy_info.offer(conn, sc, st),
+                                      {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                    st['policy_id'] = candidate['policy_id']
+                    for key in ('version_id', 'requested_policy', 'contract_number', 'change_pending',
+                                'policy_switch_required', 'awaiting', 'pending_human',
+                                'reference_policy', 'reference_version_id'):
+                        st.pop(key, None)
+                elif confirmation == 'no':
+                    for key in ('requested_policy', 'contract_number', 'change_pending',
+                                'policy_switch_required', 'awaiting'):
+                        st.pop(key, None)
+                    if st.get('question'):
+                        st['awaiting'] = 'retry'
+                    return finish('No he cambiado la póliza. Puedes continuar con tu consulta.',
+                                  {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                else:
+                    st['awaiting'] = 'policy_confirmation'
+                    return finish('¿Confirmas el cambio de póliza? Responde sí o no.',
+                                  {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            elif st.get('awaiting') == 'policy_confirmation':
+                return finish('¿Confirmas el cambio de póliza? Responde sí o no.',
+                              {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if st.get('policy_switch_required'):
                 st['awaiting'] = 'policy'
-                return finish(ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                return finish(policy_info.offer(conn, sc, st),
+                              {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            if just_verified and not st.get('policy_id') and not st.get('requested_policy'):
+                policies, more = policy_info.authorized_page(conn, bid, customer_id)
+                if len(policies) > 1 or more or not st.get('question'):
+                    return finish(policy_info.offer(conn, sc, st),
+                                  {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if just_verified and st.get('question') and not st.get('pending_human'):
                 try:
                     interpretation = orchestrator.interpret(
@@ -662,7 +738,8 @@ def _answer(business, state, text, channel, external_id, customer):
                     st['interpretation_invoked'] = code != 'llm_not_configured'
             if st.get('interpretation_diagnostic') in (
                     'llm_auth_failed', 'llm_timeout', 'llm_rate_limited',
-                    'llm_invalid_response', 'llm_refusal', 'llm_error') and st.get('question'):
+                    'llm_invalid_response', 'llm_refusal', 'llm_error', 'llm_empty_response',
+                    'llm_network_error', 'llm_context_limit') and st.get('question'):
                 st['last_retrieval'] = {
                     'question': st['question'], 'question_turn_id': st.get('question_turn_id'),
                     'intent': st.get('question_intent', 'question'),
@@ -725,9 +802,9 @@ def _answer(business, state, text, channel, external_id, customer):
                     return finish(ASK_REFERENCE, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                 else:
                     st.pop('awaiting', None)
-            elif is_query or reviewing or (just_verified and st.get('question')):
+            elif not detail and (is_query or reviewing or (just_verified and st.get('question'))):
                 last = memory.last_answered(conn, sc)
-                resolving = (st.get('question') if reviewing else
+                resolving = ((st.get('normalized_question') or st.get('question')) if reviewing else
                              incoming if is_query else st['question'])
                 classification = references.classify(resolving, has_last_answer=bool(last),
                                                     has_recent=bool(memory.recent(conn, sc)))
@@ -788,6 +865,12 @@ def _answer(business, state, text, channel, external_id, customer):
                     return finish(ASK_REFERENCE, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                 else:
                     st['normalized_question'] = resolving
+                    if not any(re.search(pattern, resolving, re.I)
+                               for _, pattern in incident_context.TYPES):
+                        # An independent question about a new object must not inherit a
+                        # previous incident solely because it also contains "cubre".
+                        for key in ('active_topic', 'last_incident_type', 'incident_date', 'fact_date'):
+                            st.pop(key, None)
                     for key in ('recalled_id', 'explain_prior', 'reference_policy',
                                 'reference_version_id'):
                         st.pop(key, None)
@@ -1067,11 +1150,13 @@ def _consent(business, customer, channel, external_id, st, text):
 
 
 def _policy_metadata(conn, business, sc, st, question, intent, corr):
+    requested_date = _fact_date(st.get('fact_date')) or _fact_date(question)
     policy = policy_info.lookup(
-        conn, sc.bid, sc.customer_id, _business_date(business),
+        conn, sc.bid, sc.customer_id, requested_date or _business_date(business),
         st.get('requested_policy') or st.get('reference_policy') or st.get('policy_id')
         or st.get('contract_number'),
-        selected_version=st.get('reference_version_id') or st.get('version_id'))
+        selected_version=(st.get('reference_version_id') or st.get('version_id'))
+        if not requested_date else None)
     code = policy['reason_code']
     st['last_retrieval'] = {
         'question': memory.redact(question, bounded=False),
@@ -1086,13 +1171,13 @@ def _policy_metadata(conn, business, sc, st, question, intent, corr):
     st.pop('awaiting', None)
     if code == 'multiple_policies':
         st['awaiting'] = 'policy'
-        return ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
+        return policy_info.offer(conn, sc, st), {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
     if code == 'no_authorized_policy':
         return ('No he podido confirmar una póliza autorizada para esta consulta.',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
     if code == 'multiple_versions':
-        return ('Hay varias versiones registradas; aclara qué versión o período quieres consultar. '
-                'No puedo confirmar una única vigencia.',
+        st['awaiting'] = 'date'
+        return ('Hay varias versiones registradas. ¿Qué fecha quieres consultar?',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
     st['policy_id'], st['version_id'] = policy['policy_id'], policy.get('version_id')
     st['normalized_question'] = f'metadata:{intent}\n{memory.redact(question, bounded=False)}'
@@ -1118,7 +1203,7 @@ def _technical_failure(st, code, corr, bid, ev, invoked):
     _diag(corr, 'llm', bid, reason_code=code, identity_verified=True,
           llm_invoked=invoked, evidence_count=len(ev), decision='technical_error')
     reply = ('No pude preparar la respuesta por un límite técnico de contexto. Inténtalo con una consulta más concreta.'
-             if code == 'context_budget_exceeded' else
+             if code in ('context_budget_exceeded', 'llm_context_limit') else
              TECHNICAL_RETRY + ' Esto no indica falta de evidencia ni confirma o descarta cobertura.')
     return (reply, {'insurance_result': ResultKind.TECHNICAL_ERROR.value, 'diagnostic_code': code},
             memory.pages_of(ev))
@@ -1128,6 +1213,9 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
                 intent='question', reviewing=False):
     bid, channel, customer_id = sc.bid, sc.channel, sc.customer_id
     if intent in ('policy_name', 'policy_validity'):
+        requested_span = incident_dates.parse(text, tz=business.get('timezone') or 'Europe/Madrid')
+        if requested_span and requested_span.status == 'resolved':
+            st['fact_date'] = requested_span.start.isoformat()
         return _policy_metadata(conn, business, sc, st, question, intent, corr)
     hypothetical = bool(HYPOTHETICAL_RE.search(question))
     span = incident_dates.parse(text, tz=business.get('timezone') or 'Europe/Madrid')
@@ -1199,7 +1287,7 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
                     {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
         if fine == 'multiple_policies':
             st['awaiting'] = 'policy'
-            return ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
+            return policy_info.offer(conn, sc, st), {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
         if fine == 'multiple_versions':
             st['awaiting'] = 'date'
             return ('No puedo confirmar qué versión corresponde. ¿Qué fecha quieres consultar?',
@@ -1214,11 +1302,15 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
         st['awaiting'] = 'date'
         return ('Ese intervalo cruza versiones de póliza. ¿En qué día ocurrió el hecho?',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
-    if fine == 'multiple_policies':  # verified: safe to ask; nothing is listed
+    if fine == 'multiple_policies':
         st['awaiting'] = 'policy'
         _diag(corr, 'decision', bid, reason_code='policy_number_required', identity_verified=True,
               decision='ask_policy_number')
-        return ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
+        return policy_info.offer(conn, sc, st), {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
+    if fine == 'multiple_versions':
+        st['awaiting'] = 'date'
+        return ('Hay varias versiones aplicables. ¿Qué fecha quieres consultar?',
+                {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
     if fine in ('policy_not_matched', 'no_authorized_policy', 'version_not_applicable') and st.get('requested_policy'):
         st['awaiting'] = 'policy'
         return ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []

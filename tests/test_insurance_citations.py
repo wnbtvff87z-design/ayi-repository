@@ -168,12 +168,12 @@ def test_explicit_flag_consumed_only_on_success():
     assert 'citation_context_requested' not in state
 
 
-def test_document_change_repeats_context_and_labels_survive_evidence_reordering():
+def test_document_change_keeps_header_once_and_labels_survive_evidence_reordering():
     state = {}
     evidence = [fragment('DOC-A'), fragment('DOC-B')]
     show('Hay condiciones [e.1].', evidence, state)
     _, _, reference = show('Hay exclusiones [e.2].', evidence, state)
-    assert 'Póliza 900' in reference and 'Documento 2, página 1' in reference
+    assert 'Póliza 900' not in reference and 'Documento 2, página 1' in reference
     _, _, reference = show('Hay límites [e.1].', list(reversed(evidence)), state)
     assert 'Póliza' not in reference and 'Documento 2, página 1' in reference
 

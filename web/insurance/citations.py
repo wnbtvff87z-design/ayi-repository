@@ -164,8 +164,7 @@ def present(conn, scope, state, result, text_out, evidence):
     }
     explicit = state.get('citation_context_requested') or _CONTEXT_REQUEST.search(references.fold(
         state.get('question') or state.get('normalized_question') or result.get('question') or ''))
-    changed = any(old.get(key) != value for key, value in context.items()
-                  if key != 'document_labels')
+    changed = not same_policy
     parts = []
     if changed or explicit:
         number = metadata.get('contract_number')

@@ -17,7 +17,7 @@ from twilio.request_validator import RequestValidator
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'web'))
 import main
-from insurance import admin, cases, voice_trace
+from insurance import admin, cases, identity, voice_trace
 
 spec = importlib.util.spec_from_file_location('insurance_transport_relay', ROOT / 'relay' / 'main.py')
 relay = importlib.util.module_from_spec(spec)
@@ -425,3 +425,85 @@ def test_core_insurance_exception_is_type_only(flow, monkeypatch, caplog):
         assert flow[1].post('/internal/turn', json=data, headers=INTERNAL_AUTH).status_code == 503
     assert 'error_type=RuntimeError' in caplog.text
     assert '12345678Z' not in caplog.text and CALL not in caplog.text
+
+
+@pytest.mark.parametrize('event', [
+    {'voicePrompt': 'DNI 01234567L', 'last': 'false'},
+    {'voicePrompt': 'DNI 01234567L', 'last': 1},
+    {'voicePrompt': 'DNI 01234567L', 'last': None},
+    {'voicePrompt': {'document': '01234567L'}, 'last': True},
+    {'voicePrompt': 12345678, 'last': True},
+])
+def test_malformed_provider_prompts_never_enter_identity_capture(flow, event):
+    run_events(flow, [{'type': 'prompt', **event},
+                      {'type': 'prompt', 'voicePrompt': 'hola', 'last': True}], replies=1)
+    turns = [data for path, data in flow[3] if path == '/internal/turn']
+    assert [data['text'] for data in turns] == ['hola']
+    assert turns[0]['external_id'] == CALL + ':turn:1'
+
+
+@pytest.mark.parametrize('call_sid', ['CA:first', 'CA second', ' CA ', 'x' * 201])
+def test_ambiguous_provider_call_scope_fails_closed(flow, call_sid):
+    with flow[0].websocket_connect('/ws', headers={
+            'X-Twilio-Signature': signature(WS_URL, {})}) as ws:
+        ws.send_json({**setup(), 'callSid': call_sid})
+        with pytest.raises(WebSocketDisconnect) as error:
+            ws.receive_json()
+        assert error.value.code == 1008
+    assert not any(path == '/internal/turn' for path, _ in flow[3])
+    assert trace_rows(flow) == []
+    response = flow[1].post('/internal/insurance/voice/transport',
+                           json=transport_payload(CallSid=call_sid,
+                                                  external_id=call_sid + ':disconnect'),
+                           headers=INTERNAL_AUTH)
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize('overrides', [
+    {'external_id': 123},
+    {'external_id': 'CA invalid:turn:1'},
+    {'external_id': 'x' * 201 + ':turn:1'},
+    {'voice_transport': {'last': False}},
+    {'voice_transport': {'last': 'true'}},
+    {'text': {'document': '01234567L'}},
+])
+def test_core_refuses_malformed_final_identity_transport(flow, monkeypatch, overrides):
+    monkeypatch.setattr(main, 'process', lambda *a, **k: pytest.fail('invalid transport entered dialogue'))
+    data = {'business_id': 'INS', 'business_phone': TO, 'channel': 'Voice',
+            'customer_phone': FROM, 'external_id': CALL + ':turn:1', 'text': 'hola',
+            **overrides}
+    assert flow[1].post('/internal/turn', json=data, headers=INTERNAL_AUTH).status_code == 400
+    assert trace_rows(flow) == []
+
+
+def test_signed_voice_identity_fragments_correction_dedup_and_call_isolation(flow):
+    with flow[2]() as conn:
+        identity.upsert_customer(conn, 'INS', 'SYNTHETIC-ZERO', 'Ana P.', 'X0123456L',
+                                 'Ana de la Peña')
+    with flow[0].websocket_connect('/ws', headers={
+            'X-Twilio-Signature': signature(WS_URL, {})}) as ws:
+        ws.send_json(setup())
+        for text in ['hola', 'mi nombre es Ana y mi apellido es de la Peña',
+                     'NIE es la equis nueve nueve nueve', 'No, equis cero uno dos',
+                     'póliza 000123', '06/10/2026', 'teléfono 600111222', '250 euros']:
+            ws.send_json({'type': 'prompt', 'voicePrompt': text, 'last': True})
+            ws.receive_json()
+        ws.send_json({'type': 'prompt', 'voicePrompt': 'discarded mistaken interim',
+                      'last': False})
+        final = {'type': 'prompt', 'voicePrompt': 'tres cuatro cinco seis letra ele',
+                 'last': True, 'eventSid': 'identity-final'}
+        ws.send_json(final)
+        assert 'He verificado tus datos' in ws.receive_json()['token']
+        ws.send_json(final)
+        ws.send_json({**setup(), 'callSid': CALL + '-new'})
+        ws.send_json({'type': 'prompt', 'voicePrompt': 'hola', 'last': True})
+        assert 'nombre y apellido' in ws.receive_json()['token']
+    with flow[2]() as conn:
+        verified = conn.execute('SELECT session_ref,customer_id FROM insurance_identity_verifications').fetchall()
+        assert verified == [{'session_ref': CALL, 'customer_id': 'SYNTHETIC-ZERO'}]
+        assert conn.execute('SELECT count(*) AS n FROM insurance_identity_attempts').fetchone()['n'] == 0
+        state = conn.execute('SELECT state::text AS s FROM insurance_conversation_state').fetchall()
+        assert 'X0123456L' not in json.dumps(state)
+    turns = [data for path, data in flow[3] if path == '/internal/turn']
+    assert sum(data['external_id'] == CALL + ':event:identity-final' for data in turns) == 1
+    assert all('discarded mistaken interim' not in data['text'] for data in turns)
