@@ -31,6 +31,43 @@ _SOCIAL = re.compile(
     r'(?:(?:listo|vale|bueno|ok)\s+)?(?:muchas\s+)?gracias(?:\s+por\s+(?:todo|tu ayuda))?|'
     r'hasta luego|adios|chau|chao|nos vemos|eso era todo)')
 _CLOSING = re.compile(r'\b(?:hasta luego|adios|chau|chao|nos vemos|eso era todo)\b')
+_GENERIC_QUERY = re.compile(
+    r'(?:(?:hola|buenas|buenos dias|buenas tardes|buenas noches)\s+)?'
+    r'(?:(?:quiero|queria|querria|quisiera|necesito|puedo|podria|me gustaria)\s+'
+    r'(?:(?:hacer|realizar)\s+(?:una\s+)?(?:consulta|pregunta)|'
+    r'(?:una\s+)?(?:consulta|pregunta)|consultar)|'
+    r'tengo\s+(?:una\s+)?(?:consulta|pregunta|duda))'
+    r'(?:\s+(?:de|sobre|acerca de|respecto a|respecto de)\s+'
+    r'(?:(?:mi|la|el|una|un)\s+)?(?:poliza|seguro|contrato)|'
+    r'\s+(?:mi|la|una)\s+poliza)?(?:\s+por favor)?')
+
+
+def generic_request(text):
+    """Whole requests to start a consultation, never a request with a concrete topic."""
+    folded = ' '.join(re.findall(r'\w+', references.fold(text)))
+    return bool(folded and _GENERIC_QUERY.fullmatch(folded))
+
+
+def safe_fallback(text, intent):
+    """Only route explicit independent requests; this grants no identity or coverage."""
+    folded = ' '.join(re.findall(r'\w+', references.fold(text)))
+    if not folded or len(folded) > 256:
+        return False
+    if re.search(r'\b(?:eso|esto|ello|esa|ese|anterior|tambien|pero|corrijo|correccion)\b', folded):
+        return False
+    if intent == 'policy_name':
+        return bool(re.fullmatch(
+            r'(?:como se llama|cual es (?:el )?(?:nombre|numero) de) '
+            r'(?:mi|la|el) (?:poliza|seguro|contrato)', folded))
+    if intent == 'policy_validity':
+        return bool(re.fullmatch(
+            r'(?:hasta cuando (?:esta vigente|vale)|cuando (?:vence|caduca|expira)) '
+            r'(?:mi|la|el) (?:poliza|seguro|contrato)', folded))
+    if intent != 'question':
+        return False
+    return bool(re.fullmatch(
+        r'(?:(?:mi (?:poliza|seguro) )?(?:me )?cubre|'
+        r'que dice (?:mi|la) poliza sobre) [a-z0-9 ]+', folded))
 
 
 def social(text):
@@ -71,7 +108,8 @@ def interpret(conn, scope, state, text, declaration, fallback):
     identity_turn = bool(declaration.get('identity_kind') and not declaration.get('question'))
     base = {'intents': [local or ('identity' if identity_turn else fallback)],
             'reference': 'independent', 'topic': ''}
-    if local or identity_turn or os.getenv('INSURANCE_DIALOG_LLM_ENABLED', 'true').lower() != 'true':
+    if (local or identity_turn or generic_request(text) or references.consent_only(text)
+            or os.getenv('INSURANCE_DIALOG_LLM_ENABLED', 'true').lower() != 'true'):
         return {**base, 'source': 'local'}
     summary, _ = memory.load_summary(conn, scope) if scope.customer_id else ({}, None)
     recent = memory.recent(conn, scope) if scope.customer_id else []

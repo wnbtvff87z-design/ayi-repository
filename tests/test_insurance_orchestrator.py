@@ -4,7 +4,9 @@ import json
 import httpx
 import pytest
 
-from test_insurance_attribution import BUSINESS, BIZ, PHONE, add_document, ask, pg, rows, verify
+from test_insurance_attribution import (
+    BUSINESS, BIZ, PHONE, add_document, ask, pg, rows, verify, evidence_markers,
+)
 from test_insurance_llm_adapter import completion, provider
 from insurance import dialog, identity, llm, memory, orchestrator
 
@@ -85,6 +87,38 @@ def test_identity_pii_never_reaches_interpreter(pg, provider):
     assert not requests
 
 
+@pytest.mark.parametrize('channel', ['WhatsApp', 'Voice'])
+def test_identity_policy_ordinals_and_confirmation_are_deterministic(pg, monkeypatch, channel):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Identity and policy controls must be entirely local')
+
+    monkeypatch.setattr(llm, 'interpret', forbidden)
+    monkeypatch.setattr(dialog.retrieval, 'retrieve', forbidden)
+    session = 'CA-controls' if channel == 'Voice' else ''
+
+    def turn(text, number):
+        return ask(text, channel=channel, ext=f'{session}:turn:{number}')
+
+    turn('Hola', 1)
+    reply, _ = turn('Me llamo Ana Pérez López, DNI 12345678Z', 2)
+    assert dialog.IDENTITY_CONFIRMED in reply and '000123' in reply and '000124' in reply
+    turn('La primera', 3)
+    reply, _ = turn('La segunda', 4)
+    assert '¿Confirmas el cambio?' in reply
+    turn('Sí', 5)
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['policy_id'] == 'POL-000124'
+    assert not state.get('change_pending')
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+@pytest.mark.parametrize('text', ['Sí', 'No', 'Sí, registra la consulta'])
+def test_confirmation_is_local_even_without_a_pending_case(pg, monkeypatch, text):
+    verify(pg, customer='C2')
+    monkeypatch.setattr(llm, 'interpret', lambda *args, **kwargs: pytest.fail('Consent is local'))
+    ask(text)
+
+
 def test_unverified_question_uses_only_abstract_context_and_retains_question(pg, provider):
     requests, _ = provider(lambda request: httpx.Response(
         200, json=completion('{"intents":["question"],"reference":"independent","topic":""}')))
@@ -104,6 +138,22 @@ def test_interpreter_duplicate_is_not_invoked_twice(pg, provider):
     first = ask('¿Cómo se llama mi póliza?', ext='duplicate')
     assert ask('¿Cómo se llama mi póliza?', ext='duplicate') == first
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize('text,intent,safe', [
+    ('¿Cubre daños por agua?', 'question', True),
+    ('¿Qué dice mi póliza sobre cristales?', 'question', True),
+    ('¿Cómo se llama mi póliza?', 'policy_name', True),
+    ('¿Cuándo vence mi póliza?', 'policy_validity', True),
+    ('¿Cubre eso?', 'question', False),
+    ('Y el incendio', 'question', False),
+    ('Quiero consultar algo que no aparece en las páginas', 'question', False),
+    ('Mi DNI es 87654321X', 'identity', False),
+    ('Sí, registra la consulta', 'case_accept', False),
+    ('¿Qué nombre figura en mi seguro si hay un incendio?', 'policy_name', False),
+])
+def test_failure_fallback_has_a_narrow_routing_allowlist(text, intent, safe):
+    assert orchestrator.safe_fallback(text, intent) is safe
 
 
 @pytest.mark.parametrize('status,code', [(401, 'llm_auth_failed'), (429, 'llm_rate_limited')])
@@ -240,11 +290,73 @@ def test_interpretation_provider_error_never_becomes_insufficient_contractual_ev
     verify(pg, customer='C2')
     provider(lambda request: httpx.Response(429, json={'error': {'message': 'private'}}))
     reply, out = ask('Quiero consultar algo que no aparece en las páginas', ext='interpretation-error')
-    assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'llm_rate_limited'}
+    assert out == {'insurance_result': 'missing_information', 'diagnostic_code': 'llm_rate_limited'}
+    assert reply == dialog.ASK_REPHRASE
     assert 'revisión humana' not in reply
     state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
     assert state['awaiting'] == 'retry' and state['question']
     assert not state.get('pending_human')
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+@pytest.mark.parametrize('channel', ['WhatsApp', 'Voice'])
+@pytest.mark.parametrize('code', ['llm_timeout', 'llm_auth_failed', 'llm_invalid_response'])
+def test_unsafe_interpretation_failure_retains_pending_question_and_verified_diagnostic(
+        pg, monkeypatch, channel, code, caplog):
+    session = 'CA-fallback' if channel == 'Voice' else ''
+    verify(pg, customer='C2', channel=channel, session=session)
+    ref = identity.conversation_ref(BIZ, channel, PHONE)
+    pending = '¿Cubre daños por agua?'
+    with pg() as conn:
+        state = {'question': pending, 'normalized_question': pending, 'question_intent': 'question',
+                 'awaiting': 'retry', 'customer_id': 'C2', 'verified': True}
+        identity.save_state(conn, BIZ, channel, ref, session, state)
+
+    def fail(*args, **kwargs):
+        raise llm.LLMError(code)
+
+    monkeypatch.setattr(llm, 'interpret', fail)
+    monkeypatch.setattr(dialog.retrieval, 'retrieve',
+                        lambda *args, **kwargs: pytest.fail('Unsafe fallback must clarify'))
+    with caplog.at_level('INFO', logger='insurance.dialog'):
+        reply, out = ask('¿Y eso?', ext=f'{session}:unclear', channel=channel)
+    assert reply == dialog.ASK_REFERENCE
+    assert out == {'insurance_result': 'missing_information', 'diagnostic_code': code}
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['question'] == pending and state['awaiting'] == 'retry'
+    assert not state.get('pending_human')
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+    assert f'reason_code={code} identity_verified=true' in caplog.text
+    assert all(pii not in caplog.text for pii in ('Luis', 'Gil', PHONE, '87654321X', pending))
+    if channel == 'Voice':
+        trace = rows(pg, 'SELECT customer_id,transport FROM insurance_voice_trace')[0]
+        assert trace['customer_id'] == 'C2'
+        assert trace['transport'] == {'llm_diagnostic': code, 'identity_verified': True}
+
+
+@pytest.mark.parametrize('revoked', [False, True])
+def test_safe_fallback_only_routes_to_authorized_evidence_not_coverage(pg, monkeypatch, revoked):
+    verify(pg, customer='C2')
+    add_document(pg, 'POL-900', 'DOC-FALLBACK')
+
+    def fail(*args, **kwargs):
+        raise llm.LLMError('llm_timeout')
+
+    seen = []
+    monkeypatch.setattr(llm, 'interpret', fail)
+    monkeypatch.setattr(dialog, 'llm_explain', lambda context, evidence:
+                        seen.append(evidence) or 'La cláusula contiene condiciones. ' + evidence_markers(evidence))
+    if revoked:
+        with pg() as conn:
+            conn.execute("UPDATE insurance_authorizations SET revoked_at=now() WHERE policy_id='POL-900'")
+    reply, out = ask('¿Cubre daños por agua?', ext='safe-fallback')
+    if revoked:
+        assert not seen and 'No he podido confirmar una póliza autorizada' in reply
+        assert out['insurance_result'] == 'missing_information'
+    else:
+        assert len(seen) == 1 and 'Fuentes:' in reply
+        assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'está cubierto' not in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
 

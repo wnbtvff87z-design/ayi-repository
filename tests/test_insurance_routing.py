@@ -347,7 +347,7 @@ def test_whatsapp_webhook_rejects_missing_or_invalid_to_without_default_phone(mo
     response = main.app.test_client().post('/webhook-whatsapp', data=data)
 
     assert response.status_code == 200
-    assert 'No puedo identificar el negocio asociado a este número.' in response.get_data(as_text=True)
+    assert main.BUSINESS_NOT_FOUND_REPLY in response.get_data(as_text=True)
     assert requests == []
 
 

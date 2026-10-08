@@ -343,6 +343,9 @@ def _answer(business, state, text, channel, external_id, customer):
                 _turn_diag(corr, bid, decision, customer_id, 'read_only')
                 return cached['content'], out
             awaiting_at_start = st.get('awaiting')
+            if orchestrator.generic_request(st.get('question')):
+                for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent'):
+                    st.pop(key, None)
             pending_question = st.get('normalized_question') or st.get('question')
             pending_fields = {key: st[key] for key in (
                 'question', 'normalized_question', 'question_turn_id', 'question_intent')
@@ -407,6 +410,9 @@ def _answer(business, state, text, channel, external_id, customer):
                 incoming, tz=business.get('timezone') or 'Europe/Madrid'))
             if date_answer:
                 is_query = False
+            generic_request = orchestrator.generic_request(incoming)
+            if generic_request:
+                is_query = False
             if st.get('pending_human') and references.consent_only(incoming):
                 is_query = False
             if ((is_query or awaiting_at_start == 'date') and not reviewing and not explaining_missing
@@ -435,7 +441,7 @@ def _answer(business, state, text, channel, external_id, customer):
                               'source': 'local'}
             try:
                 # No model call precedes the idempotency check or receives identity declarations.
-                if not _real_urgent(incoming) and not policy_control:
+                if not _real_urgent(incoming) and not policy_control and not date_answer:
                     interpretation = orchestrator.interpret(conn, sc, st, incoming, decl, turn_intent)
                 st['interpretation_diagnostic'] = None
             except memory.ContextBudgetExceeded:
@@ -544,7 +550,9 @@ def _answer(business, state, text, channel, external_id, customer):
                                        stage, code, reply, customer_id=sc.customer_id,
                                        policy_id=policy, version_id=version, pages=list(pages),
                                        transport=business.get('_insurance_voice_transport'),
-                                       correlation_id=corr)
+                                       correlation_id=corr,
+                                       llm_diagnostic=(out.get('diagnostic_code')
+                                                       or st.get('interpretation_diagnostic')))
                 identity.save_state(conn, bid, channel, ref, sess, st, user_activity=True)
                 _turn_diag(corr, bid, decision, sc.customer_id, 'write_pending_commit')
                 return reply, out
@@ -737,9 +745,12 @@ def _answer(business, state, text, channel, external_id, customer):
                               {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if just_verified and not st.get('policy_id') and not st.get('requested_policy'):
                 policies, more = policy_info.authorized_page(conn, bid, customer_id)
-                if len(policies) > 1 or more or not st.get('question'):
+                if len(policies) > 1 or more:
                     return finish(policy_info.offer(conn, sc, st),
                                   {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                if not st.get('question'):
+                    st.pop('awaiting', None)
+                    return finish(ASK_QUERY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if just_verified and st.get('question') and not st.get('pending_human'):
                 try:
                     interpretation = orchestrator.interpret(
@@ -759,17 +770,24 @@ def _answer(business, state, text, channel, external_id, customer):
                     code = getattr(exc, 'code', 'llm_error')
                     st['interpretation_diagnostic'] = code if code in LLM_FAILURE_CODES else 'llm_error'
                     st['interpretation_invoked'] = code != 'llm_not_configured'
-            if st.get('interpretation_diagnostic') in (
-                    'llm_auth_failed', 'llm_timeout', 'llm_rate_limited',
-                    'llm_invalid_response', 'llm_refusal', 'llm_error', 'llm_empty_response',
-                    'llm_network_error', 'llm_context_limit') and st.get('question'):
-                st['last_retrieval'] = {
-                    'question': st['question'], 'question_turn_id': st.get('question_turn_id'),
-                    'intent': st.get('question_intent', 'question'),
-                    'retrieval_status': 'interpretation_error'}
-                reply, out, _ = _technical_failure(
-                    st, st['interpretation_diagnostic'], corr, bid, [], True)
-                return finish(reply, out)
+                _diag(corr, 'interpretation', bid,
+                      reason_code=st.get('interpretation_diagnostic') or interpretation['source'],
+                      identity_verified=True, llm_invoked=st['interpretation_invoked'])
+            if st.get('interpretation_diagnostic') not in (
+                    None, 'llm_not_configured', 'context_budget_exceeded') and st.get('question'):
+                if not orchestrator.safe_fallback(
+                        st['question'], st.get('question_intent', 'question')):
+                    if pending_fields:
+                        st.update(pending_fields)
+                    is_query = False
+                    memory.set_user_kind(conn, user_id, 'clarification', incoming)
+                    st['awaiting'] = 'retry'
+                    return finish(
+                        ASK_REFERENCE if pending_fields else ASK_REPHRASE,
+                        {'insurance_result': ResultKind.MISSING_INFORMATION.value,
+                         'diagnostic_code': st['interpretation_diagnostic']})
+            if generic_request:
+                return finish(ASK_QUERY_AGAIN, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if not st.get('policy_id') and not st.get('requested_policy'):
                 summary, _ = memory.load_summary(conn, sc)
                 pending_selection = next((
@@ -958,6 +976,8 @@ def _is_question(text):
     if not text:
         return False
     if _is_social(text):
+        return False
+    if orchestrator.generic_request(text):
         return False
     if _intent(text) in ('availability', 'summary', 'policy_name', 'policy_validity'):
         return True

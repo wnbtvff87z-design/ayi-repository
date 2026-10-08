@@ -138,6 +138,14 @@ def test_cipher_scope_and_authentication(change, monkeypatch):
     assert prepare('nueve cinco seis seis jota', state, **kwargs)['document'] is None
 
 
+def test_voice_fragments_require_a_call_session():
+    state = {'awaiting': 'identity'}
+    parsed = prepare('DNI cinco uno nueve cinco', state, session='')
+    assert parsed['document'] is None
+    assert parsed['identity_kind'] == 'failed'
+    assert voice.BUFFER_KEY not in state
+
+
 def test_expiry_does_not_extend_on_unrelated_turns(monkeypatch):
     monkeypatch.setenv('INSURANCE_IDENTITY_BUFFER_TTL_SECONDS', '300')
     monkeypatch.setattr(voice.time, 'time', lambda: 1000)
@@ -185,6 +193,35 @@ def test_channel_equivalence_includes_spoken_mapping():
     assert (a['name'], a['document']) == (b['name'], b['document'])
     spoken = 'DNI cinco uno nueve cinco nueve cinco seis seis jota'
     assert prepare(spoken, channel='WhatsApp')['document'] == '51959566J'
+
+
+@pytest.mark.parametrize('text', [
+    'Mi nombre es Luis', 'Hola, soy Luis Gil Mora', 'DNI 87654321X',
+    'Mi DNI es ocho siete seis cinco cuatro tres dos uno equis',
+    'No, mi apellido es Gil', 'Nombre: Luis Gil', '87654321X',
+    'DNI ocho siete', 'Soy otra persona', 'reinicia la conversación',
+])
+def test_explicit_identity_switch_invalidates_reused_verification(text):
+    assert voice.declares_new_identity(text)
+
+
+@pytest.mark.parametrize('text', [
+    '¿Qué DNI necesitáis?', '¿Dónde está el documento de mi póliza?',
+    'La póliza 000123 cubre agua', '¿Cubre los daños por agua?',
+    'Hola', 'Gracias', 'La franquicia son 250 euros', 'cambiar póliza',
+    'Soy propietaria de la vivienda', 'soy el tomador', 'soy española',
+])
+def test_policy_and_social_turns_do_not_reset_identity(text):
+    assert not voice.declares_new_identity(text)
+    assert not voice.is_identity_reset(text)
+
+
+@pytest.mark.parametrize('text', [
+    'reinicia', 'Reinicia la conversación.', 'restablece mi identidad',
+    'borra mi identidad', 'cierra la sesión', 'empezar de nuevo', 'soy otra persona',
+])
+def test_explicit_identity_reset_commands(text):
+    assert voice.is_identity_reset(text)
 
 
 @pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
@@ -438,15 +475,15 @@ def test_unambiguous_full_document_correction_consumes_new_data(text):
 def test_guided_parts_survive_existing_postgresql_state_fixture(pg):
     state = {'awaiting': 'identity'}
     with pg() as conn:
-        identity.upsert_customer(conn, BIZ, 'GUIDED', 'Celia de la Peña', 'X1234567L')
+        identity.upsert_customer(conn, BIZ, 'GUIDED', 'Celia de la Peña', 'X1234567M')
         first = prepare('NIE equis doce treinta y cuatro', state, channel='WhatsApp', session='')
         assert first['document'] is None and first['identity_kind'] == 'partial'
         prepare('Celia', state, channel='WhatsApp', session='')
         identity.save_state(conn, BIZ, 'WhatsApp', 'conversation', '', state)
         loaded = identity.load_state(conn, BIZ, 'WhatsApp', 'conversation', '')
         prepare('mi apellido es de la Peña', loaded, channel='WhatsApp', session='')
-        complete = prepare('cincuenta y seis siete ele', loaded, channel='WhatsApp', session='')
-        assert complete['document'] == 'X1234567L'
+        complete = prepare('cincuenta y seis siete eme', loaded, channel='WhatsApp', session='')
+        assert complete['document'] == 'X1234567M'
         assert identity.match_by_hashes(conn, BIZ, identity.document_hmac(BIZ, complete['document']),
                                        loaded['name_hmac']) == ['GUIDED']
         assert identity.failed_attempts(conn, BIZ, 'WhatsApp', 'conversation') == 0

@@ -112,3 +112,40 @@ def test_cli_reads_conversation_context_without_locking_or_writing(pg, monkeypat
         after = conn.execute(
             'SELECT state,updated_at FROM insurance_conversation_state').fetchone()
     assert after == before
+
+
+@pytest.mark.parametrize('code', [
+    'llm_empty_response', 'llm_network_error', 'llm_invalid_response',
+])
+def test_identity_diagnostic_retains_verified_status_after_llm_failure(pg, code):
+    ref = 'c' * 64
+    with pg() as conn:
+        identity.upsert_customer(conn, BIZ, 'C2', 'Lucía Peña Torres', '12345678Z')
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C2')
+        identity.save_state(conn, BIZ, 'WhatsApp', ref, '', {
+            '_identity_diagnostic': 'identity_verified',
+            'interpretation_diagnostic': code,
+        })
+    with pg() as conn:
+        conn.execute('SET TRANSACTION READ ONLY')
+        report = diagnose.diagnose_identity(
+            conn, business_id=BIZ, conversation_ref=ref)
+    assert report['identity_verified'] is True
+    assert report['reason_code'] == 'identity_verified'
+    assert report['interpretation_diagnostic'] == code
+    assert 'Lucía' not in json.dumps(report) and '12345678Z' not in json.dumps(report)
+
+
+def test_identity_diagnostic_rejects_hmac_configuration_drift(pg, monkeypatch):
+    ref = 'd' * 64
+    with pg() as conn:
+        identity.upsert_customer(conn, BIZ, 'C2', 'Lucía Peña Torres', '12345678Z')
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C2')
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'different-synthetic-key-for-test-only-0000')
+    with pg() as conn:
+        conn.execute('SET TRANSACTION READ ONLY')
+        report = diagnose.diagnose_identity(
+            conn, business_id=BIZ, conversation_ref=ref)
+    assert report['identity_verified'] is False
+    assert report['reason_code'] == 'hmac_configuration_mismatch'
+    assert report['candidate_count'] == 0

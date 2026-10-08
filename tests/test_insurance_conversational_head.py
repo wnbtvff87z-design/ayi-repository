@@ -7,7 +7,36 @@ import pytest
 from test_insurance_attribution import (
     pg, rows, BIZ, PHONE, BUSINESS, add_document, verify, evidence_markers, assert_visible_sources,
 )
-from insurance import dialog, identity
+from insurance import dialog, identity, llm, orchestrator
+from test_insurance_whatsapp_grounded import grounded, NAME, DNI
+
+
+@pytest.mark.parametrize('text', [
+    'Quería hacer una consulta de la póliza',
+    'Hola, quisiera hacer una consulta sobre mi póliza.',
+    'Me gustaría realizar una consulta acerca de mi seguro',
+    'Tengo una duda sobre el contrato',
+    'Quiero consultar mi póliza',
+    '¿Podría hacer una pregunta respecto a la póliza?',
+])
+def test_generic_consultation_is_not_a_contractual_question(text):
+    assert orchestrator.generic_request(text)
+    assert not dialog._is_question(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Quería hacer una consulta de la póliza: ¿cubre daños por agua?',
+    'Quisiera hacer una consulta sobre mi póliza si se rompe un cristal',
+    'Tengo una duda sobre la cobertura de mi seguro',
+    'Quiero consultar mi póliza sobre una mesa de vidrio',
+    '¿Puedes consultar mi póliza?',
+    '¿Qué cubre mi seguro?',
+    'Quiero cancelar el seguro',
+    '¿Cubre agua y fuego?',
+])
+def test_generic_filter_preserves_real_questions(text):
+    assert not orchestrator.generic_request(text)
+    assert dialog._is_question(text)
 
 
 def say(text, n, channel='Voice'):
@@ -35,6 +64,50 @@ def test_voice_identity_one_turn_does_not_retrieve_and_trace_is_masked(client, m
     trace = rows(client, 'SELECT * FROM insurance_voice_trace')[0]
     assert trace['diagnostic'] == 'identity_verified'
     assert '51959566' not in str(dict(trace))
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_reported_generic_query_then_identity_never_calls_provider(client, monkeypatch, channel):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Generic consultation and identity must not call LLM or retrieval')
+
+    monkeypatch.setattr(llm, 'interpret', forbidden)
+    monkeypatch.setattr(dialog, 'llm_explain', forbidden)
+    monkeypatch.setattr(dialog, 'llm_rewrite', forbidden)
+    monkeypatch.setattr(dialog.retrieval, 'retrieve', forbidden)
+    say('Hola', 1, channel)
+    say('Quería hacer una consulta de la póliza', 2, channel)
+    state = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert not state.get('question')
+    reply, out = say('Mi nombre es Celia Zorro Condes y mi DNI es 51959566J', 3, channel)
+    assert reply == dialog.ASK_QUERY
+    assert out == {'insurance_result': 'missing_information'}
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 1
+    state = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['verified'] and not state.get('question')
+    assert not state.get('interpretation_diagnostic')
+    if channel == 'Voice':
+        trace = rows(client, 'SELECT stage,diagnostic,customer_id FROM insurance_voice_trace ORDER BY turn_no')[-1]
+        assert trace == {'stage': 'identity_verified', 'diagnostic': 'identity_verified', 'customer_id': 'C2'}
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_generic_query_identity_flow_through_real_endpoints(grounded, monkeypatch, channel):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Production-shaped generic flow must not call any LLM')
+
+    monkeypatch.setattr(llm, 'interpret', forbidden)
+    monkeypatch.setattr(llm, 'rewrite', forbidden)
+    monkeypatch.setattr(llm, 'explain', forbidden)
+    grounded.turn(channel, 'Hola')
+    grounded.turn(channel, 'Quería hacer una consulta de la póliza')
+    assert not grounded.state().get('question')
+    response = grounded.turn(channel, f'Mi nombre es {NAME} y mi DNI es {DNI}')
+    assert response['reply'] == dialog.ASK_QUERY
+    assert grounded.state()['verified'] is True
+    assert grounded.count('insurance_identity_verifications') == 1
+    assert grounded.count('insurance_cases') == 0
+    assert not grounded.interpretations and not grounded.explanations
 
 
 def test_voice_identity_accumulates_name_and_spoken_document(client):

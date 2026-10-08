@@ -95,7 +95,7 @@ def test_unique_active_exact_document_and_business(pg):
         assert find('33333333P', 'Celia Zorro') == []
         identity.upsert_customer(conn, BIZ, 'DUPLICATE', 'Celia Zorro Pérez', '11111111H')
         assert set(find('11111111H', 'Celia Zorro')) == {'CELIA', 'DUPLICATE'}
-        assert find('11111111H', 'Celia Zorro Condes') == ['CELIA']
+        assert set(find('11111111H', 'Celia Zorro Condes')) == {'CELIA', 'DUPLICATE'}
         conn.execute("UPDATE insurance_customers SET active=false WHERE business_id=%s AND customer_id='DUPLICATE'",
                      (BIZ,))
         assert find('11111111H', 'Celia Zorro') == ['CELIA']
@@ -107,13 +107,124 @@ def test_unique_active_exact_document_and_business(pg):
 def test_verification_checks_channel_and_active_customer(pg):
     with pg() as conn:
         ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
-        identity.create_verification(conn, BIZ, 'Voice', ref, '', 'C1')
+        identity.create_verification(conn, BIZ, 'Voice', ref, 'call-a', 'C1')
         assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
         identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
         assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) == 'C1'
         conn.execute("UPDATE insurance_customers SET active=false WHERE business_id=%s AND customer_id='C1'",
                      (BIZ,))
         assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+
+
+def test_duplicate_document_is_ambiguous_even_with_different_names(pg):
+    with pg() as conn:
+        identity.upsert_customer(conn, BIZ, 'DUP-ANA', 'Ana Pérez López', '55555555K')
+        identity.upsert_customer(conn, BIZ, 'DUP-LUIS', 'Luis Gil Mora', '55555555K')
+        doc = identity.document_hmac(BIZ, '55555555K')
+        name = identity.name_hmac(BIZ, 'Ana Pérez López')
+        assert set(identity.match_by_hashes(conn, BIZ, doc, name)) == {'DUP-ANA', 'DUP-LUIS'}
+        diagnostic = identity.match_diagnostic(conn, BIZ, doc, name)
+        assert diagnostic['reason_code'] == 'identity_ambiguous'
+        assert diagnostic['candidate_count'] == 2
+
+
+def test_duplicate_document_also_blocks_reused_verification(pg):
+    with pg() as conn:
+        ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) == 'C1'
+        identity.upsert_customer(conn, BIZ, 'DUPLICATE', 'Luis Gil Mora', '12345678Z')
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+
+
+@pytest.mark.parametrize('status,expected', [
+    ('inactive', 'customer_inactive'),
+    ('unprovisioned', 'customer_not_provisioned'),
+    ('document_missing', 'customer_not_provisioned'),
+    ('mismatch', 'identity_no_match'),
+])
+def test_local_match_diagnostic_is_readonly_and_metadata_only(pg, status, expected):
+    with pg() as conn:
+        if status == 'inactive':
+            conn.execute("UPDATE insurance_customers SET active=false WHERE business_id=%s AND customer_id='C1'",
+                         (BIZ,))
+        elif status == 'unprovisioned':
+            conn.execute("UPDATE insurance_customers SET name_hmac=NULL,name_prefix_hmacs='{}' "
+                         "WHERE business_id=%s AND customer_id='C1'", (BIZ,))
+        elif status == 'document_missing':
+            conn.execute("UPDATE insurance_customers SET document_hmac=NULL "
+                         "WHERE business_id=%s AND customer_id='C1'", (BIZ,))
+    with pg() as conn:
+        conn.execute('SET TRANSACTION READ ONLY')
+        diagnostic = identity.match_diagnostic(
+            conn, BIZ, identity.document_hmac(BIZ, '12345678Z'),
+            identity.name_hmac(BIZ, 'Wrong Surname' if status == 'mismatch' else 'Ana Pérez'))
+        assert diagnostic['reason_code'] == expected
+        assert diagnostic['candidate_count'] == 0
+        assert set(diagnostic) == {'reason_code', 'candidate_count', 'document_hmac_match',
+                                   'name_hmac_match'}
+        empty = identity.match_diagnostic(
+            conn, 'UNPROVISIONED', identity.document_hmac('UNPROVISIONED', '12345678Z'),
+            identity.name_hmac('UNPROVISIONED', 'Ana Pérez'))
+        assert empty['reason_code'] == 'customer_not_provisioned'
+
+
+def test_verification_revocation_expiry_and_voice_session_isolation(pg):
+    with pg() as conn:
+        wa_ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
+        voice_ref = identity.conversation_ref(BIZ, 'Voice', PHONE)
+        identity.create_verification(conn, BIZ, 'WhatsApp', wa_ref, '', 'C1')
+        identity.create_verification(conn, BIZ, 'Voice', voice_ref, 'CA-ONE', 'C1')
+        identity.create_verification(conn, BIZ, 'Voice', voice_ref, 'CA-TWO', 'C2')
+        assert identity.verified_customer(conn, BIZ, 'Voice', PHONE, 'CA-ONE') == 'C1'
+        assert identity.verified_customer(conn, BIZ, 'Voice', PHONE, 'CA-TWO') == 'C2'
+        assert identity.verified_customer(conn, BIZ, 'Voice', PHONE, '') is None
+        assert identity.verified_customer(conn, BIZ, 'Voice', PHONE, 'CA-THREE') is None
+        assert identity.load_state(conn, BIZ, 'Voice', voice_ref, '') == {}
+        with pytest.raises(ValueError):
+            identity.create_verification(conn, BIZ, 'Voice', voice_ref, '', 'C1')
+        with pytest.raises(ValueError):
+            identity.save_state(conn, BIZ, 'Voice', voice_ref, '', {'name': 'Ana Pérez'})
+        identity.revoke_verifications(conn, BIZ, 'Voice', voice_ref, 'CA-ONE')
+        assert identity.verified_customer(conn, BIZ, 'Voice', PHONE, 'CA-ONE') is None
+        assert identity.verified_customer(conn, BIZ, 'Voice', PHONE, 'CA-TWO') == 'C2'
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) == 'C1'
+        identity.revoke_verifications(conn, BIZ, 'WhatsApp', wa_ref)
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        identity.create_verification(conn, BIZ, 'WhatsApp', wa_ref, '', 'C2')
+        conn.execute("UPDATE insurance_identity_verifications SET expires_at=now()-interval '1 second' "
+                     "WHERE business_id=%s AND channel='WhatsApp'", (BIZ,))
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+
+
+def test_hmac_key_rotation_fails_closed_for_matches_and_reused_verification(pg, monkeypatch):
+    with pg() as conn:
+        ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
+        doc = identity.document_hmac(BIZ, '12345678Z')
+        name = identity.name_hmac(BIZ, 'Ana Pérez')
+        identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+        monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'y' * 40)
+        assert identity.match_by_hashes(conn, BIZ, doc, name) == []
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        diagnostic = identity.match_diagnostic(conn, BIZ, doc, name)
+        assert diagnostic['reason_code'] == 'hmac_key_mismatch'
+        assert diagnostic['candidate_count'] == 0
+        with pytest.raises(ValueError):
+            identity.create_verification(conn, BIZ, 'WhatsApp', ref, '', 'C1')
+
+
+@pytest.mark.parametrize('registered,given,surname,declared,valid', [
+    ('María del Mar Ruiz de la Torre', 'María del Mar', 'Ruiz', 'Maria del Mar', False),
+    ('María del Mar Ruiz de la Torre', 'María del Mar', 'Ruiz', 'Maria del Mar Ruiz', True),
+    ('José María de la Peña Ruiz', 'José María', 'de la Peña', 'Jose Maria de la', False),
+    ('José María de la Peña Ruiz', 'José María', 'de la Peña', 'Jose Maria de la Peña', True),
+    ('Íñigo García-López Ruiz', 'Íñigo', 'García-López', 'Iñigo Garcia', False),
+    ('Íñigo García-López Ruiz', 'Íñigo', 'García-López', 'Iñigo Garcia Lopez', True),
+])
+def test_explicit_first_surname_boundaries(registered, given, surname, declared, valid, monkeypatch):
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    prefixes = identity.name_prefix_hmacs(BIZ, registered, given, surname)
+    assert (identity.name_hmac(BIZ, declared) in prefixes) is valid
 
 
 def test_automatic_state_updates_do_not_extend_user_inactivity(pg, monkeypatch):

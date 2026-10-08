@@ -5,6 +5,172 @@ document registration in ONE transaction, idempotently. Dry run by default; `--a
 Load order follows the FKs (migrations 004 onward). The PDF is only *registered* (`pending_verification`);
 `insurance_doc_worker.py` is the only process that reads the bucket and verifies SHA-256.
 
+## Separate automatic master-data sync (Airtable input, PostgreSQL authority)
+
+`web/insurance_sync_master.py` is a **separate** worker, not the case outbox and
+not a web startup task. It imports customer/policy/version/document registrations
+in one PostgreSQL transaction per business after successfully fetching all four
+tables and all pages. No Airtable text, attachment URL, status or `ready` flag is
+contractual evidence. The existing SHA-256 bucket/document worker is unchanged.
+New customers are immediately available to the PostgreSQL identity gate; PDFs
+remain `pending_verification` until the document worker verifies the actual bytes.
+
+### Railway service and configuration
+
+Create `insurance-master-worker` using the same image/repository as web, root
+directory `web`, start command:
+
+```sh
+python insurance_sync_master.py --worker --apply
+```
+
+Required variables:
+
+- `INSURANCE_DATABASE_URL`: the **same insurance PostgreSQL database** used by web;
+  a writer role with SELECT/INSERT/UPDATE on master tables, sentinel/source-map
+  tables, authorizations/verifications/audit, DELETE on conversation state, and
+  USAGE on identity sequences.
+- `INSURANCE_CASE_HMAC_KEY`: identical on web, manual provisioning and master
+  worker; at least 32 UTF-8 bytes. Never put it into the mapping JSON or logs.
+- `AIRTABLE_INSURANCE_TOKEN`: a read-only Airtable token scoped to the configured bases.
+- `INSURANCE_MASTER_SOURCES_JSON`: explicit JSON array below, one entry per business.
+- Optional `INSURANCE_MASTER_POLL_SECONDS`: 15–3600, default 60.
+
+No bucket credentials, case table, alert webhook or new dependency is needed.
+Do not reuse the outbox worker's start command. Apply migration
+`014_master_sync.sql` through `python -m insurance.migrate` using
+`INSURANCE_MIGRATION_DATABASE_URL` before deploying the runtime identity gate
+and before starting the master worker. No Railway deployment is performed by
+the implementation.
+
+Example mapping (all table/field names are owner-supplied, not autodetected):
+
+```json
+[
+  {
+    "business_id": "INS-BIZ-001",
+    "source_id": "airtable-master-v1",
+    "base_id": "appREPLACE",
+    "tables": {
+      "customers": {
+        "table": "tblCUSTOMERS",
+        "fields": {"name": "Full name", "document": "DNI NIE", "active": "Identity active"}
+      },
+      "policies": {
+        "table": "tblPOLICIES",
+        "fields": {
+          "customer": "Customer", "product": "Product", "contract_number": "Contract number",
+          "authorized": "Authorization", "authorization_from": "Authorization from",
+          "authorization_to": "Authorization to"
+        }
+      },
+      "versions": {
+        "table": "tblVERSIONS",
+        "fields": {"policy": "Policy", "valid_from": "Effective from", "valid_to": "Effective to"}
+      },
+      "documents": {
+        "table": "tblDOCUMENTS",
+        "fields": {"version": "Policy version", "sha256": "Expected SHA256"}
+      }
+    }
+  }
+]
+```
+
+Each relationship is a single Airtable linked-record ID, not a name or internal
+ID. References must exist in the same business snapshot. Configure physically
+tenant-specific tables/bases: shared mixed-business tables are unsupported,
+because this importer does not guess a business from source fields.
+Use stable table IDs (`tbl…`) rather than renameable labels.
+Names and DNI/NIE are processed only in memory; imported customers store HMACs
+and NULL display_name. Optional `given_name` and `first_surname` mappings must be
+supplied together for compound-name boundaries.
+
+`active` and `authorized` must be explicitly populated text/select values:
+`true`/`false`, `active`/`inactive`, or `granted`/`revoked` (case-sensitive).
+An absent field is an error, **not false**: unchecked Airtable checkboxes omit
+the field, so use explicit select/text columns instead. Policy contract numbers
+must be strings (preserve leading zeros), never derived from customer DNI,
+document ID, PDF name or attachment URL. Version dates use `YYYY-MM-DD`;
+optional authorization times use ISO 8601 with timezone. An absent optional
+authorization start means first grant at database `now()`; repeated syncs do
+not extend it. A mapped authorization end that becomes empty explicitly removes
+that end. A revoked flag or inactive customer revokes access.
+
+### Stable IDs and immutable document bindings
+
+Unless an explicit `id` field mapping is configured for an entity, its internal
+ID is deterministic from business/source/base/table/entity/Airtable record ID.
+Source mappings are persisted, and source configuration changes, duplicate IDs,
+duplicate customer DNI within a tenant (including inactive customers), duplicate
+contracts, reused document IDs, or a moved policy-version/document binding fail
+closed with the entire business import rolled back. Explicit IDs cannot take
+over previously manually provisioned rows. Migrating existing manually loaded
+data requires an operator-reviewed mapping/data migration, not an automatic merge.
+
+An existing document's policy/version/object key/**expected hash** never changes
+through sync; upload/register a new document record/ID for changed content.
+New registrations use the existing deterministic key:
+`insurance-policies/<business>/<policy>/<version>/<document>.pdf`.
+Use `stable_id(config, entity, record_id)` from `insurance.master_sync` or inspect
+`insurance_master_record_map` after apply to plan uploads (dry-run rolls the map back).
+The sync does not retry terminal document jobs or overwrite worker statuses.
+Future versions may be registered but retrieval still enforces dates.
+
+### HMAC agreement and legacy adoption
+
+`insurance_hmac_keys` contains only a domain-separated, per-business HMAC
+fingerprint of a public sentinel, never a key or PII. Provision/sync initialize
+it for an empty tenant under the shared transaction advisory lock.
+Runtime `check_hmac_key(conn, business_id)` is read-only and fails closed for
+missing/different sentinels. Changing a key without controlled re-HMAC migration
+will reject sync and verification, not silently create incompatible identities.
+
+For existing tenants, verify the configured key against known synthetic/control
+identity hashes first. Only then temporarily set
+`INSURANCE_HMAC_ADOPT_EXISTING=true` on the provisioning/master service and
+perform an applied import/provision to initialize the sentinel. Remove that flag
+afterward. Legacy HMACs cannot prove agreement without a known control identity;
+the flag is an explicit operator attestation, not automatic key validation.
+Initialize sentinels before deploying the strict runtime gate to avoid denying
+legacy tenants.
+
+### Dry-run, safety and operational checks
+
+```sh
+railway ssh --service insurance-master-worker -- sh -c \
+  'cd /app/web 2>/dev/null || cd web; python insurance_sync_master.py'
+# Same command with --apply performs a one-shot import.
+```
+
+Dry-run executes validations and rolls back all writes, including ID maps and
+sentinel. The continuous worker requires both `--worker` and `--apply`.
+Updates to customer identity/active status, policy ownership/product/number,
+version dates or authorization revoke affected temporary verifications and
+clear associated conversation state; reactivation does not restore verification.
+All PostgreSQL queries include the business scope. The tenant lock serializes
+manual provisioning and master sync. Source deletions/omissions never deactivate
+anything: use explicit flags to revoke. Fetch failures, repeated pagination
+tokens, duplicate records, invalid relationships and exhausted bounded retries
+never import a partial business snapshot. Logs include safe error codes/counts,
+not response bodies, secrets or customer data.
+
+Risks: Airtable cannot provide an atomic cross-table snapshot; changes during
+pagination can cause safe validation failures and should be retried after source
+editing completes. Intentional record recreation changes deterministic IDs.
+Source omission preserves existing access until an explicit revocation; operators
+must not delete records as a substitute for revoking them. Configure only trusted,
+tenant-specific tables and least-privilege write roles. Failures across several
+configured businesses are independent transactions; a successful earlier tenant
+may commit before a later tenant fails.
+
+```sql
+SELECT business_id,source_id,entity,record_id,internal_id,parent_id
+  FROM insurance_master_record_map ORDER BY business_id,entity;
+SELECT business_id,created_at FROM insurance_hmac_keys;
+-- Continue with the existing customer/authorization/document checks below.
+```
+
 ## Values that cannot be derived from the repo (must be supplied by the owner)
 | Value | Where it is required | Where to get it |
 |---|---|---|

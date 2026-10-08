@@ -31,6 +31,10 @@ def session_key(channel, external_id):
 
 
 def verified_customer(conn, business_id, channel, phone, session_ref=''):
+    if channel == 'Voice' and not session_ref:
+        return None
+    if not _key_agrees(conn, business_id):
+        return None
     ref = conversation_ref(business_id, channel, phone)
     if not ref:
         return None
@@ -39,6 +43,9 @@ def verified_customer(conn, business_id, channel, phone, session_ref=''):
         'ON c.business_id=v.business_id AND c.customer_id=v.customer_id AND c.active '
         'WHERE v.business_id=%s AND v.channel=%s AND v.conversation_ref=%s AND v.session_ref=%s '
         'AND v.revoked_at IS NULL AND v.expires_at>now() '
+        'AND c.document_hmac IS NOT NULL AND c.name_hmac IS NOT NULL '
+        'AND NOT EXISTS(SELECT 1 FROM insurance_customers other WHERE other.business_id=c.business_id '
+        'AND other.active AND other.document_hmac=c.document_hmac AND other.customer_id<>c.customer_id) '
         'ORDER BY v.verification_id DESC LIMIT 1', (business_id, channel, ref, session_ref)).fetchone()
     return row['customer_id'] if row else None
 
@@ -200,13 +207,80 @@ def extract_claims(text):
 def match_by_hashes(conn, business_id, doc_hash, name_hash):
     """Exact DNI/NIE hash AND declared name equal to the registered full name or to one of its leading
     prefixes (first name + first surname at least), on the resolved business only, ACTIVE customers.
-    0 = no match, 1 = verified, >1 = ambiguous. The DNI index narrows to a handful of rows first."""
+    0 = no match, 1 = verified, >1 = ambiguous. Duplicate active documents are ambiguous
+    even when only one registered name matches. The DNI index narrows the rows first."""
     if not doc_hash or not name_hash:
         return []
-    return [r['customer_id'] for r in conn.execute(
-        'SELECT customer_id FROM insurance_customers WHERE business_id=%s AND active '
-        'AND document_hmac=%s AND (name_hmac=%s OR name_prefix_hmacs @> ARRAY[%s]::text[]) LIMIT 20',
-        (business_id, doc_hash, name_hash, name_hash)).fetchall()]
+    if not _key_agrees(conn, business_id):
+        return []
+    rows = _document_candidates(conn, business_id, doc_hash, name_hash)
+    active = [r for r in rows if r['active']]
+    return [r['customer_id'] for r in active
+            if len(active) > 1 or r['name_matches']]
+
+
+def _document_candidates(conn, business_id, doc_hash, name_hash):
+    return conn.execute(
+        'SELECT customer_id,active,name_hmac IS NOT NULL AS name_provisioned,'
+        'COALESCE(name_hmac=%s OR name_prefix_hmacs @> ARRAY[%s]::text[],false) AS name_matches '
+        'FROM insurance_customers WHERE business_id=%s AND document_hmac=%s',
+        (name_hash, name_hash, business_id, doc_hash)).fetchall()
+
+
+def _key_agrees(conn, business_id):
+    if len(os.getenv('INSURANCE_CASE_HMAC_KEY', '').encode()) < MIN_KEY_BYTES:
+        return False
+    from insurance.master_sync import check_hmac_key
+    return check_hmac_key(conn, business_id)
+
+
+def match_diagnostic(conn, business_id, doc_hash, name_hash):
+    """Read-only local metadata for operators; never returns identity values or customer IDs.
+
+    Missing provisioning is distinguishable from a genuine mismatch without a runtime lookup
+    of the external master. The caller-facing failure must remain generic.
+    """
+    if not _key_agrees(conn, business_id):
+        provisioned = conn.execute(
+            'SELECT EXISTS(SELECT 1 FROM insurance_customers WHERE business_id=%s '
+            'AND document_hmac IS NOT NULL) AS present', (business_id,)).fetchone()['present']
+        return {'reason_code': 'hmac_key_mismatch' if provisioned else 'customer_not_provisioned',
+                'candidate_count': 0, 'document_hmac_match': False, 'name_hmac_match': False}
+    rows = _document_candidates(conn, business_id, doc_hash, name_hash) if doc_hash else []
+    active = [r for r in rows if r['active']]
+    matching = [r for r in active if r['name_matches']]
+    count = len(active) if len(active) > 1 else len(matching)
+    if not doc_hash or not name_hash:
+        reason = 'identity_data_partial'
+    elif len(active) > 1:
+        reason = 'identity_ambiguous'
+    elif matching:
+        reason = 'identity_verified'
+    elif any(r['name_matches'] and not r['active'] for r in rows):
+        reason = 'customer_inactive'
+    elif any(not r['name_provisioned'] for r in active):
+        reason = 'customer_not_provisioned'
+    else:
+        provisioned = conn.execute(
+            'SELECT EXISTS(SELECT 1 FROM insurance_customers WHERE business_id=%s '
+            'AND document_hmac IS NOT NULL AND name_hmac IS NOT NULL) AS present,'
+            'EXISTS(SELECT 1 FROM insurance_customers WHERE business_id=%s '
+            'AND document_hmac IS NULL AND (name_hmac=%s OR '
+            'name_prefix_hmacs @> ARRAY[%s]::text[])) AS document_missing',
+            (business_id, business_id, name_hash, name_hash)).fetchone()
+        reason = ('identity_no_match' if provisioned['present'] and not provisioned['document_missing']
+                  else 'customer_not_provisioned')
+    return {'reason_code': reason, 'candidate_count': count,
+            'document_hmac_match': bool(active),
+            'name_hmac_match': bool(matching)}
+
+
+def revoke_verifications(conn, business_id, channel, ref, session_ref=''):
+    """Revoke only this conversation/session on an explicit identity change or reset."""
+    conn.execute(
+        'UPDATE insurance_identity_verifications SET revoked_at=now() WHERE business_id=%s '
+        'AND channel=%s AND conversation_ref=%s AND session_ref=%s AND revoked_at IS NULL',
+        (business_id, channel, ref, session_ref))
 
 
 def _int_env(name, default):
@@ -245,6 +319,10 @@ def record_failed_attempt(conn, business_id, channel, ref, session_ref, outcome)
 
 
 def create_verification(conn, business_id, channel, ref, session_ref, customer_id):
+    if not ref or (channel == 'Voice' and not session_ref):
+        raise ValueError('verification requires a conversation and Voice call session')
+    if not _key_agrees(conn, business_id):
+        raise ValueError('identity HMAC key does not agree with provisioning')
     row = conn.execute(
         'INSERT INTO insurance_identity_verifications(business_id,conversation_ref,customer_id,method,'
         'verified_by,expires_at,channel,session_ref) VALUES(%s,%s,%s,%s,%s,'
@@ -258,6 +336,8 @@ def create_verification(conn, business_id, channel, ref, session_ref, customer_i
 
 
 def load_state(conn, business_id, channel, ref, session_ref):
+    if channel == 'Voice' and not session_ref:
+        return {}
     row = conn.execute(
         'SELECT state FROM insurance_conversation_state WHERE business_id=%s AND channel=%s '
         'AND conversation_ref=%s AND session_ref=%s AND updated_at>now()-make_interval(secs=>%s)',
@@ -278,6 +358,8 @@ def load_state(conn, business_id, channel, ref, session_ref):
 
 
 def save_state(conn, business_id, channel, ref, session_ref, state, user_activity=False):
+    if channel == 'Voice' and not session_ref:
+        raise ValueError('Voice state requires a call session')
     if user_activity or 'last_user_at' not in state:
         state['last_user_at'] = datetime.now(timezone.utc).isoformat()
     conn.execute(
@@ -295,6 +377,8 @@ def clear_state(conn, business_id, channel, ref, session_ref):
 def upsert_customer(conn, business_id, customer_id, display_name, document, full_name=None,
                     given_name=None, first_surname=None):
     """Controlled provisioning helper (ops/tests). No public endpoint calls this."""
+    from insurance.master_sync import ensure_hmac_key
+    ensure_hmac_key(conn, business_id)
     conn.execute(
         'INSERT INTO insurance_customers(business_id,customer_id,display_name,document_hmac,name_hmac,'
         'name_prefix_hmacs) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (business_id,customer_id) DO UPDATE SET '

@@ -49,13 +49,54 @@ NON_NAME_WORDS = (identity.NAME_STOP - NAME_PARTICLES) | {
 }
 
 
+def is_identity_reset(text):
+    """Explicit identity/session resets, not ordinary incident or policy changes."""
+    folded = _fold_word(str(text or '').strip(' \t\r\n.!¡,;'))
+    return bool(re.fullmatch(
+        r'(?:reinicia(?:r)?(?: (?:la )?(?:conversacion|identidad))?|'
+        r'restablece (?:mi |la )?identidad|borra (?:mi |la )?identidad|'
+        r'cierra (?:mi |la )?sesion|empezar de nuevo|empiezo de nuevo|'
+        r'soy otra persona|cambiar (?:de )?(?:cliente|identidad))', folded))
+
+
+def declares_new_identity(text):
+    """Invalidate reused verification on literal declarations, including incomplete ones.
+
+    Questions mentioning a document are not declarations; unlabelled names are recognized
+    only during guided capture, never guessed from ordinary policy discussion.
+    """
+    text = str(text or '').strip()
+    if is_identity_reset(text):
+        return True
+    corrected = CORRECTION_RE.sub('', GREETING_PREFIX.sub('', text), count=1).lstrip(' ,;:.-')
+    if identity.DOC_RE.search(text):
+        return True
+    if (not LABEL.search(corrected) and re.match(
+            r'^soy\s+(?:el|la|un|una|propietari[oa]|inquilin[oa]|'
+            r'tomador[ae]?|asegurad[oa]|espa[nñ]ol[ae]?)\b', corrected, re.I)):
+        return False
+    if re.match(r'^\s*(?:' + GIVEN_LABEL + '|' + SURNAME_LABEL + ')', corrected, re.I):
+        return True
+    if corrected.startswith(('?', '¿')):
+        return False
+    label = LABEL.search(corrected)
+    if label:
+        prefix = _fold_word(corrected[:label.start()]).strip(' ,;:')
+        if prefix not in {'', 'mi', 'el', 'la', 'mi numero de', 'el numero de'}:
+            return False
+        parts, _, _, bad = _parts(corrected[label.end():], True)
+        return bool(parts or bad)
+    return False
+
+
 def _scope(business_id, channel, ref, session):
     return [str(business_id), str(channel), str(ref), str(session)]
 
 
 def _cipher(scope):
     key = os.getenv('INSURANCE_CASE_HMAC_KEY', '').encode()
-    if len(key) < identity.MIN_KEY_BYTES or not scope[2]:
+    if (len(key) < identity.MIN_KEY_BYTES or not scope[2]
+            or scope[1] == 'Voice' and not scope[3]):
         return None
     material = json.dumps(['insurance-identity-buffer-v1', *scope],
                           ensure_ascii=False, separators=(',', ':')).encode()

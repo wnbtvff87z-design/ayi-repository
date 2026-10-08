@@ -49,7 +49,8 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
             report['session_closed'] = bool(state.get('closed_at'))
             interpretation = state.get('last_interpretation') or {}
             report['interpretation_source'] = (
-                interpretation.get('source') if interpretation.get('source') in ('local', 'llm') else None)
+                interpretation.get('source') if interpretation.get('source') in (
+                    'local', 'llm', 'local_fallback') else None)
             report['interpretation_invoked'] = state.get('interpretation_invoked') is True
             report['interpretation_intents'] = [
                 item for item in interpretation.get('intents', [])
@@ -58,7 +59,8 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
             report['interpretation_diagnostic'] = (
                 code if code in (
                     'llm_not_configured', 'llm_auth_failed', 'llm_timeout', 'llm_rate_limited',
-                    'llm_invalid_response', 'llm_refusal', 'llm_error', 'context_budget_exceeded') else None)
+                    'llm_invalid_response', 'llm_refusal', 'llm_error', 'context_budget_exceeded',
+                    'llm_empty_response', 'llm_network_error', 'llm_context_limit') else None)
             policy_id = policy_id or state.get('policy_id')
     social = orchestrator.social(question)
     if social:
@@ -134,7 +136,9 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
 
 IDENTITY_REASONS = frozenset((
     'identity_data_partial', 'identity_no_match', 'identity_ambiguous',
-    'identity_attempts_exceeded', 'identity_verified'))
+    'identity_attempts_exceeded', 'identity_verified', 'identity_parse_failed',
+    'identity_data_missing', 'customer_inactive', 'customer_not_provisioned',
+    'hmac_configuration_mismatch'))
 
 
 def diagnose_identity(conn, *, business_id, conversation_ref, channel='WhatsApp', session_ref=''):
@@ -174,6 +178,16 @@ def diagnose_identity(conn, *, business_id, conversation_ref, channel='WhatsApp'
             'identity', 'policy', 'date', 'reference', 'human_consent') else None,
         'awaiting_document': bool(state.get('awaiting_document')),
     }
+    from insurance.master_sync import MasterSyncError, check_hmac_key
+    try:
+        key_agrees = check_hmac_key(conn, business_id)
+    except MasterSyncError:
+        key_agrees = False
+    if not key_agrees:
+        report.update(identity_verified=False, document_hmac_match=False,
+                      name_hmac_match=False, candidate_count=0, stage='identity',
+                      reason_code='hmac_configuration_mismatch')
+        return report
     report['document_hmac_match'] = bool(doc_hash) and conn.execute(
         'SELECT count(*) AS n FROM insurance_customers WHERE business_id=%s AND active '
         'AND document_hmac=%s', (business_id, doc_hash)).fetchone()['n'] > 0
@@ -188,6 +202,12 @@ def diagnose_identity(conn, *, business_id, conversation_ref, channel='WhatsApp'
     report['reason_code'] = (code if code in IDENTITY_REASONS else
                              'identity_verified' if verified else
                              'state_missing' if not state else 'identity_not_evaluated')
+    interpretation_code = state.get('interpretation_diagnostic')
+    report['interpretation_diagnostic'] = (
+        interpretation_code if interpretation_code in (
+            'llm_not_configured', 'llm_auth_failed', 'llm_timeout', 'llm_rate_limited',
+            'llm_invalid_response', 'llm_empty_response', 'llm_network_error',
+            'llm_refusal', 'llm_error', 'llm_context_limit', 'context_budget_exceeded') else None)
     return report
 
 
