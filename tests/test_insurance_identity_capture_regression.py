@@ -4,13 +4,14 @@ Reproduces the reported sequence with SYNTHETIC data and the same linguistic str
 "Hola" -> "mi nombre es <nombre completo> y mi DNI es <DNI>" -> (wrongly) "Me falta tu apellido"
 -> "<apellidos>" -> (wrongly) "No he podido verificar tus datos". No real name or document is used.
 """
+import io
 import json
 
 import pytest
 
-from test_insurance_whatsapp_grounded import BIZ, grounded  # noqa: F401
+from test_insurance_whatsapp_grounded import BIZ, PHONE, grounded  # noqa: F401
 from test_insurance_voice_transport import flow, run_events  # noqa: F401
-from insurance import cases, identity, voice_identity
+from insurance import admin, cases, diagnose, identity, voice_identity
 
 GIVEN, SURNAMES = 'Lucía', 'Fernández Ortega'
 FULL = f'{GIVEN} {SURNAMES}'
@@ -183,3 +184,68 @@ def test_enrolment_and_verification_normalize_equivalently(monkeypatch, register
     assert identity.name_hmac(BIZ, parsed['name']) == identity.name_hmac(BIZ, registered)
     assert identity.document_hmac(BIZ, parsed['document']) == identity.document_hmac(BIZ, doc_registered)
     assert identity.name_hmac(BIZ, 'pena ruiz') != identity.name_hmac(BIZ, 'peña ruiz')
+
+
+def _identity_report(conn, channel='WhatsApp'):
+    return diagnose.diagnose_identity(
+        conn, business_id=BIZ, conversation_ref=identity.conversation_ref(BIZ, channel, PHONE),
+        channel=channel, session_ref='')
+
+
+def _assert_no_identity_values(output):
+    for secret in (DNI, DNI[:-1], DNI[-3:], GIVEN, 'Fernández', 'Ortega', 'Ortiz', PHONE):
+        assert secret not in output
+    assert not __import__('re').search(r'[0-9a-f]{40,}', output)
+
+
+def test_identity_diagnostic_is_readonly_and_metadata_only(wa):
+    _turn(wa, 'WhatsApp', 'Hola')
+    _turn(wa, 'WhatsApp', f'mi nombre es {GIVEN} y mi DNI es {DNI}')
+    with cases.db() as conn:
+        conn.execute('SET TRANSACTION READ ONLY')
+        partial = _identity_report(conn)
+    assert partial['fields'] == {
+        'name': True, 'name_has_surname': False, 'given_name_boundary': True,
+        'surname_pending': True, 'document': True, 'document_partial': False}
+    assert partial['capture']['status'] == 'partial'
+    assert partial['document_hmac_match'] is True and partial['name_hmac_match'] is False
+    assert partial['candidate_count'] == 0
+    assert (partial['stage'], partial['reason_code']) == ('identity', 'identity_data_partial')
+    _assert_no_identity_values(json.dumps(partial, ensure_ascii=False))
+
+    assert GENERIC in _turn(wa, 'WhatsApp', 'Fernández Ortiz')
+    with cases.db() as conn:
+        conn.execute('SET TRANSACTION READ ONLY')
+        failed = _identity_report(conn)
+    assert failed['capture']['status'] == 'complete'
+    assert failed['document_hmac_match'] is True and failed['name_hmac_match'] is False
+    assert failed['candidate_count'] == 0 and failed['failed_attempts'] == 1
+    assert failed['reason_code'] == 'identity_no_match'
+    _assert_no_identity_values(json.dumps(failed, ensure_ascii=False))
+
+    assert VERIFIED in _turn(wa, 'WhatsApp', f'No, mi apellido es {SURNAMES}')
+    with cases.db() as conn:
+        done = _identity_report(conn)
+    assert done['identity_verified'] is True and done['reason_code'] == 'identity_verified'
+
+
+def test_identity_diagnostic_cli_requires_authorized_operator(wa, monkeypatch, capsys):
+    _turn(wa, 'WhatsApp', f'mi DNI es {DNI}')
+    ref = identity.conversation_ref(BIZ, 'WhatsApp', PHONE)
+    args = ['--business-id', BIZ, '--identity', '--conversation-ref', ref]
+    monkeypatch.setenv('INSURANCE_ADMIN_TOKEN_KEY', 'a' * 40)
+    monkeypatch.setattr('sys.stdin', io.StringIO(''))
+    assert diagnose.main(args) == 1
+    assert json.loads(capsys.readouterr().out)['reason_code'] == 'unauthorized'
+    monkeypatch.setenv('INSURANCE_DIAGNOSTIC_TOKEN', 'synthetic-console-token')
+    with cases.db() as conn:
+        conn.execute('INSERT INTO insurance_admin_users(actor_id,business_id,token_hmac,can_read_cases) '
+                     'VALUES(%s,%s,%s,true)',
+                     ('synthetic-operator', BIZ, admin.token_hmac('synthetic-console-token')))
+    assert diagnose.main(args) == 0
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert report['fields']['document'] is True and report['fields']['name'] is False
+    assert report['document_hmac_match'] is True and report['candidate_count'] == 0
+    assert report['reason_code'] == 'identity_data_partial'
+    _assert_no_identity_values(output)

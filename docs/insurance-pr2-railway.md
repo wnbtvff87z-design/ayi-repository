@@ -149,6 +149,18 @@ generales o en el PR. El diagnóstico imprime metadatos y clasificación segura;
 no confirma que una llamada real funcione. Las trazas completas se leen únicamente
 por el endpoint administrativo individual, con permiso del negocio y auditoría.
 
+Diagnóstico de identificación (solo lectura, sin stdin ni `--customer-id`):
+
+```sh
+python -m insurance.diagnose --business-id INS-BIZ-001 --identity \
+  --conversation-ref '<HMAC existente>' [--channel Voice --session-ref '<CallSid>']
+```
+
+Imprime solo booleanos y recuentos: campos presentes/ausentes (`fields`), estado de
+captura (`capture`), `document_hmac_match`, `name_hmac_match`, `candidate_count`,
+`failed_attempts`, `stage` y `reason_code`. Nunca imprime DNI, nombres, hashes,
+tokens ni transcripción.
+
 Prueba Railway/Twilio/OpenAI **no ejecutada en esta entrega**:
 1. Comprobar SHA aprobado y migraciones existentes hasta `011`; no hay migración nueva.
 2. Usar cliente, póliza, versión y documento ya autorizados/ready; no registrar,
