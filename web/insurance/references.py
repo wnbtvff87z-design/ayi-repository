@@ -57,6 +57,19 @@ def confirmation(text):
     return None
 
 
+def consent_only(text):
+    """A consent prefix never consumes a new topic or a request to explain evidence."""
+    if confirmation(text) == 'yes':
+        return True
+    f = ' '.join(re.findall(r'\w+', fold(text)))
+    return bool(re.fullmatch(
+        r'(?:no(?:\s+gracias)?|dejalo|olvidalo|cancela|mejor\s+no|'
+        r'no\s+(?:quiero|deseo|autorices|registres|abras|crees)\s+'
+        r'(?:(?:un|una|el|la|ningun|ninguna)\s+)?(?:caso|consulta|revision)|'
+        r'si|vale|ok|claro|por\s+favor|adelante|de\s+acuerdo|correcto|afirmativo|'
+        r'registra(?:la|lo)?|hazlo|perfecto)', f))
+
+
 def classify(text, *, has_last_answer, has_recent):
     """-> {'kind': independent|continuation|ambiguous|explain_prior|recall, ...}"""
     f = _strip(text)

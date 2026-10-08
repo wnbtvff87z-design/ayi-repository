@@ -4,11 +4,12 @@ import json
 import logging
 import os
 import re
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 from insurance import cases as _cases, identity, memory, references, retrieval
-from insurance import incident_context, incident_dates, voice_identity, voice_trace
+from insurance import incident_context, incident_dates, policy_info, voice_identity, voice_trace
 
 from insurance.cases import CasePersistenceError, create_or_update_case
 
@@ -21,6 +22,8 @@ class ResultKind(str, Enum):
     DOCUMENT_NOT_READY = 'document_not_ready'
     HUMAN_CASE_REQUIRED = 'human_case_required'
     URGENT = 'urgent'
+    TECHNICAL_ERROR = 'technical_error'
+    POLICY_INFORMATION = 'policy_information'
 
 
 log = logging.getLogger(__name__)
@@ -51,12 +54,13 @@ AVAILABILITY_RE = re.compile(
 SUMMARY_RE = re.compile(
     r'\b(?:resumen|cobertura\s+general)\b|'
     r'\b(?:qu[eé]\s+me\s+cubre|qu[eé]\s+cubre)\b.{0,40}'
-    r'\b(?:en\s+general|a\s+grandes\s+rasgos)\b|'
-    r'\b(?:en\s+general|a\s+grandes\s+rasgos)\b.{0,40}'
+    r'\b(?:en\s+general|de\s+forma\s+general|a\s+grandes\s+rasgos)\b|'
+    r'\b(?:en\s+general|de\s+forma\s+general|a\s+grandes\s+rasgos)\b.{0,40}'
     r'\b(?:cubre|cobertura|p[oó]liza)\b', re.I)
-SOCIAL_RE = re.compile(
-    r'\W*(?:hola|buenas|buenos días|buenas tardes|gracias|muchas gracias|gracias por (?:todo|tu ayuda))\W*',
-    re.I)
+SOCIAL_PHRASES = frozenset((
+    'hola', 'hola buenas', 'buenas', 'buenos dias', 'buenas tardes', 'gracias',
+    'muchas gracias', 'gracias por todo', 'gracias por tu ayuda'))
+HYPOTHETICAL_RE = incident_context.HYPOTHETICAL_RE
 OCCURRED_RE = re.compile(r'siniestro|\btuve\b|\btuvimos\b|ocurri|sufr[ií]|me han|se me ', re.I)
 DATE_RE = re.compile(r'\b(\d{4})-(\d{2})-(\d{2})\b|\b(\d{1,2})/(\d{1,2})/(\d{4})\b')
 CASE_ONLY_REASONS = {
@@ -73,7 +77,15 @@ CAUSES = {
     'no_matching_pages': 'no_evidence', 'llm_escalated': 'no_evidence', 'llm_error': 'human_interpretation',
 }
 DIAG_FIELDS = ('business_id', 'stage', 'reason_code', 'match_count', 'identity_verified', 'policy_found',
-               'document_ready', 'retrieval_status', 'evidence_count', 'decision')
+               'document_ready', 'retrieval_status', 'evidence_count', 'decision',
+               'page_count', 'fragment_count', 'context_chars', 'llm_invoked',
+               'policy_candidates', 'page_candidates', 'fts_candidate_pages',
+               'normalized_candidate_pages', 'retained_page_candidates', 'selected_pages',
+               'text_chars', 'fragment_index', 'page_number', 'position_start', 'position_end')
+LLM_FAILURE_CODES = frozenset((
+    'llm_not_configured', 'llm_timeout', 'llm_rate_limited', 'llm_auth_failed',
+    'llm_invalid_response', 'llm_refusal', 'llm_error', 'context_budget_exceeded'))
+FINAL_DECISIONS = frozenset(kind.value for kind in ResultKind) | {'case_persistence_failed'}
 UNVERIFIED_ACTION = ('Identidad NO verificada: los datos declarados no coincidieron con un único cliente. '
                      'No atribuir el caso a ningún cliente; revisar por un canal aprobado.')
 VERIFIED_ACTION = ('Identidad verificada (nombre, apellidos y DNI/NIE coinciden). Revisar la evidencia '
@@ -94,13 +106,25 @@ OFFER_HUMAN = ('No encontré evidencia suficiente en tu póliza. '
                '¿Quieres que registre la consulta para revisión humana?')
 ASK_REFERENCE = '¿A qué consulta te refieres? Indica el tema o la pregunta concreta.'
 SAVED = ('He guardado tu consulta para revisión humana. No puedo confirmar un plazo ni una resolución.')
-NOT_SAVED = ('No pude guardar tu consulta. No se ha creado un caso y no puedo confirmarte una respuesta.')
+NOT_SAVED = ('No pude guardar tu consulta de forma confirmada. No puedo confirmar si se creó un caso. '
+             'Puedes reintentar la misma solicitud.')
+OPERATION_UNKNOWN = ('No pude confirmar el resultado de esta operación por un problema técnico. '
+                     'Puedes volver a intentarlo; no puedo confirmar el guardado.')
+OPERATION_NOT_STARTED = ('No pude iniciar esta operación. No se ha creado un caso en este intento; '
+                         'no puedo confirmar el resultado de intentos anteriores.')
 
 
 def _correlation_id(business, channel, external_id):
     """Stable per message (retries reuse it); a hash, so it carries no identifiers."""
     raw = f"{business.get('business_id')}|{channel}|{external_id}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _is_social(text):
+    if not text or len(text) > 256:
+        return False
+    normalized = ' '.join(re.sub(r'[^\w\s]', ' ', references.fold(text or '')).split())
+    return normalized in SOCIAL_PHRASES
 
 
 def _diag(corr, stage, business_id=None, **fields):
@@ -110,6 +134,14 @@ def _diag(corr, stage, business_id=None, **fields):
     safe = ' '.join(f'{k}={str(v).lower() if isinstance(v, bool) else v}'
                     for k, v in ((k, fields.get(k)) for k in DIAG_FIELDS) if v is not None)
     log.info('insurance_diag correlation_id=%s %s', corr, safe)
+
+
+def _turn_diag(corr, bid, decision, verified, persistence):
+    safe_decision = decision if decision in FINAL_DECISIONS else 'unknown'
+    _diag(corr, 'persistence', bid, reason_code=persistence,
+          identity_verified=bool(verified), decision=safe_decision)
+    _diag(corr, 'decision', bid, reason_code=persistence,
+          identity_verified=bool(verified), decision=safe_decision)
 
 
 def _fact_date(text):
@@ -126,18 +158,12 @@ def _fact_date(text):
 
 def llm_explain(question, evidence):
     """Plain-language explanation grounded only in the evidence; raises if unavailable."""
-    from openai import OpenAI
-    model = os.getenv('INSURANCE_LLM_MODEL', '').strip()
-    if not model or not os.getenv('OPENAI_API_KEY'):
-        raise RuntimeError('llm_not_configured')
-    context = question if isinstance(question, dict) else memory.build_context(
-        question=question, evidence=evidence)
-    r = OpenAI(timeout=15).chat.completions.create(
-        model=model, temperature=0,
-        messages=[
-            {'role': 'system', 'content': memory.INSTRUCTIONS},
-            {'role': 'user', 'content': memory.format_prompt(context)}])
-    return (r.choices[0].message.content or '').strip()
+    from insurance import llm
+    return llm.explain(question, evidence)
+
+
+def _business_date(business):
+    return datetime.now(ZoneInfo(business.get('timezone') or 'Europe/Madrid')).date()
 
 
 def _case(business, customer, text, channel, external_id, **kw):
@@ -181,8 +207,10 @@ def _answer(business, state, text, channel, external_id, customer):
     bid = business.get('business_id')  # resolved from the dialled number; never from the caller's words
     sess = identity.session_key(channel, external_id)
     ctx = {'correlation_id': corr}
+    operation_started = False
     try:
         with _cases.db() as conn:
+            operation_started = True
             ref = identity.conversation_ref(bid, channel, customer)
             if not ref:
                 raise CasePersistenceError('conversation key unavailable')
@@ -195,12 +223,48 @@ def _answer(business, state, text, channel, external_id, customer):
             cached = memory.find_reply(conn, sc, external_id)
             if cached:
                 if cached.get('customer_id') != customer_id or (
-                        cached['decision'] == ResultKind.EVIDENCE_BACKED_EXPLANATION.value
-                        and not _authorized_retry(conn, sc, cached)):
+                        cached['decision'] in (ResultKind.EVIDENCE_BACKED_EXPLANATION.value,
+                                               ResultKind.POLICY_INFORMATION.value)
+                        and not _authorized_retry(conn, sc, cached, _business_date(business))):
+                    _turn_diag(corr, bid, ResultKind.MISSING_INFORMATION.value if customer_id else
+                              ResultKind.IDENTITY_NOT_VERIFIED.value, customer_id, 'read_only')
                     return (ASK_QUERY_AGAIN if customer_id else ASK_IDENTITY,
                             {'insurance_result': (ResultKind.MISSING_INFORMATION.value if customer_id
                                                   else ResultKind.IDENTITY_NOT_VERIFIED.value)})
                 decision = cached['decision']
+                if (decision == 'case_persistence_failed' and st.get('pending_human')
+                        and references.confirmation(text) == 'yes'):
+                    reply, out = _consent(business, customer, channel, external_id, st, text)
+                    conn.execute(
+                        'UPDATE insurance_conversation_turns SET content=%s,decision=%s '
+                        'WHERE turn_id=%s AND business_id=%s',
+                        (reply, out['insurance_result'], cached['turn_id'], bid))
+                    conn.execute(
+                        "UPDATE insurance_conversation_turns SET decision=%s "
+                        "WHERE business_id=%s AND channel=%s AND external_id=%s AND role='user'",
+                        (out['insurance_result'], bid, channel, external_id))
+                    if out['insurance_result'] == ResultKind.HUMAN_CASE_REQUIRED.value:
+                        summary, summary_turn = memory.load_summary(conn, sc)
+                        if summary and summary_turn == cached['turn_id']:
+                            summary['pending'] = []
+                            summary['open_issues'] = [
+                                item for item in summary.get('open_issues', [])
+                                if item.get('turn') != st.get('question_turn_id')]
+                            for topic in summary.get('topics', []):
+                                if topic.get('id') == st.get('question_turn_id'):
+                                    topic['decision'] = out['insurance_result']
+                            conn.execute(
+                                'UPDATE insurance_conversation_summary SET summary=%s::jsonb,updated_at=now() '
+                                'WHERE business_id=%s AND channel=%s AND conversation_ref=%s '
+                                'AND session_ref=%s AND customer_id=%s AND last_turn_id=%s',
+                                (json.dumps(summary), sc.bid, sc.channel, sc.ref, sc.sess,
+                                 sc.customer_id, cached['turn_id']))
+                        for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent',
+                                    'recalled_id', 'explain_prior'):
+                            st.pop(key, None)
+                    identity.save_state(conn, bid, channel, ref, sess, st, user_activity=True)
+                    _turn_diag(corr, bid, out['insurance_result'], customer_id, 'write_pending_commit')
+                    return reply, out
                 out = {'insurance_result': decision}
                 if decision in (ResultKind.HUMAN_CASE_REQUIRED.value, ResultKind.URGENT.value):
                     case = conn.execute(
@@ -208,6 +272,7 @@ def _answer(business, state, text, channel, external_id, customer):
                         'AND external_id=%s', (bid, channel, external_id)).fetchone()
                     if case:
                         out['case_id'] = str(case['case_id'])
+                _turn_diag(corr, bid, decision, customer_id, 'read_only')
                 return cached['content'], out
             awaiting_at_start = st.get('awaiting')
             just_verified = False
@@ -216,7 +281,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 identity.NAME_TRIGGER_RE.search(text) or re.search(r'\b(?:dni|nie)\b', text, re.I))))
             if identity_declaration and not customer_id:
                 st.setdefault('awaiting', 'identity')
-            decl = (voice_identity.prepare(text, st, bid, channel, ref, sess) if identity_declaration
+            decl = (identity.parse_declaration('') if _is_social(text) else
+                    voice_identity.prepare(text, st, bid, channel, ref, sess) if identity_declaration
                     else identity.parse_declaration(text, st.get('awaiting')))
             _merge_declaration(st, decl, bid)
             incoming = decl['question'] if (decl['document'] or decl['name'] or decl['contract_number']) else text
@@ -236,20 +302,24 @@ def _answer(business, state, text, channel, external_id, customer):
                 if declared_date:
                     user_fact = f'Fecha del hecho declarada por el usuario (no contractual): {declared_date}'
             is_query = (_is_question(incoming) and not decl.get('policy_only')
-                        and not reviewing and not explaining_missing)
+                        and turn_intent not in ('review', 'explain_missing'))
             if decl.get('identity_kind') and not decl.get('question'):
                 is_query = False
-            if awaiting_at_start == 'date' and incident_dates.parse(
-                    incoming, tz=business.get('timezone') or 'Europe/Madrid'):
+            date_answer = (awaiting_at_start == 'date' and incident_dates.parse(
+                incoming, tz=business.get('timezone') or 'Europe/Madrid'))
+            if date_answer:
                 is_query = False
-            consent = references.confirmation(incoming)
-            if (st.get('pending_human') and '?' not in incoming
-                    and (consent is not None or references.YES_RE.match(incoming) or references.NO_RE.match(incoming))):
+            if st.get('pending_human') and references.consent_only(incoming):
                 is_query = False
-            if (is_query or awaiting_at_start == 'date') and not reviewing and not explaining_missing:
+            if ((is_query or awaiting_at_start == 'date') and not reviewing and not explaining_missing
+                    and turn_intent not in ('policy_name', 'policy_validity')):
                 incident_context.update(st, incoming, business)
+                if st.get('_incident_reset'):
+                    st.pop('incident_ended', None)
+                if ENDED_RE.search(incoming):
+                    st['incident_ended'] = True
             user_kind = 'question' if is_query else (
-                'clarification' if reviewing or explaining_missing
+                'clarification' if turn_intent in ('review', 'explain_missing')
                 or st.get('awaiting') in ('date', 'policy', 'reference')
                 or decl['contract_number'] else 'other')
             user_id, created = memory.record_user(
@@ -257,6 +327,8 @@ def _answer(business, state, text, channel, external_id, customer):
             if not created:
                 # The id belongs to a different/expired verification scope, not to this caller's
                 # current authorization. Do not replay or overwrite another customer's exchange.
+                _turn_diag(corr, bid, ResultKind.MISSING_INFORMATION.value if customer_id else
+                           ResultKind.IDENTITY_NOT_VERIFIED.value, customer_id, 'read_only')
                 return (ASK_QUERY_AGAIN if customer_id else ASK_IDENTITY,
                         {'insurance_result': (ResultKind.MISSING_INFORMATION.value if customer_id
                                               else ResultKind.IDENTITY_NOT_VERIFIED.value)})
@@ -295,7 +367,7 @@ def _answer(business, state, text, channel, external_id, customer):
                     kind=kind or ('answer' if decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value
                                  else 'clarification'),
                     policy_id=policy, version_id=version, pages=list(pages))
-                if sc.customer_id and not (SOCIAL_RE.fullmatch(incoming) and not st.get('question')):
+                if sc.customer_id and not _is_social(incoming):
                     pending_text = st.get('question') if st.get('awaiting') else None
                     if st.get('change_pending') and st.get('requested_policy'):
                         pending_text = f"Póliza solicitada sin confirmar: {st['requested_policy']}"
@@ -326,6 +398,7 @@ def _answer(business, state, text, channel, external_id, customer):
                                        transport=business.get('_insurance_voice_transport'),
                                        correlation_id=corr)
                 identity.save_state(conn, bid, channel, ref, sess, st, user_activity=True)
+                _turn_diag(corr, bid, decision, sc.customer_id, 'write_pending_commit')
                 return reply, out
 
             if decl['contract_number']:
@@ -342,15 +415,15 @@ def _answer(business, state, text, channel, external_id, customer):
                 st['question_turn_id'] = user_id
                 st['question_intent'] = turn_intent
             if _real_urgent(incoming):
+                st.pop('incident_ended', None)
                 reply, out = _urgent(business, customer, memory.redact(text), channel, external_id,
                                     corr, customer_id, _claim_record(bid, st) if not customer_id else None, ctx)
                 st['pending_human'] = out.pop('pending_human')
                 st['awaiting'] = 'human_consent'
                 st.pop('reference_options', None)
                 return finish(reply, out)
-            if (SOCIAL_RE.fullmatch(incoming) and not st.get('question')
-                    and not st.get('pending_human')):
-                if not customer_id:
+            if _is_social(incoming):
+                if not customer_id and not st.get('awaiting'):
                     st['awaiting'] = 'identity'
                 reply = ('De nada. ¿Qué quieres consultar sobre tu póliza?' if 'gracias' in incoming.casefold()
                          else 'Hola. ¿Qué quieres consultar sobre tu póliza?')
@@ -415,10 +488,12 @@ def _answer(business, state, text, channel, external_id, customer):
                     for key in ('question', 'normalized_question', 'question_turn_id', 'pending_human',
                                 'awaiting', 'recalled_id', 'explain_prior', 'fact_date'):
                         st.pop(key, None)
+            if turn_intent in ('review', 'explain_missing') and not (reviewing or explaining_missing):
+                return finish(ASK_REFERENCE, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if explaining_missing:
                 return finish(_explain_insufficient(st['last_retrieval']),
                               {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-            if st.get('pending_human') and not is_query and not reviewing:
+            if st.get('pending_human') and not is_query and not reviewing and not date_answer:
                 memory.set_user_kind(conn, user_id, 'confirmation', incoming)
                 reply, out = _consent(business, customer, channel, external_id, st, incoming)
                 return finish(reply, out)
@@ -482,6 +557,11 @@ def _answer(business, state, text, channel, external_id, customer):
                     remainder = resolving if kind in ('continuation', 'explain_prior') else classification.get('remainder', '')
                     question_turn_id = st.get('question_turn_id') or user_id
                     _use_reference(st, chosen, remainder)
+                    if kind == 'continuation' and HYPOTHETICAL_RE.search(resolving):
+                        st['question'] = incoming
+                        st['normalized_question'] = memory.redact(resolving)
+                        for key in ('fact_date', 'incident_date', 'last_incident_type'):
+                            st.pop(key, None)
                     st['explain_prior'] = kind == 'explain_prior' or classification.get('about_answer', False)
                     st['question_turn_id'] = question_turn_id
                 elif kind != 'independent':
@@ -502,7 +582,7 @@ def _answer(business, state, text, channel, external_id, customer):
                     st.pop('awaiting', None)
             if decl['contract_number'] and not st.get('question'):
                 # A policy-only message changes the requested selection, never replays an old question.
-                check = retrieval.retrieve(conn, bid, customer_id, '', date.today(),
+                check = retrieval.retrieve(conn, bid, customer_id, '', _business_date(business),
                                           policy_hint=st['requested_policy'])
                 if check.get('policy_id') and check.get('version_id'):
                     st['policy_id'], st['version_id'] = check['policy_id'], check['version_id']
@@ -524,15 +604,26 @@ def _answer(business, state, text, channel, external_id, customer):
             return finish(reply, out, pages=pages, question=question)
     except Exception as exc:
         log.error('insurance_lookup_failed correlation_id=%s error_type=%s', corr, type(exc).__name__)
-        _diag(corr, 'lookup', bid, reason_code='lookup_failed', identity_verified=False,
-              decision='case_persistence_failed')
-        return NOT_SAVED, {'insurance_result': 'case_persistence_failed'}
+        decision = ResultKind.TECHNICAL_ERROR.value if operation_started else 'case_persistence_failed'
+        _diag(corr, 'lookup', bid, reason_code='persistence_failed', identity_verified=False,
+              decision=decision)
+        _turn_diag(corr, bid, decision, False, 'write_failed')
+        reply = OPERATION_UNKNOWN if operation_started else OPERATION_NOT_STARTED
+        if _real_urgent(text):
+            protocol = os.getenv('INSURANCE_URGENT_PROTOCOL_TEXT', '').strip() or URGENT_SAFETY_FALLBACK
+            reply = f'{protocol} {reply}'
+        out = {'insurance_result': decision}
+        if operation_started:
+            out['diagnostic_code'] = 'persistence_failed'
+        return reply, out
 
 
 def _is_question(text):
     if not text:
         return False
-    if _intent(text) in ('availability', 'summary'):
+    if _is_social(text):
+        return False
+    if _intent(text) in ('availability', 'summary', 'policy_name', 'policy_validity'):
         return True
     if DATE_RE.fullmatch(text.strip(' .')):
         return False
@@ -547,7 +638,7 @@ def _is_question(text):
     if re.fullmatch(r'\W*(?:tengo\s+(?:una\s+)?(?:pregunta|consulta)|'
                     r'gracias\s+por\s+(?:todo|(?:tu|su|la)\s+ayuda))\W*', text, re.I):
         return False
-    return '?' in text or '¿' in text or len(memory.toks(text)) >= 2
+    return '?' in text or '¿' in text or bool(memory.toks(text))
 
 
 def _intent(text):
@@ -559,17 +650,37 @@ def _intent(text):
         return 'availability'
     if SUMMARY_RE.search(text or ''):
         return 'summary'
+    metadata = policy_info.intent(text)
+    if metadata:
+        return metadata
     return 'question'
 
 
 def _explain_insufficient(last):
     question = memory.redact(last.get('question') or 'tu consulta', bounded=False).strip()
     status = last.get('retrieval_status')
-    if status == 'no_match':
+    technical = (last.get('llm_diagnostic') in LLM_FAILURE_CODES
+                 or last.get('llm_result') in LLM_FAILURE_CODES
+                 or last.get('llm_result') == 'error' or status == 'llm_error')
+    if technical:
+        cause = 'La explicación no se completó por un problema técnico, no por ausencia de evidencia.'
+    elif last.get('llm_result') == 'answered' or (
+            status == 'ok' and last.get('llm_result') != 'escalated'):
+        return (f'La consulta «{question}» sí recibió una explicación basada en las páginas recuperadas. '
+                'No registré falta de evidencia en esa consulta. Esto no confirma ni descarta cobertura. '
+                'Si te refieres a otra consulta, indica cuál.')
+    elif status == 'available':
+        return (f'En la consulta «{question}» confirmé la disponibilidad del documento autorizado; '
+                'no señalé una falta de evidencia de cobertura. Si te refieres a otra consulta, indica cuál.')
+    elif (status in ('metadata', 'metadata_information', 'policy_information')
+          and last.get('policy_id') and last.get('reason_code') not in (
+              'multiple_versions', 'multiple_policies', 'no_authorized_policy')):
+        return (f'La consulta «{question}» fue sobre datos registrados de la póliza, '
+                'no una búsqueda de cláusulas de cobertura. No señalé una falta de evidencia. '
+                'Si te refieres a otra consulta, indica cuál.')
+    elif status == 'no_match':
         cause = 'No encontré páginas con información suficiente para responderla.'
-    elif status == 'llm_error':
-        cause = 'No pude completar la revisión del texto recuperado.'
-    elif status == 'llm_escalated':
+    elif status == 'llm_escalated' or last.get('llm_result') == 'escalated':
         cause = 'Las páginas recuperadas no permitieron confirmar una respuesta.'
     elif status in ('document_not_ready', 'ready_without_pages'):
         cause = 'El documento no está disponible con texto utilizable para esta consulta.'
@@ -581,15 +692,37 @@ def _explain_insufficient(last):
 
 def _real_urgent(text):
     text = text or ''
-    if ENDED_RE.search(text):
+    if HYPOTHETICAL_RE.search(text):
         return False
-    if re.search(r'en caso de|si hubiera|si ocurriera|\bsi (?:tengo|tenemos|hay|ocurre|estoy)\b', text, re.I):
+    if ENDED_RE.search(text):
+        clauses = re.split(r'\b(?:pero|sin embargo|aunque|y)\b', text, flags=re.I)
+        ended = [(index, clause) for index, clause in enumerate(clauses) if ENDED_RE.search(clause)]
+        for index, clause in enumerate(clauses):
+            if ENDED_RE.search(clause) or not HAZARD_RE.search(clause):
+                continue
+            if not (LIVE_RE.search(clause) or re.search(r'en curso|ahora mismo', clause, re.I)):
+                continue
+            if any(previous < index for previous, _ in ended):
+                return True
+            current = _hazard_types(clause)
+            if any(_hazard_types(previous) and current.isdisjoint(_hazard_types(previous))
+                   for following, previous in ended if following > index):
+                return True
         return False
     assertion = bool(LIVE_RE.search(text))
     if re.search(r'cub(?:re|ierto)|cobertura', text, re.I) and not assertion:
         return False
     live = bool(HAZARD_RE.search(text) and (assertion or re.search(r'en curso|ahora mismo', text, re.I)))
     return live or bool(URGENT_RE.search(text))
+
+
+def _hazard_types(text):
+    types = set()
+    for match in HAZARD_RE.finditer(text):
+        hazard = match.group().casefold()
+        types.add('fire' if hazard in ('incendio', 'fuego') else
+                  'flood' if hazard.startswith('inund') else hazard)
+    return types
 
 
 def _user_fact(text):
@@ -701,22 +834,78 @@ def _consent(business, customer, channel, external_id, st, text):
     return OFFER_HUMAN, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
 
 
+def _policy_metadata(conn, business, sc, st, question, intent, corr):
+    policy = policy_info.lookup(
+        conn, sc.bid, sc.customer_id, _business_date(business),
+        st.get('requested_policy') or st.get('reference_policy') or st.get('policy_id')
+        or st.get('contract_number'),
+        selected_version=st.get('reference_version_id') or st.get('version_id'))
+    code = policy['reason_code']
+    st['last_retrieval'] = {
+        'question': memory.redact(question, bounded=False),
+        'question_turn_id': st.get('question_turn_id'), 'intent': intent,
+        'retrieval_status': 'metadata', 'reason_code': code,
+        'policy_id': policy.get('policy_id'), 'version_id': policy.get('version_id'),
+        'pages': [], 'llm_invoked': False,
+    }
+    _diag(corr, 'policy_metadata', sc.bid, reason_code=code, identity_verified=True,
+          policy_found=bool(policy.get('policy_id')), llm_invoked=False)
+    st.pop('pending_human', None)
+    st.pop('awaiting', None)
+    if code == 'multiple_policies':
+        st['awaiting'] = 'policy'
+        return ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
+    if code == 'no_authorized_policy':
+        return ('No he podido confirmar una póliza autorizada para esta consulta.',
+                {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
+    if code == 'multiple_versions':
+        return ('Hay varias versiones registradas; aclara qué versión o período quieres consultar. '
+                'No puedo confirmar una única vigencia.',
+                {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
+    st['policy_id'], st['version_id'] = policy['policy_id'], policy.get('version_id')
+    for key in ('requested_policy', 'contract_number', 'change_pending', 'reference_policy',
+                'reference_version_id'):
+        st.pop(key, None)
+    return (policy_info.describe(policy, intent),
+            {'insurance_result': ResultKind.POLICY_INFORMATION.value}, [])
+
+
+def _technical_failure(st, code, corr, bid, ev, invoked):
+    invoked = invoked and code != 'llm_not_configured'
+    st['last_retrieval'].update(llm_result=code, llm_diagnostic=code, llm_invoked=invoked)
+    st.pop('pending_human', None)
+    st.pop('awaiting', None)
+    _diag(corr, 'llm', bid, reason_code=code, identity_verified=True,
+          llm_invoked=invoked, evidence_count=len(ev), decision='technical_error')
+    reply = ('No pude preparar la respuesta por un límite técnico de contexto. Inténtalo con una consulta más concreta.'
+             if code == 'context_budget_exceeded' else
+             'No pude completar la explicación por un problema técnico. Puedes volver a intentarlo; '
+             'esto no indica falta de evidencia ni confirma o descarta cobertura.')
+    return (reply, {'insurance_result': ResultKind.TECHNICAL_ERROR.value, 'diagnostic_code': code},
+            memory.pages_of(ev))
+
+
 def _documental(conn, business, sc, st, text, question, corr, ctx, customer, external_id,
                 intent='question', reviewing=False):
     bid, channel, customer_id = sc.bid, sc.channel, sc.customer_id
+    if intent in ('policy_name', 'policy_validity'):
+        return _policy_metadata(conn, business, sc, st, question, intent, corr)
+    hypothetical = bool(HYPOTHETICAL_RE.search(question))
     span = incident_dates.parse(text, tz=business.get('timezone') or 'Europe/Madrid')
     if span and span.status == 'ambiguous':
         st['awaiting'] = 'date'
         return ('¿Cuándo ocurrió exactamente? La fecha indicada admite varias interpretaciones.',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
-    if not span:
+    if not span and not hypothetical:
         span = incident_context.span_from_state(st)
-    fact = span.start if span else _fact_date(question)
-    if fact is None and st.get('recalled_id') and st.get('fact_date'):
+    fact = span.start if span else (_fact_date(question) if not hypothetical else None)
+    if fact is None and not hypothetical and st.get('recalled_id') and st.get('fact_date'):
         fact = _fact_date(st['fact_date'])
-    serious = st.get('active_topic') in ('incendio', 'inundación') and (
+    serious = (not hypothetical and incident_context.relevant(st, question)
+               and st.get('active_topic') in ('incendio', 'inundación')) and (
         incident_context.OCCURRED.search(question or '') or st.get('last_incident_type'))
-    provisional = fact is None and bool(incident_context.OCCURRED.search(question or ''))
+    provisional = (not hypothetical and fact is None
+                   and bool(incident_context.OCCURRED.search(question or '')))
     if provisional and not serious:
         st['awaiting'] = 'date'
         _diag(corr, 'dialogue', bid, identity_verified=True, decision='ask_event_date')
@@ -739,7 +928,7 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
         conn.execute('UPDATE insurance_conversation_turns SET normalized=%s WHERE turn_id=%s',
                     (memory.redact(question), st['question_turn_id']))
     mode = intent if intent in ('availability', 'summary') else 'question'
-    result = retrieval.retrieve(conn, bid, customer_id, question, fact or date.today(),
+    result = retrieval.retrieve(conn, bid, customer_id, question, fact or _business_date(business),
                                 policy_hint=st.get('requested_policy') or st.get('reference_policy')
                                 or st.get('policy_id') or st.get('contract_number'),
                                 fact_end=span.end if span else None, mode=mode)
@@ -754,7 +943,10 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
     }
     _diag(corr, 'retrieval', bid, reason_code=result.get('reason_code'), identity_verified=True,
           policy_found=result.get('policy_id') is not None, document_ready=d.get('document_status') == 'ready',
-          retrieval_status=result['status'], evidence_count=d.get('evidence_count'))
+          retrieval_status=result['status'], evidence_count=d.get('evidence_count'),
+          **{key: d.get(key) for key in (
+              'policy_candidates', 'page_candidates', 'fts_candidate_pages',
+              'normalized_candidate_pages', 'retained_page_candidates', 'selected_pages', 'text_chars')})
     fine = result.get('reason_code')
     if mode == 'availability':
         if result['status'] == 'available':
@@ -807,24 +999,48 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
             if not ev:
                 fine = 'no_matching_pages'
         summary, _ = memory.load_summary(conn, sc)
+        customer_profile = conn.execute(
+            'SELECT display_name FROM insurance_customers '
+            'WHERE business_id=%s AND customer_id=%s AND active', (bid, customer_id)).fetchone()
+        registered_name = (customer_profile or {}).get('display_name') or ''
+        private_names = [registered_name]
+        if registered_name.split():
+            private_names.append(registered_name.split()[0])
+        for index, fragment in enumerate(ev):
+            _diag(corr, 'retrieval_fragment', bid, fragment_index=index,
+                  page_number=fragment['page'], position_start=fragment.get('position_start'),
+                  position_end=fragment.get('position_end'))
+        invoked = False
         try:
             package = memory.build_context(
                 question=question, evidence=ev, policy=result['policy_id'], version=result['version_id'],
+                intent=mode,
+                private_names=private_names,
                 pending=st.get('question') if st.get('awaiting') else None,
                 recent_turns=memory.recent(conn, sc),
                 summary_text=memory.render_summary(summary, memory.cfg('INSURANCE_SUMMARY_MAX_CHARS')),
                 recalled=[recalled] if recalled else [])
+            _diag(corr, 'context', bid, context_chars=package['report']['used'],
+                  evidence_count=len(ev), page_count=len({(e['document_id'], e['page']) for e in ev}),
+                  fragment_count=len(ev), llm_invoked=False)
+            invoked = bool(ev)
+            st['last_retrieval']['llm_invoked'] = invoked
             text_out = llm_explain(package, package['evidence']) if ev else 'ESCALAR'
+            if not isinstance(text_out, str) or not text_out.strip():
+                return _technical_failure(st, 'llm_invalid_response', corr, bid, ev, invoked)
+            text_out = text_out.strip()
             st['last_retrieval']['llm_result'] = (
-                'answered' if text_out and 'ESCALAR' not in text_out.upper() else 'escalated')
+                'escalated' if text_out.upper() == 'ESCALAR' else 'answered')
         except memory.ContextBudgetExceeded:
-            text_out, fine = 'ESCALAR', 'context_budget_exceeded'
-            st['last_retrieval']['llm_result'] = 'context_budget_exceeded'
+            return _technical_failure(st, 'context_budget_exceeded', corr, bid, ev, invoked)
         except Exception as exc:
             log.error('insurance_llm_failed correlation_id=%s error_type=%s', corr, type(exc).__name__)
-            text_out, fine = 'ESCALAR', 'llm_error'
-            st['last_retrieval']['llm_result'] = 'error'
-        if text_out and 'ESCALAR' not in text_out.upper():
+            code = getattr(exc, 'code', 'llm_error')
+            return _technical_failure(st, code if code in LLM_FAILURE_CODES else 'llm_error',
+                                      corr, bid, ev, invoked)
+        if text_out.upper() != 'ESCALAR':
+            _diag(corr, 'llm', bid, reason_code='llm_answered', evidence_count=len(ev),
+                  llm_invoked=invoked, decision='answer')
             _diag(corr, 'decision', bid, identity_verified=True, policy_found=True, document_ready=True,
                   retrieval_status='ok', evidence_count=len(ev), decision='answer')
             cites = '; '.join(f"documento {e['document_id']}, versión {e['version_id']}, página {e['page']}" for e in ev)
@@ -838,7 +1054,7 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
                 reply += ' Estas son las cláusulas actuales; dime cuándo ocurrió para comprobar su aplicabilidad.'
             if serious:
                 protocol = os.getenv('INSURANCE_URGENT_PROTOCOL_TEXT', '').strip()
-                if protocol:
+                if protocol and not st.get('incident_ended') and not ENDED_RE.search(question):
                     reply = protocol + ' ' + reply
                 st['pending_human'] = {'question': _original_question(conn, sc, st, question), 'case': {
                     'reason': 'human_interpretation', 'customer_id': customer_id,
@@ -852,16 +1068,15 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
                           'puedo registrar un caso. ¿Quieres que lo registre?')
             return (reply,
                     {'insurance_result': ResultKind.EVIDENCE_BACKED_EXPLANATION.value}, memory.pages_of(ev))
-        if mode == 'summary':
-            st['last_retrieval']['retrieval_status'] = 'ok'
-            return ('No pude preparar un resumen fiable con las cláusulas disponibles. '
-                    'Si quieres, dime qué cobertura o aspecto concreto te interesa.',
-                    {'insurance_result': ResultKind.MISSING_INFORMATION.value}, memory.pages_of(ev))
-        fine = fine if fine in ('llm_error', 'context_budget_exceeded') else 'llm_escalated'
+        fine = 'llm_escalated'
+        st['last_retrieval'].update(retrieval_status=fine, reason_code=fine,
+                                    llm_diagnostic=fine)
+        _diag(corr, 'llm', bid, reason_code=fine, evidence_count=len(ev),
+              llm_invoked=invoked, decision='offer_human')
         reason, extra['evidence'] = 'human_interpretation', ev
     else:
         reason = CASE_ONLY_REASONS.get(result['status'], 'human_interpretation')
-    if mode == 'summary':
+    if mode == 'summary' and result['status'] != 'ok':
         return ('No hay suficiente texto utilizable para resumir la póliza. '
                 '¿Qué cobertura o aspecto concreto quieres consultar?',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
@@ -905,13 +1120,26 @@ def _reload_pages(conn, sc, result, pair):
                                     question=(pair.get('normalized') or pair.get('q')))
 
 
-def _authorized_retry(conn, sc, cached):
+def _authorized_retry(conn, sc, cached, today=None):
     question = conn.execute(
         'SELECT q.normalized,q.content FROM insurance_conversation_turns a '
         'JOIN insurance_conversation_turns q ON q.turn_id=a.reply_to '
         'WHERE a.turn_id=%s AND q.business_id=%s AND q.customer_id=%s',
         (cached['turn_id'], sc.bid, sc.customer_id)).fetchone()
-    fact = _fact_date((question.get('normalized') or question['content']) if question else '') or date.today()
+    fact = _fact_date((question.get('normalized') or question['content']) if question else '') or today or date.today()
+    if cached['decision'] == ResultKind.POLICY_INFORMATION.value:
+        policy = policy_info.lookup(conn, sc.bid, sc.customer_id, today or fact,
+                                   cached.get('policy_id'), selected_version=cached.get('version_id'))
+        metadata_intent = _intent(
+            (question.get('normalized') or question['content']) if question else '')
+        return bool(policy.get('policy_id') == cached.get('policy_id')
+                    and policy.get('version_id') == cached.get('version_id')
+                    and policy['reason_code'] in (
+                        'authorized_policy_metadata', 'version_not_applicable',
+                        'version_not_registered', 'version_expired', 'version_future')
+                    and metadata_intent in ('policy_name', 'policy_validity')
+                    and cached['content'].removeprefix(IDENTITY_CONFIRMED + ' ')
+                    == policy_info.describe(policy, metadata_intent))
     authorized = conn.execute(
         'SELECT 1 FROM insurance_policies p JOIN insurance_authorizations a '
         'ON a.business_id=p.business_id AND a.policy_id=p.policy_id AND a.customer_id=p.customer_id '

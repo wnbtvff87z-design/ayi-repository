@@ -387,7 +387,7 @@ def test_llm_escalation_keeps_evidence_and_verified_attribution(pg, monkeypatch)
     assert q['diagnostic_code'] == 'no_evidence' and q['evidence'][0]['page'] == 1
 
 
-def test_llm_technical_failure_requires_consent_and_preserves_evidence(pg, monkeypatch):
+def test_llm_technical_failure_does_not_offer_case_and_preserves_evidence(pg, monkeypatch):
     def unavailable(context, evidence):
         raise RuntimeError('synthetic llm failure')
 
@@ -395,14 +395,17 @@ def test_llm_technical_failure_requires_consent_and_preserves_evidence(pg, monke
     add_document(pg, 'POL-900', 'DOC-900')
     verify(pg, 'C2')
     reply, out = say(TEXT, ext='technical-question')
-    assert '¿Quieres que registre' in reply and 'He guardado' not in reply
-    assert out['insurance_result'] == 'missing_information'
+    assert '¿Quieres que registre' not in reply and 'He guardado' not in reply
+    assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'llm_error'}
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_outbox')[0]['n'] == 0
-    consent_to_review(pg, ext='technical-consent')
-    question = rows(pg, 'SELECT diagnostic_code,evidence,reason FROM insurance_case_questions')[0]
-    assert question['diagnostic_code'] == 'human_interpretation'
-    assert question['reason'] == 'human_interpretation' and question['evidence'][0]['page'] == 1
+    state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['last_retrieval']['llm_diagnostic'] == 'llm_error'
+    assert state['last_retrieval']['pages'][0]['page'] == 1
+    reply, _ = say('Sí', ext='technical-consent')
+    assert 'He guardado' not in reply
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_outbox')[0]['n'] == 0
 
 
 def test_declining_review_never_creates_a_case_and_keeps_verified_identity(pg, llm):
