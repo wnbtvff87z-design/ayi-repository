@@ -125,6 +125,7 @@ REPEAT_OFFER = ('Con lo que me has dicho no puedo darte más información de tu 
                 'qué ocurrió o qué bien quieres revisar, lo busco de otra forma.')
 REPEAT_ANSWER_PREFIX = 'Es la misma información que te di antes: '
 REPEAT_ANSWER_QUESTION = '¿Quieres que te aclare algún punto concreto, como límites o exclusiones?'
+REPEAT_POLICY_QUESTION = '¿Quieres consultar ahora alguna cobertura concreta?'
 REPEAT_GENERIC = ('Para no repetirme: dime qué quieres consultar de tu póliza, por ejemplo una '
                   'cobertura, su vigencia o su número.')
 ASK_REFERENCE = '¿A qué consulta te refieres? Indica el tema o la pregunta concreta.'
@@ -1370,6 +1371,8 @@ def _vary(st, reply, decision, incoming):
             reply = TECHNICAL_REPEAT
         elif decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value:
             reply = REPEAT_ANSWER_PREFIX + reply + ' ' + REPEAT_ANSWER_QUESTION
+        elif decision == ResultKind.POLICY_INFORMATION.value:
+            reply = REPEAT_ANSWER_PREFIX + reply + ' ' + REPEAT_POLICY_QUESTION
         elif reply.endswith(OFFER_QUESTION) or reply.endswith(NO_REPEAT_OFFER):
             reply = REPEAT_OFFER
         else:
