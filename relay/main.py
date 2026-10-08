@@ -85,7 +85,7 @@ async def voice(req:Request):
   ws=escape(env('RELAY_WS_URL'),{'"':'&quot;'})
   if not ws.startswith('wss://'):raise ValueError('Secure WebSocket required')
   voice_id=escape(str(b.get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B'),{'"':'&quot;'})
-  action=escape(env('RELAY_PUBLIC_URL').rstrip('/')+'/relay-ended',{'"':'&quot;'})
+  action=escape(env('RELAY_PUBLIC_URL').rstrip('/')+'/voice/relay/action',{'"':'&quot;'})
   xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect action="{action}" method="POST"><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="es-ES" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="es-ES" /></Connect><Hangup/></Response>'
   return Response(xml,media_type='application/xml')
  except Exception as exc:
@@ -93,6 +93,7 @@ async def voice(req:Request):
   else:log.exception('Voice setup failed')
   return Response('<Response><Say language="es-ES">No puedo atender ahora.</Say><Hangup/></Response>',media_type='application/xml')
 @app.api_route('/relay-ended',methods=['POST'])
+@app.api_route('/voice/relay/action',methods=['POST'])
 async def relay_ended(req:Request):
  form=await req.form()
  if not valid_http(req,form):return Response('Forbidden',status_code=403)
@@ -101,9 +102,10 @@ async def relay_ended(req:Request):
  except (ValueError,TypeError,AttributeError):pass
  if not isinstance(payload,dict):payload={}
  reason=payload.get('reason','')
- # The caller already said goodbye: hang up silently, never add a farewell phrase.
- # Only the unresolved-operation notice is spoken, because the caller must not retry it.
- message='La operación sigue pendiente de verificación. No la repitas; consulta con recepción.' if reason=='verification' else ''
+ # Insurance passes its complete rendered farewell to TwiML: Say finishes before Hangup.
+ # Legacy sectors retain their silent goodbye / unresolved-operation notice.
+ message=str(payload.get('message') or '') if reason=='goodbye' else ''
+ if reason=='verification':message='La operación sigue pendiente de verificación. No la repitas; consulta con recepción.'
  say=''
  if message:
   voice_id=str(payload.get('voice_id') or '').strip()
@@ -162,20 +164,24 @@ async def websocket(ws:WebSocket):
       data['voice_transport']={'last':True,'last_present':'last' in event,'partial_count':state['partial_count'],'fragment_count':state['partial_count']+1}
       state['partial_count']=0;state['last_partial']=''
      out=await core('/internal/turn',data)
-     reply=out.get('reply')
-     end_reason=out.get('end_reason') if out.get('end_call') is True else None
+     reply=(out.get('voice_reply') or out.get('reply')) if state['insurance'] else out.get('reply')
+     if state['insurance']:
+      end_reason='goodbye' if out.get('should_end_call') is True and out.get('end_reason')=='goodbye' else None
+     else:end_reason=out.get('end_reason') if out.get('end_call') is True else None
      state['processed_ids'].add(external_id)
      if not reply:continue
     except Exception as exc:
      if state['insurance']:insurance_error('turn',exc,state['call_sid'])
      else:log.exception('Voice turn failed')
      reply='No pude verificar el estado de tu solicitud. No la repitas; contacta con recepción.'
-    if end_reason not in ('goodbye','cancelled','verification'):
+    if not state['insurance'] and end_reason not in ('goodbye','cancelled','verification'):
      end_reason={'¡Gracias a ti! Hasta luego.':'goodbye','De acuerdo, no hice cambios. ¡Hasta luego!':'cancelled','La operación sigue pendiente de verificación. No la repitas; consulta con recepción. Hasta luego.':'verification'}.get(reply)
     # Do not synthesize the goodbye over WebSocket and then end immediately:
     # Twilio's signed <Connect action> callback speaks it once, then hangs up.
     if end_reason:
-     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps({'reason':end_reason,'voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')})}))
+     handoff={'reason':end_reason,'voice_id':str(state['business'].get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B')}
+     if state['insurance']:handoff['message']=reply
+     await ws.send_text(json.dumps({'type':'end','handoffData':json.dumps(handoff,ensure_ascii=False)},ensure_ascii=False))
      return
     await ws.send_text(json.dumps({'type':'text','token':reply,'last':True,'interruptible':True},ensure_ascii=False))
    elif kind=='error':

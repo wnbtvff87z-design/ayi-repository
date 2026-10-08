@@ -2,6 +2,7 @@
 import math
 import logging
 import os
+import json
 from urllib.parse import urlsplit
 
 import openai
@@ -29,6 +30,19 @@ def _setting(name, default, minimum, maximum, cast):
 
 def _client(*, api_key, timeout):
     return openai.OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
+
+
+def _validate_endpoint():
+    if 'OPENAI_BASE_URL' not in os.environ:
+        return
+    try:
+        endpoint = urlsplit(os.environ['OPENAI_BASE_URL'])
+        if (endpoint.scheme not in ('http', 'https') or not endpoint.hostname
+                or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment):
+            raise ValueError
+        endpoint.port
+    except ValueError:
+        raise LLMError('llm_not_configured') from None
 
 
 def _suppress_provider_logs():
@@ -70,15 +84,7 @@ def explain(question, evidence):
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
     if not model or not api_key:
         raise LLMError('llm_not_configured')
-    if 'OPENAI_BASE_URL' in os.environ:
-        try:
-            endpoint = urlsplit(os.environ['OPENAI_BASE_URL'])
-            if (endpoint.scheme not in ('http', 'https') or not endpoint.hostname
-                    or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment):
-                raise ValueError
-            endpoint.port
-        except ValueError:
-            raise LLMError('llm_not_configured') from None
+    _validate_endpoint()
     timeout = _setting('INSURANCE_LLM_TIMEOUT_SECONDS', 15, 1, 120, float)
     max_tokens = _setting('INSURANCE_LLM_MAX_TOKENS', 512, 64, 4096, int)
     context = _context(question, evidence)
@@ -113,3 +119,44 @@ def explain(question, evidence):
         raise LLMError('llm_invalid_response') from None
     except Exception:
         raise LLMError('llm_error') from None
+
+
+def interpret(messages):
+    """Return a JSON proposal, never a tool call or an authorization decision."""
+    _suppress_provider_logs()
+    model = os.getenv('INSURANCE_LLM_MODEL', '').strip()
+    api_key = os.getenv('OPENAI_API_KEY', '').strip()
+    if not model or not api_key:
+        raise LLMError('llm_not_configured')
+    _validate_endpoint()
+    timeout = _setting('INSURANCE_LLM_TIMEOUT_SECONDS', 15, 1, 120, float)
+    try:
+        with _client(api_key=api_key, timeout=timeout) as client:
+            response = client.chat.completions.create(
+                model=model, temperature=0, max_tokens=256,
+                response_format={'type': 'json_object'}, messages=messages)
+        if not response.choices or len(response.choices) != 1:
+            raise LLMError('llm_invalid_response')
+        choice = response.choices[0]
+        if choice.message.refusal or choice.finish_reason == 'content_filter':
+            raise LLMError('llm_refusal')
+        if choice.finish_reason != 'stop' or choice.message.role != 'assistant':
+            raise LLMError('llm_invalid_response')
+        raw = choice.message.content
+        if not isinstance(raw, str) or len(raw) > 4096:
+            raise LLMError('llm_invalid_response')
+        return json.loads(raw)
+    except LLMError:
+        raise
+    except openai.APITimeoutError:
+        raise LLMError('llm_timeout') from None
+    except openai.RateLimitError:
+        raise LLMError('llm_rate_limited') from None
+    except (openai.AuthenticationError, openai.PermissionDeniedError):
+        raise LLMError('llm_auth_failed') from None
+    except openai.APIStatusError:
+        raise LLMError('llm_error') from None
+    except openai.APIConnectionError:
+        raise LLMError('llm_error') from None
+    except Exception:
+        raise LLMError('llm_invalid_response') from None

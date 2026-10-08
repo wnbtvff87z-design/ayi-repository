@@ -2,13 +2,16 @@
 from datetime import date
 import gc
 import json
+import re
 import time
 import tracemalloc
 
 import httpx
 import pytest
 
-from test_insurance_attribution import BIZ, add_document, ask, pg, verify  # noqa: F401
+from test_insurance_attribution import (
+    BIZ, add_document, ask, pg, verify, assert_visible_sources,
+)  # noqa: F401
 from test_insurance_llm_adapter import completion, provider  # noqa: F401
 from insurance import memory, retrieval
 
@@ -130,22 +133,39 @@ def test_real_sdk_dialog_answer_explanation_and_authorized_duplicate_keep_suppor
     verify(pg, customer='C2')
 
     def grounded_http(request):
-        prompt = json.loads(request.content)['messages'][-1]['content'].split('CLÁUSULAS:\n', 1)[-1]
+        payload = json.loads(request.content)
+        if payload.get('response_format') == {'type': 'json_object'}:
+            package = json.loads(payload['messages'][-1]['content'])
+            assert package['identity'] == 'verified'
+            explaining = '¿Dónde lo dice?' in package['context']
+            return httpx.Response(200, json=completion(json.dumps({
+                'intents': ['explain_prior' if explaining else 'question'],
+                'reference': 'explain_prior' if explaining else 'independent', 'topic': '',
+            })))
+        prompt = payload['messages'][-1]['content'].split('CLÁUSULAS:\n', 1)[-1]
         assert 'Agua: cubre tuberías rotas.' in prompt
         assert 'No se cubre desgaste ni falta de mantenimiento.' in prompt
+        markers = {}
+        for document in ('COVERAGE', 'SUPPORT'):
+            match = re.search(r'\[e\.(\d+)\] \[p\.1\] \[documento ' + document + r'\b', prompt)
+            assert match
+            markers[document] = f'[e.{match.group(1)}]'
         return httpx.Response(200, json=completion(
-            'La cláusula cubre tuberías rotas, salvo desgaste o falta de mantenimiento.'))
+            f"La cláusula cubre tuberías rotas {markers['COVERAGE']}, "
+            f"salvo desgaste o falta de mantenimiento {markers['SUPPORT']}."))
 
     requests, _ = provider(grounded_http)
     answer, out = ask('¿Cubre agua?', ext='standalone-answer')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'desgaste' in answer and len(requests) == 1
+    assert 'desgaste' in answer and len(requests) == 2
+    assert_visible_sources(answer, number='900')
     explanation, out = ask('¿Dónde lo dice?', ext='standalone-explain')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'SUPPORT' in explanation and len(requests) == 2
+    assert 'Documento 1, página 1' in explanation and 'Documento 2, página 1' in explanation
+    assert 'SUPPORT' not in explanation and len(requests) == 4
     duplicate, out = ask('¿Dónde lo dice?', ext='standalone-explain')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert duplicate == explanation and len(requests) == 2
+    assert duplicate == explanation and len(requests) == 4
 
 
 def test_support_fallback_remains_customer_policy_version_ready_and_quality_scoped(pg):

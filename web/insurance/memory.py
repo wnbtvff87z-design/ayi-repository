@@ -128,7 +128,7 @@ def record_assistant(conn, sc, external_id, content, decision, reply_to, corr, k
 def find_reply(conn, sc, external_id):
     """Retry record with ownership/evidence metadata; caller must revalidate before disclosure."""
     row = conn.execute(
-        'SELECT turn_id,content,decision,customer_id,policy_id,version_id,pages '
+        'SELECT turn_id,content,kind,decision,customer_id,policy_id,version_id,pages '
         'FROM insurance_conversation_turns WHERE business_id=%s AND '
         "channel=%s AND conversation_ref=%s AND session_ref=%s AND external_id=%s AND role='assistant'",
         (sc.bid, sc.channel, sc.ref, sc.sess, external_id)).fetchone()
@@ -450,16 +450,18 @@ INSTRUCTIONS = (
     'ni denegues siniestros. No infieras que cristal o vidrio cubre cualquier objeto (por ejemplo, una mesa) '
     'si la cláusula no lo establece; pregunta qué objeto o daño quiere decir si eso cambia la respuesta. '
     'Resume solo apartados que aparezcan en la evidencia. Si las cláusulas no bastan, responde exactamente '
-    'ESCALAR. Menciona condiciones y exclusiones presentes. Máximo 120 palabras.')
+    'ESCALAR. Menciona condiciones y exclusiones presentes. Cita cada afirmación contractual '
+    'con [e.N] (índice del fragmento) o [p.N] solo si la página es inequívoca entre documentos. '
+    'No agregues una lista de fuentes, IDs ni encabezado de referencias: lo hace el sistema. Máximo 120 palabras.')
 
 
 def _fmt_evidence(evidence):
     lines = []
-    for item in evidence:
+    for index, item in enumerate(evidence, 1):
         position = ''
         if 'position_start' in item and 'position_end' in item:
             position = f"; caracteres {item['position_start']}-{item['position_end']}"
-        lines.append(f"[p.{item['page']}] [documento {item.get('document_id')} "
+        lines.append(f"[e.{index}] [p.{item['page']}] [documento {item.get('document_id')} "
                      f"versión {item.get('version_id')}{position}] {item['text']}")
     return '\n\n'.join(lines)
 

@@ -8,6 +8,7 @@ import pytest
 
 from test_insurance_attribution import (
     ANA, BIZ, BUSINESS, PHONE, TEXT, add_document, ask, pg, rows, verify,
+    evidence_markers, assert_visible_sources,
 )
 from insurance import dialog, identity, memory
 
@@ -18,7 +19,7 @@ def explained(monkeypatch):
 
     def explain(context, evidence):
         calls.append((context, evidence))
-        return 'La cláusula exige revisar las condiciones y exclusiones indicadas.'
+        return 'La cláusula exige revisar las condiciones y exclusiones indicadas. ' + evidence_markers(evidence)
 
     monkeypatch.setattr(dialog, 'llm_explain', explain)
     return calls
@@ -82,12 +83,13 @@ def test_themed_recall_crosses_all_retained_batches(pg, explained, monkeypatch):
         ask(f'¿Cubre cristales en ventana número {n}?', ext=f'intervening-{n}')
     reply, out = ask('Volviendo a daños por agua', ext='theme-recall')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'agua' in explained[-1][0]['question'] and 'DOC-POL-900' in reply
+    assert 'agua' in explained[-1][0]['question']
+    assert_visible_sources(reply)
     assert explained[-1][0]['recalled'][0]['q'] == '¿Cubre daños por agua en el techo?'
-    assert explained[-1][0]['recalled'][0]['a'] == (
-        'La cláusula exige revisar las condiciones y exclusiones indicadas.\n'
-        'Fuente: documento DOC-POL-900, versión VER-001, página 1. '
-        'Esto no es una aprobación ni denegación de un siniestro.')
+    recalled_answer = explained[-1][0]['recalled'][0]['a']
+    assert recalled_answer.startswith('La cláusula exige revisar las condiciones y exclusiones indicadas.')
+    assert_visible_sources(recalled_answer, number='900')
+    assert 'Esto no es una aprobación ni denegación de un siniestro.' in recalled_answer
 
 
 def test_required_prompt_over_budget_does_not_truncate_evidence_or_call_llm(pg, explained, monkeypatch):
@@ -297,7 +299,8 @@ def test_policy_switch_failure_remains_pending_and_never_reverts_silently(pg, ex
     assert len(explained) == before and 'número de póliza' in reply
     reply, out = ask('000124', ext='policy-b')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-OTHER' in reply and state(pg)['policy_id'] == 'POL-000124'
+    assert_visible_sources(reply, number='000124')
+    assert state(pg)['policy_id'] == 'POL-000124'
     assert explained[-1][0]['question'].startswith('¿Cubre cristales?')
     assert explained[-1][0]['question'].count('Tema:') <= 1
 
@@ -327,7 +330,8 @@ def test_theme_recall_selects_original_confirmed_policy(pg, explained):
     ask('¿Cubre daños por agua? Póliza 000123', ext='water-a')
     ask('¿Cubre cristales? Póliza 000124', ext='glass-b')
     reply, _ = ask('La de los daños por agua', ext='theme-a')
-    assert 'DOC-POL-000123' in reply and 'DOC-OTHER' not in reply
+    assert_visible_sources(reply)
+    assert state(pg)['policy_id'] == 'POL-000123'
     assert state(pg)['policy_id'] == 'POL-000123'
 
 
@@ -444,7 +448,7 @@ def test_expired_identity_requires_reverification_without_losing_scoped_history(
         conn.execute("UPDATE insurance_conversation_state SET updated_at=now()-interval '2 hours'")
     before = len(explained)
     reply, out = ask('¿Dónde lo dice?', ext='expired')
-    assert 'nombre, apellidos y DNI' in reply and len(explained) == before
+    assert 'nombre y apellido' in reply and len(explained) == before
     assert out['insurance_result'] == 'identity_not_verified'
     ask('Me llamo Luis Gil Mora, DNI 87654321X', ext='reverified')
     assert 'agua' in explained[-1][0]['question'] and len(explained) == before + 1
@@ -480,7 +484,8 @@ def test_inactive_working_state_recovers_active_selection_from_scoped_summary(pg
                      "state=jsonb_set(state,'{last_user_at}',to_jsonb((now()-interval '2 hours')::text))")
     reply, out = ask('¿Cubre cristales?', ext='after-idle')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-POL-000123' in reply and 'DOC-OTHER' not in reply
+    assert_visible_sources(reply)
+    assert state(pg)['policy_id'] == 'POL-000123'
     assert state(pg)['policy_id'] == 'POL-000123'
 
 
@@ -589,7 +594,7 @@ def test_exact_human_offer_wording_and_social_reply_without_identity_challenge(p
         'No encontré evidencia suficiente en tu póliza. '
         '¿Quieres que registre la consulta para revisión humana?')
     reply, out = ask('Hola', ext='plain-hello')
-    assert reply == 'Hola. ¿Qué quieres consultar sobre tu póliza?'
+    assert reply == 'Hola. Para consultar tu póliza, dime tu nombre y apellido.'
     assert out['insurance_result'] == 'missing_information'
     assert count(pg, 'insurance_identity_attempts') == 0 and count(pg, 'insurance_cases') == 0
 
@@ -599,8 +604,10 @@ def test_ambiguous_identity_and_no_match_request_full_name_without_field_disclos
         identity.upsert_customer(conn, BIZ, 'C9', 'Luis duplicado', '87654321X', 'Luis Gil Mora')
     ambiguous, _ = ask('Me llamo Luis Gil Mora, DNI 87654321X', ext='ambiguous-identity')
     missing, _ = ask('Me llamo Nadie Existe, DNI 11111111H', ext='missing-identity')
-    assert ambiguous == missing == dialog.IDENTITY_FAILED
-    assert 'nombre completo' in ambiguous
+    assert 'verificación única' in ambiguous
+    assert missing.startswith('No he podido verificar tus datos.')
+    assert 'sin repetir el otro dato' in missing
+    assert 'nombre y apellido' in ambiguous and 'documento' in ambiguous
     assert 'Luis' not in ambiguous and '87654321X' not in ambiguous
     assert 'coincid' not in ambiguous and count(pg, 'insurance_cases') == 0
 
@@ -622,7 +629,8 @@ def test_llm_technical_failure_records_only_a_real_question_after_consent(pg, mo
     assert not state(pg).get('pending_human')
     assert count(pg, 'insurance_cases') == 0
     reply, out = ask('Sí', ext='technical-consent')
-    assert 'He guardado' not in reply and out['insurance_result'] == 'missing_information'
+    assert 'He guardado' not in reply and out['insurance_result'] == 'technical_error'
+    assert out['diagnostic_code'] == 'llm_error'
     assert count(pg, 'insurance_cases') == 0
 
 

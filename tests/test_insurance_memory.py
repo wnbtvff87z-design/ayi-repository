@@ -81,6 +81,15 @@ def test_identity_redaction_preserves_contractual_amounts_and_dates():
     assert memory.redact('DNI 12345678Z 10000 euros', bounded=False) == 'DNI [documento] 10000 euros'
 
 
+def test_identity_redaction_preserves_generic_customer_source_labels():
+    sources = 'Fuentes: Documento 1, página 1; Documento 2, páginas 2, 3.'
+    assert memory.redact(sources, bounded=False) == sources
+    combined = sources + ' DNI cinco uno nueve cinco nueve cinco seis seis jota.'
+    redacted = memory.redact(combined, bounded=False)
+    assert redacted.startswith(sources)
+    assert 'cinco uno nueve cinco' not in redacted
+
+
 def test_prompt_budget_mandatory_not_truncated():
     evidence = [{'document_id': 'DOC', 'version_id': 'V2', 'page': 8,
                  'text': 'Cubre agua. ' + 'x' * 900 + ' Excepto falta de mantenimiento.'}]

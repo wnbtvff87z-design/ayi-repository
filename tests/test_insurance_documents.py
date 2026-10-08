@@ -15,6 +15,7 @@ sys.path.insert(0, str(WEB))
 
 from insurance import cases, documents, storage, dialog as idialog, identity  # noqa: E402
 import insurance.admin as admin  # noqa: E402
+from test_insurance_attribution import evidence_markers, assert_visible_sources
 
 MIGRATIONS = sorted((WEB / 'insurance' / 'migrations').glob('*.sql'))
 BIZ, POL, VER, DOC = 'INS-BIZ-001', 'POL-T1', 'VER-T1', 'DOC-T1'
@@ -120,7 +121,8 @@ def ask(text, channel='WhatsApp', ext='SM1'):
 
 @pytest.fixture
 def llm(monkeypatch):
-    monkeypatch.setattr(idialog, 'llm_explain', lambda q, ev: 'Cubre la rotura de tuberías, con exclusiones.')
+    monkeypatch.setattr(idialog, 'llm_explain', lambda q, ev:
+                        'Cubre la rotura de tuberías, con exclusiones. ' + evidence_markers(ev))
 
 
 def test_register_and_process_textual_pdf(pg):
@@ -291,12 +293,16 @@ def test_cited_answer_with_clause_and_exclusion_together(pg, llm):
     verify(pg)
     reply, state = ask('¿Me cubre el daño por agua por rotura de tuberías el 2020-01-01?'.replace('2020-01-01', date.today().isoformat()))
     assert state['insurance_result'] == 'evidence_backed_explanation'
-    assert f'documento {DOC}, versión {VER}, página 1' in reply and 'página 2' in reply
+    assert_visible_sources(reply, pages=(1, 2))
+    assert 'páginas 1, 2' in reply
+    assert (date.today() - timedelta(days=100)).isoformat() in reply
     _, switched = ask('¿Me cubre el daño por agua por rotura de tuberías el %s?' % date.today().isoformat(), 'Voice', 'CA0')
     assert switched['insurance_result'] == 'identity_not_verified'  # verification is per channel
     verify(pg, 'Voice', session='CA1')
     again, state2 = ask('¿Me cubre el daño por agua por rotura de tuberías el %s?' % date.today().isoformat(), 'Voice', 'CA1')
-    assert again == reply and state2 == state  # same domain and answer on Voice and WhatsApp
+    assert 'Cubre la rotura de tuberías, con exclusiones.' in again
+    assert_visible_sources(again, pages=(1, 2))
+    assert state2 == state  # same domain decision, channel-specific presentation
 
 
 def test_unverified_identity_never_reads_policy(pg, llm, monkeypatch):
@@ -304,7 +310,7 @@ def test_unverified_identity_never_reads_policy(pg, llm, monkeypatch):
     run_worker()
     monkeypatch.setattr(idialog.retrieval, 'retrieve', lambda *a, **k: pytest.fail('retrieved without identity'))
     reply, state = ask('¿Me cubre el daño por agua?')
-    assert state['insurance_result'] == 'identity_not_verified' and 'DNI' in reply
+    assert state['insurance_result'] == 'identity_not_verified' and 'nombre y apellido' in reply
     with pg() as conn:
         assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
 
@@ -361,15 +367,19 @@ def test_llm_failure_escalates_with_evidence(pg, monkeypatch):
         raise RuntimeError('down')
 
     monkeypatch.setattr(idialog, 'llm_explain', boom)
-    _, state = ask('¿Me cubre el daño por agua por rotura de tuberías?')
-    assert state['insurance_result'] == 'missing_information'
+    reply, state = ask('¿Me cubre el daño por agua por rotura de tuberías?')
+    assert state['insurance_result'] == 'technical_error'
+    assert state['diagnostic_code'] == 'llm_error'
+    assert 'problema técnico' in reply and 'evidencia suficiente' not in reply
     with pg() as conn:
         assert conn.execute('SELECT count(*) AS n FROM insurance_cases').fetchone()['n'] == 0
     _, state = ask('Sí', ext='SM-llm-consent')
-    assert state['insurance_result'] == 'human_case_required'
+    assert state['insurance_result'] != 'human_case_required'
     with pg() as conn:
-        q = conn.execute('SELECT evidence,reason FROM insurance_case_questions').fetchone()
-    assert q['reason'] == 'human_interpretation' and len(q['evidence']) >= 1
+        assert conn.execute('SELECT count(*) AS n FROM insurance_case_questions').fetchone()['n'] == 0
+        recorded = conn.execute('SELECT state FROM insurance_conversation_state').fetchone()['state']
+    assert recorded['last_retrieval']['pages']
+    assert recorded['last_retrieval']['llm_diagnostic'] == 'llm_error'
 
 
 def test_duplicate_webhook_keeps_single_case(pg, monkeypatch):

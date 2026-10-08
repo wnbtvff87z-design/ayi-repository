@@ -10,7 +10,7 @@ import uuid
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from insurance import admin, cases, identity, memory, retrieval
+from insurance import admin, cases, identity, memory, retrieval, orchestrator
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,25 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
             report['state_status'] = 'loaded'
             report['pending_human'] = bool(state.get('pending_human'))
             report['pending_question'] = bool(state.get('question'))
+            report['session_closed'] = bool(state.get('closed_at'))
+            interpretation = state.get('last_interpretation') or {}
+            report['interpretation_source'] = (
+                interpretation.get('source') if interpretation.get('source') in ('local', 'llm') else None)
+            report['interpretation_invoked'] = state.get('interpretation_invoked') is True
+            report['interpretation_intents'] = [
+                item for item in interpretation.get('intents', [])
+                if isinstance(item, str) and item in orchestrator.INTENTS]
+            code = state.get('interpretation_diagnostic')
+            report['interpretation_diagnostic'] = (
+                code if code in (
+                    'llm_not_configured', 'llm_auth_failed', 'llm_timeout', 'llm_rate_limited',
+                    'llm_invalid_response', 'llm_refusal', 'llm_error', 'context_budget_exceeded') else None)
             policy_id = policy_id or state.get('policy_id')
+    social = orchestrator.social(question)
+    if social:
+        return {**report, 'stage': 'dialogue', 'intent': social,
+                'reason_code': 'social_closure' if social == 'farewell' else 'social_acknowledgement',
+                'decision': 'close' if social == 'farewell' else 'answer'}
     from insurance import dialog, policy_info
     intent = dialog._intent(question)
     if intent in ('review', 'explain_missing'):

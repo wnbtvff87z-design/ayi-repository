@@ -95,7 +95,7 @@ def test_enabled_insurance_agent_returns_only_identity_boundary(monkeypatch):
         {'sector': 'seguros'}, {}, [], '¿me cubre?', 'Voice', 'CA1:turn:1', '+100'
     )
     assert state == {'insurance_result': 'identity_not_verified'}
-    assert 'nombre, apellidos y DNI' in reply and 'He guardado' not in reply
+    assert 'nombre y apellido' in reply and 'He guardado' not in reply
     assert calls == [('¿me cubre?', 'Voice', 'CA1:turn:1', '+100')]
 
 
@@ -114,7 +114,7 @@ def test_insurance_turn_does_not_use_shared_conversation_storage(monkeypatch):
         include_end_reason=True,
     )
     assert end_reason is None
-    assert 'nombre, apellidos y DNI' in reply and 'He guardado' not in reply
+    assert 'nombre y apellido' in reply and 'He guardado' not in reply
 
 
 def test_insurance_conversations_cannot_be_mirrored_to_airtable(monkeypatch):

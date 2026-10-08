@@ -904,7 +904,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
         )
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     record['fields']['Status'] = 'resolved'
-    incoming('SM-integrated-2', '¿La póliza cubre daños anteriores a la vigencia?')
+    incoming('SM-integrated-2', '¿La póliza cubre daños preexistentes por agua?')
     assert cases.sync_outbox() == [{'case_id': case_id, 'synced': True}]
     assert record['fields']['Status'] == 'Pendiente'
     assert set(record['fields']) == {
@@ -926,7 +926,7 @@ def test_whatsapp_case_to_airtable_retry_human_resolution_and_mirror_update(
     assert details.status_code == 200
     assert [row['question'] for row in details.json['questions']] == [
         '¿La póliza cubre esta filtración?',
-        '¿La póliza cubre daños anteriores a la vigencia?',
+        '¿La póliza cubre daños preexistentes por agua?',
     ]
     resolved = client.post(
         path + '/resolve',

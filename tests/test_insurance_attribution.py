@@ -5,6 +5,7 @@ nothing here touches Railway, Airtable, the Bucket, Twilio or any real PDF.
 """
 import logging
 import os
+import re
 import sys
 import uuid
 from datetime import date, timedelta
@@ -102,7 +103,31 @@ GENERIC = 'No he podido verificar tus datos'
 
 @pytest.fixture
 def llm(monkeypatch):
-    monkeypatch.setattr(idialog, 'llm_explain', lambda q, ev: 'Cubre la rotura de tuberías, con exclusiones.')
+    monkeypatch.setattr(idialog, 'llm_explain', lambda q, ev:
+                        'La cláusula de rotura de tuberías tiene condiciones. ' + evidence_markers(ev))
+
+
+def evidence_markers(evidence):
+    """Cite actual supplied pages; disambiguate equal page numbers across documents."""
+    assert evidence
+    pages = {}
+    for item in evidence:
+        assert item['text'].strip() and item['page'] >= 1
+        pages.setdefault(item['page'], set()).add(item['document_id'])
+    return ' '.join(dict.fromkeys(
+        f"[p.{item['page']}]" if len(pages[item['page']]) == 1 else f'[e.{index}]'
+        for index, item in enumerate(evidence, 1)))
+
+
+def assert_visible_sources(reply, *, number=None, pages=(1,)):
+    assert 'Fuentes:' in reply
+    sources = reply.split('Fuentes:', 1)[1]
+    cited_pages = {int(page) for group in re.findall(r'páginas?\s+(\d+(?:,\s*\d+)*)', sources)
+                   for page in group.split(',')}
+    assert set(pages) <= cited_pages
+    assert 'DOC-' not in reply and 'VER-' not in reply and 'POL-' not in reply
+    if number:
+        assert number in reply
 
 
 def rows(pg, sql, *args):
@@ -154,7 +179,7 @@ def urgent_review(pg, urgent_protocol, *, text='Hay una inundación en curso aho
 def test_unknown_caller_is_asked_for_the_three_data_and_nothing_is_stored_as_a_case(pg, monkeypatch):
     monkeypatch.setattr(idialog.retrieval, 'retrieve', lambda *a, **k: pytest.fail('retrieved unverified'))
     reply, out = say(TEXT)
-    assert 'nombre, apellidos y DNI' in reply and out['insurance_result'] == 'identity_not_verified'
+    assert 'nombre y apellido' in reply and out['insurance_result'] == 'identity_not_verified'
     assert '000123' not in reply and 'POL-' not in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
@@ -164,7 +189,8 @@ def test_correct_data_in_following_turn_keeps_original_question_and_answers_with
     say(TEXT, ext='A1')                                  # question first; identity not yet known
     reply, out = say('Me llamo Luis Gil Mora, DNI 87654321X', ext='A2')  # identity only: no repeat
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-900' in reply and 'versión VER-001' in reply and 'página 1' in reply
+    assert_visible_sources(reply, number='900')
+    assert 'versión con vigencia desde ' + (date.today() - timedelta(days=100)).isoformat() in reply
     v = rows(pg, 'SELECT * FROM insurance_identity_verifications')[0]
     assert v['customer_id'] == 'C2' and v['business_id'] == BIZ and v['channel'] == 'WhatsApp'
     assert v['session_ref'] == '' and v['expires_at'] > v['created_at']
@@ -179,7 +205,8 @@ def test_all_data_and_policy_number_in_one_message_are_processed_in_that_turn(pg
     add_document(pg, 'POL-000124', 'DOC-X')
     reply, out = say(f'{TEXT} {ANA} Póliza número 000123')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-000456' in reply and 'DOC-X' not in reply
+    assert_visible_sources(reply, number='000123')
+    assert '000124' not in reply
 
 
 @pytest.mark.parametrize('declared', [
@@ -204,7 +231,8 @@ def test_nie_and_compound_names_verify(pg, llm):
     add_document(pg, 'POL-300', 'DOC-300')
     say(TEXT)
     reply, out = say('Me llamo José María García López, NIE x-1234567-l')  # hyphen == space in a surname
-    assert out['insurance_result'] == 'evidence_backed_explanation' and 'DOC-300' in reply
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert_visible_sources(reply, number='300')
 
 
 def test_mismatches_get_one_identical_generic_reply_and_never_say_which_datum_failed(pg, monkeypatch):
@@ -225,7 +253,7 @@ def test_partial_or_missing_data_is_not_a_match_and_does_not_burn_attempts(pg):
     declarations = [
         ('Me llamo Ana Pérez López', 'Me falta el DNI o NIE.'),
         ('DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
-        ('Me llamo Ana, DNI 12345678Z', 'Me falta tu nombre y al menos un apellido.'),
+        ('Me llamo Ana, DNI 12345678Z', 'Me falta tu apellido.'),
         ('Me llamo Ana Pérez López, DNI 1234567Z',
          'No comprendí el documento de forma inequívoca. Repite solo ese dato.'),
     ]
@@ -244,7 +272,9 @@ def test_zero_ambiguous_and_inactive_do_not_verify(pg):
     r1, _ = say(ANA, ext='Z1')
     r2, _ = say('Me llamo Marta Sanz Ruiz, DNI 55555555K', ext='Z2')
     r3, _ = say('Me llamo Nadie Existe Aqui, DNI 00000000T', ext='Z3')
-    assert r1 == r2 == r3 and GENERIC in r1
+    assert 'verificación única' in r1
+    assert r2 == r3 and GENERIC in r2
+    assert all('He verificado' not in reply for reply in (r1, r2, r3))
     assert [r['outcome'] for r in rows(pg, 'SELECT outcome FROM insurance_identity_attempts ORDER BY attempt_id')] \
         == ['ambiguous', 'no_match', 'no_match']
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
@@ -257,11 +287,11 @@ def test_attempt_limit_blocks_without_creating_a_case_or_false_attribution(pg, l
         assert GENERIC in say('Me llamo Pedro Ruiz Soto, DNI 11111111H', ext=f'L{n}')[0]
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     reply, out = say(f'{TEXT} Me llamo Pedro Ruiz Soto, DNI 11111111H', ext='L2')
-    assert GENERIC in reply and out['insurance_result'] == 'identity_not_verified'
+    assert 'límite de intentos' in reply and out['insurance_result'] == 'identity_not_verified'
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     # blocked: even correct data does not verify now
     reply, _ = say(ANA, ext='L3')
-    assert GENERIC in reply and 'He guardado' not in reply
+    assert 'límite de intentos' in reply and 'He guardado' not in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_case_questions')[0]['n'] == 0
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
     with pg() as conn:  # window elapses -> attempts allowed again
@@ -296,11 +326,11 @@ def test_business_is_resolved_by_the_dialled_number_not_by_the_caller(pg):
 def test_verification_is_not_reused_between_voice_and_whatsapp_or_between_calls(pg, llm):
     add_document(pg, 'POL-900', 'DOC-900')
     say(TEXT, ext='W1')
-    assert 'DOC-900' in say('Me llamo Luis Gil Mora, DNI 87654321X', ext='W2')[0]
+    assert_visible_sources(say('Me llamo Luis Gil Mora, DNI 87654321X', ext='W2')[0], number='900')
     reply, out = say(TEXT, ext='CA1:turn:1', channel='Voice')           # WhatsApp verification, now Voice
-    assert out['insurance_result'] == 'identity_not_verified' and 'nombre, apellidos y DNI' in reply
+    assert out['insurance_result'] == 'identity_not_verified' and 'nombre y apellido' in reply
     reply, _ = say('Me llamo Luis Gil Mora, DNI 87654321X', ext='CA1:turn:2', channel='Voice')
-    assert 'DOC-900' in reply                                            # same call: question kept
+    assert_visible_sources(reply, number='900')                          # same call: question kept
     v = rows(pg, "SELECT session_ref FROM insurance_identity_verifications WHERE channel='Voice'")[0]
     assert v['session_ref'] == 'CA1'
     reply, out = say(TEXT, ext='CA2:turn:1', channel='Voice')           # a NEW call must verify again
@@ -314,7 +344,7 @@ def test_verification_is_temporary(pg, llm, monkeypatch):
     say('Me llamo Luis Gil Mora, DNI 87654321X')
     v = rows(pg, "SELECT extract(epoch FROM expires_at-created_at) AS ttl FROM insurance_identity_verifications")[0]
     assert 590 <= float(v['ttl']) <= 610
-    assert 'DOC-900' in say(TEXT)[0]                                    # still valid
+    assert_visible_sources(say(TEXT)[0])                                # still valid
     with pg() as conn:
         conn.execute("UPDATE insurance_identity_verifications SET expires_at=now()-interval '1 second'")
     reply, out = say(TEXT)
@@ -329,8 +359,9 @@ def test_multiple_policies_ask_number_then_leading_zeros_are_kept(pg, llm):
     assert 'número de póliza' in reply and out['insurance_result'] == 'missing_information'
     assert 'POL-' not in reply and '000124' not in reply
     reply, out = say('000124')                                          # a different policy, exact text
-    assert 'DOC-X' in reply and 'DOC-000456' not in reply
-    assert 'DOC-000456' in say(f'{TEXT} póliza 000123')[0]
+    assert_visible_sources(reply, number='000124')
+    assert '000123' not in reply
+    assert_visible_sources(say(f'{TEXT} póliza 000123')[0], number='000123')
     reply, out = say(f'{TEXT} póliza 123')                              # no partial / zero-stripped match
     assert out['insurance_result'] == 'missing_information' and 'número de póliza' in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
@@ -419,7 +450,8 @@ def test_declining_review_never_creates_a_case_and_keeps_verified_identity(pg, l
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_outbox')[0]['n'] == 0
     reply, out = say(TEXT, ext='decline-next-question')
-    assert out['insurance_result'] == 'evidence_backed_explanation' and 'DOC-900' in reply
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert_visible_sources(reply, number='900')
 
 
 def test_consented_review_write_failure_never_confirms_a_case(pg, monkeypatch):
@@ -434,7 +466,8 @@ def test_consented_review_write_failure_never_confirms_a_case(pg, monkeypatch):
     monkeypatch.setattr(idialog, 'create_or_update_case', unavailable)
     reply, out = say('Sí', ext='failed-review-consent')
     assert out['insurance_result'] == 'case_persistence_failed'
-    assert 'No se ha creado un caso' in reply and 'He guardado' not in reply
+    assert 'No puedo confirmar' in reply and 'He guardado' not in reply
+    assert 'No se ha creado un caso' not in reply and 'misma solicitud' in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_outbox')[0]['n'] == 0
 
@@ -556,7 +589,8 @@ def test_operator_retrieval_diagnostic_is_scoped_audited_and_read_only(
         'Cobertura de daños por agua: cubre tuberías rotas.',
         'Exclusiones de agua: falta de mantenimiento.',
     ))
-    monkeypatch.setattr(idialog, 'llm_explain', lambda context, evidence: 'Respuesta de prueba.')
+    monkeypatch.setattr(idialog, 'llm_explain', lambda context, evidence:
+                        'Respuesta de prueba. ' + evidence_markers(evidence))
     before_cases = rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n']
     before_documents = rows(pg, 'SELECT count(*) AS n FROM insurance_documents')[0]['n']
     with caplog.at_level(logging.INFO):
@@ -692,7 +726,7 @@ def test_identity_only_message_never_triggers_retrieval_or_a_case(pg, llm, monke
     assert st['verified'] is True and st['customer_id'] == 'C2' and 'question' not in st
     assert 'doc_hmac' not in st and 'name' not in st
     # a thanks/greeting after verification is not a question either
-    assert 'qué quieres consultar' in say('Gracias', ext='I3')[0].lower()
+    assert 'de nada' in say('Gracias', ext='I3')[0].lower()
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
 
@@ -701,18 +735,19 @@ def test_multi_turn_conversation_reuses_identity_policy_and_references(pg, monke
 
     def explain(q, ev):
         seen.append(q)
-        return 'Respuesta basada en la póliza.'
+        return 'Respuesta basada en la póliza. ' + evidence_markers(ev)
     monkeypatch.setattr(idialog, 'llm_explain', explain)
     add_document(pg, 'POL-900', 'DOC-900', pages=(
         'Cobertura de daños por agua: cubre tuberías rotas.',
         'Robo: cubre la sustracción de joyas con límite de importe.',
         'Exclusiones: no cubre la falta de mantenimiento.'))
     # identification (name and DNI in separate messages)
-    assert 'nombre, apellidos y DNI' in say('Quiero hacer una consulta', ext='M0')[0]
+    assert 'nombre y apellido' in say('Quiero hacer una consulta', ext='M0')[0]
     assert 'qué quieres consultar' in say('Luis Gil Mora y 87654321X', ext='M1')[0].lower()
     # consultation
     reply, out = say('¿Cubre los daños por agua si se rompe una tubería?', ext='M2')
-    assert out['insurance_result'] == 'evidence_backed_explanation' and 'DOC-900' in reply
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert_visible_sources(reply, number='900')
     # follow-up referencing the previous question: no identity or policy asked again
     reply, out = say('¿Y eso tiene alguna exclusión?', ext='M3')
     assert out['insurance_result'] == 'evidence_backed_explanation'
@@ -748,6 +783,6 @@ def test_session_context_is_dropped_when_the_verified_customer_changes(pg, llm):
     add_document(pg, 'POL-900', 'DOC-900')
     add_document(pg, 'POL-300', 'DOC-300')
     verify(pg, 'C2')
-    assert 'DOC-900' in say(TEXT, ext='X1')[0]
+    assert_visible_sources(say(TEXT, ext='X1')[0], number='900')
     verify(pg, 'C3')
-    assert 'DOC-300' in say(TEXT, ext='X2')[0]
+    assert_visible_sources(say(TEXT, ext='X2')[0], number='300')

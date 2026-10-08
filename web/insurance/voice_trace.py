@@ -16,12 +16,15 @@ from insurance.cases import MIN_KEY_BYTES, CasePersistenceError
 STAGES = frozenset({
     'voice_transcription_missing', 'voice_transcription_partial',
     'identity_data_partial', 'identity_data_complete', 'identity_parse_failed', 'identity_no_match',
-    'identity_ambiguous', 'identity_verified', 'question', 'answer', 'clarification',
+    'identity_ambiguous', 'identity_verified', 'identity_attempts_exceeded',
+    'technical_error', 'closing', 'question', 'answer', 'clarification',
     'confirmation', 'policy_selection', 'handoff', 'unknown', 'transport_setup', 'transport_error',
 })
 DIAGNOSTICS = STAGES | frozenset({
     'identity_not_verified', 'missing_information', 'insufficient_evidence', 'ambiguity',
     'contradiction', 'unreadable_document', 'human_interpretation', 'ok',
+    'llm_not_configured', 'llm_auth_failed', 'llm_timeout', 'llm_rate_limited',
+    'llm_invalid_response', 'llm_refusal', 'llm_error', 'context_budget_exceeded',
 })
 MAX_CHARS = 4000
 MAX_PAGE_REFS = 100

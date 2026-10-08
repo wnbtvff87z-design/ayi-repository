@@ -1,4 +1,4 @@
-"""Closed-vocabulary Voice identity parsing and scope-bound encrypted fragments."""
+"""Closed-vocabulary guided identity parsing and scope-bound encrypted fragments."""
 import base64
 import hashlib
 import hmac
@@ -19,7 +19,7 @@ LETTERS = {
     'a': 'A', 'be': 'B', 'ce': 'C', 'de': 'D', 'e': 'E', 'efe': 'F',
     'ge': 'G', 'hache': 'H', 'i': 'I', 'jota': 'J', 'ka': 'K', 'ele': 'L',
     'eme': 'M', 'ene': 'N', 'o': 'O', 'pe': 'P', 'cu': 'Q', 'erre': 'R',
-    'ese': 'S', 'te': 'T', 'u': 'U', 'uve': 'V', 'equis': 'X',
+    'ese': 'S', 'te': 'T', 'u': 'U', 'uve': 'V', 've': 'V', 'equis': 'X',
     'ye': 'Y', 'zeta': 'Z',
 }
 CARDINALS = incident_dates.SPOKEN_NUMBERS
@@ -30,6 +30,18 @@ YEAR_RE = re.compile(r'^(?:19|20)\d{2}$')
 CORRECTION_RE = re.compile(
     r'^\W*(?:no\b|perd[oó]n\b|me\s+equivoqu[eé]\b|corrige\b|correcci[oó]n\b|'
     r'empiezo\s+de\s+nuevo\b)', re.I)
+LETTER_PAIRS = {
+    ('i', 'griega'): 'Y', ('uve', 'doble'): 'W', ('doble', 'uve'): 'W',
+    ('doble', 've'): 'W', ('be', 'larga'): 'B', ('be', 'alta'): 'B',
+    ('ve', 'corta'): 'V', ('ve', 'baja'): 'V', ('uve', 'corta'): 'V',
+}
+NAME_PARTICLES = {'de', 'del', 'la', 'las', 'los', 'y', 'e'}
+NON_NAME_WORDS = (identity.NAME_STOP - NAME_PARTICLES) | {
+    'el', 'su', 'sus', 'tu', 'tus', 'hola', 'gracias', 'no', 'si', 'sí', 'perdon', 'perdón', 'corrige',
+    'correccion', 'corrección', 'equivoque', 'equivoqué', 'cubre', 'cobertura',
+    'saber', 'donde', 'dónde', 'cuanto', 'cuánto', 'cuando', 'cuándo', 'como',
+    'cómo', 'fecha', 'euros', 'importe', 'franquicia', 'limite', 'límite',
+}
 
 
 def _scope(business_id, channel, ref, session):
@@ -101,7 +113,8 @@ def _document_token(text, spoken):
     word = _fold_word(text)
     return (bool(re.fullmatch(r'\d+[a-z]?|[xyz]\d+[a-z]?', word, re.ASCII))
             or len(word) == 1 and word.isascii() and word.isalpha()
-            or spoken and (word in DIGITS or word in LETTERS or word in CARDINALS))
+            or spoken and (word in DIGITS or word in LETTERS or word in CARDINALS
+                           or word == 'doble'))
 
 
 def _parts(text, spoken):
@@ -131,7 +144,10 @@ def _parts(text, spoken):
                 _fold_word(matches[i + 1].group()) not in DIGITS and
                 not re.match(r'\d', matches[i + 1].group())):
             break
-        if re.fullmatch(r'\d+[a-z]?|[xyz]\d+[a-z]?', word, re.ASCII):
+        pair = (word, _fold_word(matches[i + 1].group())) if i + 1 < len(matches) else None
+        if spoken and pair in LETTER_PAIRS:
+            value, consumed = LETTER_PAIRS[pair], 2
+        elif re.fullmatch(r'\d+[a-z]?|[xyz]\d+[a-z]?', word, re.ASCII):
             value = word.upper()
         elif len(word) == 1 and word.isascii() and word.isalpha():
             value = word.upper()
@@ -143,12 +159,6 @@ def _parts(text, spoken):
             # Unknown vocabulary before completing a document is not a correction candidate.
             bad = not bool(identity.normalize_document(chars))
             break
-        # Multiword names must take priority over individual i/uve.
-        if spoken and i + 1 < len(matches) and (
-                (word, _fold_word(matches[i + 1].group())) in {
-                    ('i', 'griega'), ('uve', 'doble')}):
-            value = 'Y' if word == 'i' else 'W'
-            consumed = 2
         chars += value
         end = matches[i + consumed - 1].end()
         count += consumed
@@ -167,20 +177,101 @@ def _non_document_context(text):
     if identity.CONTRACT_RE.search(text or '') or incident_dates.parse(text or ''):
         return True
     folded = _fold_word(str(text or '').strip())
-    return bool(YEAR_RE.fullmatch(folded))
+    return bool(YEAR_RE.fullmatch(folded)
+        or re.fullmatch(r'\+?\d(?:[\s().-]*\d){8,14}', folded)
+        or re.search(
+        r'\b(?:euros?|importe|franquicia|limite|telefono|movil|poliza|fecha|'
+        r'nacionalidad|nacional|extranjero|espanol|espanola)\b|[€$]', folded)
+        or re.search(r'\d\s*[/]\s*\d', folded))
 
 
-def _waiting_for_document(state, scope, saved, *, diagnostic='identity_data_partial'):
+def _name_datum(text, state):
+    """Take literal guided name data, retaining surname particles and token order."""
+    surname = re.match(r'^\s*(?:mi\s+)?apellidos?\s*(?:es|son|[:=-])\s*', text, re.I)
+    given = re.match(r'^\s*(?:(?:mi\s+)?nombre\s*(?:es|[:=-])|me\s+llamo|soy)\s*', text, re.I)
+    given_only = re.match(r'^\s*(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', text, re.I)
+    label = surname or given
+    value = text[label.end():] if label else text
+    value = value.strip(' ,;.-')
+    words = identity.WORD_RE.findall(value)
+    if (not words or len(words) > identity.MAX_NAME_TOKENS
+            or not re.fullmatch(r'\s*' + identity.WORD + r'(?:\s+' + identity.WORD + r')*\s*', value)
+            or any(w.casefold() in NON_NAME_WORDS or _fold_word(w) in DIGITS
+                   or _fold_word(w) in CARDINALS for w in words)):
+        return None
+    if not label and state.get('awaiting') != 'identity':
+        return None
+    if surname:
+        first = state.get('identity_given_name')
+        if not first and state.get('name') and not identity.name_is_sufficient(state['name']):
+            first = state['name']
+        if not first:
+            return None
+        state['identity_surname'] = ' '.join(words)
+        return first + ' ' + state['identity_surname']
+    if not given and state.get('name') and (
+            _surname_pending(state) or not identity.name_is_sufficient(state['name'])):
+        state['identity_given_name'] = state['name']
+        state['identity_surname'] = ' '.join(words)
+        return state['name'] + ' ' + state['identity_surname']
+    if given_only:
+        state['identity_given_name'] = ' '.join(words)
+        return (' '.join(words) + ' ' + state['identity_surname']
+                if state.get('identity_surname') else ' '.join(words))
+    if len(words) == 1:
+        state['identity_given_name'] = words[0]
+        if given and state.get('identity_surname'):
+            return words[0] + ' ' + state['identity_surname']
+    else:
+        if len(words) == 2:
+            state['identity_given_name'] = words[0]
+            state['identity_surname'] = words[1]
+        else:
+            state.pop('identity_given_name', None)
+            state.pop('identity_surname', None)
+    return ' '.join(words)
+
+
+def _surname_pending(state):
+    return bool(state.get('identity_given_name') and not state.get('identity_surname'))
+
+
+def _replace_fragment(text, saved):
+    folded = _fold_word(text).strip(' ,;.')
+    match = re.fullmatch(
+        r'corrige (?:los|las) (ultimos|primeros) (\w+) digitos? (?:por|a) (.+)', folded)
+    if not match or not saved:
+        return None
+    size = DIGITS.get(match[2], match[2])
+    if not size.isdigit() or not 1 <= int(size) <= 8:
+        return None
+    size = int(size)
+    replacement, end, _, bad = _parts(match[3], True)
+    parts = saved['parts']
+    prefix = parts[:1] if parts[:1] in {'X', 'Y', 'Z'} else ''
+    digits = parts[len(prefix):]
+    if (bad or match[3][end:].strip(' ,;.-') or not replacement.isdigit()
+            or len(replacement) != size or not digits.isdigit() or len(digits) < size):
+        return None
+    return prefix + (digits[:-size] + replacement if match[1] == 'ultimos'
+                     else replacement + digits[size:])
+
+
+def _waiting_for_document(state, scope, saved, *, diagnostic='identity_data_partial', question=None):
     cipher = _cipher(scope)
     if saved and cipher:
         state[BUFFER_KEY] = cipher.encrypt_at_time(
             json.dumps({'scope': scope, 'parts': saved['parts']},
                        separators=(',', ':')).encode(), saved['started']).decode()
     state['awaiting_document'] = True
-    decl = identity.parse_declaration('', None)
+    decl = identity.parse_declaration(question or '', None)
     decl.update(document=None, name=None, question='', has_question=False,
-                identity_kind='partial', missing='document', diagnostic=diagnostic,
+                identity_kind='failed' if diagnostic == 'identity_parse_failed' else 'partial',
+                missing='document', diagnostic=diagnostic,
                 normalized_text='[documento pendiente]', token_count=0)
+    if question:
+        decl.update(question=question, has_question=True,
+                    normalized_text=mask_transcript(question))
     return decl
 
 
@@ -189,22 +280,74 @@ def prepare(text, state, business_id, channel, ref, session):
     text = str(text or '')[:identity._int_env('INSURANCE_TURN_MAX_CHARS', identity.MAX_TEXT)]
     scope, now = _scope(business_id, channel, ref, session), int(time.time())
     saved = _load(state, scope, now)
-    labels = list(LABEL.finditer(text))
-    spoken = channel == 'Voice'
+    spoken = channel in {'Voice', 'WhatsApp'}
     explicitly_waiting = bool(state.get('awaiting_document') or saved)
-    if explicitly_waiting and CORRECTION_RE.search(text):
-        state.pop(BUFFER_KEY, None)
-        state['awaiting_document'] = True
-        return _waiting_for_document(state, scope, None, diagnostic='identity_parse_failed')
-    if explicitly_waiting and not labels and _non_document_context(text):
+    ordinary = identity.parse_declaration(text)
+    words = identity.WORD_RE.findall(text)
+    capitalized_name = bool(words and all(
+        word[0].isupper() or word.casefold() in NAME_PARTICLES for word in words))
+    document_words, document_end, _, document_bad = _parts(text, spoken)
+    document_only = bool(not document_bad and document_words
+                         and not text[document_end:].strip(' ,;.-'))
+    identity_syntax = bool(
+        LABEL.search(text) or identity.NAME_TRIGGER_RE.search(text)
+        or identity.LABEL_RE.search(text)
+        or re.search(r'\b(?:mi\s+)?apellidos?\s*(?:es|son|[:=-])', text, re.I)
+        or CORRECTION_RE.search(text) and '?' not in text and '¿' not in text)
+    unmistakable_question = bool(
+        not identity_syntax and not ordinary['name'] and not ordinary['document']
+        and not document_only and
+        ('?' in text or '¿' in text or ordinary['has_question'] and not capitalized_name))
+    if unmistakable_question:
+        if explicitly_waiting:
+            return _waiting_for_document(state, scope, saved, question=text.strip())
+        ordinary.update(identity_kind='none', missing=None, diagnostic=None,
+                        question=text.strip(), has_question=True,
+                        normalized_text=mask_transcript(text), token_count=0)
+        return ordinary
+    correction = bool(CORRECTION_RE.search(text))
+    correction_document = False
+    if correction:
+        replacement = _replace_fragment(text, saved)
+        if replacement is not None:
+            _save(state, scope, replacement, now, saved['started'])
+            saved['parts'] = replacement
+            state.pop('doc_hmac', None)
+            state.pop('doc_tail', None)
+            return _waiting_for_document(state, scope, saved)
+        corrected_text = CORRECTION_RE.sub('', text, count=1).lstrip(' ,;:.-')
+        corrected_text = re.sub(r'^(?:me equivoqu[eé]|perd[oó]n)\b[,;:\s]*', '',
+                                corrected_text, flags=re.I)
+        name_correction = re.match(
+            r'^(?:(?:mi\s+)?(?:nombre|apellidos?)\b|me\s+llamo\b|soy\b)', corrected_text, re.I)
+        new_parts, new_end, _, new_bad = _parts(corrected_text, spoken)
+        correction_document = bool(not new_bad and identity.normalize_document(new_parts)
+                                   and not corrected_text[new_end:].strip(' ,;.-'))
+        if name_correction or LABEL.search(corrected_text) or correction_document:
+            text = corrected_text
+            if not name_correction:
+                saved = None
+                state.pop(BUFFER_KEY, None)
+        elif explicitly_waiting or state.get('awaiting') == 'identity' or state.get('doc_hmac'):
+            state.pop('doc_hmac', None)
+            state.pop('doc_tail', None)
+            return _waiting_for_document(state, scope, None, diagnostic='identity_parse_failed')
+    labels = list(LABEL.finditer(text))
+    non_document = not labels and _non_document_context(text)
+    if non_document and explicitly_waiting:
         return _waiting_for_document(state, scope, saved)
     candidate = labels[0].end() if labels else None
-    if candidate is None and (state.get('awaiting') == 'identity' or explicitly_waiting or state.get('name')):
+    if candidate is None and not non_document and (
+            state.get('awaiting') == 'identity' or explicitly_waiting or correction_document):
         first = TOKENS.search(text)
-        if first and (_document_token(first.group(), spoken) or
+        surname_particles = (first and state.get('name') and
+                             (_surname_pending(state) or not identity.name_is_sufficient(state['name'])) and
+                             _fold_word(first.group()) in {'de', 'del', 'la', 'las', 'los'})
+        if first and not surname_particles and (_document_token(first.group(), spoken) or
                       re.match(r'\d|[XYZxyz](?:\d|\b)', first.group())):
             candidate = first.start()
-    if explicitly_waiting and not labels and candidate is None:
+    name_datum = _name_datum(text, state) if candidate is None and not non_document else None
+    if explicitly_waiting and not labels and candidate is None and not name_datum:
         return _waiting_for_document(state, scope, saved)
     parts, end, count, bad = ('', 0, 0, False)
     if candidate is not None:
@@ -219,6 +362,27 @@ def prepare(text, state, business_id, channel, ref, session):
             cleaned = text[:start]
     decl = identity.parse_declaration(
         cleaned, 'identity' if labels and candidate is not None else state.get('awaiting'))
+    guided_name = None
+    if candidate is not None and not bad:
+        name_text = cleaned.strip(' ,;.-')
+        if name_text.casefold().startswith('y '):
+            name_text = name_text[2:]
+        guided_name = _name_datum(name_text, state)
+        if guided_name:
+            decl.update(name=guided_name, question='', has_question=False)
+    elif name_datum:
+        decl.update(name=name_datum, question='', has_question=False)
+    if decl['name'] and not (name_datum or guided_name) and re.search(
+            r'\b(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', cleaned, re.I) and not re.search(
+            r'\bapellidos?\s*(?:es|son|[:=-])', cleaned, re.I):
+        declared_given = decl['name']
+        state['identity_given_name'] = declared_given
+        if state.get('identity_surname'):
+            decl['name'] = declared_given + ' ' + state['identity_surname']
+    elif decl['name'] and not (name_datum or guided_name) and re.search(
+            r'\b(?:me\s+llamo|soy)\s+', cleaned, re.I):
+        state.pop('identity_given_name', None)
+        state.pop('identity_surname', None)
     document = identity.normalize_document(parts)
     if saved and parts and not labels and not document and not bad:
         if explicitly_waiting and len(saved['parts']) + len(parts) <= 9:
@@ -255,14 +419,17 @@ def prepare(text, state, business_id, channel, ref, session):
     decl['document'] = document or (decl['document'] if candidate is None else None)
     if decl['name']:
         state['name'] = decl['name'][:160]
-        state['name_hmac'] = identity.name_hmac(business_id, decl['name'])
-    has_name = identity.name_is_sufficient(state.get('name') or decl['name'])
+        state['name_hmac'] = (None if _surname_pending(state)
+                              else identity.name_hmac(business_id, decl['name']))
+    has_name = (not _surname_pending(state)
+                and identity.name_is_sufficient(state.get('name') or decl['name']))
     has_document = bool(decl['document'] or state.get('doc_hmac'))
     has_partial = BUFFER_KEY in state
     active = bool(decl['name'] or decl['document'] or parts or has_partial)
     kind = ('failed' if bad else 'none' if not active else
             'complete' if has_name and has_document else 'partial')
     missing = (None if kind == 'none' else 'document' if bad or has_partial else
+               'surname' if state.get('name') and not has_name else
                'name' if not has_name else 'document' if not has_document else None)
     if missing == 'document':
         state['awaiting_document'] = True
@@ -271,7 +438,8 @@ def prepare(text, state, business_id, channel, ref, session):
     decl.update(identity_kind=kind, missing=missing,
                 diagnostic={'failed': 'identity_parse_failed', 'partial': 'identity_data_partial',
                             'complete': 'identity_data_complete'}.get(kind),
-                normalized_text=mask_transcript(text, state.get('awaiting')), token_count=count)
+                normalized_text='[name]' if name_datum else
+                mask_transcript(text, state.get('awaiting')), token_count=count)
     return decl
 
 
@@ -283,6 +451,8 @@ def mask_declarations(text, mask_names=True):
     name_text = text[:labels[0].start()] if labels else text
     declared = identity.parse_declaration(name_text)
     for label in reversed(labels):
+        if re.match(r'documento [1-9]\d{0,3}, páginas? \d', text[label.start():], re.I):
+            continue
         parts, end, count, _ = _parts(text[label.end():], True)
         if end and (re.search(r'\d', parts) or parts in {'X', 'Y', 'Z'}):
             text = (text[:label.end()] + f'[identity:{count} tokens]' +
@@ -315,6 +485,8 @@ def mask_transcript(text, awaiting=None, mask_names=True):
                 r'(?:' + identity.WORD + r'\s+){2,7}\d{1,8}[A-Za-z]?', text.strip()):
             text = re.sub(r'\d{1,8}[A-Za-z]?\s*$', '[digits]', text)
         return text
+    if awaiting == 'identity' and _name_datum(text, {'awaiting': awaiting}):
+        return '[name]'
     labels = list(LABEL.finditer(text))
     name_text = text[:labels[0].start()] if labels else text
     words = identity.WORD_RE.findall(name_text)
