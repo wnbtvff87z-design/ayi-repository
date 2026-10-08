@@ -343,7 +343,7 @@ def whatsapp():
    corr=hashlib.sha256(raw.encode()).hexdigest()[:16]
    if sector=='insurance':
     _insurance_logger.error('insurance_diag correlation_id=%s stage=%s reason_code=webhook_failed error_type=%s',corr,stage,type(exc).__name__)
-    tw.message('No pude procesar tu consulta de seguros ahora. No he confirmado ninguna operación.')
+    tw.message('No pude consultarlo ahora, inténtalo en un minuto.')
    else:
     log.error('WhatsApp error correlation_id=%s stage=%s error_type=%s',corr,stage,type(exc).__name__)
     tw.message('No pude identificar el negocio para atender tu mensaje ahora. No he ejecutado ninguna operación.'

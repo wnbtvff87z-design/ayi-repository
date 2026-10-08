@@ -187,7 +187,8 @@ def test_glass_retrieval_keeps_another_page_exclusion_and_does_not_generalize(cl
 
     def explain(context, evidence):
         seen.extend(evidence)
-        assert 'No infieras que cristal o vidrio cubre cualquier objeto' in dialog.memory.INSTRUCTIONS
+        assert 'mesa' not in dialog.memory.INSTRUCTIONS
+        assert 'UNA sola pregunta aclaratoria' in dialog.memory.INSTRUCTIONS
         return ('La póliza excluye tableros de mesa de vidrio y no permite extender la cobertura de ventanas. '
                 + evidence_markers(evidence))
 
@@ -214,7 +215,7 @@ def test_availability_and_general_summary_are_separate_from_coverage_questions(c
     assert summary_result['insurance_result'] == 'evidence_backed_explanation'
     assert calls and calls[-1][0]['question'] == 'Qué me cubre en general'
     assert_visible_sources(summary, number='900')
-    assert 'No infieras que cristal o vidrio cubre cualquier objeto' in dialog.memory.INSTRUCTIONS
+    assert 'No extiendas una cobertura a objetos o daños que la cláusula no nombra' in dialog.memory.INSTRUCTIONS
     assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
 

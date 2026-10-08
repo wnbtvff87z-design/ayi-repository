@@ -95,7 +95,8 @@ recordada no sustituye páginas ready ni revalida por sí misma autorización/ve
 | `INSURANCE_DIALOG_LLM_ENABLED` | `true`; permite desactivar solo el nuevo intérprete, no los controles ni la explicación |
 | `INSURANCE_LLM_MODEL`, `OPENAI_API_KEY` | Existentes, sin cambio; ausencia → `llm_not_configured` |
 | `OPENAI_BASE_URL` | Endpoint existente opcional; se valida, no se cambia |
-| `INSURANCE_LLM_TIMEOUT_SECONDS` | 15 s, rango 1–120, sin reintentos SDK |
+| `INSURANCE_LLM_TIMEOUT_SECONDS` | 8 s, rango 1–120, sin reintentos SDK (`max_retries=0`) |
+| `INSURANCE_LLM_BUDGET_SECONDS` | 12 s, rango 1–240; un único reintento propio ante timeout, conexión o 5xx solo si quedan ≥2 s |
 | `INSURANCE_LLM_MAX_TOKENS` | Explicación: 512, rango 64–4096; interpretación: salida de 256 tokens |
 | `INSURANCE_LLM_CONTEXT_CHARS` | 12000 caracteres incluyendo instrucciones y mensajes; no es una garantía de tokens exactos |
 | `INSURANCE_RECENT_TURNS`, `INSURANCE_RECALLED_TURNS` | 6 intercambios recientes; hasta 2 antiguos seleccionados |
@@ -148,6 +149,18 @@ y la `--session-ref` existente. No pegar tokens, transcripciones ni DNI en logs
 generales o en el PR. El diagnóstico imprime metadatos y clasificación segura;
 no confirma que una llamada real funcione. Las trazas completas se leen únicamente
 por el endpoint administrativo individual, con permiso del negocio y auditoría.
+
+Diagnóstico de identificación (solo lectura, sin stdin ni `--customer-id`):
+
+```sh
+python -m insurance.diagnose --business-id INS-BIZ-001 --identity \
+  --conversation-ref '<HMAC existente>' [--channel Voice --session-ref '<CallSid>']
+```
+
+Imprime solo booleanos y recuentos: campos presentes/ausentes (`fields`), estado de
+captura (`capture`), `document_hmac_match`, `name_hmac_match`, `candidate_count`,
+`failed_attempts`, `stage` y `reason_code`. Nunca imprime DNI, nombres, hashes,
+tokens ni transcripción.
 
 Prueba Railway/Twilio/OpenAI **no ejecutada en esta entrega**:
 1. Comprobar SHA aprobado y migraciones existentes hasta `011`; no hay migración nueva.
@@ -371,7 +384,7 @@ variables de la tabla anterior y las de tenant/Twilio existentes:
 
 Opcionales Web: `LOG_LEVEL=INFO` (lo lee y configura el logger `insurance` con
 salida stderr), `OPENAI_BASE_URL` para endpoint compatible,
-`INSURANCE_LLM_TIMEOUT_SECONDS=15` (1–120),
+`INSURANCE_LLM_TIMEOUT_SECONDS=8` (1–120), `INSURANCE_LLM_BUDGET_SECONDS=12` (1–240),
 `INSURANCE_LLM_MAX_TOKENS=512` (64–4096). El modelo debe soportar Chat Completions,
 temperatura y `max_tokens`; incompatibilidad es fallo técnico, no prueba de
 ausencia de cobertura. `INSURANCE_LLM_CONTEXT_CHARS` mantiene 12000 por defecto.
@@ -507,3 +520,29 @@ no equivale a revisión aprobada. Se solicita revisión independiente del cambio
 CodeQL Python sí está disponible; la primera ejecución detectó un riesgo ReDoS
 en la clasificación de saludos, que debe quedar corregido y reanalizado antes
 de la entrega. El escaneo de secretos inicial no encontró secretos.
+
+## Conversación de seguros: causas, datos de póliza y repetición
+
+- Respuestas por causa: «No encontré evidencia suficiente» solo tras una búsqueda
+  válida sin resultado; documento no listo, póliza no confirmada, versión ambigua y
+  `ESCALAR` con cláusulas relacionadas tienen textos propios. Sin términos
+  buscables se pide reformular, sin oferta humana. Fallo técnico (LLM/BD): «No pude
+  consultarlo ahora por un problema técnico, inténtalo en un minuto», sin oferta humana.
+- Datos de póliza sin PDF ni LLM: producto, número de contrato, vigencia y titular.
+- Retrieval: stopwords conversacionales ampliadas; la reescritura de la pregunta
+  (errores de tipeo y sinónimos) la hace el LLM con solo palabras de contenido
+  (sin nombre del cliente ni dígitos) y sustituye a las listas fijas de cristal/incendio;
+  si falla, no hay expansión. Migración `012_page_search_vectors.sql`: columna
+  generada `body_tsv` + índice GIN; si `pgvector` está disponible y el rol puede
+  habilitarlo, añade `embedding vector(1536)` nulo (aún no se usa).
+- Prompt: tres salidas (responder; relacionado pero no concluyente con UNA pregunta
+  aclaratoria; `ESCALAR`).
+- Guardia de repetición: una respuesta idéntica a la anterior cambia de estrategia y
+  una oferta de caso humano ignorada no se repite (salvo urgencia); los datos
+  obligatorios (número de póliza, fecha, identidad) se piden igual.
+- Un saludo antes de la identidad no escribe ni bloquea: solo una lectura de solo
+  lectura comprueba si la conversación ya está verificada; si la BD falla se pide la
+  identidad igualmente.
+
+Despliegue: requiere aplicar `012_page_search_vectors.sql` antes del código nuevo
+(la consulta usa `body_tsv`). **NO EJECUTADO** en Railway desde este entorno.

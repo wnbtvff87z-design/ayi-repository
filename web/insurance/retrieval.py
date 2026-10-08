@@ -4,7 +4,11 @@ import unicodedata
 
 from insurance import identity
 
-STOP = set('de la el los las un una y o en que por para con del al se mi me es lo a su sus si no'.split())
+STOP = set('de la el los las un una y o en que por para con del al se mi me es lo a su sus si no '
+           # Conversational filler: never evidence on its own.
+           'como cuando donde cual hasta desde queria quiero quisiera tengo tiene tenemos forma '
+           'manera general saber poliza seguro esta este esto pero muy mas hay puede '
+           'puedo sobre favor hola buenas gracias'.split())
 SUPPORT = ('exclusions', 'general_conditions', 'particular')
 MAX_PAGES = 5
 MAX_FRAGMENTS_PER_PAGE = 2
@@ -56,7 +60,8 @@ SCOPED_PAGES_SQL = (
     'AND pp.source IN (\'text\',\'ocr\') AND length(btrim(pp.body))>0 '
     'ORDER BY pp.document_id,pp.page_number'
 )
-FTS_VECTOR = "to_tsvector('simple',translate(lower(pp.body),'áéíóúüñ','aeiouun'))"
+# Stored generated column (migration 012) with a GIN index; same expression as before.
+FTS_VECTOR = 'pp.body_tsv'
 MATCHING_PAGES_SQL = (
     'SELECT pp.document_id,pp.page_number,pp.section,pp.source,pp.body,'
     f'ts_rank_cd({FTS_VECTOR},to_tsquery(\'simple\',%s)) AS fts_rank '
@@ -71,8 +76,6 @@ MATCHING_PAGES_SQL = (
     'ORDER BY pp.document_id,pp.page_number'
 )
 SUMMARY_SECTION_ORDER = ('particular', 'coverage', 'general_conditions', 'exclusions', 'general', 'annex')
-GLASS_TERMS = frozenset(('vidrio', 'vidrios', 'cristal', 'cristales', 'cristale'))
-FIRE_TERMS = frozenset(('incendio', 'incendios', 'fuego', 'fuegos'))
 SENTENCE_SPLIT = re.compile(r'(?<=[.!?;])\s+|\n+')
 
 
@@ -176,7 +179,13 @@ def _tokens(text):
     t = unicodedata.normalize('NFD', text.casefold())
     t = ''.join(c for c in t if unicodedata.category(c) != 'Mn')
     words = {w for w in re.findall(r'[a-z0-9]{3,}', t) if w not in STOP}
-    return {w[:-1] if len(w) > 4 and w.endswith('s') else w for w in words}
+    return {_singular(w) for w in words}
+
+
+def _singular(word):
+    if len(word) > 5 and word.endswith('es') and word[-3] in 'lrnd':
+        return word[:-2]
+    return word[:-1] if len(word) > 4 and word.endswith('s') else word
 
 
 def _raw_tokens(text):
@@ -185,13 +194,11 @@ def _raw_tokens(text):
     return {w for w in re.findall(r'[a-z0-9]{3,}', folded) if w not in STOP}
 
 
-def _query_terms(question):
-    raw = _raw_tokens(question)
+def _query_terms(question, extra_terms=()):
+    """Lexical terms of the question plus optional rewrite terms (typos/synonyms from the
+    LLM rewrite); there is no hard-coded synonym list."""
     terms = set(_tokens(question))
-    if raw & GLASS_TERMS:
-        terms.update(GLASS_TERMS)
-    if raw & FIRE_TERMS:
-        terms.update(FIRE_TERMS)
+    terms.update(_tokens(' '.join(t for t in extra_terms if isinstance(t, str))))
     return terms
 
 
@@ -203,6 +210,8 @@ def _fts_query(terms):
         words.add(term)
         if not term.endswith('s'):
             words.add(term + 's')
+            if term[-1] in 'lrnd':
+                words.add(term + 'es')
     return ' | '.join(sorted(words))
 
 
@@ -263,7 +272,7 @@ def _mentions(question, ident):
 
 
 def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=None, fact_end=None,
-             mode='question', include_trace=False):
+             mode='question', include_trace=False, extra_terms=()):
     """Returns {'status','reason_code','evidence','policy_id','version_id','diagnostics'}.
 
     fact_end optionally requires one version to cover the entire inclusive incident range.
@@ -378,7 +387,7 @@ def retrieve(conn, business_id, customer_id, question, fact_date, policy_hint=No
                     candidate, score=0, fts_rank=0, selected=is_selected,
                     reason=None if is_selected else 'summary_section_not_selected'))
         return out('ok', 'summary_sections_selected', evidence, **base)
-    terms = _query_terms(question)
+    terms = _query_terms(question, extra_terms)
     query = _fts_query(terms)
     if not query:
         return out('no_match', 'no_searchable_terms', **base)

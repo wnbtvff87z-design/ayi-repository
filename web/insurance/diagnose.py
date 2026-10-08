@@ -132,10 +132,71 @@ def diagnose(conn, *, business_id, customer_id, question, fact_date, policy_id=N
             'decision': 'offer_human' if insufficient else 'answer'}
 
 
+IDENTITY_REASONS = frozenset((
+    'identity_data_partial', 'identity_no_match', 'identity_ambiguous',
+    'identity_attempts_exceeded', 'identity_verified'))
+
+
+def diagnose_identity(conn, *, business_id, conversation_ref, channel='WhatsApp', session_ref=''):
+    """Identity capture state for one conversation, as booleans and counts only.
+
+    Never returns the declared name, document, its tail, hashes or the transcript: only which
+    fields are present, whether the stored HMACs hit an active customer of THIS business, how
+    many candidates the exact rule selects, and the persisted stage/reason code."""
+    report = {'correlation_id': uuid.uuid4().hex[:16], 'stage': 'state', 'channel': channel}
+    try:
+        state = identity.load_state(conn, business_id, channel, conversation_ref, session_ref)
+    except (TypeError, ValueError):
+        return {**report, 'reason_code': 'state_invalid'}
+    verified = conn.execute(
+        'SELECT count(*) AS n FROM insurance_identity_verifications v JOIN insurance_customers c '
+        'ON c.business_id=v.business_id AND c.customer_id=v.customer_id AND c.active '
+        'WHERE v.business_id=%s AND v.channel=%s AND v.conversation_ref=%s AND v.session_ref=%s '
+        'AND v.revoked_at IS NULL AND v.expires_at>now()',
+        (business_id, channel, conversation_ref, session_ref)).fetchone()['n'] > 0
+    name = state.get('name') if isinstance(state.get('name'), str) else ''
+    doc_hash = state.get('doc_hmac') if isinstance(state.get('doc_hmac'), str) else None
+    name_hash = identity.name_hmac(business_id, name) if name else None
+    surname_pending = bool(state.get('identity_given_name') and not state.get('identity_surname'))
+    fields = {
+        'name': bool(name), 'name_has_surname': identity.name_is_sufficient(name) and not surname_pending,
+        'given_name_boundary': bool(state.get('identity_given_name')),
+        'surname_pending': surname_pending, 'document': bool(doc_hash),
+        'document_partial': bool(state.get('identity_buffer')),
+    }
+    report['state_status'] = 'loaded' if state else 'missing_or_expired'
+    report['identity_verified'] = verified
+    report['fields'] = fields
+    report['capture'] = {
+        'status': ('complete' if fields['name_has_surname'] and fields['document'] else
+                   'partial' if any(fields.values()) else 'empty'),
+        'awaiting': state.get('awaiting') if state.get('awaiting') in (
+            'identity', 'policy', 'date', 'reference', 'human_consent') else None,
+        'awaiting_document': bool(state.get('awaiting_document')),
+    }
+    report['document_hmac_match'] = bool(doc_hash) and conn.execute(
+        'SELECT count(*) AS n FROM insurance_customers WHERE business_id=%s AND active '
+        'AND document_hmac=%s', (business_id, doc_hash)).fetchone()['n'] > 0
+    report['name_hmac_match'] = bool(name_hash) and conn.execute(
+        'SELECT count(*) AS n FROM insurance_customers WHERE business_id=%s AND active '
+        'AND (name_hmac=%s OR name_prefix_hmacs @> ARRAY[%s]::text[])',
+        (business_id, name_hash, name_hash)).fetchone()['n'] > 0
+    report['candidate_count'] = len(identity.match_by_hashes(conn, business_id, doc_hash, name_hash))
+    report['failed_attempts'] = identity.failed_attempts(conn, business_id, channel, conversation_ref)
+    code = state.get('_identity_diagnostic')
+    report['stage'] = 'identity'
+    report['reason_code'] = (code if code in IDENTITY_REASONS else
+                             'identity_verified' if verified else
+                             'state_missing' if not state else 'identity_not_evaluated')
+    return report
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--business-id', required=True)
-    parser.add_argument('--customer-id', required=True)
+    parser.add_argument('--customer-id')
+    parser.add_argument('--identity', action='store_true',
+                        help='identity capture diagnostic for --conversation-ref (no stdin needed)')
     parser.add_argument('--policy-id')
     parser.add_argument('--mode', choices=('question', 'summary', 'availability'), default='question')
     parser.add_argument('--fact-date', type=date.fromisoformat)
@@ -147,8 +208,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.conversation_ref and not re.fullmatch(r'[0-9a-f]{64}', args.conversation_ref):
         parser.error('conversation-ref must be an existing HMAC reference')
-    question = sys.stdin.read(2001).strip()
-    if not question or len(question) > 2000:
+    if args.identity and not args.conversation_ref:
+        parser.error('--identity requires --conversation-ref')
+    if not args.identity and not args.customer_id:
+        parser.error('--customer-id is required')
+    question = '' if args.identity else sys.stdin.read(2001).strip()
+    if not args.identity and (not question or len(question) > 2000):
         parser.error('provide a question of 1–2000 characters on stdin')
     token = os.getenv('INSURANCE_DIAGNOSTIC_TOKEN', '').strip()
     digest = admin.token_hmac(token) if token and len(token) <= 256 else None
@@ -166,13 +231,18 @@ def main(argv=None):
                     'AND can_read_cases AND business_id=%s', (digest, args.business_id)).fetchone()
                 if operator:
                     actor_ref = hashlib.sha256(operator['actor_id'].encode()).hexdigest()[:16]
-                    report = diagnose(
-                        conn, business_id=args.business_id, customer_id=args.customer_id,
-                        question=question,
-                        fact_date=args.fact_date or datetime.now(ZoneInfo(args.timezone)).date(),
-                        policy_id=args.policy_id, mode=args.mode, run_llm=args.run_llm,
-                        conversation_ref=args.conversation_ref, channel=args.channel,
-                        session_ref=args.session_ref)
+                    if args.identity:
+                        report = diagnose_identity(
+                            conn, business_id=args.business_id, conversation_ref=args.conversation_ref,
+                            channel=args.channel, session_ref=args.session_ref)
+                    else:
+                        report = diagnose(
+                            conn, business_id=args.business_id, customer_id=args.customer_id,
+                            question=question,
+                            fact_date=args.fact_date or datetime.now(ZoneInfo(args.timezone)).date(),
+                            policy_id=args.policy_id, mode=args.mode, run_llm=args.run_llm,
+                            conversation_ref=args.conversation_ref, channel=args.channel,
+                            session_ref=args.session_ref)
     except Exception as exc:
         report = {'correlation_id': corr, 'stage': 'storage',
                   'reason_code': 'persistence_failed', 'error_type': type(exc).__name__}

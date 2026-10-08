@@ -26,7 +26,7 @@ from twilio.request_validator import RequestValidator
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'web'))
 import main
-from insurance import cases, identity, memory, orchestrator
+from insurance import cases, identity, llm, memory, orchestrator
 
 BIZ = 'INS-SYNTHETIC-GROUNDED'
 PHONE = '+34600999111'
@@ -86,6 +86,16 @@ def _install_transports(monkeypatch, captures, mode):
         assert [item['role'] for item in payload['messages']] == ['system', 'user']
         assert len(messages) <= memory.cfg('INSURANCE_LLM_CONTEXT_CHARS') + 1
         prompt = payload['messages'][-1]['content']
+        if payload['messages'][0]['content'] == llm.REWRITE_INSTRUCTIONS:
+            # Query rewrite: only folded content words travel; answer typo/synonym terms.
+            words = json.loads(prompt)['palabras']
+            assert all(re.fullmatch(r'[a-z]{3,24}', word) for word in words)
+            terms = ['cristal', 'cristales'] if {'vidrio', 'vidrios'} & set(words) else []
+            return httpx.Response(200, json={
+                'id': 'chatcmpl-synthetic-rewrite', 'object': 'chat.completion', 'created': 1,
+                'model': payload['model'], 'choices': [
+                    {'index': 0, 'finish_reason': 'stop',
+                     'message': {'role': 'assistant', 'content': json.dumps({'terms': terms})}}]})
         interpreting = payload.get('response_format') == {'type': 'json_object'}
         if interpreting:
             assert payload['max_tokens'] == 256 and payload['temperature'] == 0
@@ -217,7 +227,13 @@ class Harness:
 
     @property
     def interpretations(self):
-        return [capture for capture in self.captures if 'response_format' in capture]
+        return [capture for capture in self.captures if 'response_format' in capture
+                and capture['messages'][0]['content'] != llm.REWRITE_INSTRUCTIONS]
+
+    @property
+    def rewrites(self):
+        return [capture for capture in self.captures
+                if capture['messages'][0]['content'] == llm.REWRITE_INSTRUCTIONS]
 
     def voice(self, text, session='CA-SYNTHETIC-GROUNDED', sid=None):
         self.sequence += 1
@@ -446,7 +462,8 @@ def test_model_evidence_insufficiency_remains_explicit_and_consent_gated(grounde
     flow = grounded
     flow.verify()
     flow.mode['value'] = 'insufficient'
-    assert 'evidencia suficiente' in flow.say(QUESTION)
+    first = flow.say(QUESTION)
+    assert 'cláusulas relacionadas' in first and 'revisión humana' in first
     reply = flow.say('No encontraste evidencia de qué?')
     assert 'mesa de vidrio' in reply and 'no significa que esté cubierto ni excluido' in reply
     assert flow.count('insurance_cases') == 0
@@ -665,7 +682,8 @@ def test_real_sdk_error_general_logs_are_classified_counted_and_private(grounded
                (NAME, DNI, PHONE, QUESTION, GLASS, EXCLUSION, 'Celia'))
     assert all(not record.exc_info for record in caplog.records
                if record.name == 'insurance' or record.name.startswith('insurance.'))
-    assert len(flow.explanations) == 1 and flow.count('insurance_cases') == 0
+    # One SDK attempt plus the single own retry for a transient timeout.
+    assert len(flow.explanations) == 2 and flow.count('insurance_cases') == 0
 
 
 @pytest.mark.parametrize('channel', ['WhatsApp', 'Voice'])

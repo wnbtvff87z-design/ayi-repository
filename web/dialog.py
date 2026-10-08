@@ -1,8 +1,13 @@
 """Sector router. No restaurant logic belongs in this module."""
 import os
-from restaurant_dialog import process as restaurant_process
 from consulting_dialog import process as consulting_process
 from general_dialog import process as general_process
+
+
+def restaurant_process(*args):
+    # Imported lazily: insurance and consulting requests never load the restaurant stack.
+    from restaurant_dialog import process
+    return process(*args)
 
 
 class BusinessSectorError(ValueError):
