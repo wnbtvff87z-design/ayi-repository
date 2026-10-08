@@ -167,7 +167,11 @@ endpoints y SDK reales con PostgreSQL local y transportes HTTP/WebSocket externo
 controlados; todos los datos son sintéticos y cada esquema es desechable.
 La prueba existente de 10000 pólizas mide candidatos, planes SQL antes/después de
 índices, memoria y latencia del retrieval, varios negocios, múltiples contratos,
-versiones y documentos. No mide 10000 llamadas OpenAI simultáneas ni garantiza
+versiones y documentos. La memoria medida es el pico de asignaciones Python
+durante una segunda ejecución perfilada con `tracemalloc`, separada de la latencia
+sin perfilado; no mide RSS, memoria nativa de psycopg ni memoria del servidor PG.
+También se comprueba el tamaño de los lotes de cursor (128 filas).
+No mide 10000 llamadas OpenAI simultáneas ni garantiza
 latencia Railway; el intérprete añade una petición en turnos no locales.
 
 Resultados finales y SHA publicado se registran en la descripción del PR tras

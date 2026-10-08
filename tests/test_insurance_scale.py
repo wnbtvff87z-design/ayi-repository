@@ -1,6 +1,7 @@
 """Synthetic local PostgreSQL scope, exact scoring, bounded-memory and index measurements."""
 import json
 import time
+import tracemalloc
 from datetime import date, timedelta
 
 import pytest
@@ -193,6 +194,13 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
         start = time.perf_counter()
         result = retrieval.retrieve(observed, 'S-BIZ', 'S-single', 'agua tuberias', date.today())
         elapsed = (time.perf_counter() - start) * 1000
+        tracemalloc.start()
+        try:
+            profiled = retrieval.retrieve(observed, 'S-BIZ', 'S-single', 'agua tuberias', date.today())
+            _, python_peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert profiled['evidence'] == result['evidence']
         assert result['status'] == 'ok'
         assert result['policy_id'] == 'S-P1' and result['version_id'] == 'S-V2'
         assert {(e['document_id'], e['page']) for e in result['evidence']} == {
@@ -293,6 +301,8 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
                           'large_customer_candidates': many['diagnostics']['policy_candidates'],
                           'large_customer_hint_candidates': large_hinted['diagnostics']['policy_candidates'],
                           'local_retrieval_ms': elapsed,
+                          'python_retrieval_peak_bytes': python_peak_bytes,
+                          'max_stream_chunk_rows': max(observed.chunk_sizes),
                           'multiple_policy_ambiguity_ms': ambiguity_elapsed,
                           'explicit_policy_ms': explicit_elapsed,
                           'large_customer_ambiguity_ms': many_elapsed,
@@ -320,12 +330,21 @@ def test_scoring_preserves_late_exclusions_and_bounds_candidates(pg):
         start = time.perf_counter()
         result = retrieval.retrieve(observed, BIZ, 'C2', 'agua tuberias', date.today())
         elapsed = (time.perf_counter() - start) * 1000
+        tracemalloc.start()
+        try:
+            profiled = retrieval.retrieve(observed, BIZ, 'C2', 'agua tuberias', date.today())
+            _, python_peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert profiled['evidence'] == result['evidence']
         assert [p['page'] for p in result['evidence']] == [1, 2, 3, 10001]
         assert result['diagnostics']['page_candidates'] == 10001
         assert result['diagnostics']['scored_pages'] == 10001
         assert result['diagnostics']['retained_page_candidates'] <= 3 + len(retrieval.SUPPORT) * 5
         assert max(observed.chunk_sizes) == retrieval.STREAM_CHUNK
         print(json.dumps({'large_document_candidates': result['diagnostics'],
+                          'python_retrieval_peak_bytes': python_peak_bytes,
+                          'max_stream_chunk_rows': max(observed.chunk_sizes),
                           'local_retrieval_ms': elapsed}, sort_keys=True))
 
 
