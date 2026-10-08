@@ -1,5 +1,6 @@
 """Authorized selection and recovery through signed webhooks, PostgreSQL and SDK HTTP."""
 from datetime import date, timedelta
+import unicodedata
 
 import pytest
 
@@ -324,3 +325,24 @@ def test_recovery_guidance_matches_provider_failure_even_on_repeated_questions(
         assert state['awaiting'] == 'retry' and state['question'] == QUESTION
         assert state['last_retrieval']['llm_diagnostic'] == code
         assert not state.get('pending_human') and flow.count('insurance_cases') == 0
+
+
+@pytest.mark.parametrize('channel', ['WhatsApp', 'Voice'])
+@pytest.mark.parametrize('selector', ['automóvil', 'automovil'])
+@pytest.mark.parametrize('stored_form', ['NFC', 'NFD'])
+def test_authorized_accented_product_exact_selection_succeeds(grounded, channel, selector, stored_form):
+    flow = grounded
+    say = lambda text: flow.turn(channel, text)['reply']
+    product = unicodedata.normalize(stored_form, 'automóvil')
+    add_policy('AUTO-010', product)
+    assert 'He verificado tus datos' in say(DECLARATION)
+    say(selector)
+    assert flow.state()['policy_id'] == 'POL-AUTO-010'
+    metadata = say('como se llama mi poliza?')
+    assert 'AUTO-010' in metadata and product in metadata and 'SYN-0731' not in metadata
+    assert not flow.explanations and flow.count('insurance_cases') == 0
+    index = flow.rows(
+        'SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname=%s',
+        ('insurance_policies_product_selection_idx',))[0]['indexdef']
+    assert 'business_id, customer_id' in index.lower()
+    assert 'normalize' in index.lower() and 'translate' in index.lower()

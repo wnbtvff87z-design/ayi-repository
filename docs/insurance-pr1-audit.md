@@ -180,6 +180,12 @@ La comprobación sucede en cada consulta del Web al registro, pero no controla l
   la pregunta pendiente no se sustituye por la elección. Las versiones ambiguas
   requieren fecha. Se mantienen `valid_to` inclusivo para versión y exclusivo para
   autorización.
+- La selección de producto normaliza Unicode NFC y acentos de forma simétrica,
+  con coincidencia exacta y detección de múltiples candidatos, sin similitud ni
+  datos personales. La migración `013_policy_product_selection_index.sql` añade
+  el índice de expresión por negocio/cliente correspondiente. Debe aplicarse con
+  el migrador existente y su credencial separada antes de activar estos cambios;
+  aquí solo se aplicó en schemas sintéticos de PostgreSQL local, sin despliegue.
 
 ### Errores: ubicación, condiciones y recuperación
 

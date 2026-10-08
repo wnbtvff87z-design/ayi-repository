@@ -147,11 +147,12 @@ def test_ten_thousand_policies_scoped_streaming_and_measured_plans(pg, monkeypat
             'authorized_matching_pages': (retrieval.MATCHING_PAGES_SQL, matching_params),
         }
         migration = WEB / 'insurance/migrations/010_retrieval_indexes.sql'
-        # Drop only this migration's indexes inside the fixture's isolated schema.
+        # Isolate this migration's before/after plans from later policy-selection indexes.
         for index in ('insurance_authorizations_active_retrieval_idx',
                       'insurance_documents_version_retrieval_idx',
                       'insurance_policies_hint_id_retrieval_idx',
-                      'insurance_policies_hint_contract_retrieval_idx'):
+                      'insurance_policies_hint_contract_retrieval_idx',
+                      'insurance_policies_product_selection_idx'):
             conn.execute('DROP INDEX IF EXISTS ' + index)
         before = {name: _explain(conn, *query) for name, query in queries.items()}
         conn.execute(migration.read_text())

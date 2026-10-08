@@ -76,7 +76,7 @@ def selection(conn, scope, state, text, number=None):
         'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
         + retrieval.AUTHORIZED +
         ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s) '
-        "OR translate(lower(p.product),'áéíóúüñ','aeiouun')=lower(%s)) "
+        "OR translate(lower(normalize(p.product,NFC)),'áéíóúüñ','aeiouun')=lower(%s)) "
         'ORDER BY p.policy_id LIMIT 2',
         (scope.bid, scope.customer_id, number or candidate, number or candidate, candidate)).fetchall()
     if len(rows) > 1:
