@@ -23,7 +23,11 @@ LETTERS = {
     'ye': 'Y', 'zeta': 'Z',
 }
 CARDINALS = incident_dates.SPOKEN_NUMBERS
-LABEL = re.compile(r'\b(?:dni|nie|documento)\b\s*(?:(?:es|n[úu]mero)\b\s*)?[:=-]?\s*', re.I)
+# Document label, including "número de DNI es el …", "documento (nacional) de identidad …".
+LABEL = re.compile(
+    r'\b(?:n[úu]mero\s+de\s+(?:mi\s+)?)?'
+    r'(?:dni|nie|documento(?:\s+(?:nacional\s+)?de\s+identidad|\s+de\s+identificaci[óo]n)?)\b'
+    r'\s*(?:(?:es|n[úu]mero)\b\s*)?(?:(?:el|la)\s+(?=\d|[XYZxyz]\W*\d))?[:=-]?\s*', re.I)
 TOKENS = re.compile(r'[^\W_]+|[/?¿,;]', re.UNICODE)
 BUFFER_KEY = 'identity_buffer'
 YEAR_RE = re.compile(r'^(?:19|20)\d{2}$')
@@ -193,19 +197,48 @@ def _full_name_declared(name, with_document=False):
     return len(words) >= 3 or (len(words) == 2 and with_document)
 
 
-def _name_datum(text, state, with_document=False):
-    """Take literal guided name data, retaining surname particles and token order."""
-    surname = re.match(r'^\s*(?:mi\s+)?apellidos?\s*(?:es|son|[:=-])\s*', text, re.I)
-    given = re.match(r'^\s*(?:(?:mi\s+)?nombre\s*(?:es|[:=-])|me\s+llamo|soy)\s*', text, re.I)
-    given_only = re.match(r'^\s*(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', text, re.I)
-    label = surname or given
-    value = text[label.end():] if label else text
+GREETING_PREFIX = re.compile(
+    r'^\s*(?:(?:hola|buenas|buenos\s+d[ií]as|buenas\s+(?:tardes|noches|d[ií]as))\b[\s,.!¡]*)+', re.I)
+GIVEN_LABEL = (r'(?:(?:mi\s+)?nombre\s+y\s+apellidos?\s*(?:son\b|es\b|[:=-])?|'
+               r'(?:mi\s+)?nombre(?:\s+completo)?\s*(?:es\b|[:=-])|'
+               r'(?:mi\s+)?nombre(?=\s+(?!y\b)[A-ZÁÉÍÓÚÑ])|me\s+llamo\b|soy\b)')
+SURNAME_LABEL = r'(?:mis?\s+)?apellidos?\s*(?:es\b|son\b|[:=-])'
+COMBINED_NAME = re.compile(
+    r'^\s*' + GIVEN_LABEL + r'\s*(?P<given>.+?)\s*(?:,\s*|\s+y\s+|\s+)(?:y\s+)?'
+    + SURNAME_LABEL + r'\s*(?P<surname>.+?)\s*$', re.I)
+
+
+def _name_words(value):
     value = value.strip(' ,;.-')
     words = identity.WORD_RE.findall(value)
     if (not words or len(words) > identity.MAX_NAME_TOKENS
             or not re.fullmatch(r'\s*' + identity.WORD + r'(?:\s+' + identity.WORD + r')*\s*', value)
             or any(w.casefold() in NON_NAME_WORDS or _fold_word(w) in DIGITS
                    or _fold_word(w) in CARDINALS for w in words)):
+        return None
+    return words
+
+
+def _name_datum(text, state, with_document=False):
+    """Take literal guided name data, retaining surname particles and token order."""
+    text = GREETING_PREFIX.sub('', text)
+    combined = COMBINED_NAME.match(text)
+    if combined:
+        # "mi nombre es X, mi apellido es Y" / "me llamo X y mis apellidos son Y" in one message.
+        given_words, surname_words = _name_words(combined['given']), _name_words(combined['surname'])
+        if not given_words or not surname_words:
+            return None
+        state['identity_given_name'] = ' '.join(given_words)
+        state['identity_surname'] = ' '.join(surname_words)
+        return state['identity_given_name'] + ' ' + state['identity_surname']
+    surname = re.match(r'^\s*' + SURNAME_LABEL + r'\s*', text, re.I)
+    given = re.match(r'^\s*' + GIVEN_LABEL + r'\s*', text, re.I)
+    given_only = re.match(r'^\s*(?:mi\s+)?nombre(?:\s*(?:es\b|[:=-])|(?=\s+(?!y\b)[A-ZÁÉÍÓÚÑ]))\s*',
+                          text, re.I)
+    label = surname or given
+    value = (text[label.end():] if label else text).strip(' ,;.-')
+    words = _name_words(value)
+    if not words:
         return None
     if not label and state.get('awaiting') != 'identity':
         return None
@@ -220,7 +253,7 @@ def _name_datum(text, state, with_document=False):
         if not first:
             return None
         state['identity_surname'] = ' '.join(words)
-        return first + ' ' + state['identity_surname']
+        return _merge(first, words)
     if not given and state.get('name') and (
             _surname_pending(state) or not identity.name_is_sufficient(state['name'])):
         pending = identity.normalize_name(state['name']).split()
@@ -232,7 +265,7 @@ def _name_datum(text, state, with_document=False):
             return ' '.join(words)
         state['identity_given_name'] = state['name']
         state['identity_surname'] = ' '.join(words)
-        return state['name'] + ' ' + state['identity_surname']
+        return _merge(state['name'], words)
     if given_only and _full_name_declared(value, with_document):
         state.pop('identity_given_name', None)
         state.pop('identity_surname', None)
@@ -253,6 +286,21 @@ def _name_datum(text, state, with_document=False):
             state.pop('identity_given_name', None)
             state.pop('identity_surname', None)
     return ' '.join(words)
+
+
+def _merge(given, surname_words):
+    """Append surnames without duplicating words the caller already gave: "Lucía Fernández"
+    + "Fernández Ortega" is "Lucía Fernández Ortega", never "Lucía Fernández Fernández Ortega"."""
+    stored = given.split()
+    folded = [identity.normalize_name(w) for w in stored]
+    new = [identity.normalize_name(w) for w in surname_words]
+    overlap = next((k for k in range(min(len(stored) - 1, len(new)), 0, -1)
+                    if folded[-k:] == new[:k]), 0)
+    return ' '.join(stored + list(surname_words[overlap:]))
+
+
+SEGMENT_HEAD = re.compile(r'^(?:[\s,;:.-]|\b(?:y|e|con|mi|el|la|su)\b)*', re.I)
+SEGMENT_TAIL = re.compile(r'(?:[\s,;:.-]|\b(?:y|e|con|mi|el|la|su|de)\b)*$', re.I)
 
 
 def _given_before_surname(name, surname_words):
@@ -328,7 +376,7 @@ def prepare(text, state, business_id, channel, ref, session):
     identity_syntax = bool(
         LABEL.search(text) or identity.NAME_TRIGGER_RE.search(text)
         or identity.LABEL_RE.search(text)
-        or re.search(r'\b(?:mi\s+)?apellidos?\s*(?:es|son|[:=-])', text, re.I)
+        or re.search(r'\b(?:mis?\s+)?apellidos?\s*(?:es|son|[:=-])', text, re.I)
         or CORRECTION_RE.search(text) and '?' not in text and '¿' not in text)
     unmistakable_question = bool(
         not identity_syntax and not ordinary['name'] and not ordinary['document']
@@ -400,12 +448,17 @@ def prepare(text, state, business_id, channel, ref, session):
         cleaned, 'identity' if labels and candidate is not None else state.get('awaiting'))
     guided_name = None
     if candidate is not None and not bad:
-        name_text = cleaned.strip(' ,;.-')
-        if name_text.casefold().startswith('y '):
-            name_text = name_text[2:]
-        guided_name = _name_datum(name_text, state, with_document=True)
-        if guided_name:
-            decl.update(name=guided_name, question='', has_question=False)
+        # The name may come before or after the document ("el DNI X, nombre Y").
+        start = labels[0].start() if labels else candidate
+        segments = [SEGMENT_TAIL.sub('', SEGMENT_HEAD.sub('', part))
+                    for part in (text[:start], text[candidate + end:])]
+        for index, segment in enumerate(segments):
+            guided_name = _name_datum(segment, state, with_document=True) if segment else None
+            if guided_name:
+                decl['name'] = guided_name
+                if not segments[1 - index]:
+                    decl.update(question='', has_question=False)
+                break
     elif name_datum:
         decl.update(name=name_datum, question='', has_question=False)
     declares_given = bool(decl['name'] and not (name_datum or guided_name) and re.search(

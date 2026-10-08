@@ -250,3 +250,92 @@ def test_identity_diagnostic_cli_requires_authorized_operator(wa, monkeypatch, c
     assert report['document_hmac_match'] is True and report['candidate_count'] == 0
     assert report['reason_code'] == 'identity_data_partial'
     _assert_no_identity_values(output)
+
+
+# --- Phrasing matrix (synthetic data) ---
+VARIANT_FULL = 'Lucía Fernández Ortega'
+
+
+@pytest.fixture
+def variants(grounded):  # noqa: F811
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'C-VARIANTS', 'Lucía F.', '23456781R', VARIANT_FULL)
+        identity.upsert_customer(conn, BIZ, 'C-NIE', 'Mar R.', 'X1234567L', 'María del Mar Ruiz de la Torre')
+    return grounded
+
+
+# Ways of saying/writing name, surnames and DNI/NIE, in one or several messages.
+VARIANTS = [
+    ['Soy Lucía Fernández Ortega, DNI 23456781R'],
+    ['Me llamo Lucía Fernández Ortega y mi DNI es 23456781R'],
+    ['lucia fernandez ortega 23456781r'],
+    ['LUCÍA FERNÁNDEZ ORTEGA DNI 23456781-R'],
+    ['23456781 R Lucía Fernández Ortega'],
+    ['Mi DNI es 23.456.781-R y me llamo Lucía Fernández Ortega'],
+    ['nombre: Lucía Fernández Ortega dni: 23456781r'],
+    ['Hola, soy Lucía Fernández Ortega con DNI 23456781R'],
+    ['Buenas, mi nombre es Lucía, mi apellido es Fernández Ortega y mi documento es 23456781R'],
+    ['Lucía Fernández Ortega\n23456781R'],
+    ['mi nombre es Lucía y mis apellidos son Fernández Ortega, DNI 23456781R'],
+    ['el dni 23456781R, nombre Lucía Fernández Ortega'],
+    ['Lucia Fernandez, 23456781R'],
+    ['Mi nombre es Lucía Fernández Ortega. Mi DNI: 23456781R'],
+    ['Lucía Fernández Ortega, documento de identidad 23456781R'],
+    ['Me llamo Lucía Fernández Ortega y mi número de DNI es el 23456781R'],
+    ['Lucía', 'Fernández Ortega', '23456781R'],
+    ['23456781R', 'Lucía Fernández Ortega'],
+    ['me llamo Lucía', 'mis apellidos son Fernández Ortega', 'mi dni es 23456781R'],
+    ['Lucía Fernández Ortega', '23456781R'],
+    ['Lucía Fernández Ortega', 'mi DNI es 23456781R'],
+    ['soy Lucía', 'Fernández', '23456781R'],
+    ['Me llamo María del Mar Ruiz de la Torre y mi NIE es X1234567L'],
+    ['María del Mar Ruiz de la Torre, NIE X-1234567-L'],
+    ['mi nombre es María del Mar', 'mi apellido es Ruiz de la Torre', 'NIE X1234567L'],
+    ['x1234567l', 'María del Mar Ruiz de la Torre'],
+    ['mi nie es equis uno dos tres cuatro cinco seis siete ele y me llamo María del Mar Ruiz de la Torre'],
+    ['mi nombre es Lucía Fernández Ortega y mi DNI es dos tres cuatro cinco seis siete ocho uno erre'],
+    ['nombre y apellidos: Lucía Fernández Ortega, DNI 23456781R'],
+    ['Nombre y apellidos Lucía Fernández Ortega DNI 23456781R'],
+    ['mi nombre completo es Lucía Fernández Ortega y mi DNI 23456781R'],
+    ['Nombre Lucía Fernández Ortega DNI 23456781R'],
+    ['nombre lucía fernández ortega, dni 23456781r'],
+    ['Me llamo María del Mar Ruiz de la Torre y mi número de NIE es X1234567L'],
+    ['Mi documento nacional de identidad es 23456781R y soy Lucía Fernández Ortega'],
+    ['buenos días, me llamo Lucía Fernández Ortega, mi dni es 23456781R'],
+    ['Hola buenas soy Lucía Fernández Ortega', '23456781R'],
+    ['Lucía Fernández Ortega DNI 23456781 R'],
+    ['mi nombre es Lucía', 'Fernández Ortega', 'dni 23456781R'],
+    ['mi nombre es Lucía Fernández', 'mi DNI es 23456781R', 'Fernández Ortega'],
+    ['mi nombre es Lucía Fernández', 'mi DNI es 23456781R', 'mi apellido es Fernández Ortega'],
+    ['mi nombre es Lucía Fernández', 'Ortega', '23456781R'],
+    ['mi nombre es Lucía Fernández Ortega y mi DNI es veintitrés cuarenta y cinco sesenta y siete ochenta y uno R'],
+]
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+@pytest.mark.parametrize('seq', VARIANTS, ids=[' | '.join(s)[:60] for s in VARIANTS])
+def test_identity_phrasings_verify_exactly_on_the_last_datum(variants, channel, seq):
+    variants.turn(channel, 'Hola')
+    replies = [variants.turn(channel, t)['reply'] for t in seq]
+    assert VERIFIED in replies[-1], replies
+    assert all(VERIFIED not in r for r in replies[:-1]), replies
+    assert all(GENERIC not in r for r in replies), replies
+    assert variants.count('insurance_identity_attempts') == 0
+
+
+# Incompatible data is still rejected: no fuzzy widening.
+INCOMPATIBLE = [
+    ['mi nombre es Lucía Fernández Ortega y mi DNI es 23456782R'],
+    ['mi nombre es Lucía Gómez Ortega y mi DNI es 23456781R'],
+    ['mi nombre es Lucía, mi apellido es Gómez y mi DNI es 23456781R'],
+    ['el dni 23456781R, nombre Lucía Gómez Ortega'],
+]
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+@pytest.mark.parametrize('seq', INCOMPATIBLE, ids=[' | '.join(s)[:60] for s in INCOMPATIBLE])
+def test_incompatible_phrasings_are_rejected(variants, channel, seq):
+    variants.turn(channel, 'Hola')
+    replies = [variants.turn(channel, t)['reply'] for t in seq]
+    assert all(VERIFIED not in r for r in replies), replies
+    assert variants.count('insurance_identity_verifications') == 0
