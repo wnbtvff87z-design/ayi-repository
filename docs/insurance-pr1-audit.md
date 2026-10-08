@@ -200,11 +200,19 @@ mensajes, prompts, respuestas ni cuerpos de excepciones del proveedor:
 | `context_budget_exceeded` | Presupuesto local insuficiente antes del envío | Concretar consulta; no afirmar invocación del modelo |
 | `llm_error` | Otros errores del proveedor | Diagnóstico seguro y consulta pendiente |
 
-Las cadenas se centralizan en `TECHNICAL_RETRY` y `_technical_failure` de
+Las cadenas se centralizan en `TECHNICAL_RETRY`, `_technical_message` y `_technical_failure` de
 `web/insurance/dialog.py`: «No pude consultarlo ahora por un problema técnico,
 inténtalo en un minuto.» no equivale a falta de
 evidencia; para contexto se usa exactamente «No pude preparar la respuesta por un
-límite técnico de contexto. Inténtalo con una consulta más concreta.»
+problema técnico: límite técnico de contexto. Inténtalo con una consulta más concreta.»
+Configuración/acceso usan «No pude consultarlo por un problema técnico de configuración
+o acceso del servicio. Necesita revisión del operador para restablecerlo; no necesitas
+volver a enviar tus datos.» Rechazo, formato inválido y respuesta vacía usan «No pude
+preparar una respuesta segura por un problema técnico del servicio. Puedes solicitar
+revisión humana por un canal de atención autorizado.» Rate limit usa «No pude consultarlo
+por un problema técnico: el servicio está temporalmente saturado. Espera un minuto antes
+de volver a intentarlo.» Todas añaden «Esto no indica falta de evidencia ni confirma o
+descarta cobertura.»
 `_offer_for` y `_explain_insufficient` separan ausencia de páginas, documento no listo
 y necesidad de interpretación humana de esos errores técnicos. No se incluyen
 fuentes documentales en la respuesta técnica.
@@ -214,6 +222,11 @@ con `awaiting=retry`. `tests/test_insurance_provider_failures.py` comprueba diez
 categorías en ambos endpoints (**20 pruebas**), sin reemplazar `llm_explain`, y
 reanuda tras reiniciar el proceso en WhatsApp. Comprueba que el detalle «Es de vidrio»
 se incorpora a la consulta de mesa pendiente y que se presentan citas verificadas.
+`tests/test_insurance_policy_selection_integration.py` reproduce además un inicio
+limpio con una petición de receta ajena a cobertura, verificación, consulta sobre
+mesa, detalles «está declarada»/«vidrio», timeout y reinicio real. Los controles de
+selección, confirmación, revocación y versiones ambiguas recorren ambos endpoints,
+con listas de varias páginas y sin contaminación del tema anterior.
 `tests/test_insurance_llm_adapter.py` valida los códigos en el transporte HTTP real
 del SDK (**55 pruebas**). Las siete suites focalizadas de identidad/transporte
 obtuvieron **417 pruebas aprobadas**, incluyendo nombre/documento/pregunta e
