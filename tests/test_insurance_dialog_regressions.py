@@ -32,7 +32,19 @@ def state(pg):
 def test_combined_greeting_does_not_become_pending_question(pg):
     reply, _ = ask('hola buenas', ext='greeting')
     assert reply.startswith('Hola.')
-    assert not state(pg).get('question')
+    # A greeting before identity is read-only: no state, turn or attempt is written.
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_conversation_state')[0]['n'] == 0
+    assert rows(pg, 'SELECT count(*) AS n FROM insurance_conversation_turns')[0]['n'] == 0
+
+
+def test_greeting_before_identity_survives_database_failure(pg, monkeypatch):
+    def unavailable():
+        raise RuntimeError('synthetic database outage')
+
+    monkeypatch.setattr(dialog._cases, 'db', unavailable)
+    reply, out = ask('hola buenas', ext='greeting-db-down')
+    assert reply == dialog.GREETING_ASK_IDENTITY
+    assert out == {'insurance_result': 'missing_information'}
 
 
 @pytest.mark.parametrize('text', ['ventanas', 'no y ventanas', 'no gracias y ventanas',
@@ -140,7 +152,8 @@ def test_classified_model_failure_never_becomes_no_evidence_or_case(ready, monke
 def test_evidence_escalation_still_offers_without_automatic_case(ready, monkeypatch, question):
     pg, _ = ready
     monkeypatch.setattr(dialog, 'llm_explain', lambda *a: 'ESCALAR')
-    assert ask(question, ext='evidence-insufficient')[0] == dialog.OFFER_HUMAN
+    # Related clauses reached the model but were inconclusive: not "no evidence".
+    assert ask(question, ext='evidence-insufficient')[0] == dialog.OFFER_ESCALATED
     assert state(pg)['last_retrieval']['llm_diagnostic'] == 'llm_escalated'
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
     assert ask('sí', ext='explicit-consent')[1]['insurance_result'] == 'human_case_required'
@@ -594,7 +607,7 @@ def test_failed_commit_logs_write_failure_not_confirmed_persistence(pg, monkeypa
 
     monkeypatch.setattr(dialog._cases, 'db', FailingCommit)
     caplog.set_level(logging.INFO, logger='insurance.dialog')
-    _, out = ask('hola buenas', ext='failed-commit')
+    _, out = ask('gracias', ext='failed-commit')
     assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'persistence_failed'}
     messages = '\n'.join(record.getMessage() for record in caplog.records
                          if record.name == 'insurance.dialog')
@@ -630,7 +643,7 @@ def test_committed_case_then_failed_conversation_commit_reports_unknown_and_retr
     monkeypatch.setattr(dialog._cases, 'db', connect)
     reply, out = ask('sí', ext='consent-after-commit-loss')
     assert out == {'insurance_result': 'technical_error', 'diagnostic_code': 'persistence_failed'}
-    assert 'No pude confirmar' in reply
+    assert 'No puedo confirmar si se guardó' in reply
     assert 'No se ha creado' not in reply and 'He guardado' not in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 1
     assert state(pg).get('pending_human')

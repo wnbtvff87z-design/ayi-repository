@@ -30,6 +30,7 @@ def provider(monkeypatch):
     monkeypatch.setenv('OPENAI_BASE_URL', 'https://controlled.invalid/v1')
     monkeypatch.delenv('INSURANCE_LLM_TIMEOUT_SECONDS', raising=False)
     monkeypatch.delenv('INSURANCE_LLM_MAX_TOKENS', raising=False)
+    monkeypatch.delenv('INSURANCE_LLM_BUDGET_SECONDS', raising=False)
     requests = []
     clients = []
 
@@ -79,13 +80,14 @@ def test_exact_insufficient_signal_not_incidental_word(provider, content):
 @pytest.mark.parametrize('status,code', [
     (401, 'llm_auth_failed'), (403, 'llm_auth_failed'), (429, 'llm_rate_limited'),
     (400, 'llm_error'), (500, 'llm_error'), (503, 'llm_error')])
-def test_http_failure_classified_without_retry_or_sensitive_content(provider, caplog, status, code):
+def test_http_failure_classified_with_single_own_retry_only_for_5xx(provider, caplog, status, code):
     requests, _ = provider(lambda request: httpx.Response(
         status, json={'error': {'message': 'private-provider-content', 'type': 'synthetic'}}))
     with pytest.raises(llm.LLMError) as exc:
         llm.explain('private-user-question agua', EVIDENCE)
     assert exc.value.code == code and str(exc.value) == code
-    assert len(requests) == 1
+    # SDK retries stay disabled; one own retry only for transient 5xx while budget remains.
+    assert len(requests) == (2 if status >= 500 else 1)
     assert 'private-provider-content' not in caplog.text
     assert 'private-user-question' not in caplog.text
 
@@ -93,13 +95,57 @@ def test_http_failure_classified_without_retry_or_sensitive_content(provider, ca
 @pytest.mark.parametrize('exception,code', [
     (httpx.ReadTimeout, 'llm_timeout'), (httpx.ConnectTimeout, 'llm_timeout'),
     (httpx.ConnectError, 'llm_error'), (httpx.RemoteProtocolError, 'llm_error')])
-def test_transport_failures_classified_without_retry(provider, exception, code):
+def test_transport_failures_classified_after_one_own_retry(provider, exception, code):
     def fail(request):
         raise exception('private-network-detail', request=request)
-    requests, _ = provider(fail)
+    requests, clients = provider(fail)
     with pytest.raises(llm.LLMError) as exc:
         llm.explain('agua', EVIDENCE)
-    assert exc.value.code == code and len(requests) == 1
+    assert exc.value.code == code and len(requests) == 2
+    assert all(client.max_retries == 0 and client.is_closed() for client in clients)
+
+
+def test_own_retry_is_skipped_without_remaining_budget(provider, monkeypatch):
+    monkeypatch.setenv('INSURANCE_LLM_BUDGET_SECONDS', '1')
+
+    def fail(request):
+        raise httpx.ReadTimeout('private-network-detail', request=request)
+    requests, _ = provider(fail)
+    with pytest.raises(llm.LLMError, match='llm_timeout'):
+        llm.explain('agua', EVIDENCE)
+    assert len(requests) == 1
+
+
+def test_retry_succeeds_and_default_timeout_is_eight_seconds(provider):
+    calls = []
+
+    def flaky(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ConnectError('private-network-detail', request=request)
+        return httpx.Response(200, json=completion())
+    requests, _ = provider(flaky)
+    assert llm.explain('agua', EVIDENCE) == completion()['choices'][0]['message']['content']
+    assert len(requests) == 2
+    assert requests[0].extensions['timeout'] == dict.fromkeys(('connect', 'read', 'write', 'pool'), 8.0)
+
+
+def test_query_rewrite_sends_only_words_and_validates_terms(provider):
+    requests, _ = provider(lambda request: httpx.Response(200, json=completion(json.dumps(
+        {'terms': ['Cristal', 'cristales', 'rotura', '12345678', 'x', {'bad': 1}]}))))
+    assert llm.rewrite(['mesa', 'vidrio', '12345678z']) == ['cristal', 'cristales', 'rotura']
+    payload = json.loads(requests[0].content)
+    assert payload['messages'][0]['content'] == llm.REWRITE_INSTRUCTIONS
+    assert json.loads(payload['messages'][1]['content']) == {'palabras': ['mesa', 'vidrio']}
+
+
+def test_query_rewrite_fails_open_to_no_expansion(provider, monkeypatch):
+    def fail(request):
+        raise httpx.ReadTimeout('private-network-detail', request=request)
+    requests, _ = provider(fail)
+    assert llm.rewrite(['mesa', 'vidrio']) == [] and len(requests) == 1
+    monkeypatch.delenv('OPENAI_API_KEY')
+    assert llm.rewrite(['mesa']) == [] and len(requests) == 1
 
 
 @pytest.mark.parametrize('body,code', [

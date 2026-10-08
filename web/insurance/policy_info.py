@@ -10,7 +10,7 @@ def intent(text):
                  r'\b(?:hasta|desde)\s+cuando\b|\b(?:fecha|periodo)\s+de\s+(?:inicio|fin|validez)\b',
                  folded):
         return 'policy_validity'
-    if re.search(r'\b(?:como\s+se\s+llama|nombre|producto)\b|'
+    if re.search(r'\b(?:como\s+se\s+llama|nombre|producto|titular|tomador)\b|'
                  r'\bnumero\s+de\s+(?:(?:mi|la|el)\s+)?(?:poliza|seguro|contrato)\b',
                  folded) and re.search(
             r'\b(?:poliza|seguro|contrato)\b', folded):
@@ -19,7 +19,10 @@ def intent(text):
 
 
 def lookup(conn, business_id, customer_id, today, hint=None, selected_version=None):
-    sql = ('SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+    # The policy's own customer is its holder; AUTHORIZED already binds it to the verified customer.
+    sql = ('SELECT p.policy_id,p.product,p.contract_number,c.display_name AS holder '
+           'FROM insurance_policies p LEFT JOIN insurance_customers c '
+           'ON c.business_id=p.business_id AND c.customer_id=p.customer_id WHERE '
            + retrieval.AUTHORIZED)
     params = (business_id, customer_id)
     if hint:
@@ -78,6 +81,8 @@ def describe(policy, metadata_intent):
     reply = f'El producto registrado es {product}.' if product else 'No hay un producto registrado.'
     reply += (f' Número de póliza: {number}.' if number else
               ' No hay un número de contrato registrado.')
+    if policy.get('holder'):
+        reply += f" Titular: {policy['holder']}."
     if metadata_intent == 'policy_name':
         reply += ' No tengo un nombre comercial ni una aseguradora registrados; no los puedo confirmar.'
     if policy.get('version_id'):

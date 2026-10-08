@@ -201,13 +201,15 @@ def test_old_response_cannot_bypass_current_ready_or_authorization(pg, explained
     before = len(explained)
     reply, out = ask('¿Dónde lo dice?', ext='no-longer-ready')
     assert len(explained) == before and out['insurance_result'] == 'missing_information'
-    assert reply == dialog.OFFER_HUMAN and count(pg, 'insurance_cases') == 0
+    # The cause is stated: no "no evidence" claim when no valid search could run.
+    expected = dialog.OFFER_DOCUMENT_NOT_READY if change == 'document' else dialog.OFFER_NO_POLICY
+    assert reply == expected and count(pg, 'insurance_cases') == 0
 
 
 def test_consent_is_pending_in_postgres_and_negative_cancels(pg, explained):
     verify(pg, customer='C2')
     reply, out = ask('¿Cubre daños por agua?', ext='offer')
-    assert reply == dialog.OFFER_HUMAN and 'guardado' not in reply
+    assert reply == dialog.OFFER_DOCUMENT_NOT_READY and 'guardado' not in reply
     assert state(pg)['pending_human']['question'] == '¿Cubre daños por agua?'
     assert count(pg, 'insurance_cases') == 0
     ask('No gracias', ext='cancel')

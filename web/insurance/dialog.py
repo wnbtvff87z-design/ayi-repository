@@ -51,12 +51,14 @@ AVAILABILITY_RE = re.compile(
     r'\b(?:pod[eé]s?|puedes?|puede|podr[ií]as?|quer[eé]s?)\b.{0,35}'
     r'\b(?:ver|consultar|acceder|abrir|revisar)\b.{0,25}\bp[oó]liza\b|'
     r'\b(?:disponible|cargada|lista)\b.{0,35}\bp[oó]liza\b', re.I)
+_GENERAL = (r'(?:en\s+general|de\s+(?:forma|manera)\s+general|en\s+t[eé]rminos\s+generales|'
+            r'a\s+grandes\s+rasgos)')
 SUMMARY_RE = re.compile(
     r'\b(?:resumen|cobertura\s+general)\b|'
-    r'\b(?:qu[eé]\s+me\s+cubre|qu[eé]\s+cubre)\b.{0,40}'
-    r'\b(?:en\s+general|de\s+forma\s+general|a\s+grandes\s+rasgos)\b|'
-    r'\b(?:en\s+general|de\s+forma\s+general|a\s+grandes\s+rasgos)\b.{0,40}'
-    r'\b(?:cubre|cobertura|p[oó]liza)\b', re.I)
+    r'\b(?:qu[eé]\s+me\s+cubre|qu[eé]\s+cubre)\b.{0,40}\b' + _GENERAL + r'\b|'
+    r'\b' + _GENERAL + r'\b.{0,40}\b(?:cubre|cobertura|p[oó]liza|seguro)\b|'
+    # "¿qué (me) cubre mi seguro/póliza?" only as the whole question, not "qué cubre mi seguro si…".
+    r'\bqu[eé]\s+(?:me\s+)?cubre\s+(?:mi|el)\s+(?:seguro|p[oó]liza)\s*[?¿.!]*\s*$', re.I)
 SOCIAL_PHRASES = frozenset((
     'hola', 'hola buenas', 'buenas', 'buenos dias', 'buenas tardes', 'gracias',
     'muchas gracias', 'gracias por todo', 'gracias por tu ayuda'))
@@ -94,6 +96,7 @@ URGENT_SAFETY_FALLBACK = (
     'Si hay peligro inmediato para las personas, aléjate de la zona de riesgo y contacta con los '
     'servicios de emergencia locales. No esperes a revisar la póliza.')
 ASK_IDENTITY = 'Para consultar tu póliza, dime tu nombre y apellido.'
+GREETING_ASK_IDENTITY = 'Hola. Para consultar tu póliza, dime tu nombre y apellido.'
 IDENTITY_FAILED = ('No he podido verificar tus datos. Indica tu nombre completo, apellidos y DNI o NIE '
                    'de nuevo.')
 ASK_POLICY = ('Para continuar necesito el número de póliza sobre el que preguntas. Indícalo tal como '
@@ -101,14 +104,34 @@ ASK_POLICY = ('Para continuar necesito el número de póliza sobre el que pregun
 IDENTITY_CONFIRMED = 'Gracias. He verificado tus datos.'
 ASK_QUERY = IDENTITY_CONFIRMED + ' ¿Qué quieres consultar?'
 ASK_QUERY_AGAIN = ('¿Qué quieres consultar sobre tu póliza? Ya no necesito que repitas tus datos.')
-OFFER_HUMAN = ('No encontré evidencia suficiente en tu póliza. '
-               '¿Quieres que registre la consulta para revisión humana?')
+OFFER_QUESTION = '¿Quieres que registre la consulta para revisión humana?'
+# "No encontré evidencia" is reserved for a valid search over a ready document without results.
+OFFER_HUMAN = 'No encontré evidencia suficiente en tu póliza. ' + OFFER_QUESTION
+OFFER_ESCALATED = ('Encontré cláusulas relacionadas en tu póliza, pero no permiten responder tu '
+                   'consulta con seguridad. ' + OFFER_QUESTION)
+OFFER_DOCUMENT_NOT_READY = ('El documento de tu póliza todavía no está listo para consultarlo, así que '
+                            'no he podido buscar la respuesta. ' + OFFER_QUESTION)
+OFFER_NO_POLICY = ('No he podido confirmar una póliza autorizada y aplicable a esta consulta, así que '
+                   'no he podido buscar la respuesta. ' + OFFER_QUESTION)
+OFFER_AMBIGUOUS = ('No puedo determinar con seguridad qué póliza o versión aplica a esta consulta. '
+                   + OFFER_QUESTION)
+ASK_REPHRASE = ('No identifico qué cobertura quieres consultar. ¿Puedes decirme qué ocurrió o qué bien '
+                'quieres revisar?')
+TECHNICAL_RETRY = 'No pude consultarlo ahora por un problema técnico, inténtalo en un minuto.'
+TECHNICAL_REPEAT = ('Sigo sin poder consultarlo por un problema técnico. Espera un minuto antes de '
+                    'volver a intentarlo, o pregúntame por otro aspecto de tu póliza.')
+NO_REPEAT_OFFER = '¿Quieres preguntarme por otra cobertura o aspecto concreto de tu póliza?'
+REPEAT_OFFER = ('Con lo que me has dicho no puedo darte más información de tu póliza. Si me cuentas '
+                'qué ocurrió o qué bien quieres revisar, lo busco de otra forma.')
+REPEAT_ANSWER_PREFIX = 'Es la misma información que te di antes: '
+REPEAT_ANSWER_QUESTION = '¿Quieres que te aclare algún punto concreto, como límites o exclusiones?'
+REPEAT_GENERIC = ('Para no repetirme: dime qué quieres consultar de tu póliza, por ejemplo una '
+                  'cobertura, su vigencia o su número.')
 ASK_REFERENCE = '¿A qué consulta te refieres? Indica el tema o la pregunta concreta.'
 SAVED = ('He guardado tu consulta para revisión humana. No puedo confirmar un plazo ni una resolución.')
 NOT_SAVED = ('No pude guardar tu consulta de forma confirmada. No puedo confirmar si se creó un caso. '
              'Puedes reintentar la misma solicitud.')
-OPERATION_UNKNOWN = ('No pude confirmar el resultado de esta operación por un problema técnico. '
-                     'Puedes volver a intentarlo; no puedo confirmar el guardado.')
+OPERATION_UNKNOWN = (TECHNICAL_RETRY + ' No puedo confirmar si se guardó algún cambio.')
 OPERATION_NOT_STARTED = ('No pude iniciar esta operación. No se ha creado un caso en este intento; '
                          'no puedo confirmar el resultado de intentos anteriores.')
 
@@ -158,6 +181,28 @@ def llm_explain(question, evidence):
     return llm.explain(question, evidence)
 
 
+def llm_rewrite(words):
+    """Search-term rewrite (typos and synonyms); returns [] when unavailable."""
+    from insurance import llm
+    return llm.rewrite(words)
+
+
+def _rewrite_terms(conn, bid, customer_id, question, corr):
+    """Content words of the question, without the customer's name tokens or any digits, go
+    to the LLM rewrite. Its terms only widen the lexical search; they are never evidence."""
+    row = conn.execute('SELECT display_name FROM insurance_customers '
+                       'WHERE business_id=%s AND customer_id=%s', (bid, customer_id)).fetchone()
+    private = retrieval._raw_tokens((row or {}).get('display_name') or '')
+    words = sorted(w for w in retrieval._raw_tokens(question)
+                   if w not in private and not any(c.isdigit() for c in w))
+    try:
+        terms = llm_rewrite(words) if words else []
+    except Exception:
+        terms = []
+    _diag(corr, 'query_rewrite', bid, match_count=len(terms))
+    return terms
+
+
 def _business_date(business):
     return datetime.now(ZoneInfo(business.get('timezone') or 'Europe/Madrid')).date()
 
@@ -204,6 +249,21 @@ def _answer(business, state, text, channel, external_id, customer):
     sess = identity.session_key(channel, external_id)
     ctx = {'correlation_id': corr}
     operation_started = False
+    if orchestrator.social(text) == 'greeting':
+        # A greeting before identity neither writes, locks nor consumes anything. Only a
+        # read-only check decides whether this conversation is already verified; if the
+        # database is unavailable the caller is simply asked to identify.
+        verified = None
+        try:
+            with _cases.db() as conn:
+                conn.execute('SET TRANSACTION READ ONLY')
+                verified = identity.verified_customer(conn, bid, channel, customer, sess)
+        except Exception as exc:
+            log.warning('insurance_greeting_readonly_failed correlation_id=%s error_type=%s',
+                        corr, type(exc).__name__)
+        if not verified:
+            _diag(corr, 'dialogue', bid, identity_verified=False, decision='ask_identity_data')
+            return GREETING_ASK_IDENTITY, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
     try:
         with _cases.db() as conn:
             operation_started = True
@@ -382,6 +442,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 if just_verified and not reply.startswith(IDENTITY_CONFIRMED):
                     reply = f'{IDENTITY_CONFIRMED} {reply}'
                 decision = out['insurance_result']
+                if sc.customer_id:
+                    reply = _vary(st, reply, decision, incoming)
                 authorized_state = sc.customer_id and sc.customer_id == st.get('customer_id')
                 policy = st.get('policy_id') if authorized_state else None
                 version = st.get('version_id') if authorized_state else None
@@ -488,7 +550,7 @@ def _answer(business, state, text, channel, external_id, customer):
                     st['awaiting'] = 'identity'
                 reply = ('De nada. Estoy aquí si necesitas otra consulta.' if 'gracias' in incoming.casefold()
                          else 'Hola. ¿Qué quieres consultar sobre tu póliza?' if customer_id
-                         else 'Hola. Para consultar tu póliza, dime tu nombre y apellido.')
+                         else GREETING_ASK_IDENTITY)
                 return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if customer_id and interpretation['source'] == 'llm':
                 only = set(semantic)
@@ -981,7 +1043,7 @@ def _urgent(business, customer, text, channel, external_id, corr, customer_id, c
         'reason': 'human_interpretation', 'urgency': 'critical', 'customer_id': customer_id,
         'claim': claim, 'diagnostic_code': 'human_interpretation', 'context': {**ctx, 'urgent': True},
         'next_action': 'Urgencia: contactar al cliente según protocolo aprobado.'}}
-    return (protocol + ' ' + OFFER_HUMAN,
+    return (protocol + ' ' + OFFER_QUESTION,
             {'insurance_result': ResultKind.URGENT.value, 'pending_human': pending})
 
 
@@ -1000,7 +1062,7 @@ def _consent(business, customer, channel, external_id, st, text):
         st.pop('pending_human', None)
         st.pop('awaiting', None)
         return SAVED, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value, 'case_id': str(case_id)}
-    return OFFER_HUMAN, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+    return OFFER_QUESTION + ' Responde sí o no.', {'insurance_result': ResultKind.MISSING_INFORMATION.value}
 
 
 def _policy_metadata(conn, business, sc, st, question, intent, corr):
@@ -1056,8 +1118,7 @@ def _technical_failure(st, code, corr, bid, ev, invoked):
           llm_invoked=invoked, evidence_count=len(ev), decision='technical_error')
     reply = ('No pude preparar la respuesta por un límite técnico de contexto. Inténtalo con una consulta más concreta.'
              if code == 'context_budget_exceeded' else
-             'No pude completar la explicación por un problema técnico. Puedes volver a intentarlo; '
-             'esto no indica falta de evidencia ni confirma o descarta cobertura.')
+             TECHNICAL_RETRY + ' Esto no indica falta de evidencia ni confirma o descarta cobertura.')
     return (reply, {'insurance_result': ResultKind.TECHNICAL_ERROR.value, 'diagnostic_code': code},
             memory.pages_of(ev))
 
@@ -1105,10 +1166,12 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
         conn.execute('UPDATE insurance_conversation_turns SET normalized=%s WHERE turn_id=%s',
                     (memory.redact(question), st['question_turn_id']))
     mode = intent if intent in ('availability', 'summary') else 'question'
+    extra_terms = _rewrite_terms(conn, bid, customer_id, question, corr) if mode == 'question' else []
     result = retrieval.retrieve(conn, bid, customer_id, question, fact or _business_date(business),
                                 policy_hint=st.get('requested_policy') or st.get('reference_policy')
                                 or st.get('policy_id') or st.get('contract_number'),
-                                fact_end=span.end if span else None, mode=mode)
+                                fact_end=span.end if span else None, mode=mode,
+                                extra_terms=extra_terms)
     d = result.get('diagnostics', {})
     st['last_retrieval'] = {
         'question': memory.redact(st.get('question') or question, bounded=False),
@@ -1265,6 +1328,9 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
         cause = _explain_insufficient(st['last_retrieval'])
         return (f'He vuelto a revisar tu consulta. {cause} La opción de revisión humana anterior sigue pendiente.',
                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}, [])
+    if fine == 'no_searchable_terms':
+        # Nothing was actually searched: ask for the topic instead of claiming missing evidence.
+        return ASK_REPHRASE, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, []
     cause = CAUSES.get(fine, 'human_interpretation')
     _diag(corr, 'decision', bid, reason_code=cause, identity_verified=True,
           policy_found=result.get('policy_id') is not None, document_ready=d.get('document_status') == 'ready',
@@ -1281,7 +1347,52 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
                             for e in case.get('evidence', [])]
     st['awaiting'] = 'human_consent'
     st['pending_human'] = {'question': _original_question(conn, sc, st, question), 'case': case}
-    return OFFER_HUMAN, {'insurance_result': ResultKind.MISSING_INFORMATION.value}, pages
+    return _offer_for(fine, result['status'], bool(extra.get('evidence'))), {'insurance_result': ResultKind.MISSING_INFORMATION.value}, pages
+
+
+def _digest(reply):
+    return hashlib.sha256(' '.join(str(reply).casefold().split()).encode()).hexdigest()[:16]
+
+
+def _vary(st, reply, decision, incoming):
+    """Repetition guard for verified conversations. Identical consecutive replies change
+    strategy, and an ignored human-review offer is not repeated unless the turn is urgent.
+    The pending case is kept, so a later "sí" still registers it."""
+    urgent = decision == ResultKind.URGENT.value
+    offered_before = st.pop('offered_human', False)
+    if (offered_before and not urgent and reply.endswith(OFFER_QUESTION)
+            and not references.consent_only(incoming)):
+        reply = (reply[:-len(OFFER_QUESTION)].rstrip() + ' ' + NO_REPEAT_OFFER).strip()
+    # Requests for data that is still required (policy number, date) stay exact.
+    required = ASK_POLICY in reply or st.get('awaiting') in ('policy', 'date', 'identity')
+    if _digest(reply) == st.get('last_reply_digest') and not urgent and not required:
+        if decision == ResultKind.TECHNICAL_ERROR.value:
+            reply = TECHNICAL_REPEAT
+        elif decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value:
+            reply = REPEAT_ANSWER_PREFIX + reply + ' ' + REPEAT_ANSWER_QUESTION
+        elif reply.endswith(OFFER_QUESTION) or reply.endswith(NO_REPEAT_OFFER):
+            reply = REPEAT_OFFER
+        else:
+            reply = REPEAT_GENERIC
+    if reply.endswith(OFFER_QUESTION) and not urgent:
+        st['offered_human'] = True
+    st['last_reply_digest'] = _digest(reply)
+    return reply
+
+
+def _offer_for(fine, status, had_evidence=False):
+    """Human-review offer whose wording states the real cause, never a generic "no evidence"."""
+    if fine == 'llm_escalated':
+        # Related clauses reached the model but did not settle the question; without any
+        # reloaded clause the valid search simply found nothing usable.
+        return OFFER_ESCALATED if had_evidence else OFFER_HUMAN
+    if status == 'no_match':
+        return OFFER_HUMAN
+    if status in ('document_not_ready', 'ready_without_pages'):
+        return OFFER_DOCUMENT_NOT_READY
+    if status in ('no_policy', 'policy_not_matched'):
+        return OFFER_NO_POLICY
+    return OFFER_AMBIGUOUS
 
 
 def _original_question(conn, sc, st, fallback):

@@ -13,7 +13,7 @@ from test_insurance_attribution import (
     BIZ, add_document, ask, pg, verify, assert_visible_sources,
 )  # noqa: F401
 from test_insurance_llm_adapter import completion, provider  # noqa: F401
-from insurance import memory, retrieval
+from insurance import llm, memory, retrieval
 
 
 def retrieve(conn, question='agua', **kwargs):
@@ -134,6 +134,8 @@ def test_real_sdk_dialog_answer_explanation_and_authorized_duplicate_keep_suppor
 
     def grounded_http(request):
         payload = json.loads(request.content)
+        if payload['messages'][0]['content'] == llm.REWRITE_INSTRUCTIONS:
+            return httpx.Response(200, json=completion(json.dumps({'terms': []})))
         if payload.get('response_format') == {'type': 'json_object'}:
             package = json.loads(payload['messages'][-1]['content'])
             assert package['identity'] == 'verified'
@@ -154,18 +156,22 @@ def test_real_sdk_dialog_answer_explanation_and_authorized_duplicate_keep_suppor
             f"La cláusula cubre tuberías rotas {markers['COVERAGE']}, "
             f"salvo desgaste o falta de mantenimiento {markers['SUPPORT']}."))
 
-    requests, _ = provider(grounded_http)
+    sent, _ = provider(grounded_http)
+
+    def model_calls():  # query rewrites are auxiliary; count interpret/explain only
+        return [r for r in sent
+                if json.loads(r.content)['messages'][0]['content'] != llm.REWRITE_INSTRUCTIONS]
     answer, out = ask('¿Cubre agua?', ext='standalone-answer')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'desgaste' in answer and len(requests) == 2
+    assert 'desgaste' in answer and len(model_calls()) == 2
     assert_visible_sources(answer, number='900')
     explanation, out = ask('¿Dónde lo dice?', ext='standalone-explain')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert 'Documento 1, página 1' in explanation and 'Documento 2, página 1' in explanation
-    assert 'SUPPORT' not in explanation and len(requests) == 4
+    assert 'SUPPORT' not in explanation and len(model_calls()) == 4
     duplicate, out = ask('¿Dónde lo dice?', ext='standalone-explain')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert duplicate == explanation and len(requests) == 4
+    assert duplicate == explanation and len(model_calls()) == 4
 
 
 def test_support_fallback_remains_customer_policy_version_ready_and_quality_scoped(pg):
