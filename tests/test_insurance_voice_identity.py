@@ -179,12 +179,239 @@ def test_no_fuzzy_or_ambiguous_selection(text):
     assert 'doc_hmac' not in state
 
 
-def test_channel_equivalence_and_voice_only_spoken_mapping():
+def test_channel_equivalence_includes_spoken_mapping():
     text = 'Mi nombre es Celia Zorro y mi DNI es 51 959 566 J'
     a, b = prepare(text), prepare(text, channel='WhatsApp')
     assert (a['name'], a['document']) == (b['name'], b['document'])
     spoken = 'DNI cinco uno nueve cinco nueve cinco seis seis jota'
-    assert prepare(spoken, channel='WhatsApp')['document'] is None
+    assert prepare(spoken, channel='WhatsApp')['document'] == '51959566J'
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+@pytest.mark.parametrize('surname', ['Zorro', 'mi apellido es Zorro', 'de la Peña',
+                                      'mi apellido es de la Peña'])
+def test_guided_single_given_name_then_literal_surname(channel, surname):
+    state = {'awaiting': 'identity'}
+    first = prepare('Celia', state, channel=channel)
+    assert first['name'] == state['name'] == 'Celia'
+    assert first['missing'] == 'surname'
+    assert first['identity_kind'] == 'partial'
+    assert first['question'] == '' and not first['has_question']
+    assert first['normalized_text'] == '[name]'
+    assert state['name_hmac'] is None
+    second = prepare(surname, state, channel=channel)
+    expected = 'Celia de la Peña' if 'Peña' in surname else 'Celia Zorro'
+    assert second['name'] == state['name'] == expected
+    assert second['missing'] == 'document'
+    assert second['question'] == '' and not second['has_question']
+    assert state['name_hmac'] == identity.name_hmac(BIZ, expected)
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_document_then_given_name_then_surname(channel):
+    state = {'awaiting': 'identity'}
+    first = prepare('DNI cinco uno nueve cinco nueve cinco seis seis jota', state, channel=channel)
+    assert first['missing'] == 'name'
+    # The dialog stores the exact document's HMAC, never the clear document.
+    state['doc_hmac'] = identity.document_hmac(BIZ, first['document'])
+    second = prepare('Celia', state, channel=channel)
+    assert second['missing'] == 'surname'
+    third = prepare('mi apellido es Zorro', state, channel=channel)
+    assert third['identity_kind'] == 'complete' and third['missing'] is None
+    assert third['question'] == ''
+    assert state['doc_hmac'] == identity.document_hmac(BIZ, first['document'])
+    assert '51959566' not in json.dumps(state)
+
+
+def test_name_can_arrive_while_document_is_fragmented():
+    state = {'awaiting': 'identity'}
+    prepare('DNI cinco uno nueve cinco', state)
+    parsed = prepare('Celia', state)
+    assert parsed['name'] == state['name'] == 'Celia'
+    assert voice.BUFFER_KEY in state
+    prepare('mi apellido es Zorro', state)
+    complete = prepare('nueve cinco seis seis jota', state)
+    assert complete['identity_kind'] == 'complete'
+    assert complete['document'] == '51959566J'
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_corrections_preserve_other_identity_datum(channel):
+    state = {'awaiting': 'identity'}
+    prepare('Celia Zorro', state, channel=channel)
+    state['doc_hmac'] = identity.document_hmac(BIZ, '51959566J')
+    old_document = state['doc_hmac']
+    parsed = prepare('No, mi apellido es Peña', state, channel=channel)
+    assert parsed['name'] == state['name'] == 'Celia Peña'
+    assert parsed['identity_kind'] == 'complete'
+    assert state['doc_hmac'] == old_document
+    parsed = prepare('corrige mi nombre es Ana', state, channel=channel)
+    assert parsed['name'] == 'Ana Peña' and state['doc_hmac'] == old_document
+    parsed = prepare('No, me equivoqué, DNI 12345678Z', state, channel=channel)
+    assert parsed['document'] == '12345678Z'
+    assert state['name'] == 'Ana Peña'
+    assert 'doc_hmac' not in state
+    assert parsed['identity_kind'] == 'complete'
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_explicit_encrypted_fragment_substitution(channel):
+    state = {'awaiting': 'identity'}
+    prepare('Celia Zorro', state, channel=channel)
+    prepare('DNI cinco uno nueve cinco nueve cinco ocho ocho', state, channel=channel)
+    parsed = prepare('corrige los últimos dos dígitos por seis seis', state, channel=channel)
+    assert parsed['identity_kind'] == 'partial'
+    assert parsed['diagnostic'] == 'identity_data_partial'
+    assert parsed['document'] is None
+    assert state['name'] == 'Celia Zorro'
+    assert '51959566' not in json.dumps(state)
+    assert prepare('jota', state, channel=channel)['document'] == '51959566J'
+
+
+@pytest.mark.parametrize('command', [
+    'corrige los últimos dos dígitos por seis',
+    'corrige los últimos dos dígitos por seis seis siete',
+    'corrige los últimos dos dígitos por seis hota',
+    'corrige los últimos nueve dígitos por seis seis',
+    'corrige dos dígitos por seis seis',
+    'corrige la letra por hota',
+])
+def test_ambiguous_correction_clears_only_document(command):
+    state = {'awaiting': 'identity'}
+    prepare('Celia Zorro', state)
+    prepare('DNI cinco uno nueve cinco', state)
+    parsed = prepare(command, state)
+    assert parsed['identity_kind'] == 'failed' and parsed['missing'] == 'document'
+    assert parsed['document'] is None and voice.BUFFER_KEY not in state
+    assert state['name'] == 'Celia Zorro'
+
+
+@pytest.mark.parametrize('invalid', ['business', 'channel', 'ref', 'session', 'expiry', 'tamper'])
+def test_fragment_substitution_requires_valid_scope(invalid, monkeypatch):
+    monkeypatch.setattr(voice.time, 'time', lambda: 1000)
+    state = {'awaiting': 'identity'}
+    prepare('DNI cinco uno nueve cinco', state)
+    kwargs = {}
+    if invalid == 'expiry':
+        monkeypatch.setattr(voice.time, 'time', lambda: 2000)
+    elif invalid == 'tamper':
+        state[voice.BUFFER_KEY] = state[voice.BUFFER_KEY][:-10] + 'invalid'
+    else:
+        kwargs[invalid] = 'other'
+    parsed = prepare('corrige los últimos dos dígitos por seis seis', state, **kwargs)
+    assert parsed['identity_kind'] == 'failed'
+    assert parsed['document'] is None and voice.BUFFER_KEY not in state
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+@pytest.mark.parametrize('letter,expected', [
+    ('ve', 'V'), ('doble ve', 'W'), ('be larga', 'B'), ('ve corta', 'V'),
+    ('i griega', 'Y'), ('uve doble', 'W'),
+])
+def test_closed_letter_aliases_for_both_channels(channel, letter, expected):
+    parsed = prepare('NIE equis doce treinta y cuatro 56 siete ' + letter, channel=channel)
+    assert parsed['document'] == 'X1234567' + expected
+
+
+@pytest.mark.parametrize('text', [
+    '600111222', 'teléfono seis cero cero uno uno uno dos dos dos',
+    '250 euros', 'importe cincuenta y uno', 'póliza 000123', '2026',
+    '6 de octubre de 2026', '06/10/2026', 'soy española', 'nacionalidad española',
+])
+def test_nonidentity_values_never_join_an_explicit_fragment(text):
+    state = {'awaiting': 'identity'}
+    prepare('DNI cinco uno nueve cinco', state)
+    scope = voice._scope(BIZ, 'Voice', 'conversation', 'call')
+    before = voice._load(dict(state), scope, int(voice.time.time()))
+    parsed = prepare(text, state)
+    assert parsed['document'] is None
+    assert parsed['identity_kind'] == 'partial'
+    after = voice._load(dict(state), scope, int(voice.time.time()))
+    assert after['parts'] == before['parts']
+    assert after['started'] == before['started']
+    assert state.get('name') is None
+
+
+def test_fragments_are_not_concatenated_outside_guided_capture():
+    state = {'name': 'Celia Zorro'}
+    assert prepare('cinco uno nueve cinco', state)['document'] is None
+    assert voice.BUFFER_KEY not in state
+    assert prepare('nueve cinco seis seis jota', state)['document'] is None
+    assert voice.BUFFER_KEY not in state
+
+
+@pytest.mark.parametrize('text', [
+    'DNI 51959566J Celia Zorro', 'DNI 51959566J y Celia Zorro',
+    'DNI 51959566J y mi nombre es Celia Zorro',
+])
+def test_document_before_name_in_same_turn(text):
+    parsed = prepare(text, {'awaiting': 'identity'})
+    assert parsed['document'] == '51959566J'
+    assert parsed['name'] == 'Celia Zorro'
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['question'] == ''
+
+
+@pytest.mark.parametrize('text', [
+    'No, 12345678Z', 'perdón, uno dos tres cuatro cinco seis siete ocho zeta',
+    'corrige el DNI es 12345678Z',
+])
+def test_unambiguous_full_document_correction_consumes_new_data(text):
+    state = {'awaiting': 'identity', 'name': 'Celia Zorro', 'doc_hmac': 'old'}
+    prepare('DNI cinco uno nueve cinco', state)
+    parsed = prepare(text, state)
+    assert parsed['document'] == '12345678Z'
+    assert parsed['identity_kind'] == 'complete'
+    assert state['name'] == 'Celia Zorro'
+    assert voice.BUFFER_KEY not in state
+
+
+def test_guided_parts_survive_existing_postgresql_state_fixture(pg):
+    state = {'awaiting': 'identity'}
+    with pg() as conn:
+        identity.upsert_customer(conn, BIZ, 'GUIDED', 'Celia de la Peña', 'X1234567L')
+        first = prepare('NIE equis doce treinta y cuatro', state, channel='WhatsApp', session='')
+        assert first['document'] is None and first['identity_kind'] == 'partial'
+        prepare('Celia', state, channel='WhatsApp', session='')
+        identity.save_state(conn, BIZ, 'WhatsApp', 'conversation', '', state)
+        loaded = identity.load_state(conn, BIZ, 'WhatsApp', 'conversation', '')
+        prepare('mi apellido es de la Peña', loaded, channel='WhatsApp', session='')
+        complete = prepare('cincuenta y seis siete ele', loaded, channel='WhatsApp', session='')
+        assert complete['document'] == 'X1234567L'
+        assert identity.match_by_hashes(conn, BIZ, identity.document_hmac(BIZ, complete['document']),
+                                       loaded['name_hmac']) == ['GUIDED']
+        assert identity.failed_attempts(conn, BIZ, 'WhatsApp', 'conversation') == 0
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+@pytest.mark.parametrize('question', [
+    '¿cubre agua?', 'No, y ventanas?', '¿Dónde lo dice?',
+    'quiero saber si cubre daños por agua', 'las tuberías están rotas',
+    '¿Cuál es la franquicia de 250 euros?',
+])
+def test_unmistakable_questions_preserve_capture_and_question(question, channel):
+    state = {'awaiting': 'identity'}
+    prepare('Celia Zorro', state, channel=channel)
+    prepare('DNI cinco uno nueve cinco', state, channel=channel)
+    scope = voice._scope(BIZ, channel, 'conversation', 'call')
+    before = voice._load(dict(state), scope, int(voice.time.time()))
+    parsed = prepare(question, state, channel=channel)
+    assert parsed['question'] == question and parsed['has_question']
+    assert parsed['identity_kind'] == 'partial'
+    assert parsed['missing'] == 'document' and parsed['document'] is None
+    assert parsed['name'] is None and state['name'] == 'Celia Zorro'
+    after = voice._load(dict(state), scope, int(voice.time.time()))
+    assert (after['parts'], after['started']) == (before['parts'], before['started'])
+    complete = prepare('nueve cinco seis seis jota', state, channel=channel)
+    assert complete['document'] == '51959566J'
+
+
+def test_question_during_identity_prompt_does_not_become_a_name():
+    state = {'awaiting': 'identity'}
+    parsed = prepare('las tuberías están rotas', state)
+    assert parsed['identity_kind'] == 'none'
+    assert parsed['has_question'] and parsed['question'] == 'las tuberías están rotas'
+    assert 'name' not in state
 
 
 def test_complete_identity_keeps_question_without_spoken_digits():

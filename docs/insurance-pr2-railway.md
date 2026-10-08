@@ -2,6 +2,182 @@
 
 `INSURANCE_ENABLED` permanece `false`. Nada de esto se ha desplegado ni probado contra Railway, Airtable o Twilio reales.
 
+## Entrega conversacional de octubre de 2026 (instrucciones vigentes)
+
+Las secciones anteriores de entregas históricas más abajo describen sus respectivos
+HEAD, no las pruebas de esta entrega. No reprovisionar clientes, cambiar documentos,
+claves, modelo ni números siguiendo una receta histórica. El propietario ya comprobó
+retrieval y explicación operativos; eso no valida transporte ni exactitud de otras respuestas.
+
+### Base y auditoría
+
+`git fetch origin develop` devolvió **340108792a8d506bea826992e9432749d8c8681a**.
+La rama nueva de trabajo `copilot/develop-conversational-agent-integration` comenzó
+en ese mismo SHA, con árbol limpio. No se ha hecho merge ni despliegue.
+La suite inicial, sobre ese HEAD y PostgreSQL 16 local, dio **886 passed,
+3 failed, 58 subtests passed**. Los tres fallos eran expectativas antiguas:
+confirmar que no existe un caso tras escritura ambigua, tratar una pregunta de
+vigencia como falta de evidencia, y convertir un fallo del modelo en falta de evidencia.
+Se conservan los controles correctos y se actualizan las expectativas del recorrido.
+
+Causas comprobadas por código y reproducción sintética:
+
+| Antes | Causa | Después |
+|---|---|---|
+| «muchas gracias hasta luego» llegaba al retrieval | `_is_social` solo reconocía frases aisladas; `_is_question` aceptaba cualquier token restante | Cierre local de la locución completa, sin fuentes, caso ni identificación; las preguntas mixtas siguen su recorrido |
+| «Fuente: documento …, versión …, página …» por cada fragmento | `_documental` presentaba toda la evidencia recuperada sin distinguir uso, página o presentación | Solo fragmentos citados, páginas únicas por documento/versión; número contractual y vigencia registrados, nunca IDs internos |
+| Captura de nombre y apellido separados se perdía | El parser anterior no acumulaba un nombre de un solo token; correcciones descartaban el fragmento completo | Captura local guiada; sustitución explícita y exacta de fragmentos cifrados; preservación del otro dato |
+| Bloqueo repetía «No he podido verificar tus datos…» | `_verify` devolvía el mismo texto para límite, falta de coincidencia y ambigüedad | Incompleto, ambigüedad, no coincidencia, bloqueo y fallo técnico tienen recorridos distintos; solo declaración completa consume intento |
+| LLM solo intervenía con páginas disponibles | `llm.explain` era una explicación de texto libre después de retrieval; no había intérprete semántico | Propuestas JSON validadas antes de la resolución contractual, con contexto persistido |
+| Pregunta se borraba tras timeout/salida inválida | `_technical_failure` borraba `awaiting` y `finish` eliminaba la pregunta | Estado `retry`, pregunta persistida y revisión/reintento recuperables |
+| Voice ignoraba el cierre de Insurance | `converse` descartaba los atributos de salida del dominio | Cierre confirmado por PostgreSQL → Relay `end` → callback firmado con `<Say>` completo antes de `<Hangup>` |
+
+Ya estaban incorporados: memoria A/B/C/D, retorno al primer tema tras 30 turnos,
+revalidación de autorización/evidencia al recuperar, filtros SQL de negocio y
+cliente, lectura de páginas al final de página, consentimiento e idempotencia de
+casos, aislamiento del PDF/worker, fechas naturales, diagnóstico protegido y
+trazas por CallSid. No se reemplazan por implementaciones paralelas.
+
+Rutas auditadas: `web/main.py` (`/webhook-whatsapp`, `/internal/turn`,
+`/webhook-voice`), `relay/main.py` (`/voice`, WebSocket `/ws`, callback de Connect),
+`insurance/{identity,voice_identity,dialog,memory,retrieval,llm,references,
+policy_info,cases,voice_trace,diagnose}.py`. STT sigue siendo Deepgram y TTS
+ElevenLabs mediante ConversationRelay. Solo se procesan sus eventos finales;
+los parciales se cuentan para diagnóstico, no se concatenan sin un contrato
+documentado del proveedor. Los fragmentos explícitos entre turnos pertenecen
+al parser de captura, no a una presunta alternativa STT.
+
+### Intérprete, límites y privacidad
+
+`orchestrator.py` admite saludo, identidad, consulta, disponibilidad, nombre,
+vigencia, resumen, aclaración, seguimiento, corrección, cambio/retorno de tema,
+cambio de póliza, revisión, explicación de fuentes/falta de evidencia,
+aceptación/rechazo, agradecimiento, despedida y varias intenciones.
+El modelo propone exclusivamente `intents`, `reference` y `topic`. Valores,
+tipos, número de intenciones y tema literal se validan; campos adicionales,
+IDs inventados, herramientas y salidas truncadas se rechazan.
+
+No verifica personas, selecciona clientes por semejanza, concede acceso, ejecuta
+SQL ni crea casos. Número/canal resuelven negocio; PostgreSQL decide cliente activo
+único, autorización y versión; el código controla expiración, intentos, captura,
+reintentos, aislamiento y consentimiento. Una propuesta `case_accept` no basta
+para escribir. Una despedida solo propuesta por el modelo pide aclaración, no cuelga.
+El protocolo de peligro activo se ejecuta sin esperar al modelo.
+
+Identidad se extrae localmente. Los nombres, DNI/NIE, teléfono y fragmentos de
+captura no se añaden al proveedor como una nueva interpretación de PII.
+Antes de verificación el modelo solo recibe intención abstracta y booleanos de
+captura, **no** la transcripción ni la pregunta pendiente. Datos de identidad,
+saludos/cierres inequívocos y duplicados usan rutas locales.
+Después de verificación se minimiza el mismo contexto contractual de la
+explicación: nombres registrados y declaraciones se redactan localmente.
+Historial contractual del intérprete se limita a la selección todavía autorizada;
+conclusiones de otra selección no se exportan. No hay una opción activada de
+interpretación externa de identidad. La redacción no debe confundirse con una
+garantía de detección de cualquier dato personal espontáneo en texto libre:
+el operador debe mantener la política de minimización y autorización existente.
+
+La confirmación «Gracias. He verificado tus datos.» solo sale después del commit;
+la misma entrega duplicada devuelve su respuesta persistida sin verificar otra
+vez. No se repiten DNI, teléfono ni IDs internos. Un fallo/commit desconocido no
+confirma identidad ni caso. En no coincidencia se conservan las declaraciones
+para corregir solo un dato; no se revelan alternativas del registro.
+
+### Memoria, presentación y voz
+
+Se mantiene el historial por sesión/canal/negocio/cliente; ventana reciente,
+resumen acumulativo y búsqueda por lotes de preguntas antiguas. El límite de la
+ventana no borra el historial. Ambigüedad de tema exige aclaración. Una conclusión
+recordada no sustituye páginas ready ni revalida por sí misma autorización/versiones.
+
+| Variable | Default y alcance |
+|---|---|
+| `INSURANCE_DIALOG_LLM_ENABLED` | `true`; permite desactivar solo el nuevo intérprete, no los controles ni la explicación |
+| `INSURANCE_LLM_MODEL`, `OPENAI_API_KEY` | Existentes, sin cambio; ausencia → `llm_not_configured` |
+| `OPENAI_BASE_URL` | Endpoint existente opcional; se valida, no se cambia |
+| `INSURANCE_LLM_TIMEOUT_SECONDS` | 15 s, rango 1–120, sin reintentos SDK |
+| `INSURANCE_LLM_MAX_TOKENS` | Explicación: 512, rango 64–4096; interpretación: salida de 256 tokens |
+| `INSURANCE_LLM_CONTEXT_CHARS` | 12000 caracteres incluyendo instrucciones y mensajes; no es una garantía de tokens exactos |
+| `INSURANCE_RECENT_TURNS`, `INSURANCE_RECALLED_TURNS` | 6 intercambios recientes; hasta 2 antiguos seleccionados |
+| `INSURANCE_SUMMARY_MAX_TOPICS`, `INSURANCE_SUMMARY_MAX_CHARS` | 30 temas; 6000 caracteres; entradas completas, no PDF ilimitado |
+| `INSURANCE_TURN_RETENTION_DAYS`, `INSURANCE_MAX_TURNS_PER_CONVERSATION` | 90 días; 2000 turnos físicos como máximo por conversación |
+| `INSURANCE_MEMORY_SCAN_LIMIT`, `INSURANCE_PURGE_BATCH` | Lotes de 500, no límite absoluto de búsqueda histórica |
+| `INSURANCE_STATE_RETENTION_SECONDS`, `INSURANCE_INACTIVITY_SECONDS` | Limpieza física 604800 s; estado activo 1800 s |
+| `INSURANCE_IDENTITY_BUFFER_TTL_SECONDS` | 300 s; fragmentos cifrados con la clave existente y ligados a negocio/canal/sesión |
+| `INSURANCE_IDENTITY_MAX_ATTEMPTS`, `INSURANCE_IDENTITY_WINDOW_SECONDS` | 5 declaraciones completas fallidas por ventana de 900 s |
+
+La expiración de verificación/autorización sigue vigente aunque haya historial
+retenido. La limpieza existente en `memory.purge_expired` se ejecuta oportunistamente cada
+25 turnos de asistente, por lotes. Sin tráfico, la eliminación física requiere
+que mantenimiento autorizado invoque ese helper existente; las consultas ya
+excluyen datos expirados aunque aún no se hayan borrado. No implica memoria
+infinita ni acceso después de expirar permisos.
+
+`citations.py` conserva fragmento/posición internos y acepta `[e.N]` del fragmento
+o `[p.N]` solo cuando la página no es ambigua entre documentos. Un marcador
+inexistente, texto sin atribución o IDs visibles causa error técnico, no falta de
+cobertura. La versión se identifica por fechas reales de vigencia: el esquema no
+contiene una etiqueta comercial de versión y no se inventa una. Los documentos
+múltiples tienen etiquetas explícitamente genéricas y estables de presentación.
+La respuesta posterior mantiene solo páginas si no cambió el contexto.
+
+`speech.render` separa `reply` visible de `voice_reply`. Importes, decimales,
+monedas, porcentajes, fechas y páginas se pronuncian por tipo; pólizas se deletrean
+por dígitos/letras/separadores conservando ceros y barras. Es texto plano, no SSML.
+El cierre usa el callback firmado `/voice/relay/action` (también se conserva
+`/relay-ended`), con la misma voz de ElevenLabs. No se supone un ACK de reproducción
+WebSocket inexistente. La prueba controlada comprueba orden Say/Hangup; escuchar
+audio real y la voz configurada sigue siendo una validación pendiente del operador.
+
+### Diagnóstico desde `/app` y prueba mínima autorizada
+
+En la consola del servicio Web, desde `/app`, con las variables **existentes** y
+`INSURANCE_DIAGNOSTIC_TOKEN` de un operador individual del negocio con permiso de
+lectura, puede ejecutarse:
+
+```sh
+printf '%s' '¿Qué condiciones aparecen para cristales?' |
+  python -m insurance.diagnose --business-id INS-BIZ-001 \
+    --customer-id CUS-000001 --policy-id POL-000123 --run-llm
+```
+
+Omitir `--run-llm` para diagnóstico sin proveedor; `--conversation-ref` recibe
+un HMAC existente, nunca un teléfono; Voice requiere además `--channel Voice`
+y la `--session-ref` existente. No pegar tokens, transcripciones ni DNI en logs
+generales o en el PR. El diagnóstico imprime metadatos y clasificación segura;
+no confirma que una llamada real funcione. Las trazas completas se leen únicamente
+por el endpoint administrativo individual, con permiso del negocio y auditoría.
+
+Prueba Railway/Twilio/OpenAI **no ejecutada en esta entrega**:
+1. Comprobar SHA aprobado y migraciones existentes hasta `011`; no hay migración nueva.
+2. Usar cliente, póliza, versión y documento ya autorizados/ready; no registrar,
+   reprovisionar ni reprocesar el PDF. Comprobar diagnóstico anterior.
+3. En el número de prueba existente: nombre/apellido, documento dictado, pregunta
+   pendiente, repregunta, rechazo más nueva pregunta, metadatos y despedida.
+4. Escuchar cierre completo antes de colgar; comprobar citas visibles sin IDs y
+   evidencia seleccionada en la traza individual protegida.
+5. Pregunta sin evidencia → oferta; solo aceptación explícita → caso PG/outbox.
+   Timeout del modelo → error técnico y pregunta recuperable, nunca cobertura denegada.
+
+### Validación y límites de entrega
+
+Pruebas de parser no son llamadas STT/TTS reales. Las integraciones usan los
+endpoints y SDK reales con PostgreSQL local y transportes HTTP/WebSocket externos
+controlados; todos los datos son sintéticos y cada esquema es desechable.
+La prueba existente de 10000 pólizas mide candidatos, planes SQL antes/después de
+índices, memoria y latencia del retrieval, varios negocios, múltiples contratos,
+versiones y documentos. No mide 10000 llamadas OpenAI simultáneas ni garantiza
+latencia Railway; el intérprete añade una petición en turnos no locales.
+
+Resultados finales y SHA publicado se registran en la descripción del PR tras
+la última validación; no atribuir resultados de este árbol a un HEAD diferente.
+Sin nuevas dependencias ni migraciones. Rollback: restaurar el código previo
+aprobado o desactivar `INSURANCE_DIALOG_LLM_ENABLED` para aislar el intérprete;
+mantener tablas/historial y controles. No hay despliegue ni cambios de servicios
+Railway asociados al PR. Persisten los límites del proveedor, la transcripción real,
+el presupuesto y la retención; citas válidas no demuestran por sí solas exactitud
+semántica y requieren revisión de las cláusulas para decisiones humanas.
+
 ## Qué hay en el código
 - Migraciones `004_policies_documents.sql` y `005_async_document_verification.sql` (estados de verificación asíncrona): clientes, pólizas, versiones (vigencia), documentos (hash, estado, reintentos), páginas (sección, procedencia texto/ocr, calidad), autorizaciones, verificaciones de identidad, admins individuales y auditoría. Todas las claves incluyen `business_id`.
 - `insurance/storage.py` (solo lectura del Bucket), `insurance/documents.py` (registro y worker), `insurance_doc_worker.py` (proceso separado), `insurance/retrieval.py`, `insurance/identity.py`, `insurance/dialog.py` (dominio único Voice/WhatsApp), `insurance/admin.py` (`POST /insurance/admin/documents/register` y diagnóstico de retrieval).

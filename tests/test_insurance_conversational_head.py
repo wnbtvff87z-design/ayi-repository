@@ -4,7 +4,9 @@ from datetime import date, timedelta
 
 import pytest
 
-from test_insurance_attribution import pg, rows, BIZ, PHONE, BUSINESS, add_document, verify
+from test_insurance_attribution import (
+    pg, rows, BIZ, PHONE, BUSINESS, add_document, verify, evidence_markers, assert_visible_sources,
+)
 from insurance import dialog, identity
 
 
@@ -20,7 +22,8 @@ def client(pg, monkeypatch):
     add_document(pg, 'POL-900', 'DOC-FIRE', pages=(
         'Incendio fuego cobertura vivienda agua inundación rotura cristal vidrio límites condiciones exclusiones.',
         'Exclusiones de incendio: desgaste y falta de mantenimiento.'))
-    monkeypatch.setattr(dialog, 'llm_explain', lambda q, ev: 'Según las cláusulas aportadas, hay condiciones y exclusiones.')
+    monkeypatch.setattr(dialog, 'llm_explain', lambda q, ev:
+                        'Según las cláusulas aportadas, hay condiciones y exclusiones. ' + evidence_markers(ev))
     return pg
 
 
@@ -41,7 +44,8 @@ def test_voice_identity_accumulates_name_and_spoken_document(client):
     assert 'Qué quieres consultar' in second and out['insurance_result'] == 'missing_information'
     assert rows(client, 'SELECT customer_id FROM insurance_identity_verifications')[0]['customer_id'] == 'C2'
     third, out = say('Ayer se produjo un incendio. ¿Qué indica mi póliza?', 3)
-    assert out['insurance_result'] == 'evidence_backed_explanation' and 'DOC-FIRE' in third
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert_visible_sources(third, number='900')
     state = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
     assert state['fact_date'] == (date.today() - timedelta(days=1)).isoformat()
     assert state['active_topic'] == 'incendio'
@@ -58,7 +62,8 @@ def test_glass_answers_documentally_without_default_human_case(client, channel):
     verify(client, 'C2', channel=channel, session='CA-SYNTHETIC' if channel == 'Voice' else '')
     reply, out = say('¿Qué dice la póliza sobre rotura de vidrio?', 1, channel)
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-FIRE' in reply and 'especialista' not in reply
+    assert_visible_sources(reply, number='900')
+    assert 'especialista' not in reply
     assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
 
@@ -67,7 +72,8 @@ def test_fire_without_date_explains_provisionally_and_offers_case(client, monkey
     monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Protocolo sintético aprobado.')
     reply, out = say('Se me prendió fuego la casa, ¿qué me cubre?', 1)
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-FIRE' in reply and 'aplicabilidad' in reply
+    assert_visible_sources(reply, number='900')
+    assert 'aplicabilidad' in reply
     assert 'Protocolo sintético' in reply
     assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
@@ -81,17 +87,17 @@ def test_voice_identity_connectors_confirm_once_and_resume_unpunctuated_question
 
     def explain(context, evidence):
         seen.append((context, evidence))
-        return 'Las cláusulas no permiten afirmar que una mesa de vidrio esté cubierta.'
+        return 'Las cláusulas no permiten afirmar que una mesa de vidrio esté cubierta. ' + evidence_markers(evidence)
 
     monkeypatch.setattr(dialog, 'llm_explain', explain)
     first, _ = say('si me cubre daños en mesas de vidrio', 1)
-    assert 'nombre, apellidos y DNI' in first
+    assert 'nombre y apellido' in first
     reply, out = say(
         'Celia Zorro Condes con su DNI cinco uno nueve cinco nueve cinco seis seis jota', 2)
     assert reply.startswith('Gracias. He verificado tus datos.')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert len(seen) == 1 and 'mesas de vidrio' in seen[0][0]['question']
-    assert 'DOC-TABLE' in reply and 'página' in reply
+    assert_visible_sources(reply, number='900')
     assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 1
     assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
@@ -110,8 +116,9 @@ def test_persisted_identity_fragments_are_never_retrieved_until_exact_document_c
         return real_retrieve(*args, **kwargs)
 
     monkeypatch.setattr(dialog.retrieval, 'retrieve', track_retrieval)
-    monkeypatch.setattr(dialog, 'llm_explain', lambda context, evidence: 'La póliza tiene límites.')
-    assert 'nombre, apellidos y DNI' in say(
+    monkeypatch.setattr(dialog, 'llm_explain', lambda context, evidence:
+                        'La póliza tiene límites. ' + evidence_markers(evidence))
+    assert 'nombre y apellido' in say(
         'si me cubre daños en mesas de vidrio', 1, channel=channel)[0]
     assert 'DNI o NIE' in say('Celia Zorro Condes', 2, channel=channel)[0]
     if channel == 'Voice':
@@ -153,7 +160,8 @@ def test_late_clause_is_retrieved_as_a_positioned_fragment(client, monkeypatch):
     seen = []
     monkeypatch.setattr(
         dialog, 'llm_explain',
-        lambda context, evidence: seen.extend(evidence) or 'La cláusula menciona límites y condiciones.')
+        lambda context, evidence: seen.extend(evidence) or
+        'La cláusula menciona límites y condiciones. ' + evidence_markers(evidence))
     reply, out = say('¿Cubre rotura de vidrio?', 1, channel='WhatsApp')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     fragments = [item for item in seen if item['document_id'] == 'DOC-LATE']
@@ -161,7 +169,7 @@ def test_late_clause_is_retrieved_as_a_positioned_fragment(client, monkeypatch):
     assert any('Cobertura de rotura de vidrio' in item['text'] for item in fragments)
     assert any('Véase también exclusiones en página 9' in item['text'] for item in fragments)
     assert all(len(item['text']) < len(body) for item in fragments)
-    assert 'DOC-LATE' in reply and 'página 1' in reply
+    assert_visible_sources(reply, number='900')
 
 
 def test_glass_retrieval_keeps_another_page_exclusion_and_does_not_generalize(client, monkeypatch):
@@ -180,21 +188,23 @@ def test_glass_retrieval_keeps_another_page_exclusion_and_does_not_generalize(cl
     def explain(context, evidence):
         seen.extend(evidence)
         assert 'No infieras que cristal o vidrio cubre cualquier objeto' in dialog.memory.INSTRUCTIONS
-        return 'La póliza excluye tableros de mesa de vidrio y no permite extender la cobertura de ventanas.'
+        return ('La póliza excluye tableros de mesa de vidrio y no permite extender la cobertura de ventanas. '
+                + evidence_markers(evidence))
 
     monkeypatch.setattr(dialog, 'llm_explain', explain)
     reply, out = say('¿Cubre una mesa de vidrio rota?', 1, channel='WhatsApp')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert {item['page'] for item in seen} == {1, 2}
     assert any('excluyen' in item['text'] for item in seen)
-    assert 'DOC-GLASS' in reply and 'página 2' in reply
+    assert_visible_sources(reply, number='900', pages=(1, 2))
 
 
 def test_availability_and_general_summary_are_separate_from_coverage_questions(client, monkeypatch):
     verify(client, 'C2')
     calls = []
     monkeypatch.setattr(dialog, 'llm_explain', lambda context, evidence:
-                        calls.append((context, evidence)) or 'Resumen: se mencionan condiciones generales.')
+                        calls.append((context, evidence)) or
+                        'Resumen: se mencionan condiciones generales. ' + evidence_markers(evidence))
     available, availability_result = say('La podés ver a mi póliza', 1, channel='WhatsApp')
     assert 'documento listo para consultar' in available
     assert '¿Quieres que registre' not in available
@@ -203,7 +213,7 @@ def test_availability_and_general_summary_are_separate_from_coverage_questions(c
     summary, summary_result = say('Qué me cubre en general', 2, channel='WhatsApp')
     assert summary_result['insurance_result'] == 'evidence_backed_explanation'
     assert calls and calls[-1][0]['question'] == 'Qué me cubre en general'
-    assert 'DOC-FIRE' in summary and 'página' in summary
+    assert_visible_sources(summary, number='900')
     assert 'No infieras que cristal o vidrio cubre cualquier objeto' in dialog.memory.INSTRUCTIONS
     assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 

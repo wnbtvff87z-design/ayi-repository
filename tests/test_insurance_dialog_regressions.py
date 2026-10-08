@@ -5,7 +5,9 @@ from datetime import date, datetime, timezone
 
 import pytest
 
-from test_insurance_attribution import BIZ, BUSINESS, add_document, ask, pg, rows, verify
+from test_insurance_attribution import (
+    BIZ, BUSINESS, add_document, ask, pg, rows, verify, evidence_markers, assert_visible_sources,
+)
 from insurance import dialog
 
 
@@ -18,7 +20,8 @@ def ready(pg, monkeypatch):
     ))
     calls = []
     monkeypatch.setattr(dialog, 'llm_explain', lambda q, ev:
-                        calls.append((q, ev)) or 'Hay condiciones y exclusiones para ventanas.')
+                        calls.append((q, ev)) or
+                        'Hay condiciones y exclusiones para ventanas. ' + evidence_markers(ev))
     return pg, calls
 
 
@@ -39,7 +42,8 @@ def test_new_topic_after_human_offer_is_not_consent(ready, text):
     assert ask('¿Cubre zyxwvut?', ext='missing')[0] == dialog.OFFER_HUMAN
     reply, out = ask(text, ext='new-topic')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-SYNTHETIC' in reply and calls
+    assert calls
+    assert_visible_sources(reply, number='900')
     assert not state(pg).get('pending_human')
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
@@ -48,7 +52,8 @@ def test_general_summary_uses_summary_evidence(ready):
     _, calls = ready
     reply, out = ask('podrias decirme que me cubre de forma general', ext='summary')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert calls and 'DOC-SYNTHETIC' in reply
+    assert calls
+    assert_visible_sources(reply, number='900')
     assert state(ready[0])['last_retrieval']['intent'] == 'summary'
 
 
@@ -95,8 +100,9 @@ def test_missing_reason_and_review_keep_original_question(ready):
 
 def test_pending_question_survives_greeting_and_identity_confirms_once(pg, monkeypatch):
     add_document(pg, 'POL-900', 'DOC-SYNTHETIC', pages=('Cobertura de ventanas y cristales.',))
-    monkeypatch.setattr(dialog, 'llm_explain', lambda q, ev: 'La cláusula impone condiciones.')
-    ask('ventanas', ext='pending')
+    monkeypatch.setattr(dialog, 'llm_explain', lambda q, ev:
+                        'La cláusula impone condiciones. ' + evidence_markers(ev))
+    ask('¿Cubre ventanas?', ext='pending')
     ask('hola buenas', ext='greeting')
     reply, out = ask('Me llamo Luis Gil Mora, DNI 87654321X', ext='identity')
     assert out['insurance_result'] == 'evidence_backed_explanation'
@@ -125,7 +131,8 @@ def test_classified_model_failure_never_becomes_no_evidence_or_case(ready, monke
     assert recorded['llm_invoked'] is (code != 'llm_not_configured')
     assert recorded['pages'] and not state(pg).get('pending_human')
     reply, out = ask('sí', ext='unsolicited-consent')
-    assert out['insurance_result'] == 'missing_information'
+    assert out['insurance_result'] == 'technical_error'
+    assert out['diagnostic_code'] == code
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
 
@@ -200,7 +207,8 @@ def test_coverage_with_contract_number_is_not_metadata(ready):
     _, calls = ready
     reply, out = ask('¿Qué cubre ventanas? Póliza número 900', ext='coverage-with-number')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert calls and 'DOC-SYNTHETIC' in reply
+    assert calls
+    assert_visible_sources(reply, number='900')
 
 
 def test_real_adapter_unconfigured_is_technical_without_provider_call(ready, monkeypatch):
@@ -224,11 +232,12 @@ def test_review_without_prior_question_clarifies_instead_of_searching_literal(re
 
 
 def test_incidental_escalar_word_is_not_an_escalation_sentinel(ready, monkeypatch):
-    monkeypatch.setattr(dialog, 'llm_explain', lambda *a:
-                        'La cláusula no permite escalar automáticamente una consulta.')
+    monkeypatch.setattr(dialog, 'llm_explain', lambda q, ev:
+                        'La cláusula no permite escalar automáticamente una consulta. ' + evidence_markers(ev))
     reply, out = ask('ventanas', ext='incidental-escalar')
     assert out['insurance_result'] == 'evidence_backed_explanation'
-    assert 'DOC-SYNTHETIC' in reply and '¿Quieres que registre' not in reply
+    assert_visible_sources(reply, number='900')
+    assert '¿Quieres que registre' not in reply
 
 
 def test_greeting_preserves_pending_human_question_without_becoming_consent(ready):
@@ -492,7 +501,8 @@ def test_same_topic_hypothetical_does_not_inherit_actual_incident_context(ready,
     assert not current.get('last_incident_type')
     assert old_date not in calls[-1][0]['question']
     recalled, _ = ask('volviendo a la primera pregunta', ext='recall-actual')
-    assert old_date in state(pg)['fact_date'] and 'DOC-SYNTHETIC' in recalled
+    assert old_date in state(pg)['fact_date']
+    assert_visible_sources(recalled)
 
 
 def test_same_incident_clarification_keeps_date(ready):

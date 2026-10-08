@@ -278,8 +278,9 @@ def converse(b,channel,customer,text,external_id,include_end_reason=False,sector
     raise BookingError('Falta el identificador técnico de la llamada')
    if channel=='Voice' and voice_transport is not None:
     b=dict(b);b['_insurance_voice_transport']=insurance_voice_transport(voice_transport)
-   reply,_=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector)
-   return (reply,None) if include_end_reason else reply
+   reply,out=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector)
+   end_reason='goodbye' if channel=='Voice' and out.get('should_end_call') else None
+   return (reply,end_reason) if include_end_reason else reply
   init_schema();bid=b['business_id']
   with db() as c:
    c.execute('INSERT INTO customer_sessions(business_id,channel,customer_phone) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING',(bid,channel,customer))
@@ -418,7 +419,11 @@ def internal_turn():
    if sector=='insurance' and channel=='Voice':kwargs['voice_transport']=d.get('voice_transport')
    reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),**kwargs)
    end_reason=end_reason if end_reason in ('goodbye','cancelled','verification') else None
-   return jsonify(success=True,reply=reply,end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
+   voice_reply=reply
+   if sector=='insurance' and channel=='Voice':
+    from insurance.speech import render
+    voice_reply=render(reply)
+   return jsonify(success=True,reply=reply,voice_reply=voice_reply,should_end_call=sector=='insurance' and end_reason=='goodbye',end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
   except Exception as exc:
    if sector=='insurance':insurance_voice_error('turn',exc,d.get('external_id'),b['business_id'])
    else:log.exception('Turn failed')
