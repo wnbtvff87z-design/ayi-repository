@@ -6,6 +6,7 @@ Reproduces the reported sequence with SYNTHETIC data and the same linguistic str
 """
 import io
 import json
+import re
 
 import pytest
 
@@ -195,7 +196,7 @@ def _identity_report(conn, channel='WhatsApp'):
 def _assert_no_identity_values(output):
     for secret in (DNI, DNI[:-1], DNI[-3:], GIVEN, 'Fernández', 'Ortega', 'Ortiz', PHONE):
         assert secret not in output
-    assert not __import__('re').search(r'[0-9a-f]{40,}', output)
+    assert not re.search(r'[0-9a-f]{40,}', output)
 
 
 def test_identity_diagnostic_is_readonly_and_metadata_only(wa):

@@ -262,7 +262,7 @@ def _given_before_surname(name, surname_words):
     stored = name.split()
     folded = [identity.normalize_name(w) for w in stored]
     first_new = identity.normalize_name(surname_words[0])
-    cut = next((i for i, w in enumerate(folded) if i and w == first_new), None)
+    cut = next((i for i in range(len(folded) - 1, 0, -1) if folded[i] == first_new), None)
     if cut is None:
         cut = len(stored) - len(surname_words)
     return ' '.join(stored[:cut]) if cut >= 1 else None
@@ -408,15 +408,13 @@ def prepare(text, state, business_id, channel, ref, session):
             decl.update(name=guided_name, question='', has_question=False)
     elif name_datum:
         decl.update(name=name_datum, question='', has_question=False)
-    if decl['name'] and not (name_datum or guided_name) and _full_name_declared(
-            decl['name'], candidate is not None and not bad) and re.search(
-            r'\b(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', cleaned, re.I) and not re.search(
-            r'\bapellidos?\s*(?:es|son|[:=-])', cleaned, re.I):
+    declares_given = bool(decl['name'] and not (name_datum or guided_name) and re.search(
+        r'\b(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', cleaned, re.I) and not re.search(
+        r'\bapellidos?\s*(?:es|son|[:=-])', cleaned, re.I))
+    if declares_given and _full_name_declared(decl['name'], candidate is not None and not bad):
         state.pop('identity_given_name', None)
         state.pop('identity_surname', None)
-    elif decl['name'] and not (name_datum or guided_name) and re.search(
-            r'\b(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', cleaned, re.I) and not re.search(
-            r'\bapellidos?\s*(?:es|son|[:=-])', cleaned, re.I):
+    elif declares_given:
         declared_given = decl['name']
         state['identity_given_name'] = declared_given
         if state.get('identity_surname'):
