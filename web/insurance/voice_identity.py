@@ -185,7 +185,15 @@ def _non_document_context(text):
         or re.search(r'\d\s*[/]\s*\d', folded))
 
 
-def _name_datum(text, state):
+def _full_name_declared(name, with_document=False):
+    """'mi nombre es X' names only the given name while X is ambiguous: two words or fewer
+    outside particles and no document alongside. Three name words, or two declared together
+    with the document, are a full name and must not wait for (or get appended) a surname."""
+    words = [w for w in identity.normalize_name(name).split() if w not in NAME_PARTICLES]
+    return len(words) >= 3 or (len(words) == 2 and with_document)
+
+
+def _name_datum(text, state, with_document=False):
     """Take literal guided name data, retaining surname particles and token order."""
     surname = re.match(r'^\s*(?:mi\s+)?apellidos?\s*(?:es|son|[:=-])\s*', text, re.I)
     given = re.match(r'^\s*(?:(?:mi\s+)?nombre\s*(?:es|[:=-])|me\s+llamo|soy)\s*', text, re.I)
@@ -205,15 +213,30 @@ def _name_datum(text, state):
         first = state.get('identity_given_name')
         if not first and state.get('name') and not identity.name_is_sufficient(state['name']):
             first = state['name']
+        if not first and state.get('name'):
+            first = _given_before_surname(state['name'], words)
+            if first:
+                state['identity_given_name'] = first
         if not first:
             return None
         state['identity_surname'] = ' '.join(words)
         return first + ' ' + state['identity_surname']
     if not given and state.get('name') and (
             _surname_pending(state) or not identity.name_is_sufficient(state['name'])):
+        pending = identity.normalize_name(state['name']).split()
+        declared = identity.normalize_name(value).split()
+        if len(declared) > len(pending) and declared[:len(pending)] == pending:
+            # The given name was repeated together with the surnames: replace, never append.
+            state.pop('identity_given_name', None)
+            state.pop('identity_surname', None)
+            return ' '.join(words)
         state['identity_given_name'] = state['name']
         state['identity_surname'] = ' '.join(words)
         return state['name'] + ' ' + state['identity_surname']
+    if given_only and _full_name_declared(value, with_document):
+        state.pop('identity_given_name', None)
+        state.pop('identity_surname', None)
+        return ' '.join(words)
     if given_only:
         state['identity_given_name'] = ' '.join(words)
         return (' '.join(words) + ' ' + state['identity_surname']
@@ -230,6 +253,19 @@ def _name_datum(text, state):
             state.pop('identity_given_name', None)
             state.pop('identity_surname', None)
     return ' '.join(words)
+
+
+def _given_before_surname(name, surname_words):
+    """Given-name part of a stored full name being corrected by an explicit surname. The new
+    surnames replace from the first word they share with the stored name, otherwise the same
+    number of trailing words. The result is still matched exactly; nothing is concatenated."""
+    stored = name.split()
+    folded = [identity.normalize_name(w) for w in stored]
+    first_new = identity.normalize_name(surname_words[0])
+    cut = next((i for i, w in enumerate(folded) if i and w == first_new), None)
+    if cut is None:
+        cut = len(stored) - len(surname_words)
+    return ' '.join(stored[:cut]) if cut >= 1 else None
 
 
 def _surname_pending(state):
@@ -367,12 +403,18 @@ def prepare(text, state, business_id, channel, ref, session):
         name_text = cleaned.strip(' ,;.-')
         if name_text.casefold().startswith('y '):
             name_text = name_text[2:]
-        guided_name = _name_datum(name_text, state)
+        guided_name = _name_datum(name_text, state, with_document=True)
         if guided_name:
             decl.update(name=guided_name, question='', has_question=False)
     elif name_datum:
         decl.update(name=name_datum, question='', has_question=False)
-    if decl['name'] and not (name_datum or guided_name) and re.search(
+    if decl['name'] and not (name_datum or guided_name) and _full_name_declared(
+            decl['name'], candidate is not None and not bad) and re.search(
+            r'\b(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', cleaned, re.I) and not re.search(
+            r'\bapellidos?\s*(?:es|son|[:=-])', cleaned, re.I):
+        state.pop('identity_given_name', None)
+        state.pop('identity_surname', None)
+    elif decl['name'] and not (name_datum or guided_name) and re.search(
             r'\b(?:mi\s+)?nombre\s*(?:es|[:=-])\s*', cleaned, re.I) and not re.search(
             r'\bapellidos?\s*(?:es|son|[:=-])', cleaned, re.I):
         declared_given = decl['name']

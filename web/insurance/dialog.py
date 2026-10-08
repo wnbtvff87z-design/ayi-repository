@@ -537,10 +537,17 @@ def _answer(business, state, text, channel, external_id, customer):
                 if outcome[0] == 'reply':
                     reply = outcome[1]
                     if reply == ASK_IDENTITY:
-                        reply = ('Me falta tu apellido.' if decl.get('missing') == 'surname'
-                                 else 'Me falta el DNI o NIE.' if identity.name_is_sufficient(st.get('name'))
-                                 else 'Me falta tu apellido.' if st.get('name')
-                                 else 'Me falta tu nombre y al menos un apellido.' if st.get('doc_hmac')
+                        # Confirm which categories are already held (never their values) and
+                        # ask only for what is missing.
+                        has_doc = bool(st.get('doc_hmac'))
+                        surname_missing = st.get('name') and (
+                            decl.get('missing') == 'surname'
+                            or not identity.name_is_sufficient(st.get('name')))
+                        reply = (('Tengo tu nombre y tu DNI o NIE. Me falta tu apellido.' if has_doc
+                                  else 'Tengo tu nombre. Me falta tu apellido y el DNI o NIE.')
+                                 if surname_missing
+                                 else 'Tengo tu nombre y apellido. Me falta el DNI o NIE.' if st.get('name')
+                                 else 'Tengo tu DNI o NIE. Me falta tu nombre y al menos un apellido.' if has_doc
                                  else 'Para consultar tu póliza, dime tu nombre y apellido.')
                         if decl.get('diagnostic') == 'identity_parse_failed':
                             reply = 'No comprendí el documento de forma inequívoca. Repite solo ese dato.'

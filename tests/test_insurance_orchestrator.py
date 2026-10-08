@@ -260,7 +260,7 @@ def test_expired_verification_reenters_name_capture_from_policy_stage(pg, provid
                             '', state)
         conn.execute("UPDATE insurance_identity_verifications SET expires_at=now()-interval '1 second'")
     reply, _ = ask('Luis Gil Mora', ext='fresh-name')
-    assert reply == 'Me falta el DNI o NIE.'
+    assert reply == 'Tengo tu nombre y apellido. Me falta el DNI o NIE.'
     reply, _ = ask('87654321X', ext='fresh-document')
     assert dialog.IDENTITY_CONFIRMED in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_identity_attempts')[0]['n'] == 0
