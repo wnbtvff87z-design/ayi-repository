@@ -1379,6 +1379,7 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
             if not ev:
                 fine = 'no_matching_pages'
         summary, _ = memory.load_summary(conn, sc)
+        summary, recent = policy_info.model_history(conn, sc, summary, memory.recent(conn, sc))
         customer_profile = conn.execute(
             'SELECT display_name FROM insurance_customers '
             'WHERE business_id=%s AND customer_id=%s AND active', (bid, customer_id)).fetchone()
@@ -1397,7 +1398,7 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
                 intent=mode,
                 private_names=private_names,
                 pending=st.get('question') if st.get('awaiting') else None,
-                recent_turns=memory.recent(conn, sc),
+                recent_turns=recent,
                 summary_text=memory.render_summary(summary, memory.cfg('INSURANCE_SUMMARY_MAX_CHARS')),
                 recalled=[recalled] if recalled else [])
             _diag(corr, 'context', bid, context_chars=package['report']['used'],
@@ -1504,7 +1505,8 @@ def _vary(st, reply, decision, incoming):
             and not references.consent_only(incoming)):
         reply = (reply[:-len(OFFER_QUESTION)].rstrip() + ' ' + NO_REPEAT_OFFER).strip()
     # Requests for data that is still required (policy number, date) stay exact.
-    required = ASK_POLICY in reply or st.get('awaiting') in ('policy', 'date', 'identity')
+    required = ASK_POLICY in reply or st.get('awaiting') in (
+        'policy', 'policy_confirmation', 'date', 'identity')
     if _digest(reply) == st.get('last_reply_digest') and not urgent and not required:
         if decision == ResultKind.TECHNICAL_ERROR.value:
             reply = _technical_message((st.get('last_retrieval') or {}).get('llm_diagnostic'),

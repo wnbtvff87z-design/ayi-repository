@@ -346,3 +346,39 @@ def test_authorized_accented_product_exact_selection_succeeds(grounded, channel,
         ('insurance_policies_product_selection_idx',))[0]['indexdef']
     assert 'business_id, customer_id' in index.lower()
     assert 'normalize' in index.lower() and 'translate' in index.lower()
+
+
+@pytest.mark.parametrize('channel', ['WhatsApp', 'Voice'])
+@pytest.mark.parametrize('control', ['list', 'confirmation'])
+def test_revoked_policy_controls_never_reach_interpretation_or_explanation_sdk(
+        grounded, monkeypatch, channel, control):
+    flow = grounded
+    say = lambda text: flow.turn(channel, text)['reply']
+    product, number = 'vehículo-reservado', 'AUTO-010'
+    add_policy(number, product)
+    say(DECLARATION)
+    say('hogar')
+    assert 'excluy' in say(QUESTION).lower()
+    assert flow.state()['policy_id'] == 'POL-SYNTHETIC'
+    for _ in range(2):
+        assert product in say('mis pólizas')
+    if control == 'confirmation':
+        confirmation = say(number)
+        assert 'Confirmas' in confirmation and number in confirmation
+        assert 'Confirmas' in say(product)
+        say('no')
+        # Only the harmless cancellation remains recent; older selection text is in the summary.
+        monkeypatch.setenv('INSURANCE_RECENT_TURNS', '1')
+        persisted = flow.rows('SELECT summary FROM insurance_conversation_summary')[0]['summary']
+        assert any(product in topic['q'] for topic in persisted['topics'])
+    with cases.db() as conn:
+        conn.execute("UPDATE insurance_authorizations SET revoked_at=now() WHERE policy_id='POL-AUTO-010'")
+    start = len(flow.captures)
+    answer = say(QUESTION)
+    assert 'excluy' in answer.lower() and 'página 2' in answer
+    calls = flow.captures[start:]
+    assert any('response_format' in call for call in calls)
+    assert any('response_format' not in call for call in calls)
+    for call in calls:
+        payload = '\n'.join(message['content'] for message in call['messages'])
+        assert product not in payload and number not in payload and 'POL-AUTO-010' not in payload

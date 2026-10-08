@@ -84,6 +84,32 @@ def selection(conn, scope, state, text, number=None):
     return dict(rows[0]) if rows else None
 
 
+def model_history(conn, scope, summary, recent):
+    """Local policy controls are neither model context nor contractual evidence."""
+    turn_ids = {turn['turn_id'] for turn in recent}
+    turn_ids.update(topic['a_turn'] for topic in summary.get('topics', []) if topic.get('a_turn'))
+    turn_ids.update(item['turn'] for item in summary.get('conclusions', []) if item.get('turn'))
+    controls = conn.execute(
+        'SELECT turn_id,reply_to FROM insurance_conversation_turns WHERE business_id=%s '
+        'AND channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s '
+        'AND turn_id=ANY(%s) AND EXISTS (SELECT 1 FROM jsonb_array_elements(pages) entry '
+        "WHERE entry ? 'selection_policy_id')",
+        (*scope, sorted(turn_ids))).fetchall() if turn_ids else []
+    blocked = {value for row in controls for value in (row['turn_id'], row['reply_to']) if value}
+    recent = [turn for turn in recent
+              if turn['turn_id'] not in blocked and turn.get('reply_to') not in blocked]
+    summary = {**summary,
+               'topics': [topic for topic in summary.get('topics', [])
+                          if topic.get('id') not in blocked and topic.get('a_turn') not in blocked],
+               'conclusions': [item for item in summary.get('conclusions', [])
+                               if item.get('turn') not in blocked]}
+    for key in ('facts', 'pending', 'open_issues'):
+        summary[key] = [item for item in summary.get(key, [])
+                        if item.get('turn') not in blocked and not item.get('text', '').startswith(
+                            'Póliza solicitada sin confirmar: ')]
+    return summary, recent
+
+
 def intent(text):
     folded = references.fold(text)
     if re.search(r'\b(?:vigencia|vigente|vencimiento|vence|caduca|expira)\b|'
