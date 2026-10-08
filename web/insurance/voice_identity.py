@@ -300,7 +300,17 @@ def _merge(given, surname_words):
 
 
 SEGMENT_HEAD = re.compile(r'^(?:[\s,;:.-]|\b(?:y|e|con|mi|el|la|su)\b)*', re.I)
-SEGMENT_TAIL = re.compile(r'(?:[\s,;:.-]|\b(?:y|e|con|mi|el|la|su|de)\b)*$', re.I)
+SEGMENT_TAIL_WORDS = {'y', 'e', 'con', 'mi', 'el', 'la', 'su', 'de'}
+
+
+def _strip_tail(segment):
+    # Linear right-strip of connectors/punctuation (avoids regex backtracking).
+    words = segment.rstrip(' \t\r\n,;:.-').split()
+    while words and words[-1].lower().strip(',;:.-') in SEGMENT_TAIL_WORDS:
+        words.pop()
+        if words:
+            words[-1] = words[-1].rstrip(',;:.-')
+    return ' '.join(words)
 
 
 def _given_before_surname(name, surname_words):
@@ -450,7 +460,7 @@ def prepare(text, state, business_id, channel, ref, session):
     if candidate is not None and not bad:
         # The name may come before or after the document ("el DNI X, nombre Y").
         start = labels[0].start() if labels else candidate
-        segments = [SEGMENT_TAIL.sub('', SEGMENT_HEAD.sub('', part))
+        segments = [_strip_tail(SEGMENT_HEAD.sub('', part))
                     for part in (text[:start], text[candidate + end:])]
         for index, segment in enumerate(segments):
             guided_name = _name_datum(segment, state, with_document=True) if segment else None
