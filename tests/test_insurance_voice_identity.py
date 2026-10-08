@@ -610,8 +610,28 @@ def test_incomplete_document_correction_restarts_instead_of_appending(channel):
     assert voice.BUFFER_KEY not in state
 
 
+@pytest.mark.parametrize('marker,expected', [
+    ('letra ele', 'L'), ('la letra es ele', 'L'), ('termina en ele', 'L'),
+    ('la letra es jota', 'J'),
+])
+def test_letter_marker_can_arrive_after_all_encrypted_numeric_fragments(marker, expected):
+    state = {'awaiting': 'identity'}
+    prepare('Ana Pérez', state)
+    prepare('DNI cero uno dos tres cuatro cinco seis siete', state)
+    parsed = prepare(marker, state)
+    assert parsed['document'] == '01234567' + expected
+    assert parsed['identity_kind'] == 'complete'
+    assert voice.BUFFER_KEY not in state
+
+
+def test_identity_name_removed_from_short_explicit_question():
+    parsed = prepare('Ana Pérez, DNI 01234567L, ¿cubre agua?', {'awaiting': 'identity'})
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['question'] == '¿cubre agua?' and parsed['has_question']
+
+
 @pytest.mark.parametrize('suffix', [
-    '250 euros', '250 €', '06/10/2026', '600111222', 'teléfono 600111222',
+    '250 euros', '250 €', '1.000,20 euros', '06/10/2026', '600111222', 'teléfono 600111222',
     'póliza 000123', 'quiero saber si cubre agua',
 ])
 def test_complete_document_and_name_are_not_concatenated_with_other_fields(suffix):
@@ -621,6 +641,22 @@ def test_complete_document_and_name_are_not_concatenated_with_other_fields(suffi
     assert parsed['identity_kind'] == 'complete'
     assert 'Ana Pérez' not in parsed['question']
     assert suffix in parsed['question']
+
+
+def test_name_document_question_phone_and_amount_together_preserve_only_literal_fields():
+    question = '¿cubre daños por agua por 1.000,20 euros? teléfono 600111222'
+    text = 'Ana de la Peña, DNI 01234567L, ' + question
+    parsed = prepare(text, {'awaiting': 'identity'})
+    assert parsed['name'] == 'Ana de la Peña'
+    assert parsed['document'] == '01234567L'
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['question'] == question and parsed['has_question']
+    assert 'Ana de la Peña' not in parsed['question']
+    assert '01234567' not in parsed['normalized_text']
+    assert '600111222' not in parsed['normalized_text']
+    authorized_trace = voice.mask_transcript(text, mask_names=False)
+    assert '01234567' not in authorized_trace and '600111222' not in authorized_trace
+    assert '1.000,20 euros' in authorized_trace
 
 
 @pytest.mark.parametrize('suffix', [

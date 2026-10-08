@@ -285,9 +285,11 @@ def _answer(business, state, text, channel, external_id, customer):
                     return cached['content'], {
                         'insurance_result': cached['decision'], 'should_end_call': channel == 'Voice',
                         'end_reason': 'goodbye', 'session_closed': True}
-                if cached.get('customer_id') != customer_id or (
+                if cached.get('customer_id') != customer_id or ((
                         cached['decision'] in (ResultKind.EVIDENCE_BACKED_EXPLANATION.value,
                                                ResultKind.POLICY_INFORMATION.value)
+                        or any(p.get('selection_policy_id') for p in cached.get('pages', [])
+                               if isinstance(p, dict)))
                         and not _authorized_retry(conn, sc, cached, _business_date(business))):
                     _turn_diag(corr, bid, ResultKind.MISSING_INFORMATION.value if customer_id else
                               ResultKind.IDENTITY_NOT_VERIFIED.value, customer_id, 'read_only')
@@ -342,6 +344,9 @@ def _answer(business, state, text, channel, external_id, customer):
                 return cached['content'], out
             awaiting_at_start = st.get('awaiting')
             pending_question = st.get('normalized_question') or st.get('question')
+            pending_fields = {key: st[key] for key in (
+                'question', 'normalized_question', 'question_turn_id', 'question_intent')
+                if key in st}
             just_verified = False
             st.pop('_identity_diagnostic', None)
             identity_declaration = (not customer_id or (channel == 'Voice' and (
@@ -361,7 +366,9 @@ def _answer(business, state, text, channel, external_id, customer):
             selection_attempt = bool(decl.get('policy_only') or (
                 awaiting_at_start == 'policy' and len(incoming.split()) <= 3
                 and not any(mark in incoming for mark in ('?', '¿'))))
-            policy_control = bool(policy_action or selected_policy or selection_attempt or (
+            pure_selection = bool(selected_policy and (
+                decl.get('policy_only') or not decl.get('contract_number')))
+            policy_control = bool(policy_action or pure_selection or selection_attempt or (
                 awaiting_at_start == 'policy_confirmation' and references.consent_only(incoming)))
             detail = bool(pending_question and awaiting_at_start in ('retry', 'human_consent') and
                           re.fullmatch(r'(?:(?:si|la|mesa|esta|es|de|material)\s+)*'
@@ -492,7 +499,8 @@ def _answer(business, state, text, channel, external_id, customer):
                     conn, sc, external_id, reply, decision, reply_to, corr,
                     kind=kind or ('answer' if decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value
                                  else 'clarification'),
-                    policy_id=policy, version_id=version, pages=list(pages))
+                    policy_id=policy, version_id=version,
+                    pages=list(pages) or st.pop('_policy_disclosure', []))
                 if sc.customer_id and not _is_social(incoming):
                     pending_text = st.get('question') if st.get('awaiting') else None
                     if st.get('change_pending') and st.get('requested_policy'):
@@ -591,6 +599,9 @@ def _answer(business, state, text, channel, external_id, customer):
                     return finish('De acuerdo, no registraré un caso. ¿Qué quieres consultar?',
                                   {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                 if only == {'policy_change'} and not decl['contract_number']:
+                    for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent'):
+                        st.pop(key, None)
+                    st.update(pending_fields)
                     st['awaiting'] = 'policy'
                     st['policy_switch_required'] = True
                     st['change_pending'] = True
@@ -602,7 +613,8 @@ def _answer(business, state, text, channel, external_id, customer):
                                   {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if customer_id and st.get('policy_switch_required') and not policy_control:
                 st['awaiting'] = 'policy'
-                return finish(ASK_POLICY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                return finish(policy_info.offer(conn, sc, st),
+                              {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if (st.get('pending_human') and not st['pending_human']['case'].get('customer_id')
                     and not is_query and not reviewing and not explaining_missing):
                 memory.set_user_kind(conn, user_id, 'confirmation', incoming)
@@ -660,8 +672,7 @@ def _answer(business, state, text, channel, external_id, customer):
                 return finish(policy_info.offer(conn, sc, st, policy_action),
                               {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if selection_attempt and not selected_policy:
-                st.pop('requested_policy', None)
-                st.pop('contract_number', None)
+                st['policy_switch_required'] = True
                 return finish(policy_info.offer(conn, sc, st),
                               {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             if selected_policy:
@@ -670,6 +681,9 @@ def _answer(business, state, text, channel, external_id, customer):
                     st['requested_policy'] = selected_id
                     st['change_pending'] = True
                     st['awaiting'] = 'policy_confirmation'
+                    st['_policy_disclosure'] = [{
+                        'selection_policy_id': selected_id, 'product': selected_policy.get('product'),
+                        'contract_number': selected_policy.get('contract_number')}]
                     return finish(
                         f"Cambiar a {selected_policy.get('product') or 'la póliza'} "
                         f"{selected_policy.get('contract_number') or ''}. ¿Confirmas el cambio? Responde sí o no.",
@@ -757,6 +771,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 if pending_selection:
                     st['requested_policy'], st['change_pending'] = pending_selection, True
                     st['awaiting'] = 'policy'
+                    if active.get('policy_id'):
+                        st['policy_id'], st['version_id'] = active['policy_id'], active.get('version_id')
                 elif active.get('policy_id'):
                     # This is a selection hint, not authorization; retrieval rechecks it below.
                     st['policy_id'], st['version_id'] = active['policy_id'], active.get('version_id')
@@ -865,8 +881,11 @@ def _answer(business, state, text, channel, external_id, customer):
                     return finish(ASK_REFERENCE, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                 else:
                     st['normalized_question'] = resolving
-                    if not any(re.search(pattern, resolving, re.I)
-                               for _, pattern in incident_context.TYPES):
+                    if (not any(re.search(pattern, resolving, re.I)
+                                for _, pattern in incident_context.TYPES)
+                            and retrieval._tokens(resolving) - {
+                                'cubre', 'cobertura', 'exclusion', 'condicion', 'limite',
+                                'franquicia', 'indemnizacion', 'indica', 'tiene'}):
                         # An independent question about a new object must not inherit a
                         # previous incident solely because it also contains "cubre".
                         for key in ('active_topic', 'last_incident_type', 'incident_date', 'fact_date'):
@@ -896,6 +915,8 @@ def _answer(business, state, text, channel, external_id, customer):
                 _diag(corr, 'dialogue', bid, identity_verified=True, decision='ask_query')
                 return finish(ASK_QUERY if just_verified else ASK_QUERY_AGAIN,
                              {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+            if citations._CONTEXT_REQUEST.search(references.fold(incoming)):
+                st['citation_context_requested'] = True
             reply, out, pages = _documental(
                 conn, business, sc, st, text, question, corr, ctx, customer, external_id,
                 intent=st.get('question_intent', 'question'), reviewing=reviewing)
@@ -1508,6 +1529,17 @@ def _reload_pages(conn, sc, result, pair):
 
 
 def _authorized_retry(conn, sc, cached, today=None):
+    selections = [item for item in cached.get('pages', [])
+                  if isinstance(item, dict) and item.get('selection_policy_id')]
+    if selections:
+        if len(selections) > policy_info.PAGE_SIZE:
+            return False
+        return all(conn.execute(
+            'SELECT 1 FROM insurance_policies p WHERE ' + retrieval.AUTHORIZED +
+            ' AND p.policy_id=%s AND p.product IS NOT DISTINCT FROM %s '
+            'AND p.contract_number IS NOT DISTINCT FROM %s',
+            (sc.bid, sc.customer_id, item['selection_policy_id'], item.get('product'),
+             item.get('contract_number'))).fetchone() for item in selections)
     question = conn.execute(
         'SELECT q.normalized,q.content FROM insurance_conversation_turns a '
         'JOIN insurance_conversation_turns q ON q.turn_id=a.reply_to '

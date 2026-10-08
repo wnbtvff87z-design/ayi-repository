@@ -154,6 +154,14 @@ La comprobación sucede en cada consulta del Web al registro, pero no controla l
   WhatsApp, el endpoint Voice, PostgreSQL y la serialización del SDK OpenAI real.
   Esto no certifica la precisión acústica del STT ni atribuye errores a OCR,
   retrieval o a un proveedor real sin observar esa etapa.
+- Flujo auditado: `/voice` configura ConversationRelay con Deepgram en `es-ES`;
+  los eventos `prompt` llegan a `/ws`, los finales van a `/internal/turn` y los
+  parciales solo al diagnóstico de transporte. `insurance.dialog` carga estado
+  PostgreSQL por conversación/sesión, ejecuta `voice_identity.prepare` local,
+  verifica contra identidad registrada, interpreta contexto minimizado, selecciona
+  póliza/fecha, recupera fragmentos con autorización activa, construye contexto
+  acotado, llama al SDK y valida las citas antes de presentar texto o voz.
+  WhatsApp entra por `/webhook-whatsapp` con firma y comparte las etapas de seguros.
 - Relay ya separaba los parciales de los finales; faltaba rechazar indicadores
   `last` no booleanos y tipos de transcripción inválidos. Web ahora rechaza un
   parcial explícito antes de modificar identidad. El identificador técnico de
@@ -162,7 +170,7 @@ La comprobación sucede en cada consulta del Web al registro, pero no controla l
 - El parser local no reconocía correctamente ciertas expresiones de letra final
   (`la letra es jota`) ni correcciones parciales explícitas. La corrección conserva
   nombre/apellidos y fragmentos cifrados, distingue sufijos de fecha, teléfono e
-  importe, y deja la verificación al checksum y las coincidencias HMAC exactas.
+  importe, y deja la verificación al formato local y las coincidencias HMAC exactas.
   No se añade envío de identidad completa al modelo.
 - La selección conversacional usa exclusivamente pólizas autorizadas en PostgreSQL:
   páginas de cinco opciones, producto/número exacto u ordinal de la página mostrada.
@@ -205,7 +213,11 @@ categorías en ambos endpoints (**20 pruebas**), sin reemplazar `llm_explain`, y
 reanuda tras reiniciar el proceso en WhatsApp. Comprueba que el detalle «Es de vidrio»
 se incorpora a la consulta de mesa pendiente y que se presentan citas verificadas.
 `tests/test_insurance_llm_adapter.py` valida los códigos en el transporte HTTP real
-del SDK (**55 pruebas**). Las advertencias base de ReportLab y Starlette son
+del SDK (**55 pruebas**). Las siete suites focalizadas de identidad/transporte
+obtuvieron **417 pruebas aprobadas**, incluyendo nombre/documento/pregunta e
+importe sintético juntos, fragmento seguido de letra, corrección explícita,
+`last` no booleano, idempotencia y aislamiento por llamada.
+Las advertencias base de ReportLab y Starlette son
 deprecaciones preexistentes; no se añadieron herramientas ni dependencias.
 
 ## Caso humano, persistencia y outbox (requisito prioritario)

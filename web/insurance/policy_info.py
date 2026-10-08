@@ -40,9 +40,13 @@ def offer(conn, scope, state, action='list'):
     rows, more = authorized_page(conn, scope.bid, scope.customer_id, offset)
     state.update(policy_options=[row['policy_id'] for row in rows],
                  policy_list_offset=offset, policy_list_more=more, awaiting='policy')
+    state['_policy_disclosure'] = [
+        {'selection_policy_id': row['policy_id'], 'product': row.get('product'),
+         'contract_number': row.get('contract_number')} for row in rows]
     if not rows:
         return 'No he podido confirmar una póliza autorizada para esta consulta.'
-    lines = ['Puedes elegir una póliza autorizada por producto, número o posición de esta lista:']
+    lines = ['¿Qué quieres consultar? Puedes elegir una póliza autorizada por producto, '
+             'número de póliza o posición de esta lista:']
     lines += [f"{n}. {row.get('product') or 'Producto no registrado'} — "
               f"{row.get('contract_number') or 'Número no registrado'}."
               for n, row in enumerate(rows, 1)]
@@ -72,7 +76,8 @@ def selection(conn, scope, state, text, number=None):
         'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
         + retrieval.AUTHORIZED +
         ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s) '
-        'OR lower(p.product)=lower(%s)) ORDER BY p.policy_id LIMIT 2',
+        "OR translate(lower(p.product),'áéíóúüñ','aeiouun')=lower(%s)) "
+        'ORDER BY p.policy_id LIMIT 2',
         (scope.bid, scope.customer_id, number or candidate, number or candidate, candidate)).fetchall()
     return dict(rows[0]) if len(rows) == 1 else None
 

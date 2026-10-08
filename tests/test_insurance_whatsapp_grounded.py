@@ -152,10 +152,18 @@ def _install_transports(monkeypatch, captures, mode):
 
         if mode['value'] == 'timeout':
             raise httpx.ReadTimeout('Synthetic upstream timeout', request=request)
+        if mode['value'] == 'network':
+            raise httpx.ConnectError('Synthetic upstream network failure', request=request)
+        if mode['value'] == 'context_limit':
+            return httpx.Response(400, json={'error': {
+                'message': 'Synthetic context limit', 'type': 'invalid_request_error',
+                'code': 'context_length_exceeded'}})
         if mode['value'] == 'unauthorized':
             return httpx.Response(401, json={'error': {
                 'message': 'Synthetic authorization failure', 'type': 'authentication_error'}})
-        if mode['value'] == 'insufficient':
+        if mode['value'] == 'empty':
+            content = ''
+        elif mode['value'] == 'insufficient':
             content = 'ESCALAR'
         elif mode['value'] == 'detail' and 'mesa' in question.lower() and 'vidrio' not in question.lower():
             content = 'ESCALAR'

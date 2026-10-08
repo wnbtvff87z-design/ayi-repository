@@ -193,11 +193,11 @@ def test_metadata_is_not_replayed_after_authorization_expires_or_is_revoked(pg, 
     assert 'hogar' not in repeated and 'hogar' not in fresh
 
 
-def test_metadata_multiple_policies_requests_selection_without_disclosing_numbers(pg):
+def test_metadata_multiple_policies_lists_authorized_numbers_after_verification(pg):
     verify(pg, 'C1')
     reply, _ = ask('cómo se llama mi póliza', ext='many')
-    assert reply == dialog.ASK_POLICY
-    assert '000123' not in reply and '000124' not in reply
+    assert 'número de póliza' in reply
+    assert '000123' in reply and '000124' in reply
     selected, out = ask('Póliza número 000123', ext='selection')
     assert out['insurance_result'] == 'policy_information'
     assert '000123' in selected and '000124' not in selected

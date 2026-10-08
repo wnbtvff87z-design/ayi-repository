@@ -165,3 +165,67 @@ def test_unrelated_then_mesa_declarada_vidrio_preserves_detail_on_failure_restar
     assert all(word in normalized for word in ('mesa', 'declarada', 'vidrio'))
     assert 'incendio' not in normalized
     assert question and flow.count('insurance_cases') == 0
+
+
+@pytest.mark.parametrize('mode,code', [
+    ('empty', 'llm_empty_response'), ('network', 'llm_network_error'),
+    ('context_limit', 'llm_context_limit'),
+])
+def test_classified_provider_failure_keeps_pending_question_and_recovers_after_restart(
+        grounded, mode, code):
+    flow = grounded
+    flow.verify()
+    flow.mode['value'] = mode
+    reply = flow.say(QUESTION)
+    assert 'técnico' in reply and 'evidencia suficiente' not in reply
+    state = flow.state()
+    assert state['awaiting'] == 'retry'
+    assert state['last_retrieval']['llm_diagnostic'] == code
+    assert state['normalized_question'].startswith(QUESTION)
+    assert flow.count('insurance_cases') == 0
+    recovered = flow.restart('Revisa de nuevo', 'SM-recovery-' + mode)
+    assert 'excluy' in recovered['reply'].lower() and 'página 2' in recovered['reply']
+    assert flow.count('insurance_identity_verifications') == 1
+
+
+def test_date_clarifies_ambiguous_metadata_without_provider_explanation(grounded):
+    flow = grounded
+    flow.verify()
+    today = date.today()
+    with cases.db() as conn:
+        conn.execute('INSERT INTO insurance_policy_versions '
+                     '(business_id,policy_id,version_id,valid_from,valid_to) '
+                     "VALUES(%s,'POL-SYNTHETIC','OVERLAP',%s,%s)", (BIZ, today, today))
+    response = flow.say('hasta cuándo está vigente mi póliza')
+    assert 'fecha' in response and flow.state()['awaiting'] == 'date'
+    response = flow.say((today - timedelta(days=1)).isoformat())
+    assert 'SYN-0731' in response and 'vigencia desde' in response
+    assert not flow.explanations
+
+
+def test_customer_deactivation_blocks_list_selection_and_cached_answer(grounded):
+    flow = grounded
+    flow.verify()
+    reply = flow.say(QUESTION, sid='SM-protected')
+    assert 'SYN-0731' in reply
+    with cases.db() as conn:
+        conn.execute("UPDATE insurance_customers SET active=false WHERE customer_id='CUSTOMER-SYNTHETIC'")
+    for text, sid in [('mis pólizas', None), ('hogar', None), (QUESTION, 'SM-protected')]:
+        response = flow.say(text, sid=sid)
+        assert 'SYN-0731' not in response and '731' not in response
+        assert 'nombre' in response.lower()
+
+
+@pytest.mark.parametrize('protected', ['list', 'confirmation'])
+def test_cached_policy_disclosures_revalidate_current_authorization(grounded, protected):
+    flow = grounded
+    add_policy('AUTO-010')
+    flow.verify()
+    flow.say('hogar')
+    text = 'mis pólizas' if protected == 'list' else 'AUTO-010'
+    reply = flow.say(text, sid='SM-protected-selection')
+    assert 'AUTO-010' in reply
+    with cases.db() as conn:
+        conn.execute("UPDATE insurance_authorizations SET revoked_at=now() WHERE policy_id='POL-AUTO-010'")
+    replay = flow.say(text, sid='SM-protected-selection')
+    assert 'AUTO-010' not in replay and 'automóvil' not in replay

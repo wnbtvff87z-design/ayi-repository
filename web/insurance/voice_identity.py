@@ -125,7 +125,7 @@ def _document_token(text, spoken):
 def _unrelated_numeric_suffix(text):
     """Only an explicitly formatted date, phone or amount can end a complete document."""
     return bool(re.match(
-        r'^(?:\d+(?:[.,]\d+)?\s*(?:euros?\b|[€$])|'
+        r'^(?:\d+(?:[.,]\d+)*\s*(?:euros?\b|[€$])|'
         r'\d{1,2}/\d{1,2}/\d{2,4}(?!\w)|'
         r'\+?\d(?:[\s().-]*\d){8,14}(?![\w\d]))', text, re.I))
 
@@ -494,7 +494,8 @@ def prepare(text, state, business_id, channel, ref, session):
             if guided_name:
                 decl['name'] = guided_name
                 other = identity.parse_declaration(segments[1 - index])
-                decl.update(question=other['question'], has_question=other['has_question'])
+                decl.update(question=other['question'], has_question=(
+                    other['has_question'] or '?' in other['question'] or '¿' in other['question']))
                 if other['contract_number']:
                     decl['contract_number'] = other['contract_number']
                 break
