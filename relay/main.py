@@ -63,6 +63,8 @@ async def core(path,data):
   r.raise_for_status();return r.json()
 def insurance_reference(call_sid):
  return hashlib.sha256(('insurance-voice:'+str(call_sid)).encode()).hexdigest()
+def insurance_call_id_valid(call_sid):
+ return isinstance(call_sid,str) and re.fullmatch(r'[^\s:]{1,200}',call_sid) is not None
 def insurance_error(stage,exc,call_sid):
  ref=insurance_reference(call_sid)
  log.error('insurance_voice stage=%s error_type=%s call_ref=%s correlation_id=%s',stage,type(exc).__name__,ref,ref)
@@ -124,11 +126,11 @@ async def websocket(ws:WebSocket):
    if kind=='setup':
     call_sid=event.get('callSid','')
     if state['insurance'] and state['business']:
-     if not isinstance(call_sid,str) or not call_sid.strip():
+     if not insurance_call_id_valid(call_sid):
       insurance_error('technical_call_id_missing',ValueError(),state['call_sid'])
       await ws.close(code=1008);return
      if call_sid==state['call_sid']:continue
-     if not state['final_count']:
+     if not state['final_count'] or state['partial_count']:
       await insurance_transport(state,'disconnect','voice_transcription_partial' if state['partial_count'] else 'voice_transcription_missing',state['last_partial'])
      state['seq']=0;state['partial_count']=0;state['final_count']=0;state['last_partial']='';state['processed_ids']=set()
     state['call_sid']=event.get('callSid','')
@@ -137,10 +139,14 @@ async def websocket(ws:WebSocket):
     state['business']=(await core('/internal/business',{'phone':state['to'],'channel':'Voice'}))['business']
     state['insurance']=bool(state['business'] and str(state['business'].get('sector') or '').strip().casefold() in ('insurance','seguro','seguros'))
     if state['insurance']:
-     if not isinstance(state['call_sid'],str) or not state['call_sid'].strip():
+     if not insurance_call_id_valid(state['call_sid']):
       insurance_error('technical_call_id_missing',ValueError(),state['call_sid'])
       await ws.close(code=1008);return
      await insurance_transport(state,'setup','voice_transcription_missing')
+   elif kind=='prompt' and state['insurance'] and (
+     'last' in event and not isinstance(event['last'],bool) or
+     event.get('voicePrompt') is not None and not isinstance(event['voicePrompt'],str)):
+    insurance_error('technical_prompt_invalid',ValueError(),state['call_sid'])
    elif kind=='prompt' and not event.get('last',True) and state['insurance']:
     state['partial_count']=min(10000,state['partial_count']+1)
     # No verified delta/cumulative contract: never merge interim STT into a final.
@@ -195,5 +201,5 @@ async def websocket(ws:WebSocket):
   if state['insurance']:insurance_error('disconnect',exc,state['call_sid'])
   else:log.exception('Relay disconnected')
  finally:
-  if state['insurance'] and isinstance(state['call_sid'],str) and state['call_sid'].strip() and not state['final_count']:
+  if state['insurance'] and insurance_call_id_valid(state['call_sid']) and (not state['final_count'] or state['partial_count']):
    await insurance_transport(state,'disconnect','voice_transcription_partial' if state['partial_count'] else 'voice_transcription_missing',state['last_partial'])

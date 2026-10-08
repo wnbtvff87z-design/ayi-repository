@@ -94,7 +94,7 @@ def test_http_failure_classified_with_single_own_retry_only_for_5xx(provider, ca
 
 @pytest.mark.parametrize('exception,code', [
     (httpx.ReadTimeout, 'llm_timeout'), (httpx.ConnectTimeout, 'llm_timeout'),
-    (httpx.ConnectError, 'llm_error'), (httpx.RemoteProtocolError, 'llm_error')])
+    (httpx.ConnectError, 'llm_network_error'), (httpx.RemoteProtocolError, 'llm_network_error')])
 def test_transport_failures_classified_after_one_own_retry(provider, exception, code):
     def fail(request):
         raise exception('private-network-detail', request=request)
@@ -153,9 +153,9 @@ def test_query_rewrite_fails_open_to_no_expansion(provider, monkeypatch):
     (completion('Partial', finish='content_filter'), 'llm_refusal'),
     (completion('Partial', finish='length'), 'llm_invalid_response'),
     (completion('Tool', finish='tool_calls'), 'llm_invalid_response'),
-    (completion(''), 'llm_invalid_response'),
-    (completion(' \n\t'), 'llm_invalid_response'),
-    (completion(None), 'llm_invalid_response'),
+    (completion(''), 'llm_empty_response'),
+    (completion(' \n\t'), 'llm_empty_response'),
+    (completion(None), 'llm_empty_response'),
     (completion(['unexpected']), 'llm_invalid_response'),
     (completion('a' * 8193), 'llm_invalid_response'),
     ({'choices': []}, 'llm_invalid_response'),
@@ -174,6 +174,33 @@ def test_invalid_json_response(provider):
                                             content=b'not json'))
     with pytest.raises(llm.LLMError, match='llm_invalid_response'):
         llm.explain('agua', EVIDENCE)
+
+
+@pytest.mark.parametrize('operation', ['explain', 'interpret'])
+@pytest.mark.parametrize('failure,code', [
+    ('empty', 'llm_empty_response'), ('network', 'llm_network_error'),
+    ('context', 'llm_context_limit'), ('invalid', 'llm_invalid_response')])
+def test_stage_independent_safe_diagnostics(provider, caplog, operation, failure, code):
+    def transport(request):
+        if failure == 'network':
+            raise httpx.ConnectError('private-network-content', request=request)
+        if failure == 'context':
+            return httpx.Response(400, json={'error': {
+                'code': 'context_length_exceeded', 'message': 'private-context-content',
+                'type': 'invalid_request_error'}})
+        return httpx.Response(200, json=completion(
+            ' ' if failure == 'empty' else '{broken-json' if operation == 'interpret' else 'Partial',
+            finish='stop' if operation == 'interpret' or failure == 'empty' else 'length'))
+    requests, _ = provider(transport)
+    with pytest.raises(llm.LLMError) as exc:
+        if operation == 'explain':
+            llm.explain('agua', EVIDENCE)
+        else:
+            llm.interpret([{'role': 'user', 'content': 'synthetic abstract intent'}])
+    assert exc.value.code == code and str(exc.value) == code
+    assert len(requests) == (2 if failure == 'network' else 1)
+    assert 'private-network-content' not in caplog.text
+    assert 'private-context-content' not in caplog.text
 
 
 @pytest.mark.parametrize('name,value', [

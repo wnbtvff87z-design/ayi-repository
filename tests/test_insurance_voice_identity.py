@@ -579,6 +579,97 @@ def test_bare_labelled_name_preserves_identity_parser_policy_behavior():
     assert identity.parse_declaration('póliza 000123')['policy_only'] is True
 
 
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+@pytest.mark.parametrize('document,expected', [
+    ('DNI es el cero uno dos tres cuatro cinco seis siete letra ele', '01234567L'),
+    ('DNI es el cero uno veintitrés cuarenta y cinco sesenta y siete la letra es ele',
+     '01234567L'),
+    ('DNI 01 23 cuarenta y cinco 67 termina en ele', '01234567L'),
+    ('NIE es la equis cero uno dos tres cuatro cinco seis letra ele', 'X0123456L'),
+])
+def test_articles_letter_markers_and_leading_zeroes(channel, document, expected):
+    state = {'awaiting': 'identity'}
+    parsed = prepare('María del Mar de la Peña, ' + document, state, channel=channel)
+    assert parsed['name'] == state['name'] == 'María del Mar de la Peña'
+    assert parsed['document'] == expected and parsed['identity_kind'] == 'complete'
+    assert expected not in json.dumps(state)
+    assert expected not in parsed['normalized_text']
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_incomplete_document_correction_restarts_instead_of_appending(channel):
+    state = {'awaiting': 'identity'}
+    prepare('Ana de la Peña', state, channel=channel)
+    prepare('NIE equis nueve nueve nueve', state, channel=channel)
+    corrected = prepare('No, equis cero uno dos', state, channel=channel)
+    assert corrected['document'] is None and corrected['identity_kind'] == 'partial'
+    assert state['name'] == 'Ana de la Peña'
+    completed = prepare('tres cuatro cinco seis letra ele', state, channel=channel)
+    assert completed['document'] == 'X0123456L'
+    assert completed['identity_kind'] == 'complete'
+    assert voice.BUFFER_KEY not in state
+
+
+@pytest.mark.parametrize('marker,expected', [
+    ('letra ele', 'L'), ('la letra es ele', 'L'), ('termina en ele', 'L'),
+    ('la letra es jota', 'J'),
+])
+def test_letter_marker_can_arrive_after_all_encrypted_numeric_fragments(marker, expected):
+    state = {'awaiting': 'identity'}
+    prepare('Ana Pérez', state)
+    prepare('DNI cero uno dos tres cuatro cinco seis siete', state)
+    parsed = prepare(marker, state)
+    assert parsed['document'] == '01234567' + expected
+    assert parsed['identity_kind'] == 'complete'
+    assert voice.BUFFER_KEY not in state
+
+
+def test_identity_name_removed_from_short_explicit_question():
+    parsed = prepare('Ana Pérez, DNI 01234567L, ¿cubre agua?', {'awaiting': 'identity'})
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['question'] == '¿cubre agua?' and parsed['has_question']
+
+
+@pytest.mark.parametrize('suffix', [
+    '250 euros', '250 €', '1.000,20 euros', '06/10/2026', '600111222', 'teléfono 600111222',
+    'póliza 000123', 'quiero saber si cubre agua',
+])
+def test_complete_document_and_name_are_not_concatenated_with_other_fields(suffix):
+    parsed = prepare('Ana Pérez, DNI 01234567L, ' + suffix, {'awaiting': 'identity'})
+    assert parsed['document'] == '01234567L'
+    assert parsed['name'] == 'Ana Pérez'
+    assert parsed['identity_kind'] == 'complete'
+    assert 'Ana Pérez' not in parsed['question']
+    assert suffix in parsed['question']
+
+
+def test_name_document_question_phone_and_amount_together_preserve_only_literal_fields():
+    question = '¿cubre daños por agua por 1.000,20 euros? teléfono 600111222'
+    text = 'Ana de la Peña, DNI 01234567L, ' + question
+    parsed = prepare(text, {'awaiting': 'identity'})
+    assert parsed['name'] == 'Ana de la Peña'
+    assert parsed['document'] == '01234567L'
+    assert parsed['identity_kind'] == 'complete'
+    assert parsed['question'] == question and parsed['has_question']
+    assert 'Ana de la Peña' not in parsed['question']
+    assert '01234567' not in parsed['normalized_text']
+    assert '600111222' not in parsed['normalized_text']
+    authorized_trace = voice.mask_transcript(text, mask_names=False)
+    assert '01234567' not in authorized_trace and '600111222' not in authorized_trace
+    assert '1.000,20 euros' in authorized_trace
+
+
+@pytest.mark.parametrize('suffix', [
+    '12345678Z', 'uno dos tres cuatro cinco seis siete ocho zeta',
+    '12345678Z, 250 euros', '12345678Z teléfono 600111222',
+])
+def test_nonidentity_suffix_does_not_hide_second_document(suffix):
+    state = {'awaiting': 'identity', 'name': 'Ana Pérez'}
+    parsed = prepare('DNI 01234567L, ' + suffix, state)
+    assert parsed['document'] is None and parsed['identity_kind'] == 'failed'
+    assert voice.BUFFER_KEY not in state
+
+
 def test_question_without_identity_does_not_guess_name_or_missing_datum():
     state = {}
     parsed = prepare('¿Dónde lo dice?', state)

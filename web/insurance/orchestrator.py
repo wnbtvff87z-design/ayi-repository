@@ -3,7 +3,7 @@ import json
 import os
 import re
 
-from insurance import llm, memory, references, retrieval
+from insurance import llm, memory, references, retrieval, policy_info
 
 INTENTS = frozenset((
     'greeting', 'identity', 'question', 'availability', 'policy_name', 'policy_validity',
@@ -75,6 +75,8 @@ def interpret(conn, scope, state, text, declaration, fallback):
         return {**base, 'source': 'local'}
     summary, _ = memory.load_summary(conn, scope) if scope.customer_id else ({}, None)
     recent = memory.recent(conn, scope) if scope.customer_id else []
+    if scope.customer_id:
+        summary, recent = policy_info.model_history(conn, scope, summary, recent)
     metadata = None
     if scope.customer_id and state.get('policy_id') and state.get('version_id'):
         metadata = conn.execute(

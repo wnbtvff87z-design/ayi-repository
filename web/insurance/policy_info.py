@@ -3,6 +3,112 @@ import re
 
 from insurance import references, retrieval
 
+PAGE_SIZE = 5
+
+
+def list_action(text):
+    folded = references.fold(text).strip(' .?!¿¡')
+    if folded in ('siguiente', 'siguientes', 'mas', 'mas polizas', 'ver mas'):
+        return 'next'
+    if folded in ('anterior', 'anteriores'):
+        return 'previous'
+    if re.fullmatch(r'(?:(?:ver|lista|listar|muestra|mostrar|mis|las|que|cuales|tengo|polizas|'
+                    r'autorizadas|seguros|disponibles)\s*)+', folded) and (
+            'polizas' in folded or 'seguros' in folded):
+        return 'list'
+    if re.fullmatch(r'(?:quiero\s+)?(?:cambiar|cambia)(?:\s+(?:de|la))?\s+poliza', folded):
+        return 'change'
+    return None
+
+
+def authorized_page(conn, bid, customer_id, offset=0):
+    rows = conn.execute(
+        'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+        + retrieval.AUTHORIZED + ' ORDER BY p.policy_id LIMIT %s OFFSET %s',
+        (bid, customer_id, PAGE_SIZE + 1, max(0, offset))).fetchall()
+    return [dict(row) for row in rows[:PAGE_SIZE]], len(rows) > PAGE_SIZE
+
+
+def offer(conn, scope, state, action='list'):
+    offset = state.get('policy_list_offset', 0)
+    if action == 'next' and state.get('policy_list_more'):
+        offset += PAGE_SIZE
+    elif action == 'previous':
+        offset = max(0, offset - PAGE_SIZE)
+    elif action in ('list', 'change'):
+        offset = 0
+    rows, more = authorized_page(conn, scope.bid, scope.customer_id, offset)
+    state.update(policy_options=[row['policy_id'] for row in rows],
+                 policy_list_offset=offset, policy_list_more=more, awaiting='policy')
+    state['_policy_disclosure'] = [
+        {'selection_policy_id': row['policy_id'], 'product': row.get('product'),
+         'contract_number': row.get('contract_number')} for row in rows]
+    if not rows:
+        return 'No he podido confirmar una póliza autorizada para esta consulta.'
+    lines = ['¿Qué quieres consultar? Puedes elegir una póliza autorizada por producto, '
+             'número de póliza o posición de esta lista:']
+    lines += [f"{n}. {row.get('product') or 'Producto no registrado'} — "
+              f"{row.get('contract_number') or 'Número no registrado'}."
+              for n, row in enumerate(rows, 1)]
+    if more:
+        lines.append('Di «siguiente» para ver más pólizas.')
+    if offset:
+        lines.append('Di «anterior» para volver.')
+    return '\n'.join(lines)
+
+
+def selection(conn, scope, state, text, number=None):
+    """Resolve only exact identifiers/products or an ordinal from the displayed page."""
+    folded = references.fold(text).strip(' .?!¿¡')
+    candidate = re.sub(r'^(?:(?:quiero|elige|elijo|selecciona|selecciono|cambia|cambiar)'
+                       r'\s+(?:(?:a|la|el|de)\s+)?|(?:la|el)\s+)', '', folded)
+    ordinal = {'primera': 1, 'primero': 1, 'segunda': 2, 'segundo': 2,
+               'tercera': 3, 'tercero': 3, 'cuarta': 4, 'cuarto': 4,
+               'quinta': 5, 'quinto': 5}.get(candidate)
+    if re.fullmatch(r'[1-5]', candidate):
+        ordinal = int(candidate)
+    options = state.get('policy_options', [])
+    if ordinal:
+        if ordinal > len(options):
+            return None
+        number = options[ordinal - 1]
+    rows = conn.execute(
+        'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+        + retrieval.AUTHORIZED +
+        ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s) '
+        "OR translate(lower(normalize(p.product,NFC)),'áéíóúüñ','aeiouun')=lower(%s)) "
+        'ORDER BY p.policy_id LIMIT 2',
+        (scope.bid, scope.customer_id, number or candidate, number or candidate, candidate)).fetchall()
+    if len(rows) > 1:
+        return {'reason_code': 'multiple_policies'}
+    return dict(rows[0]) if rows else None
+
+
+def model_history(conn, scope, summary, recent):
+    """Local policy controls are neither model context nor contractual evidence."""
+    turn_ids = {turn['turn_id'] for turn in recent}
+    turn_ids.update(topic['a_turn'] for topic in summary.get('topics', []) if topic.get('a_turn'))
+    turn_ids.update(item['turn'] for item in summary.get('conclusions', []) if item.get('turn'))
+    controls = conn.execute(
+        'SELECT turn_id,reply_to FROM insurance_conversation_turns WHERE business_id=%s '
+        'AND channel=%s AND conversation_ref=%s AND session_ref=%s AND customer_id=%s '
+        'AND turn_id=ANY(%s) AND EXISTS (SELECT 1 FROM jsonb_array_elements(pages) entry '
+        "WHERE entry ? 'selection_policy_id')",
+        (*scope, sorted(turn_ids))).fetchall() if turn_ids else []
+    blocked = {value for row in controls for value in (row['turn_id'], row['reply_to']) if value}
+    recent = [turn for turn in recent
+              if turn['turn_id'] not in blocked and turn.get('reply_to') not in blocked]
+    summary = {**summary,
+               'topics': [topic for topic in summary.get('topics', [])
+                          if topic.get('id') not in blocked and topic.get('a_turn') not in blocked],
+               'conclusions': [item for item in summary.get('conclusions', [])
+                               if item.get('turn') not in blocked]}
+    for key in ('facts', 'pending', 'open_issues'):
+        summary[key] = [item for item in summary.get(key, [])
+                        if item.get('turn') not in blocked and not item.get('text', '').startswith(
+                            'Póliza solicitada sin confirmar: ')]
+    return summary, recent
+
 
 def intent(text):
     folded = references.fold(text)

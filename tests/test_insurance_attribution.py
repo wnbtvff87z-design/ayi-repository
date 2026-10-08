@@ -351,17 +351,18 @@ def test_verification_is_temporary(pg, llm, monkeypatch):
     assert out['insurance_result'] == 'identity_not_verified'
 
 
-def test_multiple_policies_ask_number_then_leading_zeros_are_kept(pg, llm):
+def test_multiple_policies_list_authorized_numbers_then_leading_zeros_are_kept(pg, llm):
     add_document(pg, 'POL-000123', 'DOC-000456')
     add_document(pg, 'POL-000124', 'DOC-X')
     say(TEXT)
     reply, out = say(ANA)
     assert 'número de póliza' in reply and out['insurance_result'] == 'missing_information'
-    assert 'POL-' not in reply and '000124' not in reply
+    assert 'POL-' not in reply and '000124' in reply and '000123' in reply
     reply, out = say('000124')                                          # a different policy, exact text
     assert_visible_sources(reply, number='000124')
     assert '000123' not in reply
-    assert_visible_sources(say(f'{TEXT} póliza 000123')[0], number='000123')
+    assert 'Confirmas' in say(f'{TEXT} póliza 000123')[0]
+    assert_visible_sources(say('Sí')[0], number='000123')
     reply, out = say(f'{TEXT} póliza 123')                              # no partial / zero-stripped match
     assert out['insurance_result'] == 'missing_information' and 'número de póliza' in reply
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0

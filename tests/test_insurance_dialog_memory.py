@@ -295,11 +295,13 @@ def test_policy_switch_failure_remains_pending_and_never_reverts_silently(pg, ex
     ask('¿Cubre agua? Póliza 900', ext='forbidden-switch')
     assert state(pg)['requested_policy'] == '900'
     assert state(pg)['change_pending'] is True
-    assert 'policy_id' not in state(pg) and 'version_id' not in state(pg)
+    assert state(pg)['policy_id'] == 'POL-000123'
     before = len(explained)
     reply, _ = ask('¿Cubre cristales?', ext='still-failed')
     assert len(explained) == before and 'número de póliza' in reply
     reply, out = ask('000124', ext='policy-b')
+    assert 'Confirmas' in reply and state(pg)['policy_id'] == 'POL-000123'
+    reply, out = ask('Sí', ext='confirm-policy-b')
     assert out['insurance_result'] == 'evidence_backed_explanation'
     assert_visible_sources(reply, number='000124')
     assert state(pg)['policy_id'] == 'POL-000124'
@@ -307,23 +309,23 @@ def test_policy_switch_failure_remains_pending_and_never_reverts_silently(pg, ex
     assert explained[-1][0]['question'].count('Tema:') <= 1
 
 
-def test_failed_policy_only_switch_clears_previous_confirmed_selection(pg, explained):
+def test_failed_policy_only_switch_preserves_previous_selection_without_reusing_it(pg, explained):
     ready(pg, customer='C1', policy='POL-000123')
     ask('¿Cubre agua? Póliza 000123', ext='confirmed-first')
     before = len(explained)
     reply, _ = ask('Póliza 900', ext='failed-policy-only')
     assert 'número de póliza' in reply
     assert state(pg)['requested_policy'] == '900' and state(pg)['change_pending'] is True
-    assert 'policy_id' not in state(pg) and 'version_id' not in state(pg)
+    assert state(pg)['policy_id'] == 'POL-000123'
     ask('¿Cubre agua y fuego?', ext='unrelated-after-failed-switch')
-    assert len(explained) == before and 'policy_id' not in state(pg)
+    assert len(explained) == before and state(pg)['policy_id'] == 'POL-000123'
     with pg() as conn:
         conn.execute("UPDATE insurance_conversation_state SET updated_at=now()-interval '2 hours',"
                      "state=jsonb_set(state,'{last_user_at}',to_jsonb((now()-interval '2 hours')::text))")
     ask('Hola', ext='idle-failed-switch-greeting')
     reply, _ = ask('¿Cubre cristales?', ext='idle-failed-switch-question')
     assert 'número de póliza' in reply and len(explained) == before
-    assert state(pg)['requested_policy'] == '900' and 'policy_id' not in state(pg)
+    assert state(pg)['requested_policy'] == '900' and state(pg)['policy_id'] == 'POL-000123'
 
 
 def test_theme_recall_selects_original_confirmed_policy(pg, explained):
@@ -331,6 +333,7 @@ def test_theme_recall_selects_original_confirmed_policy(pg, explained):
     add_document(pg, 'POL-000124', 'DOC-OTHER', pages=('Cobertura de cristales y ventanas.',))
     ask('¿Cubre daños por agua? Póliza 000123', ext='water-a')
     ask('¿Cubre cristales? Póliza 000124', ext='glass-b')
+    ask('Sí', ext='confirm-glass-b')
     reply, _ = ask('La de los daños por agua', ext='theme-a')
     assert_visible_sources(reply)
     assert state(pg)['policy_id'] == 'POL-000123'

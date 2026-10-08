@@ -27,7 +27,7 @@ CARDINALS = incident_dates.SPOKEN_NUMBERS
 LABEL = re.compile(
     r'\b(?:n[úu]mero\s+de\s+(?:mi\s+)?)?'
     r'(?:dni|nie|documento(?:\s+(?:nacional\s+)?de\s+identidad|\s+de\s+identificaci[óo]n)?)\b'
-    r'\s*(?:(?:es|n[úu]mero)\b\s*)?(?:(?:el|la)\s+(?=\d|[XYZxyz]\W*\d))?[:=-]?\s*', re.I)
+    r'\s*(?:(?:es|n[úu]mero)\b\s*)?(?:(?:el|la)\s+)?[:=-]?\s*', re.I)
 TOKENS = re.compile(r'[^\W_]+|[/?¿,;]', re.UNICODE)
 BUFFER_KEY = 'identity_buffer'
 YEAR_RE = re.compile(r'^(?:19|20)\d{2}$')
@@ -39,6 +39,7 @@ LETTER_PAIRS = {
     ('doble', 've'): 'W', ('be', 'larga'): 'B', ('be', 'alta'): 'B',
     ('ve', 'corta'): 'V', ('ve', 'baja'): 'V', ('uve', 'corta'): 'V',
 }
+LETTER_MARKER = re.compile(r'(?:(?:la\s+)?letra(?:\s+es)?|termina\s+en)\s+', re.I)
 NAME_PARTICLES = {'de', 'del', 'la', 'las', 'los', 'y', 'e'}
 NON_NAME_WORDS = (identity.NAME_STOP - NAME_PARTICLES) | {
     'el', 'su', 'sus', 'tu', 'tus', 'hola', 'gracias', 'no', 'si', 'sí', 'perdon', 'perdón', 'corrige',
@@ -121,7 +122,15 @@ def _document_token(text, spoken):
                            or word == 'doble'))
 
 
-def _parts(text, spoken):
+def _unrelated_numeric_suffix(text):
+    """Only an explicitly formatted date, phone or amount can end a complete document."""
+    return bool(re.match(
+        r'^(?:\d+(?:[.,]\d+)*\s*(?:euros?\b|[€$])|'
+        r'\d{1,2}/\d{1,2}/\d{2,4}(?!\w)|'
+        r'\+?\d(?:[\s().-]*\d){8,14}(?![\w\d]))', text, re.I))
+
+
+def _parts(text, spoken, prefix=''):
     """Return exact characters, consumed span, token count and invalidity."""
     matches = list(TOKENS.finditer(text))
     chars, end, count, bad = '', 0, 0, False
@@ -130,6 +139,18 @@ def _parts(text, spoken):
         consumed = 1
         m = matches[i]
         word = _fold_word(m.group())
+        if identity.normalize_document(prefix + chars) and _unrelated_numeric_suffix(text[m.start():]):
+            break
+        if spoken and re.fullmatch(r'\d{8}|[XYZ]\d{7}', prefix + chars):
+            marker = LETTER_MARKER.match(text, m.start())
+            if marker:
+                while i < len(matches) and matches[i].start() < marker.end():
+                    i += 1
+                if i == len(matches):
+                    end = marker.end()
+                    break
+                m = matches[i]
+                word = _fold_word(m.group())
         if word == ',':
             if i + 1 < len(matches) and _document_token(matches[i + 1].group(), spoken):
                 end = m.end()
@@ -161,7 +182,7 @@ def _parts(text, spoken):
             value = LETTERS[word]
         else:
             # Unknown vocabulary before completing a document is not a correction candidate.
-            bad = not bool(identity.normalize_document(chars))
+            bad = not bool(identity.normalize_document(prefix + chars))
             break
         chars += value
         end = matches[i + consumed - 1].end()
@@ -380,7 +401,8 @@ def prepare(text, state, business_id, channel, ref, session):
     words = identity.WORD_RE.findall(text)
     capitalized_name = bool(words and all(
         word[0].isupper() or word.casefold() in NAME_PARTICLES for word in words))
-    document_words, document_end, _, document_bad = _parts(text, spoken)
+    document_words, document_end, _, document_bad = _parts(
+        text, spoken, saved['parts'] if saved and not LABEL.search(text) else '')
     document_only = bool(not document_bad and document_words
                          and not text[document_end:].strip(' ,;.-'))
     identity_syntax = bool(
@@ -415,7 +437,9 @@ def prepare(text, state, business_id, channel, ref, session):
         name_correction = re.match(
             r'^(?:(?:mi\s+)?(?:nombre|apellidos?)\b|me\s+llamo\b|soy\b)', corrected_text, re.I)
         new_parts, new_end, _, new_bad = _parts(corrected_text, spoken)
-        correction_document = bool(not new_bad and identity.normalize_document(new_parts)
+        correction_document = bool(not new_bad and (
+                                       identity.normalize_document(new_parts) or
+                                       _valid_partial(new_parts))
                                    and not corrected_text[new_end:].strip(' ,;.-'))
         if name_correction or LABEL.search(corrected_text) or correction_document:
             text = corrected_text
@@ -438,14 +462,17 @@ def prepare(text, state, business_id, channel, ref, session):
                              (_surname_pending(state) or not identity.name_is_sufficient(state['name'])) and
                              _fold_word(first.group()) in {'de', 'del', 'la', 'las', 'los'})
         if first and not surname_particles and (_document_token(first.group(), spoken) or
-                      re.match(r'\d|[XYZxyz](?:\d|\b)', first.group())):
+                     re.match(r'\d|[XYZxyz](?:\d|\b)', first.group()) or
+                     saved and re.fullmatch(r'\d{8}|[XYZ]\d{7}', saved['parts']) and
+                     LETTER_MARKER.match(text, first.start())):
             candidate = first.start()
     name_datum = _name_datum(text, state) if candidate is None and not non_document else None
     if explicitly_waiting and not labels and candidate is None and not name_datum:
         return _waiting_for_document(state, scope, saved)
     parts, end, count, bad = ('', 0, 0, False)
     if candidate is not None:
-        parts, end, count, bad = _parts(text[candidate:], spoken)
+        parts, end, count, bad = _parts(
+            text[candidate:], spoken, saved['parts'] if saved and not labels else '')
         bad = bad or len(labels) > 1
     cleaned = text
     if candidate is not None:
@@ -466,8 +493,11 @@ def prepare(text, state, business_id, channel, ref, session):
             guided_name = _name_datum(segment, state, with_document=True) if segment else None
             if guided_name:
                 decl['name'] = guided_name
-                if not segments[1 - index]:
-                    decl.update(question='', has_question=False)
+                other = identity.parse_declaration(segments[1 - index])
+                decl.update(question=other['question'], has_question=(
+                    other['has_question'] or '?' in other['question'] or '¿' in other['question']))
+                if other['contract_number']:
+                    decl['contract_number'] = other['contract_number']
                 break
     elif name_datum:
         decl.update(name=name_datum, question='', has_question=False)
@@ -506,7 +536,8 @@ def prepare(text, state, business_id, channel, ref, session):
             bad = True
         remainder = text[candidate + end:].lstrip(' ,;')
         next_parts, _, _, _ = _parts(remainder, spoken)
-        if next_parts and (identity.normalize_document(next_parts) or
+        if not _unrelated_numeric_suffix(remainder) and next_parts and (
+                           identity.normalize_document(next_parts) or
                            _valid_partial(next_parts) and re.search(r'\d', next_parts)):
             bad = True
         state.pop('doc_hmac', None)

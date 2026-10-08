@@ -165,7 +165,7 @@ def test_revoked_selection_does_not_export_retained_contractual_replies(pg, prov
     assert 'No he podido confirmar una póliza autorizada' in reply
 
 
-def test_interpreted_policy_change_invalidates_old_selection_and_consent(pg, provider, monkeypatch):
+def test_interpreted_policy_change_preserves_selection_but_invalidates_consent(pg, provider, monkeypatch):
     verify(pg, customer='C2')
     mode = {'intent': 'policy_name'}
     provider(lambda request: httpx.Response(200, json=completion(json.dumps({
@@ -180,23 +180,23 @@ def test_interpreted_policy_change_invalidates_old_selection_and_consent(pg, pro
                             '', state)
     mode['intent'] = 'policy_change'
     reply, _ = ask('Prefiero consultar otro contrato', ext='switch')
-    assert reply == dialog.ASK_POLICY
+    assert 'número de póliza' in reply and '900' in reply
     state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
     assert state['policy_switch_required']
-    assert not any(state.get(k) for k in ('policy_id', 'version_id', 'pending_human'))
+    assert state['policy_id'] == 'POL-900' and not state.get('pending_human')
     monkeypatch.setattr(dialog.retrieval, 'retrieve',
                         lambda *args, **kwargs: pytest.fail('Replacement selection is required'))
     mode['intent'] = 'case_accept'
-    assert ask('Sí', ext='no-stale-consent')[0] == dialog.ASK_POLICY
+    assert 'número de póliza' in ask('Sí', ext='no-stale-consent')[0]
     mode['intent'] = 'question'
-    assert ask('¿Cubre daños por agua?', ext='no-old-policy')[0] == dialog.ASK_POLICY
+    assert 'número de póliza' in ask('¿Cubre daños por agua?', ext='no-old-policy')[0]
     with pg() as conn:
         conn.execute("UPDATE insurance_identity_verifications SET expires_at=now()-interval '1 second'")
     assert ask('¿Cubre daños por agua?', ext='expired-switch')[1]['insurance_result'] == 'identity_not_verified'
     reply, _ = ask('Me llamo Luis Gil Mora, DNI 87654321X', ext='reverified-switch')
-    assert dialog.IDENTITY_CONFIRMED in reply and dialog.ASK_POLICY in reply
+    assert dialog.IDENTITY_CONFIRMED in reply and 'número de póliza' in reply
     state = rows(pg, 'SELECT state FROM insurance_conversation_state')[0]['state']
-    assert state['policy_switch_required'] and not state.get('policy_id')
+    assert state['policy_switch_required']
     assert rows(pg, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
 
 

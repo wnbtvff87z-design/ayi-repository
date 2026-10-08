@@ -98,6 +98,12 @@ def _install_transports(monkeypatch, captures, mode):
                      'message': {'role': 'assistant', 'content': json.dumps({'terms': terms})}}]})
         interpreting = payload.get('response_format') == {'type': 'json_object'}
         if interpreting:
+            if mode['value'] == 'interpret_network':
+                raise httpx.ConnectError('Synthetic interpretation network failure', request=request)
+            if mode['value'] == 'interpret_context_limit':
+                return httpx.Response(400, json={'error': {
+                    'message': 'Synthetic interpretation context limit', 'type': 'invalid_request_error',
+                    'code': 'context_length_exceeded'}})
             assert payload['max_tokens'] == 256 and payload['temperature'] == 0
             package = json.loads(prompt)
             assert set(package) == {'context', 'stage', 'identity', 'capture'}
@@ -136,7 +142,8 @@ def _install_transports(monkeypatch, captures, mode):
                 intents = ['farewell', *intents]
             proposal = {'intents': intents, 'reference': reference, 'topic': ''}
             assert orchestrator.validate(proposal, current) == proposal
-            content = json.dumps(proposal, ensure_ascii=False)
+            content = ('' if mode['value'] == 'interpret_empty'
+                       else json.dumps(proposal, ensure_ascii=False))
             return httpx.Response(200, json={
                 'id': 'chatcmpl-synthetic-interpret', 'object': 'chat.completion', 'created': 1,
                 'model': payload['model'], 'choices': [
@@ -152,10 +159,28 @@ def _install_transports(monkeypatch, captures, mode):
 
         if mode['value'] == 'timeout':
             raise httpx.ReadTimeout('Synthetic upstream timeout', request=request)
+        if mode['value'] == 'network':
+            raise httpx.ConnectError('Synthetic upstream network failure', request=request)
+        if mode['value'] == 'context_limit':
+            return httpx.Response(400, json={'error': {
+                'message': 'Synthetic context limit', 'type': 'invalid_request_error',
+                'code': 'context_length_exceeded'}})
         if mode['value'] == 'unauthorized':
             return httpx.Response(401, json={'error': {
                 'message': 'Synthetic authorization failure', 'type': 'authentication_error'}})
-        if mode['value'] == 'insufficient':
+        if mode['value'] == 'refusal':
+            return httpx.Response(200, json={
+                'id': 'chatcmpl-synthetic-refusal', 'object': 'chat.completion', 'created': 1,
+                'model': payload['model'], 'choices': [
+                    {'index': 0, 'finish_reason': 'stop', 'message': {
+                        'role': 'assistant', 'content': None, 'refusal': 'Synthetic refusal'}}]})
+        if mode['value'] == 'empty':
+            content = ''
+        elif mode['value'] == 'invalid':
+            content = 'Respuesta sintética sin referencias verificables.'
+        elif mode['value'] == 'insufficient':
+            content = 'ESCALAR'
+        elif mode['value'] == 'detail' and 'mesa' in question.lower() and 'vidrio' not in question.lower():
             content = 'ESCALAR'
         elif 'incendio' in question.lower() or 'fuego' in question.lower():
             assert FIRE in evidence
@@ -164,6 +189,8 @@ def _install_transports(monkeypatch, captures, mode):
             assert WATER in evidence or 'Daños por agua actualizados: límite de 615 euros.' in evidence
             limit = 615 if 'Daños por agua actualizados' in evidence else 401
             content = f'Las cláusulas de daños por agua establecen un límite de {limit} euros ' + marker('DOC-WATER', 1) + '.'
+        elif 'en qué página dice' in question.lower() and EXCLUSION in evidence:
+            content = 'La exclusión de tableros de mesa de vidrio figura en la cláusula citada [p.2].'
         elif 'mesa' in question.lower():
             assert GLASS in evidence, 'The late glass clause must reach the actual SDK request'
             assert EXCLUSION in evidence, 'Separate-page exclusions must reach the SDK'
