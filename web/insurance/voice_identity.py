@@ -22,6 +22,7 @@ LETTERS = {
     'ese': 'S', 'te': 'T', 'u': 'U', 'uve': 'V', 've': 'V', 'equis': 'X',
     'ye': 'Y', 'zeta': 'Z',
     'ceta': 'Z', 'seta': 'Z', 'ere': 'R', 'eñe': 'Ñ', 'elle': 'L',
+    'zed': 'Z', 'theta': 'Z', 'lle': 'Y', 'she': 'Y',
 }
 CARDINALS = incident_dates.SPOKEN_NUMBERS
 # Document label, including "número de DNI es el …", "documento (nacional) de identidad …".
@@ -42,6 +43,7 @@ LETTER_PAIRS = {
     ('uve', 'doble'): 'W', ('doble', 'uve'): 'W',
     ('doble', 've'): 'W', ('doble', 'u'): 'W',
     ('be', 'larga'): 'B', ('be', 'alta'): 'B', ('be', 'grande'): 'B',
+    ('be', 'corta'): 'V', ('be', 'chica'): 'V', ('be', 'baja'): 'V',
     ('ve', 'corta'): 'V', ('ve', 'baja'): 'V', ('uve', 'corta'): 'V',
     ('ve', 'chica'): 'V', ('ve', 'pequena'): 'V', ('ve', 'pequeña'): 'V',
     ('doble', 'ele'): 'L', ('doble', 'erre'): 'R',
@@ -55,7 +57,7 @@ LETTER_TRIOS = {
     ('ve', 'de', 'valencia'): 'V',
     ('ene', 'con', 'tilde'): 'Ñ',
 }
-LETTER_MARKER = re.compile(r'(?:(?:la\s+)?letra(?:\s+es)?|termina\s+en)\s+', re.I)
+LETTER_MARKER = re.compile(r'(?:(?:la\s+)?letra(?:\s+es)?|termina\s+en|con\s+(?:la\s+)?letra)\s+', re.I)
 NAME_PARTICLES = {'de', 'del', 'la', 'las', 'los', 'y', 'e'}
 NON_NAME_WORDS = (identity.NAME_STOP - NAME_PARTICLES) | {
     'el', 'su', 'sus', 'tu', 'tus', 'hola', 'gracias', 'no', 'si', 'sí', 'perdon', 'perdón', 'corrige',
