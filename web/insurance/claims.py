@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import uuid
 from datetime import datetime, date
 import psycopg
@@ -9,7 +10,59 @@ from insurance import cases, identity, llm
 
 log = logging.getLogger(__name__)
 
-SIMULATED_EMAILS_FILE = r"C:\Users\H581833\AppData\Local\Cursor\AgentStores\cursor_agent_stores\u477434232\files\simulated_emails.json"
+
+def get_store_dir():
+    windows_store = r"C:\Users\H581833\AppData\Local\Cursor\AgentStores\cursor_agent_stores\u477434232\files"
+    if os.name == 'nt' and os.path.exists(windows_store):
+        return windows_store
+    base = os.getenv('INSURANCE_STORE_DIR', '')
+    if base and os.path.exists(base):
+        return base
+    tmp = os.path.join(tempfile.gettempdir(), 'insurance_store')
+    try:
+        os.makedirs(tmp, exist_ok=True)
+    except Exception:
+        pass
+    return tmp
+
+
+def ensure_claims_schema(conn):
+    try:
+        conn.execute("""
+            CREATE SEQUENCE IF NOT EXISTS insurance_claim_ref_seq START WITH 1;
+            CREATE TABLE IF NOT EXISTS insurance_professionals (
+                professional_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                business_id text NOT NULL,
+                service_type text NOT NULL,
+                name text NOT NULL,
+                email text NOT NULL,
+                phone text,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (business_id, service_type)
+            );
+            CREATE TABLE IF NOT EXISTS insurance_claims (
+                claim_uuid uuid PRIMARY KEY,
+                business_id text NOT NULL,
+                customer_id text NOT NULL,
+                policy_id text NOT NULL,
+                policy_version_id text,
+                claim_ref text UNIQUE NOT NULL,
+                channel text NOT NULL,
+                original_description text,
+                structured_interpretation jsonb NOT NULL DEFAULT '{}'::jsonb,
+                coverage_evaluation jsonb NOT NULL DEFAULT '{}'::jsonb,
+                state text NOT NULL DEFAULT 'INFORMATION_GATHERING',
+                photos jsonb NOT NULL DEFAULT '[]'::jsonb,
+                invoices jsonb NOT NULL DEFAULT '[]'::jsonb,
+                service_notified boolean NOT NULL DEFAULT false,
+                service_notification_details jsonb NOT NULL DEFAULT '{}'::jsonb,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+        """)
+    except Exception as exc:
+        log.warning("insurance_claims ensure_schema notice: %s", exc)
+
 
 # State Constants
 class ClaimState:
@@ -41,13 +94,19 @@ class CoverageStatus:
 
 def generate_claim_ref(conn):
     """Safely generate concurrent-safe formatted reference SIN-YYYY-XXXXXX."""
-    row = conn.execute("SELECT nextval('insurance_claim_ref_seq') AS seq").fetchone()
-    seq = row['seq']
+    try:
+        row = conn.execute("SELECT nextval('insurance_claim_ref_seq') AS seq").fetchone()
+        seq = row['seq']
+    except Exception:
+        ensure_claims_schema(conn)
+        row = conn.execute("SELECT nextval('insurance_claim_ref_seq') AS seq").fetchone()
+        seq = row['seq']
     year = datetime.now().year
     return f"SIN-{year}-{seq:06d}"
 
 
 def create_claim(conn, business_id, customer_id, policy_id, policy_version_id, channel, original_description):
+    ensure_claims_schema(conn)
     claim_uuid = uuid.uuid4()
     claim_ref = generate_claim_ref(conn)
     conn.execute(
@@ -61,6 +120,7 @@ def create_claim(conn, business_id, customer_id, policy_id, policy_version_id, c
 
 
 def get_claim(conn, business_id, claim_ref_or_uuid):
+    ensure_claims_schema(conn)
     try:
         parsed_uuid = uuid.UUID(str(claim_ref_or_uuid))
         row = conn.execute(
@@ -310,18 +370,18 @@ def send_service_notification_email(conn, business_id, claim):
     
     # Persist simulated email into store
     try:
-        os.makedirs(os.path.dirname(SIMULATED_EMAILS_FILE), exist_ok=True)
-        if os.path.exists(SIMULATED_EMAILS_FILE):
-            with open(SIMULATED_EMAILS_FILE, 'r', encoding='utf-8') as f:
+        store_dir = get_store_dir()
+        target_file = os.path.join(store_dir, 'simulated_emails.json')
+        if os.path.exists(target_file):
+            with open(target_file, 'r', encoding='utf-8') as f:
                 emails = json.load(f)
         else:
             emails = []
         emails.append(email_record)
-        with open(SIMULATED_EMAILS_FILE, 'w', encoding='utf-8') as f:
+        with open(target_file, 'w', encoding='utf-8') as f:
             json.dump(emails, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.exception("Failed to write simulated email to store: %s", str(e))
-        # We don't fail the transaction, we still mark it sent in DB for simulation.
+        log.warning("Failed to write simulated email to store: %s", str(e))
         
     # Update DB fields
     update_claim(conn, claim['claim_uuid'], service_notified=True, service_notification_details={
@@ -330,6 +390,19 @@ def send_service_notification_email(conn, business_id, claim):
         "subject": subject
     })
     return True
+
+
+def save_human_summary(conn, business_id, claim):
+    """Builds and safely persists the structured summary for human review."""
+    summary = build_human_summary(conn, business_id, claim)
+    try:
+        store_dir = get_store_dir()
+        summary_file = os.path.join(store_dir, f"claim_{claim['claim_ref']}_summary.txt")
+        with open(summary_file, 'w', encoding='utf-8') as sf:
+            sf.write(summary)
+    except Exception as exc:
+        log.warning("Could not persist summary file: %s", exc)
+    return summary
 
 
 def build_human_summary(conn, business_id, claim):
