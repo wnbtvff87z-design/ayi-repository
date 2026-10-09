@@ -239,6 +239,26 @@ def hmac_key_agrees(conn, business_id):
     return check_hmac_key(conn, business_id)
 
 
+def hmac_misconfigured(conn, business_id):
+    """Whether the runtime HMAC key conflicts with provisioning or fails minimum security."""
+    if len(os.getenv('INSURANCE_CASE_HMAC_KEY', '').encode()) < MIN_KEY_BYTES:
+        return True
+    if not hmac_key_agrees(conn, business_id):
+        has_sentinel_table = conn.execute(
+            "SELECT to_regclass('insurance_hmac_keys') IS NOT NULL AS present", ()).fetchone()['present']
+        sentinel_exists = False
+        if has_sentinel_table:
+            sentinel_exists = conn.execute(
+                'SELECT EXISTS(SELECT 1 FROM insurance_hmac_keys WHERE business_id=%s) AS present',
+                (business_id,)).fetchone()['present']
+        provisioned = conn.execute(
+            'SELECT EXISTS(SELECT 1 FROM insurance_customers WHERE business_id=%s '
+            'AND document_hmac IS NOT NULL) AS present', (business_id,)).fetchone()['present']
+        if sentinel_exists or provisioned:
+            return True
+    return False
+
+
 def _lock_master_shared(conn, business_id):
     conn.execute('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))',
                  (f'insurance-master:{business_id}',))
