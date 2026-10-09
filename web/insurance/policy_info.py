@@ -29,6 +29,15 @@ def authorized_page(conn, bid, customer_id, offset=0):
     return [dict(row) for row in rows[:PAGE_SIZE]], len(rows) > PAGE_SIZE
 
 
+def mask_contract_number(num):
+    if not num:
+        return 'Número no registrado'
+    num_str = str(num).strip()
+    if len(num_str) <= 4:
+        return f"número {num_str}"
+    return 'terminación ' + num_str[-4:]
+
+
 def offer(conn, scope, state, action='list'):
     offset = state.get('policy_list_offset', 0)
     if action == 'next' and state.get('policy_list_more'):
@@ -45,11 +54,11 @@ def offer(conn, scope, state, action='list'):
          'contract_number': row.get('contract_number')} for row in rows]
     if not rows:
         return 'No he podido confirmar una póliza autorizada para esta consulta.'
-    lines = ['¿Qué quieres consultar? Puedes elegir una póliza autorizada por producto, '
-             'número de póliza o posición de esta lista:']
-    lines += [f"{n}. {row.get('product') or 'Producto no registrado'} — "
-              f"{row.get('contract_number') or 'Número no registrado'}."
-              for n, row in enumerate(rows, 1)]
+    lines = ['Para continuar, selecciona la póliza correspondiente indicando el producto o su posición en la lista:']
+    for n, row in enumerate(rows, 1):
+        prod = str(row.get('product') or 'Producto no registrado').capitalize()
+        mask = mask_contract_number(row.get('contract_number'))
+        lines.append(f"{n}. {prod} — {mask}")
     if more:
         lines.append('Di «siguiente» para ver más pólizas.')
     if offset:
