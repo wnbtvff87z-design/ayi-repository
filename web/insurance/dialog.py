@@ -282,6 +282,13 @@ def _answer(business, state, text, channel, external_id, customer):
     try:
         with _cases.db() as conn:
             operation_started = True
+            if identity.hmac_misconfigured(conn, bid):
+                _diag(corr, 'identity', bid, reason_code='hmac_configuration_mismatch',
+                      identity_verified=False, decision='technical_error')
+                _turn_diag(corr, bid, ResultKind.TECHNICAL_ERROR.value, False, 'config_failed')
+                reply = _technical_message('llm_not_configured')
+                return reply, {'insurance_result': ResultKind.TECHNICAL_ERROR.value,
+                               'diagnostic_code': 'hmac_configuration_mismatch'}
             ref = identity.conversation_ref(bid, channel, customer)
             if not ref:
                 raise CasePersistenceError('conversation key unavailable')
