@@ -327,14 +327,14 @@ def insurance_voice_error(stage,exc,external_id,business_id=None):
    except Exception:pass
   log.error('insurance_voice stage=%s error_type=%s call_ref=%s correlation_id=%s',stage,type(exc).__name__,ref,correlation)
 
-def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None,voice_transport=None):
+def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None,voice_transport=None,media_list=None):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
   if (sector if sector is not None else sector_of(b))=='insurance':
    if channel=='Voice' and not insurance_voice_call_id_valid(external_id):
     raise BookingError('Falta el identificador técnico de la llamada')
    if channel=='Voice' and voice_transport is not None:
     b=dict(b);b['_insurance_voice_transport']=insurance_voice_transport(voice_transport)
-   reply,out=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector)
+   reply,out=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector,media_list=media_list)
    end_reason='goodbye' if channel=='Voice' and out.get('should_end_call') else None
    return (reply,end_reason) if include_end_reason else reply
   init_schema();bid=b['business_id']
@@ -384,11 +384,22 @@ def whatsapp():
   tw=MessagingResponse();b=None;sector=None;stage='tenant_lookup'
   try:
    b,sector=lookup(request.form.get('To'),'WhatsApp',with_sector=True);text=request.form.get('Body','').strip()
+   media_list = []
+   try:
+       num_media = int(request.form.get('NumMedia', '0'))
+       for i in range(num_media):
+           url = request.form.get(f'MediaUrl{i}')
+           ctype = request.form.get(f'MediaContentType{i}')
+           filename = request.form.get(f'Filename{i}') or f"media_{i}.jpg"
+           if url:
+               media_list.append({'url': url, 'content_type': ctype, 'filename': filename})
+   except Exception:
+       pass
    if not b:answer=BUSINESS_NOT_FOUND_REPLY
-   elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
+   elif not text and not media_list:answer='No recibí ningún texto o imagen. ¿Me lo repites?'
    else:
     stage='dialogue'
-    answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''),sector=sector)
+    answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''),sector=sector,media_list=media_list)
    if b and text and answer and sector!='insurance':
     try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp',sector=sector)
     except Exception:log.exception('Conversation mirror failed')
