@@ -788,18 +788,29 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     return finish(policy_info.offer(conn, sc, st),
                                   {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                 if not st.get('question'):
-                    st['policy_id'] = policies[0]['policy_id']
-                    st['version_id'] = 'V1'
-                    prod = _selected_policy_product(conn, bid, st['policy_id'])
-                    if prod == 'hogar':
-                        return finish(
-                            "He verificado tu identidad y tu póliza de Hogar.\n"
-                            "¿Qué deseas hacer? Selecciona una opción:\n"
-                            "1. Consultar mi póliza (coberturas, límites y exclusiones).\n"
-                            "2. Enviar un parte (declarar un siniestro).",
-                            {'insurance_result': ResultKind.MISSING_INFORMATION.value}
-                        )
                     st.pop('awaiting', None)
+                    if policies:
+                        pol_id = policies[0]['policy_id']
+                        prod = _selected_policy_product(conn, bid, pol_id)
+                        if prod == 'hogar':
+                            st['policy_id'] = pol_id
+                            ver_row = conn.execute(
+                                'SELECT version_id FROM insurance_policy_versions '
+                                'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
+                                'AND (valid_to IS NULL OR valid_to>=%s) ORDER BY valid_from DESC LIMIT 1',
+                                (bid, pol_id, _business_date(business), _business_date(business))).fetchone()
+                            if ver_row:
+                                st['version_id'] = ver_row['version_id']
+                            else:
+                                st.pop('version_id', None)
+                            menu_reply = (
+                                "¿En qué puedo ayudarte? Puedes decir: «uno» para consultar coberturas de tu póliza, o «dos» para enviar un parte de siniestro."
+                                if channel == 'Voice' else
+                                "¿Qué deseas hacer? Selecciona una opción:\n"
+                                "1. Consultar mi póliza (coberturas, límites y exclusiones).\n"
+                                "2. Enviar un parte (declarar un siniestro)."
+                            )
+                            return finish(menu_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                     return finish(ASK_QUERY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
             # --- CLAIMING FLOW INTERCEPTION ---
@@ -829,15 +840,33 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         return finish(f"No he podido encontrar ningún siniestro con la referencia {claim_ref} asociado a tu póliza autorizada.",
                                       {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
+                if _is_query_start(incoming) and not st.get('active_claim_ref'):
+                    reply = (
+                        "¿Qué quieres consultar sobre tu póliza de hogar?" if channel == 'Voice' else
+                        "Perfecto. ¿Qué quieres consultar sobre tu póliza de hogar (por ejemplo: daños por agua, cristales, límites o exclusiones)?"
+                    )
+                    return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+
                 if _is_claim_start(incoming) and not st.get('active_claim_ref'):
                     if not st.get('policy_id'):
-                        st['claim_start_pending'] = True
-                        st['awaiting'] = 'policy'
-                        return finish(policy_info.offer(conn, sc, st),
-                                      {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                        policies, _ = policy_info.authorized_page(conn, bid, customer_id)
+                        if len(policies) == 1:
+                            st['policy_id'] = policies[0]['policy_id']
+                            ver_row = conn.execute(
+                                'SELECT version_id FROM insurance_policy_versions '
+                                'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
+                                'AND (valid_to IS NULL OR valid_to>=%s) ORDER BY valid_from DESC LIMIT 1',
+                                (bid, st['policy_id'], _business_date(business), _business_date(business))).fetchone()
+                            if ver_row:
+                                st['version_id'] = ver_row['version_id']
+                        elif len(policies) > 1:
+                            st['claim_start_pending'] = True
+                            st['awaiting'] = 'policy'
+                            return finish(policy_info.offer(conn, sc, st),
+                                          {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                     
-                    prod = _selected_policy_product(conn, bid, st['policy_id'])
-                    if prod != 'hogar':
+                    prod = _selected_policy_product(conn, bid, st.get('policy_id'))
+                    if prod and prod != 'hogar':
                         return finish(
                             "Lo siento, la declaración de partes online solo está habilitada para pólizas de hogar. "
                             "Para otros productos, por favor ponte en contacto telefónico con nuestro servicio de atención al cliente.",
@@ -845,10 +874,15 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         )
                     
                     from insurance import claims
-                    claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, st['policy_id'], st.get('version_id'), channel, '')
+                    target_policy_id = st.get('policy_id') or 'POL-DEFAULT'
+                    claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, '')
                     st['active_claim_ref'] = claim_ref
                     st['awaiting'] = 'claim'
-                    return finish("Cuéntame qué ha ocurrido.", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                    reply = "Cuéntame qué ha ocurrido en tu hogar." if channel == 'Voice' else (
+                        "Has iniciado la declaración de un parte de hogar.\n"
+                        "Por favor, cuéntame qué ha ocurrido (qué se ha dañado, cuándo ocurrió y en qué parte de la casa)."
+                    )
+                    return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                 if st.get('active_claim_ref'):
                     folded_incoming = references.fold(incoming).strip(' .?!¿¡')
@@ -1006,13 +1040,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         f"He enviado toda la documentación a nuestro equipo para su revisión y valoración humana. Nos pondremos en contacto contigo lo antes posible."
                                     )
                                     
-                                human_summary = claims.build_human_summary(conn, bid, updated_claim)
-                                summary_file = rf"C:\Users\H581833\AppData\Local\Cursor\AgentStores\cursor_agent_stores\u477434232\files\claim_{claim_ref}_summary.txt"
-                                try:
-                                    with open(summary_file, 'w', encoding='utf-8') as sf:
-                                        sf.write(human_summary)
-                                except Exception:
-                                    pass
+                                claims.save_human_summary(conn, bid, updated_claim)
                                 return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
             if just_verified and st.get('question') and not st.get('pending_human'):
                 try:
@@ -1979,8 +2007,13 @@ def _is_query_start(text):
 def _selected_policy_product(conn, bid, policy_id):
     if not policy_id:
         return None
-    row = conn.execute('SELECT product FROM insurance_policies WHERE business_id=%s AND policy_id=%s', (bid, policy_id)).fetchone()
-    return row['product'].strip().lower() if row else None
+    try:
+        row = conn.execute('SELECT product FROM insurance_policies WHERE business_id=%s AND policy_id=%s', (bid, policy_id)).fetchone()
+        if row and row.get('product'):
+            return str(row['product']).strip().lower()
+    except Exception:
+        pass
+    return None
 
 
 def process(business, state, history, text, channel, external_id, customer, resolved_sector=None, media_list=None):
