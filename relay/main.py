@@ -112,7 +112,7 @@ async def voice(req:Request):
   if not ws.startswith('wss://'):raise ValueError('Secure WebSocket required')
   voice_id=escape(str(b.get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B'),{'"':'&quot;'})
   action=escape(env('RELAY_PUBLIC_URL').rstrip('/')+'/voice/relay/action',{'"':'&quot;'})
-  transcription_lang=escape(str(b.get('transcription_language') or env('TRANSCRIPTION_LANGUAGE') or env('DEEPGRAM_LANGUAGE') or 'es-ES'),{'"':'&quot;'})
+  transcription_lang=escape(str(b.get('transcription_language') or env('TRANSCRIPTION_LANGUAGE') or env('DEEPGRAM_LANGUAGE') or 'es'),{'"':'&quot;'})
   lang=escape(str(b.get('language') or env('TTS_LANGUAGE') or 'es-ES'),{'"':'&quot;'})
   xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect action="{action}" method="POST"><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="{lang}" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="{transcription_lang}" voiceDetectionTimeout="2.0" /></Connect><Hangup/></Response>'
   return Response(xml,media_type='application/xml')
