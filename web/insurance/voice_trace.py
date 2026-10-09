@@ -148,7 +148,7 @@ def _pages(value):
 
 def record(conn, business_id, session_ref, external_id, text, normalized, stage, diagnostic,
            reply, customer_id=None, policy_id=None, version_id=None, pages=None, transport=None,
-           correlation_id=None):
+           correlation_id=None, llm_diagnostic=None):
     """Persist one masked exchange, idempotently. No commit, logs, or external projection."""
     ref = call_reference(business_id, session_ref)
     webhook = _reference(business_id, 'webhook', external_id)
@@ -161,6 +161,11 @@ def record(conn, business_id, session_ref, external_id, text, normalized, stage,
         policy_id = version_id = None
         pages = None
     awaiting = 'identity' if stage.startswith('identity_') else None
+    transport = _transport(transport)
+    if (isinstance(llm_diagnostic, str) and llm_diagnostic in DIAGNOSTICS
+            and (llm_diagnostic.startswith('llm_') or llm_diagnostic == 'context_budget_exceeded')):
+        transport['llm_diagnostic'] = llm_diagnostic
+        transport['identity_verified'] = customer_id is not None
     # Also safe for callers outside dialogue's call lock; retries cannot increment turn numbers.
     conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
                  (f'voice-trace:{business_id}:{ref}',))
@@ -172,7 +177,7 @@ def record(conn, business_id, session_ref, external_id, text, normalized, stage,
         'ON CONFLICT (business_id,call_ref,webhook_ref) DO NOTHING',
         (business_id, ref, webhook, _mask(text, awaiting=awaiting), _mask(normalized, awaiting=awaiting),
          stage, diagnostic, _mask(reply),
-         customer_id, policy_id, version_id, json.dumps(_pages(pages)), json.dumps(_transport(transport)),
+         customer_id, policy_id, version_id, json.dumps(_pages(pages)), json.dumps(transport),
          business_id, ref))
     purge_expired(conn, business_id=business_id, call_ref=ref)
 

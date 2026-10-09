@@ -20,6 +20,7 @@ from datetime import date
 from insurance import cases as _cases
 from insurance import identity, storage
 from insurance.documents import ID_RE, RegistrationError, register_existing_object
+from insurance.master_sync import ensure_hmac_key, revoke_customer
 
 
 def provision(conn, *, actor, business_id, customer_id, display_name, document, policy_id, product,
@@ -36,6 +37,34 @@ def provision(conn, *, actor, business_id, customer_id, display_name, document, 
     if not identity.document_hmac(business_id, document) or not identity.name_hmac(
             business_id, full_name or display_name):
         raise ValueError('INSURANCE_CASE_HMAC_KEY (>=32 bytes), a document and name+surname are required')
+    ensure_hmac_key(conn, business_id)
+    if conn.execute(
+            'SELECT 1 FROM insurance_customers WHERE business_id=%s AND document_hmac=%s '
+            'AND customer_id<>%s LIMIT 1',
+            (business_id, identity.document_hmac(business_id, document), customer_id)).fetchone():
+        raise ValueError('duplicate_customer_document')
+    if document_id:
+        old_document = conn.execute(
+            'SELECT policy_id,version_id FROM insurance_documents WHERE business_id=%s AND document_id=%s FOR UPDATE',
+            (business_id, document_id)).fetchone()
+        if old_document and (old_document['policy_id'], old_document['version_id']) != (policy_id, version_id):
+            raise RegistrationError('immutable_document_association')
+    old_policy = conn.execute(
+        'SELECT customer_id,product,contract_number FROM insurance_policies '
+        'WHERE business_id=%s AND policy_id=%s FOR UPDATE', (business_id, policy_id)).fetchone()
+    if old_policy and (old_policy['customer_id'], old_policy['product'], old_policy['contract_number']) != \
+            (customer_id, product, contract_number):
+        revoke_customer(conn, business_id, old_policy['customer_id'])
+        revoke_customer(conn, business_id, customer_id)
+        conn.execute(
+            'UPDATE insurance_authorizations SET revoked_at=now() '
+            'WHERE business_id=%s AND policy_id=%s AND revoked_at IS NULL', (business_id, policy_id))
+    old_version = conn.execute(
+        'SELECT valid_from,valid_to FROM insurance_policy_versions '
+        'WHERE business_id=%s AND policy_id=%s AND version_id=%s FOR UPDATE',
+        (business_id, policy_id, version_id)).fetchone()
+    if old_version and (old_version['valid_from'], old_version['valid_to']) != (valid_from, valid_to):
+        revoke_customer(conn, business_id, customer_id)
     identity.upsert_customer(conn, business_id, customer_id, display_name, document, full_name,
                              given_name, first_surname)
     conn.execute(

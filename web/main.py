@@ -4,7 +4,8 @@ from datetime import timezone, datetime, timedelta
 from urllib.parse import quote,urlparse
 from zoneinfo import ZoneInfo
 import requests
-from flask import Flask,Response,jsonify,request
+from flask import Flask,Response,jsonify,request,has_request_context
+from uuid import uuid4
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
@@ -32,6 +33,45 @@ MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
 INSURANCE_DISABLED_REPLY='Este canal no está disponible para esta consulta.'
 class InsuranceDisabledError(BookingError):pass
+class BusinessLookupError(BookingError):
+  def __init__(self,code,message='El registro de negocios no está disponible temporalmente.'):
+    super().__init__(message)
+    self.code=code
+BUSINESS_NOT_FOUND_REPLY='Este número no tiene un negocio activo configurado para este canal.'
+BUSINESS_UNAVAILABLE_REPLY='El servicio está temporalmente no disponible. Inténtalo en un minuto. No he ejecutado ninguna operación.'
+def _lookup_correlation():
+  if not has_request_context():return uuid4().hex[:16]
+  if 'business_lookup_correlation' not in request.environ:
+   payload=request.get_json(silent=True)
+   external=(request.form.get('MessageSid') or request.form.get('CallSid') or
+             (payload.get('external_id') if isinstance(payload,dict) else ''))
+   request.environ['business_lookup_correlation']=hashlib.sha256(str(external or uuid4().hex).encode()).hexdigest()[:16]
+  return request.environ['business_lookup_correlation']
+def _lookup_diagnostic(code):
+  log.warning('business_lookup correlation_id=%s reason_code=%s',_lookup_correlation(),code)
+def _registry_get(target,**kwargs):
+  for attempt in range(3):
+    try:
+      response=requests.get(target,headers=headers(),timeout=(1,2),**kwargs)
+      response.raise_for_status()
+      return response.json()
+    except requests.Timeout:
+      code='business_lookup_timeout'
+    except requests.ConnectionError:
+      code='business_lookup_network_error'
+    except requests.HTTPError as exc:
+      status=exc.response.status_code if exc.response is not None else 0
+      code='business_lookup_rate_limited' if status==429 else (
+           'business_lookup_server_error' if 500<=status<600 else 'business_lookup_failed')
+      if status!=429 and not 500<=status<600:
+        _lookup_diagnostic(code)
+        raise BusinessLookupError(code) from None
+    except (ValueError,requests.RequestException):
+      _lookup_diagnostic('business_lookup_failed')
+      raise BusinessLookupError('business_lookup_failed') from None
+    _lookup_diagnostic(code)
+    if attempt<2:time.sleep(0.1*(attempt+1))
+  raise BusinessLookupError(code) from None
 def phone(v):
   digits=re.sub(r'\D','',str(v or '').removeprefix('whatsapp:'))
   return '+'+digits if digits else ''
@@ -51,25 +91,35 @@ def _legacy_lookup(number):
   for _ in range(20):
    params={'pageSize':100}
    if offset:params['offset']=offset
-   r=requests.get(url(table),headers=headers(),params=params,timeout=12);r.raise_for_status()
-   data=r.json();rows.extend(data.get('records',[]));offset=data.get('offset')
+   data=_registry_get(url(table),params=params);rows.extend(data.get('records',[]));offset=data.get('offset')
    if not offset:break
   else:raise BookingError('Demasiados negocios para identificar el número con seguridad')
   found=[x.get('fields',{}) for x in rows if any(phone(x.get('fields',{}).get(k))==number for k in ('Twilio_Phone','Voice_Phone','WhatsApp_Phone','Telefono','Teléfono'))]
-  if len(found)>1:raise BookingError('Número duplicado en Restaurantes')
-  if not found:return None
+  if len(found)>1:raise BusinessLookupError('business_lookup_duplicate','Número duplicado en Restaurantes')
+  if not found:
+   _lookup_diagnostic('business_not_found')
+   return None
   f=found[0];name=str(f.get('Nombre') or 'Recepción')
   return {'business_id':'legacy:'+number,'name':name,'phone':number,'sector':'restaurante','allow_reservations':True,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Recepcion','Recepción','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 def _tenant_lookup(number,channel):
   table=os.getenv('AIRTABLE_NUMBERS_TABLE','Numeros')
   formula='AND({Numero_E164}='+json.dumps(number)+',{Canal}='+json.dumps(channel)+',{Estado}="Activo")'
-  r=requests.get(url(table),headers=headers(),params={'filterByFormula':formula,'maxRecords':2},timeout=10);r.raise_for_status();rows=r.json().get('records',[])
-  if len(rows)>1:raise BookingError('Número duplicado en Numeros')
-  if not rows:return None
+  rows=_registry_get(url(table),params={'filterByFormula':formula,'maxRecords':2}).get('records',[])
+  if len(rows)>1:raise BusinessLookupError('business_lookup_duplicate','Número duplicado en Numeros')
+  if not rows:
+   # Diagnostic-only lookup: never authorizes an inactive or different-channel assignment.
+   other=_registry_get(url(table),params={'filterByFormula':'{Numero_E164}='+json.dumps(number),'maxRecords':100}).get('records',[])
+   fields=[row.get('fields',{}) for row in other]
+   same=[f for f in fields if f.get('Canal')==channel]
+   code='business_number_inactive' if same else ('business_channel_mismatch' if fields else 'business_not_found')
+   _lookup_diagnostic(code)
+   return None
   links=rows[0]['fields'].get('Negocio') or []
-  if len(links)!=1:raise BookingError('Número sin negocio único')
-  r=requests.get(url(os.getenv('AIRTABLE_BUSINESSES_TABLE','Negocios'),links[0]),headers=headers(),timeout=10);r.raise_for_status();f=r.json()['fields']
-  if f.get('Estado')!='Activo' or not f.get('Business_ID'):return None
+  if len(links)!=1:raise BusinessLookupError('business_number_without_business','Número sin negocio único')
+  f=_registry_get(url(os.getenv('AIRTABLE_BUSINESSES_TABLE','Negocios'),links[0]))['fields']
+  if f.get('Estado')!='Activo' or not f.get('Business_ID'):
+   _lookup_diagnostic('business_inactive' if f.get('Estado')!='Activo' else 'business_number_without_business')
+   return None
   return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or '').strip().lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 _lookup_cache={}
 _lookup_lock=threading.Lock()
@@ -77,13 +127,15 @@ def _raise_sector_lookup_error(exc):
   error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
   raise error(str(exc)) from exc
 def lookup(number,channel,with_sector=False):
-  if channel not in ('Voice','WhatsApp'):raise BookingError('Canal no reconocido')
+  if channel not in ('Voice','WhatsApp'):raise BusinessLookupError('business_channel_invalid','Canal no reconocido')
   number=phone(number)
-  if not number:return (None,None) if with_sector else None
+  if not number:
+   _lookup_diagnostic('business_not_found')
+   return (None,None) if with_sector else None
   key=(number,channel);now=time.monotonic();ttl=int(os.getenv('BUSINESS_CACHE_TTL_SECONDS','60'))
   with _lookup_lock:
    cached=_lookup_cache.get(key)
-   if cached and cached[0]>now:
+   if MODE=='legacy' and cached and cached[0]>now:
     cached_sector=None
     if cached[1]:
      try:cached_sector=sector_of(cached[1])
@@ -105,7 +157,7 @@ def lookup(number,channel,with_sector=False):
    except BusinessSectorError as exc:
     _raise_sector_lookup_error(exc)
   with _lookup_lock:
-   if sector=='insurance':_lookup_cache.pop(key,None)
+   if sector=='insurance' or MODE!='legacy':_lookup_cache.pop(key,None)
    else:_lookup_cache[key]=(now+ttl,b)
   return (b,sector) if with_sector else b
 def save_conversation(b,customer,question,answer,status,sector=None):
@@ -332,7 +384,7 @@ def whatsapp():
   tw=MessagingResponse();b=None;sector=None;stage='tenant_lookup'
   try:
    b,sector=lookup(request.form.get('To'),'WhatsApp',with_sector=True);text=request.form.get('Body','').strip()
-   if not b:answer='No puedo identificar el negocio asociado a este número.'
+   if not b:answer=BUSINESS_NOT_FOUND_REPLY
    elif not text:answer='No recibí ningún texto. ¿Me lo repites?'
    else:
     stage='dialogue'
@@ -342,6 +394,9 @@ def whatsapp():
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
   except InsuranceDisabledError:tw.message(INSURANCE_DISABLED_REPLY)
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   tw.message(BUSINESS_UNAVAILABLE_REPLY)
   except Exception as exc:
    raw=f"{b.get('business_id') if b else 'unresolved'}|WhatsApp|{request.form.get('MessageSid','')}"
    corr=hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -362,7 +417,17 @@ def voice():
   except InsuranceDisabledError:
    r.say(INSURANCE_DISABLED_REPLY,language='es-ES');r.hangup()
    return Response(str(r),mimetype='application/xml')
-  except Exception:log.exception('Voice business lookup failed');b=None
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   r.say(BUSINESS_UNAVAILABLE_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
+  except Exception as exc:
+   log.error('business_lookup correlation_id=%s reason_code=business_lookup_failed error_type=%s',_lookup_correlation(),type(exc).__name__)
+   r.say(BUSINESS_UNAVAILABLE_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
+  if not b:
+   r.say(BUSINESS_NOT_FOUND_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
   if b and open_now(b) and phone(b.get('reception')):
    dial=r.dial(action='/voice-dial-result',method='POST',timeout=20,answer_on_bridge=True);dial.number(phone(b['reception']))
   elif relay:r.redirect(relay,method='POST')
@@ -406,8 +471,13 @@ def internal_business():
   d=request.get_json(silent=True) or {}
   try:
    b=lookup(d.get('phone'),d.get('channel','Voice'))
-   return (jsonify(success=True,business=b),200) if b else (jsonify(success=False),404)
-  except Exception:log.exception('Lookup failed');return jsonify(success=False),503
+   return (jsonify(success=True,business=b),200) if b else (jsonify(success=False,diagnostic='business_not_found',message=BUSINESS_NOT_FOUND_REPLY),404)
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   return jsonify(success=False,diagnostic=exc.code,message=BUSINESS_UNAVAILABLE_REPLY),503
+  except Exception as exc:
+   log.error('business_lookup correlation_id=%s reason_code=business_lookup_failed error_type=%s',_lookup_correlation(),type(exc).__name__)
+   return jsonify(success=False,diagnostic='business_lookup_failed',message=BUSINESS_UNAVAILABLE_REPLY),503
 @app.post('/internal/turn')
 def internal_turn():
   if not authorized():return jsonify(success=False),401
@@ -415,7 +485,8 @@ def internal_turn():
   sector=None
   try:
    channel=d.get('channel','Voice');b,sector=lookup(d.get('business_phone'),channel,with_sector=True)
-   if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
+   if not b:return jsonify(success=False,diagnostic='business_not_found',message=BUSINESS_NOT_FOUND_REPLY),404
+   if b['business_id']!=d.get('business_id'):return jsonify(success=False),403
    if sector=='insurance' and channel=='Voice' and not insurance_voice_call_id_valid(d.get('external_id')):
     insurance_voice_error('technical_call_id_missing',ValueError(),'',b['business_id'])
     return jsonify(success=False),400
@@ -433,6 +504,9 @@ def internal_turn():
     from insurance.speech import render
     out.update(voice_reply=render(reply),should_end_call=end_reason=='goodbye')
    return jsonify(out)
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   return jsonify(success=False,diagnostic=exc.code,message=BUSINESS_UNAVAILABLE_REPLY),503
   except Exception as exc:
    if sector=='insurance':insurance_voice_error('turn',exc,d.get('external_id'),b['business_id'])
    else:log.exception('Turn failed')

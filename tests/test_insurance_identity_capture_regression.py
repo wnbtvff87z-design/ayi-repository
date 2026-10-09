@@ -6,13 +6,14 @@ Reproduces the reported sequence with SYNTHETIC data and the same linguistic str
 """
 import io
 import json
+import logging
 import re
 
 import pytest
 
 from test_insurance_whatsapp_grounded import BIZ, PHONE, grounded  # noqa: F401
 from test_insurance_voice_transport import flow, run_events  # noqa: F401
-from insurance import admin, cases, diagnose, identity, voice_identity
+from insurance import admin, cases, diagnose, identity, retrieval, voice_identity
 
 GIVEN, SURNAMES = 'Lucía', 'Fernández Ortega'
 FULL = f'{GIVEN} {SURNAMES}'
@@ -339,3 +340,163 @@ def test_incompatible_phrasings_are_rejected(variants, channel, seq):
     replies = [variants.turn(channel, t)['reply'] for t in seq]
     assert all(VERIFIED not in r for r in replies), replies
     assert variants.count('insurance_identity_verifications') == 0
+
+
+AUDIT_CASES = [
+    ('A', 'Lucía Fernández Ortega', '23456781B', None, None,
+     ['23456781B', 'Lucía Fernández Ortega'], True),
+    ('B', FULL, DNI, None, None, [FULL, DNI], True),
+    ('C', FULL, DNI, None, None, ['Lucía', 'Fernández Ortega', DNI], True),
+    ('D', FULL, DNI, None, None, [f'{FULL}, DNI {DNI}'], True),
+    ('E', FULL, DNI, None, None, [f'DNI {DNI}, me llamo {FULL}'], True),
+    ('F', FULL, DNI, None, None, [f'Lucia Fernandez, DNI {DNI}'], True),
+    ('G', FULL, DNI, None, None, [f'LUCÍA   FERNÁNDEZ   ORTEGA, DNI {DNI}'], True),
+    ('H', FULL, DNI, None, None, [f'{FULL}, DNI 23.456.781-B'], True),
+    ('I', FULL, DNI, None, None, [f'{FULL}, DNI 2 3 4 5 6 7 8 1 b'], True),
+    ('J', 'Íñigo Peña Ruiz', 'X2345678L', 'Íñigo', 'Peña',
+     ['Me llamo Iñigo Peña, NIE x-2345678-l'], True),
+    ('K', 'Íñigo Peña Ruiz', 'X2345678L', 'Íñigo', 'Peña',
+     ['Me llamo Iñigo Pena, NIE X2345678L'], False),
+    ('L', 'María José de la Peña Ruiz', DNI, 'María José', 'de la Peña',
+     ['mi nombre es María José', 'mi apellido es de la Peña', DNI], True),
+    ('M', 'María José de la Peña Ruiz', DNI, 'María José', 'de la Peña',
+     [f'Me llamo María José, DNI {DNI}'], False),
+    ('N', 'Lucía Fernández-Ortega Ruiz', DNI, 'Lucía', 'Fernández-Ortega',
+     [f'Me llamo Lucia Fernandez Ortega, DNI {DNI}'], True),
+    ('O', 'Lucía Fernández-Ortega Ruiz', DNI, 'Lucía', 'Fernández-Ortega',
+     [f'Me llamo Lucia Fernandez, DNI {DNI}'], False),
+    ('P', FULL, DNI, None, None, [f'Lucía Ortega, DNI {DNI}'], False),
+    ('Q', FULL, DNI, None, None, [f'Lucía Fernande, DNI {DNI}'], False),
+    ('R', FULL, DNI, None, None, [f'{FULL}, DNI 23456782B'], False),
+    ('S', FULL, DNI, None, None,
+     [f'{FULL}, DNI 23456782B', f'No, mi DNI es {DNI}'], True),
+    ('T', FULL, DNI, None, None,
+     [f'Lucía Fernández Ortiz, DNI {DNI}', 'No, mi apellido es Fernández Ortega'], True),
+    ('U', 'María del Mar Ruiz de la Torre', 'Y2345678M', 'María del Mar', 'Ruiz',
+     ['NIE ye dos tres cuatro cinco seis siete ocho eme',
+      'mi nombre es María del Mar', 'mi apellido es Ruiz de la Torre'], True),
+]
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+@pytest.mark.parametrize('case,registered,document,given,surname,turns,valid',
+                         AUDIT_CASES, ids=[row[0] for row in AUDIT_CASES])
+def test_identity_safety_audit_a_through_u(grounded, channel, case, registered, document,
+                                        given, surname, turns, valid):
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'AUDIT-' + case, registered, document,
+                                 given_name=given, first_surname=surname)
+    _turn(grounded, channel, 'Hola')
+    replies = [_turn(grounded, channel, text) for text in turns]
+    assert (VERIFIED in replies[-1]) is valid, replies
+    assert _verifications(grounded) == int(valid)
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+def test_duplicate_active_document_different_names_never_verifies(wa, channel):
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'DUPLICATE-DNI', 'Luis Gil Mora', DNI)
+    reply = _turn(wa, channel, f'Me llamo {FULL}, DNI {DNI}')
+    assert 'verificación única' in reply and VERIFIED not in reply
+    assert _verifications(wa) == 0
+    with cases.db() as conn:
+        diagnostic = identity.match_diagnostic(
+            conn, BIZ, identity.document_hmac(BIZ, DNI), identity.name_hmac(BIZ, FULL))
+    assert diagnostic['reason_code'] == 'identity_ambiguous'
+
+
+def test_shared_whatsapp_new_partial_identity_cannot_reuse_previous_customer(wa):
+    assert VERIFIED in _turn(wa, 'WhatsApp', f'Me llamo {FULL}, DNI {DNI}')
+    reply = _turn(wa, 'WhatsApp', 'Mi nombre es Luis Gil Mora')
+    assert VERIFIED not in reply and 'DNI o NIE' in reply
+    with cases.db() as conn:
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        state = identity.load_state(conn, BIZ, 'WhatsApp',
+                                    identity.conversation_ref(BIZ, 'WhatsApp', PHONE), '')
+    assert not state.get('doc_hmac') and not state.get('policy_id')
+    assert state['name'] == 'Luis Gil Mora'
+
+
+def test_shared_whatsapp_explicit_reset_revokes_and_clears_identity(wa):
+    assert VERIFIED in _turn(wa, 'WhatsApp', f'Me llamo {FULL}, DNI {DNI}')
+    _turn(wa, 'WhatsApp', 'reinicia la conversación')
+    with cases.db() as conn:
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) is None
+        state = identity.load_state(conn, BIZ, 'WhatsApp',
+                                    identity.conversation_ref(BIZ, 'WhatsApp', PHONE), '')
+    assert not state.get('doc_hmac') and not state.get('name_hmac')
+
+
+def test_shared_whatsapp_complete_new_identity_replaces_only_current_verification(wa):
+    assert VERIFIED in _turn(wa, 'WhatsApp', f'Me llamo {FULL}, DNI {DNI}')
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'SHARED-LUIS', 'Luis Gil Mora', '87654321X')
+    assert VERIFIED in _turn(wa, 'WhatsApp', 'Me llamo Luis Gil Mora, DNI 87654321X')
+    with cases.db() as conn:
+        assert identity.verified_customer(conn, BIZ, 'WhatsApp', PHONE) == 'SHARED-LUIS'
+        old = conn.execute(
+            'SELECT revoked_at IS NOT NULL AS revoked FROM insurance_identity_verifications '
+            'WHERE business_id=%s AND customer_id=%s', (BIZ, 'CUSTOMER-LFO')).fetchone()
+    assert old['revoked']
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+def test_explicit_customer_switch_never_retrieves_previous_customers_policy(grounded, channel,
+                                                                         monkeypatch):
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'SWITCH-LUIS', 'Luis Gil Mora', '87654321X')
+    assert VERIFIED in _turn(grounded, channel, 'Me llamo Celia Zorro Condes, DNI 51959566J')
+    _turn(grounded, channel, '¿Qué cubre mi póliza sobre daños por agua?')
+    calls, original = [], retrieval.retrieve
+
+    def retrieve_for_current_customer(conn, business_id, customer_id, *args, **kwargs):
+        assert customer_id != 'CUSTOMER-SYNTHETIC'
+        calls.append(customer_id)
+        return original(conn, business_id, customer_id, *args, **kwargs)
+
+    monkeypatch.setattr(retrieval, 'retrieve', retrieve_for_current_customer)
+    reply = _turn(grounded, channel, 'Mi nombre es Luis Gil Mora')
+    assert VERIFIED not in reply and 'DNI o NIE' in reply
+    reply = _turn(grounded, channel, '¿Cuál es el límite por rotura de cristales?')
+    assert not calls
+    assert '731' not in reply and 'SYN-0731' not in reply
+    reply = _turn(grounded, channel, 'DNI 87654321X')
+    assert '731' not in reply and 'SYN-0731' not in reply
+    assert all(customer == 'SWITCH-LUIS' for customer in calls)
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+def test_long_compound_full_declaration_verifies_locally_without_llm_identity_residue(grounded,
+                                                                                   channel):
+    name = 'José María de los Santos de la Torre'
+    with cases.db() as conn:
+        identity.upsert_customer(conn, BIZ, 'LONG-COMPOUND', name, DNI,
+                                 given_name='José María', first_surname='de los Santos')
+    _turn(grounded, channel, 'Hola')
+    before = len(grounded.captures)
+    reply = _turn(grounded, channel, f'Me llamo {name}, DNI {DNI}')
+    assert VERIFIED in reply
+    assert len(grounded.captures) == before
+
+
+@pytest.mark.parametrize('channel', CHANNELS)
+@pytest.mark.parametrize('key', [None, 'short', 'y' * 40], ids=['missing', 'short', 'changed'])
+def test_configuration_failure_never_reuses_identity_or_counts_failed_attempts(wa, channel, key,
+                                                                             monkeypatch, caplog):
+    assert VERIFIED in _turn(wa, channel, f'Me llamo {FULL}, DNI {DNI}')
+    before = len(wa.captures)
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger='insurance.dialog')
+    if key is None:
+        monkeypatch.delenv('INSURANCE_CASE_HMAC_KEY')
+    else:
+        monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', key)
+    reply = _turn(wa, channel, '¿Cubre daños por agua?')
+    assert VERIFIED not in reply
+    assert len(wa.captures) == before
+    assert wa.count('insurance_identity_attempts') == 0
+    log = '\n'.join(record.getMessage() for record in caplog.records)
+    assert 'hmac_configuration_mismatch' in log
+    assert DNI not in log and FULL not in log and PHONE not in log
+    if key:
+        assert key not in log

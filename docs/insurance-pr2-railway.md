@@ -2,6 +2,45 @@
 
 `INSURANCE_ENABLED` permanece `false`. Nada de esto se ha desplegado ni probado contra Railway, Airtable o Twilio reales.
 
+## Lookup de negocio: indisponibilidad y revocación
+
+Para la sincronización de datos maestros y la nueva migración, seguir la sección
+vigente de `insurance-provisioning.md`. Las recetas y recuentos históricos más
+abajo no describen esta entrega y no deben sustituir esas instrucciones.
+
+El registro de números se consulta de nuevo en cada turno con
+`TENANT_LOOKUP_MODE=new` o `shadow`. `BUSINESS_CACHE_TTL_SECONDS` solo conserva
+la caché del lookup `legacy` de restaurantes; no mantiene asignaciones ni
+resultados negativos del registro multitenant. Así, una asignación previamente
+restaurante no puede ocultar un cambio posterior a Insurance ni una desactivación.
+No se modifican agentes, reglas ni reservas de restaurantes.
+
+Cada GET al registro tiene timeout de conexión de 1 segundo y de lectura de
+2 segundos, y un máximo de tres intentos
+solo ante timeout, conexión, HTTP 429 o 5xx, con esperas de 0,1 y 0,2 segundos.
+Los tiempos son límites de conexión/inactividad de lectura de `requests`,
+no una garantía de duración total para respuestas que transmiten continuamente.
+No hay loops ni fallback a una asignación vieja. Un error permanente no se reintenta.
+
+Los logs registran únicamente `correlation_id`, código y, en fallos inesperados,
+tipo de excepción; no contienen número, fórmula Airtable, respuesta ni texto
+de la excepción. Duplicados, asociación inválida, negocio/número inactivo,
+canal incorrecto, ausencia, timeout, 429, 5xx y red tienen códigos separados.
+La comprobación diagnóstica de un número sin asignación activa nunca autoriza
+las filas de otro canal o inactivas.
+
+WhatsApp, el webhook Voice y Relay diferencian número no configurado de
+indisponibilidad temporal. Si el lookup falla, no se abre el diálogo ni se
+ejecutan operaciones; Voice tampoco redirige al Relay ni a recepción desde una
+asignación no resuelta. Relay conserva los códigos seguros devueltos por Core.
+Esto no reemplaza las comprobaciones posteriores de identidad y autorización
+en PostgreSQL.
+
+No requiere variables nuevas para lookup. En Railway deben conservarse
+las tablas y el modo configurados; validar en un número de prueba desactivación
+y recuperación del registro antes de aprobar el despliegue. Para rollback,
+revertir el commit/despliegue completo aprobado, sin cambiar las claves HMAC.
+
 ## Entrega conversacional de octubre de 2026 (instrucciones vigentes)
 
 Las secciones anteriores de entregas históricas más abajo describen sus respectivos

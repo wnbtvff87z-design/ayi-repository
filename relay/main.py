@@ -7,6 +7,14 @@ from fastapi import FastAPI,Request,WebSocket,WebSocketDisconnect
 from fastapi.responses import Response,JSONResponse
 from twilio.request_validator import RequestValidator
 app=FastAPI();log=logging.getLogger(__name__)
+class BusinessLookupError(RuntimeError):
+ def __init__(self,diagnostic):
+  self.diagnostic=diagnostic
+  super().__init__(diagnostic)
+def business_lookup_reply(diagnostic):
+ return ('Este número no tiene un negocio activo configurado para este canal.'
+         if diagnostic=='business_not_found' else
+         'El servicio está temporalmente no disponible. Inténtalo en un minuto. No he ejecutado ninguna operación.')
 def env(k):return os.getenv(k,'').strip()
 def number(v):
  digits=re.sub(r'\D','',str(v or ''))
@@ -60,6 +68,22 @@ async def core(path,data):
  if not base or not key:raise RuntimeError('Core URL or internal key not configured')
  async with httpx.AsyncClient(timeout=25) as h:
   r=await h.post(base+path,headers={'X-Internal-API-Key':key},json=data)
+  if path in ('/internal/business','/internal/turn') and r.status_code in (404,503):
+   diagnostic='business_lookup_failed'
+   code=None
+   try:
+    payload=r.json()
+    code=payload.get('diagnostic') if isinstance(payload,dict) else None
+    if code in ('business_not_found','business_lookup_timeout','business_lookup_network_error',
+                'business_lookup_rate_limited','business_lookup_server_error','business_lookup_failed',
+                'business_lookup_duplicate','business_number_without_business'):
+     diagnostic=code
+   except ValueError:pass
+   if path=='/internal/business' or code in (
+     'business_not_found','business_lookup_timeout','business_lookup_network_error',
+     'business_lookup_rate_limited','business_lookup_server_error','business_lookup_failed',
+     'business_lookup_duplicate','business_number_without_business'):
+    raise BusinessLookupError(diagnostic)
   r.raise_for_status();return r.json()
 def insurance_reference(call_sid):
  return hashlib.sha256(('insurance-voice:'+str(call_sid)).encode()).hexdigest()
@@ -90,10 +114,14 @@ async def voice(req:Request):
   action=escape(env('RELAY_PUBLIC_URL').rstrip('/')+'/voice/relay/action',{'"':'&quot;'})
   xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect action="{action}" method="POST"><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="es-ES" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="es-ES" /></Connect><Hangup/></Response>'
   return Response(xml,media_type='application/xml')
+ except BusinessLookupError as exc:
+  insurance_error('business_lookup',exc,form.get('CallSid',''))
+  log.warning('business_lookup correlation_id=%s reason_code=%s',insurance_reference(form.get('CallSid','')),exc.diagnostic)
+  return Response('<Response><Say language="es-ES">'+escape(business_lookup_reply(exc.diagnostic))+'</Say><Hangup/></Response>',media_type='application/xml')
  except Exception as exc:
   if b and str(b.get('sector') or '').strip().casefold() in ('insurance','seguro','seguros'):insurance_error('setup',exc,form.get('CallSid',''))
-  else:log.exception('Voice setup failed')
-  return Response('<Response><Say language="es-ES">No puedo atender ahora.</Say><Hangup/></Response>',media_type='application/xml')
+  else:log.error('Voice setup failed correlation_id=%s error_type=%s',insurance_reference(form.get('CallSid','')),type(exc).__name__)
+  return Response('<Response><Say language="es-ES">'+escape(business_lookup_reply('business_lookup_failed'))+'</Say><Hangup/></Response>',media_type='application/xml')
 @app.api_route('/relay-ended',methods=['POST'])
 @app.api_route('/voice/relay/action',methods=['POST'])
 async def relay_ended(req:Request):
@@ -176,6 +204,9 @@ async def websocket(ws:WebSocket):
      else:end_reason=out.get('end_reason') if out.get('end_call') is True else None
      state['processed_ids'].add(external_id)
      if not reply:continue
+    except BusinessLookupError as exc:
+     log.warning('business_lookup correlation_id=%s reason_code=%s',insurance_reference(state['call_sid']),exc.diagnostic)
+     reply=business_lookup_reply(exc.diagnostic)
     except Exception as exc:
      if state['insurance']:insurance_error('turn',exc,state['call_sid'])
      else:log.exception('Voice turn failed')
@@ -197,9 +228,13 @@ async def websocket(ws:WebSocket):
      await insurance_transport(state,'error','voice_transcription_missing')
     else:log.error('ConversationRelay error: %s',event.get('description'))
  except WebSocketDisconnect:pass
+ except BusinessLookupError as exc:
+  log.warning('business_lookup correlation_id=%s reason_code=%s',insurance_reference(state['call_sid']),exc.diagnostic)
+  await ws.send_text(json.dumps({'type':'text','token':business_lookup_reply(exc.diagnostic),'last':True,'interruptible':True},ensure_ascii=False))
+  await ws.close(code=1013)
  except Exception as exc:
   if state['insurance']:insurance_error('disconnect',exc,state['call_sid'])
-  else:log.exception('Relay disconnected')
+  else:log.error('Relay disconnected correlation_id=%s error_type=%s',insurance_reference(state['call_sid']),type(exc).__name__)
  finally:
   if state['insurance'] and insurance_call_id_valid(state['call_sid']) and (not state['final_count'] or state['partial_count']):
    await insurance_transport(state,'disconnect','voice_transcription_partial' if state['partial_count'] else 'voice_transcription_missing',state['last_partial'])

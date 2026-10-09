@@ -72,6 +72,32 @@ def audit(pg):
         return conn.execute('SELECT * FROM insurance_audit_log ORDER BY audit_id').fetchall()
 
 
+@pytest.mark.parametrize('stage,customer,verified', [
+    ('identity_verified', 'C', True),
+    ('technical_error', 'C', True),
+    ('identity_data_partial', 'C', False),
+    ('clarification', None, False),
+])
+def test_provider_diagnostic_is_independent_of_identity_stage(pg, stage, customer, verified):
+    with pg[0]() as conn:
+        voice_trace.record(
+            conn, 'B', CALL, 'independent', 'DNI 12345678Z', '', stage, stage,
+            'Respuesta sintética', customer_id=customer, llm_diagnostic='llm_timeout',
+            transport={'identity_verified': not verified, 'llm_diagnostic': 'llm_auth_failed'})
+        trace = conn.execute('SELECT stage,diagnostic,transport,recognized FROM insurance_voice_trace').fetchone()
+    assert trace['stage'] == stage and trace['diagnostic'] == stage
+    assert trace['transport'] == {'llm_diagnostic': 'llm_timeout', 'identity_verified': verified}
+    assert '12345678' not in trace['recognized']
+
+
+@pytest.mark.parametrize('diagnostic', ['private-provider-body', {'llm_error': 'private'}, None])
+def test_voice_diagnostic_rejects_untrusted_or_non_enum_provider_details(pg, diagnostic):
+    add(pg, customer_id='C', llm_diagnostic=diagnostic,
+        transport={'llm_diagnostic': 'llm_timeout', 'identity_verified': False})
+    with pg[0]() as conn:
+        assert conn.execute('SELECT transport FROM insurance_voice_trace').fetchone()['transport'] == {}
+
+
 def test_default_deny_and_separate_permission(pg):
     connect, client = pg
     with connect() as conn:

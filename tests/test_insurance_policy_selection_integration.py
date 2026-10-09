@@ -7,7 +7,7 @@ import pytest
 from test_insurance_whatsapp_grounded import (
     BIZ, DECLARATION, FIRE, QUESTION, grounded,  # noqa: F401
 )
-from insurance import cases, policy_info, retrieval
+from insurance import cases, dialog, policy_info, retrieval
 
 
 def add_policy(number, product='automóvil', authorized=True):
@@ -287,12 +287,12 @@ def test_classified_interpreter_failure_preserves_question_without_retrieval_and
     flow.verify()
     flow.mode['value'] = mode
     response = flow.say(QUESTION)
-    assert 'técnico' in response and 'evidencia suficiente' not in response
+    assert response == dialog.ASK_REPHRASE
     state = flow.state()
     assert state['awaiting'] == 'retry'
     assert state['question'] == QUESTION and state['normalized_question'] == QUESTION
-    assert state['last_retrieval']['retrieval_status'] == 'interpretation_error'
-    assert state['last_retrieval']['llm_diagnostic'] == code
+    assert state['interpretation_diagnostic'] == code
+    assert not state.get('last_retrieval')
     assert not flow.explanations and not flow.rewrites
     assert flow.count('insurance_cases') == 0
     recovered = flow.restart('Revisa de nuevo', 'SM-interpreter-recovery-' + mode)
