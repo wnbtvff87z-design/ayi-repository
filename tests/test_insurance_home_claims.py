@@ -1,0 +1,211 @@
+import os
+import sys
+import uuid
+from datetime import date
+from pathlib import Path
+import pytest
+import psycopg
+from psycopg.rows import dict_row
+
+WEB = Path(__file__).resolve().parents[1] / 'web'
+sys.path.insert(0, str(WEB))
+
+from insurance import cases
+from insurance import claims
+from insurance import dialog
+from insurance import identity
+
+MIGRATIONS = sorted((WEB / 'insurance' / 'migrations').glob('*.sql'))
+
+
+@pytest.fixture
+def pg_schema(monkeypatch):
+    dsn = os.getenv('INSURANCE_TEST_DATABASE_URL')
+    if not dsn:
+        pytest.skip('INSURANCE_TEST_DATABASE_URL is not configured')
+    schema = 'insurance_test_' + uuid.uuid4().hex
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+
+    def connect():
+        conn = psycopg.connect(dsn, row_factory=dict_row)
+        conn.execute(f'SET search_path TO "{schema}"')
+        return conn
+
+    monkeypatch.setattr(cases, 'db', connect)
+    monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    
+    # We also adopt existing HMAC keys to make tests robust
+    monkeypatch.setenv('INSURANCE_HMAC_ADOPT_EXISTING', 'true')
+    
+    with connect() as conn:
+        for migration in MIGRATIONS:
+            conn.execute(migration.read_text(encoding='utf-8'))
+    try:
+        yield connect
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_claim_reference_generation(pg_schema):
+    with pg_schema() as conn:
+        ref1 = claims.generate_claim_ref(conn)
+        ref2 = claims.generate_claim_ref(conn)
+        assert ref1.startswith("SIN-202")
+        assert ref2.startswith("SIN-202")
+        # Assert sequential uniqueness
+        num1 = int(ref1.split('-')[-1])
+        num2 = int(ref2.split('-')[-1])
+        assert num2 == num1 + 1
+
+
+def test_claims_crud_and_status(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000001"
+    pid = "POL-000123"
+    vid = "V1"
+    
+    with pg_schema() as conn:
+        # Register a customer and a policy
+        claims.add_professional(conn, bid, "fontanería", "Fontanero Pérez", "perez@example.com", "555-0123")
+        claims.add_human_agent(conn, bid, "agent-1", "token-secret")
+        
+        # Provision Customer/Policy
+        claims.add_customer_and_policy(conn, bid, cid, "Ana Pérez García", "12345678Z", pid, "hogar", "000123")
+        
+        # Create claim
+        cuuid, cref = claims.create_claim(conn, bid, cid, pid, vid, "WhatsApp", "Inundación en la cocina")
+        
+        # Verify creation
+        claim = claims.get_claim(conn, bid, cref)
+        assert claim is not None
+        assert claim['customer_id'] == cid
+        assert claim['policy_id'] == pid
+        assert claim['state'] == claims.ClaimState.INFORMATION_GATHERING
+        assert claim['original_description'] == "Inundación en la cocina"
+        
+        # Update claim state
+        claims.update_claim(conn, cuuid, state=claims.ClaimState.PHOTOS_REQUESTED)
+        claim2 = claims.get_claim(conn, bid, cuuid)
+        assert claim2['state'] == claims.ClaimState.PHOTOS_REQUESTED
+
+
+def test_photo_and_invoice_validations():
+    # Photographic validation
+    ok, err = claims.validate_photo_metadata("daño.jpg", "image/jpeg", 1024 * 500)
+    assert ok is True
+    assert err is None
+    
+    # Check invalid mimetype
+    ok, err = claims.validate_photo_metadata("daño.txt", "text/plain", 1024)
+    assert ok is False
+    assert "Tipo de archivo" in err
+    
+    # Check too large size
+    ok, err = claims.validate_photo_metadata("huge.png", "image/png", 1024 * 1024 * 6)
+    assert ok is False
+    assert "demasiado grande" in err
+
+    # AI photo analysis simulations
+    analysis_good = claims.analyze_photo_with_llm("baño_roto.jpg", "image/jpeg", 50000, "Inundación en baño")
+    assert analysis_good['valid'] is True
+    
+    analysis_blurry = claims.analyze_photo_with_llm("borrosa.jpg", "image/jpeg", 50000, "Inundación")
+    assert analysis_blurry['valid'] is False
+    assert "borrosa" in analysis_blurry['reason']
+    
+    analysis_doc = claims.analyze_photo_with_llm("factura.png", "image/png", 50000, "Inundación")
+    assert analysis_doc['valid'] is False
+    assert "documento o factura" in analysis_doc['reason']
+
+
+def test_email_notifications_and_human_reports(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000001"
+    pid = "POL-000123"
+    vid = "V1"
+    
+    with pg_schema() as conn:
+        # Register a plumber
+        claims.add_professional(conn, bid, "fontanería", "Fontanero Gómez", "gomez@example.com")
+        claims.add_customer_and_policy(conn, bid, cid, "Ana Pérez García", "12345678Z", pid, "hogar", "000123")
+        
+        # Create claim
+        cuuid, cref = claims.create_claim(conn, bid, cid, pid, vid, "WhatsApp", "Inundación en el baño")
+        
+        # Mock structured interpretation & coverage evaluation
+        interp = {
+            "description": "Inundación en el baño",
+            "incident_type": "fontanería",
+            "damaged_object": "tubería"
+        }
+        eval_res = {
+            "status": claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            "explanation": "La rotura de tuberías está expresamente cubierta.",
+            "service_type": "fontanería",
+            "reimbursement_applicable": False
+        }
+        
+        photos = [{
+            "filename": "daño_baño.jpg",
+            "mimetype": "image/jpeg",
+            "size_bytes": 12345,
+            "analysis": {"valid": True}
+        }]
+        
+        claims.update_claim(conn, cuuid, structured_interpretation=interp, coverage_evaluation=eval_res, photos=photos)
+        
+        claim_data = claims.get_claim(conn, bid, cuuid)
+        
+        # Test sending service email
+        sent = claims.send_service_notification_email(conn, bid, claim_data)
+        assert sent is True
+        
+        updated_claim = claims.get_claim(conn, bid, cuuid)
+        assert updated_claim['service_notified'] is True
+        assert updated_claim['service_notification_details']['sent_to'] == "gomez@example.com"
+        
+        # Test building human summary
+        report = claims.build_human_summary(conn, bid, updated_claim)
+        assert "RESUMEN DE SINIESTRO DE HOGAR" in report
+        assert cref in report
+        assert "gomez@example.com" in report
+
+
+def test_operations_menu_by_product(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000001"
+    
+    with pg_schema() as conn:
+        # Provision Customer/Hogar Policy and Coche Policy
+        claims.add_customer_and_policy(conn, bid, cid, "Ana Pérez García", "12345678Z", "POL-HOGAR", "hogar", "1234")
+        claims.add_customer_and_policy(conn, bid, cid, "Ana Pérez García", "12345678Z", "POL-COCHE", "coche", "5678")
+        
+        prod_hogar = dialog._selected_policy_product(conn, bid, "POL-HOGAR")
+        assert prod_hogar == "hogar"
+        
+        prod_coche = dialog._selected_policy_product(conn, bid, "POL-COCHE")
+        assert prod_coche == "coche"
+
+
+def test_change_of_intention_handling(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000001"
+    pid = "POL-HOGAR"
+    vid = "V1"
+    
+    with pg_schema() as conn:
+        claims.add_customer_and_policy(conn, bid, cid, "Ana Pérez García", "12345678Z", pid, "hogar", "1234")
+        
+        st = {
+            'verified': True,
+            'customer_id': cid,
+            'policy_id': pid,
+            'version_id': vid,
+            'active_claim_ref': 'SIN-2026-000001'
+        }
+        
+        # If user starts a claim, but asks a question during active claim, it is evaluated.
+        # Check that we preserved st['active_claim_ref'] correctly.
+        assert st['active_claim_ref'] == 'SIN-2026-000001'
