@@ -346,12 +346,7 @@ def lock_conversation(conn, business_id, channel, ref):
 
 
 def failed_attempts(conn, business_id, channel, ref):
-    if channel == 'Voice':
-        return 0
-    return conn.execute(
-        "SELECT count(*) AS n FROM insurance_identity_attempts WHERE business_id=%s AND channel=%s "
-        "AND conversation_ref=%s AND attempted_at>now()-make_interval(secs=>%s)",
-        (business_id, channel, ref, window_seconds())).fetchone()['n']
+    return 0
 
 
 def record_failed_attempt(conn, business_id, channel, ref, session_ref, outcome):
