@@ -33,7 +33,7 @@ def sector_of(business):
     raise BusinessSectorError('Sector de negocio desconocido')
 
 
-def process(business,state,history,text,channel,external_id,customer,resolved_sector=None):
+def process(business,state,history,text,channel,external_id,customer,resolved_sector=None,media_list=None):
     sector=resolved_sector if resolved_sector is not None else sector_of(business)
     if sector=='restaurante':
         if os.getenv('RESTAURANT_AGENT','false').strip().lower()=='true':
@@ -47,5 +47,6 @@ def process(business,state,history,text,channel,external_id,customer,resolved_se
         return insurance_process(
             business,state,history,text,channel,external_id,customer,
             resolved_sector=sector,
+            media_list=media_list
         )
     return general_process(business,state,history,text,channel,external_id,customer)
