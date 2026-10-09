@@ -65,7 +65,8 @@ NAME_STOP = {'dni', 'nie', 'con', 'mi', 'y', 'e', 'documento', 'numero', 'númer
              'cedula', 'cédula', 'identificacion', 'identificación', 'rut', 'curp', 'pasaporte'}
 NAME_TRIGGER_RE = re.compile(
     r'(?:me\s+llamo|mi\s+nombre\s+es|nombre\s+y\s+apellidos?|nombre\s+completo|soy|'
-    r'(?:por\s+)?ac[aá](?:\s+(?:te\s+|le\s+)?habla)?|(?:te\s+|le\s+)?habla)\s*[:,-]?\s*', re.I)
+    r'(?:mira\s+|buenas\s+|hola\s+)?(?:por\s+)?ac[aá](?:\s+(?:te\s+|le\s+)?habla)?|'
+    r'(?:te\s+|le\s+)?habla)\s*[:,-]?\s*', re.I)
 LABEL_RE = re.compile(r'\b(nombre|apellidos?)\s*[:=-]\s*', re.I)
 KEYWORD_RE = re.compile(
     r'\b(dni|nie|c[eé]dula|identificaci[oó]n|rut|curp|pasaporte|documento|n[úu]mero|nombre|apellidos?|y)\b', re.I)
