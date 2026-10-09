@@ -760,3 +760,29 @@ def test_exact_active_and_business_name_matching_after_voice(pg):
         assert set(find(parsed['name'])) == {'CELIA', 'DUP'}
         conn.execute("UPDATE insurance_customers SET active=false WHERE business_id=%s", (BIZ,))
         assert find(parsed['name']) == []
+
+
+@pytest.mark.parametrize('phrase,expected_doc', [
+    ('DNI cinco uno nueve cinco nueve cinco seis seis ve chica', '51959566V'),
+    ('mi cédula es cinco uno nueve cinco nueve cinco seis seis be grande', '51959566B'),
+    ('cédula de identidad cinco uno nueve cinco nueve cinco seis seis ve de vaca', '51959566V'),
+    ('documento cinco uno nueve cinco nueve cinco seis seis be de burro', '51959566B'),
+    ('DNI uno dos tres cuatro cinco seis siete ocho ceta', '12345678Z'),
+    ('cédula uno dos tres cuatro cinco seis siete ocho seta', '12345678Z'),
+    ('uno dos tres cuatro cinco seis siete ocho doble u', '12345678W'),
+])
+def test_latin_american_spoken_letters_and_cedula_parsing(phrase, expected_doc):
+    parsed = prepare(phrase, {'awaiting': 'identity'})
+    assert parsed['document'] == expected_doc
+
+
+@pytest.mark.parametrize('phrase,expected_name,expected_doc', [
+    ('te habla Celia Zorro Condes y mi cédula es 51959566J', 'Celia Zorro Condes', '51959566J'),
+    ('acá Celia Zorro Condes mi número de identificación es 51959566J', 'Celia Zorro Condes', '51959566J'),
+    ('por acá habla Celia Zorro Condes mi documento es 51959566J', 'Celia Zorro Condes', '51959566J'),
+])
+def test_latin_american_introduction_formulas(phrase, expected_name, expected_doc):
+    parsed = prepare(phrase, {'awaiting': 'identity'})
+    assert parsed['name'] == expected_name
+    assert parsed['document'] == expected_doc
+

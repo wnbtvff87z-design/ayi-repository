@@ -112,7 +112,9 @@ async def voice(req:Request):
   if not ws.startswith('wss://'):raise ValueError('Secure WebSocket required')
   voice_id=escape(str(b.get('voice') or env('TTS_VOICE') or 'bN1bDXgDIGX5lw0rtY2B'),{'"':'&quot;'})
   action=escape(env('RELAY_PUBLIC_URL').rstrip('/')+'/voice/relay/action',{'"':'&quot;'})
-  xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect action="{action}" method="POST"><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="es-ES" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="es-ES" /></Connect><Hangup/></Response>'
+  transcription_lang=escape(str(b.get('transcription_language') or env('TRANSCRIPTION_LANGUAGE') or env('DEEPGRAM_LANGUAGE') or 'es-ES'),{'"':'&quot;'})
+  lang=escape(str(b.get('language') or env('TTS_LANGUAGE') or 'es-ES'),{'"':'&quot;'})
+  xml=f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect action="{action}" method="POST"><ConversationRelay url="{ws}" welcomeGreeting="{greeting}" language="{lang}" ttsProvider="ElevenLabs" voice="{voice_id}" transcriptionProvider="Deepgram" transcriptionLanguage="{transcription_lang}" /></Connect><Hangup/></Response>'
   return Response(xml,media_type='application/xml')
  except BusinessLookupError as exc:
   insurance_error('business_lookup',exc,form.get('CallSid',''))

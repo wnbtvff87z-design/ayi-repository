@@ -61,11 +61,14 @@ WORD = r"[^\W\d_]+(?:[.'’\-][^\W\d_]+)*"
 WORD_RE = re.compile(WORD)
 NAME_STOP = {'dni', 'nie', 'con', 'mi', 'y', 'e', 'documento', 'numero', 'número', 'poliza', 'póliza',
              'tengo', 'quiero', 'necesito', 'para', 'que', 'cliente', 'vivo', 'tel', 'telefono', 'teléfono',
-             'nombre', 'apellido', 'apellidos', 'es', 'en', 'por'}
+             'nombre', 'apellido', 'apellidos', 'es', 'en', 'por', 'habla', 'aca', 'acá',
+             'cedula', 'cédula', 'identificacion', 'identificación', 'rut', 'curp', 'pasaporte'}
 NAME_TRIGGER_RE = re.compile(
-    r'(?:me\s+llamo|mi\s+nombre\s+es|nombre\s+y\s+apellidos?|nombre\s+completo|soy)\s*[:,-]?\s*', re.I)
+    r'(?:me\s+llamo|mi\s+nombre\s+es|nombre\s+y\s+apellidos?|nombre\s+completo|soy|'
+    r'(?:por\s+)?ac[aá](?:\s+(?:te\s+|le\s+)?habla)?|(?:te\s+|le\s+)?habla)\s*[:,-]?\s*', re.I)
 LABEL_RE = re.compile(r'\b(nombre|apellidos?)\s*[:=-]\s*', re.I)
-KEYWORD_RE = re.compile(r'\b(dni|nie|documento|n[úu]mero|nombre|apellidos?|y)\b', re.I)
+KEYWORD_RE = re.compile(
+    r'\b(dni|nie|c[eé]dula|identificaci[oó]n|rut|curp|pasaporte|documento|n[úu]mero|nombre|apellidos?|y)\b', re.I)
 MAX_NAME_TOKENS = 24
 MAX_TEXT = 4000
 
@@ -179,7 +182,7 @@ def parse_declaration(text, awaiting=None):
                 name = ' '.join(words)
                 rest = rest[:t.start()] + ' ' + rest[t.end() + end:]
     if name is None and (awaiting == 'identity' or (
-            doc and re.search(r'\b(?:dni|nie|documento)\b', text, re.I))) and '?' not in rest:
+            doc and re.search(r'\b(?:dni|nie|documento|c[eé]dula|identificaci[oó]n|rut|curp|pasaporte)\b', text, re.I))) and '?' not in rest:
         name_words = rest.split()
         if len(name_words) >= 2 and tuple(word.casefold() for word in name_words[-2:]) in {
                 ('con', 'su'), ('con', 'mi'), ('con', 'el'), ('con', 'la'), ('y', 'mi'), ('y', 'su')}:
@@ -191,7 +194,7 @@ def parse_declaration(text, awaiting=None):
             name, rest = ' '.join(words), ''
     remaining = WORD_RE.findall(KEYWORD_RE.sub(' ', rest))
     # The case/question keeps the message WITHOUT the identity data that was in it.
-    question = re.sub(r'\b(?:dni|nie)\b', ' ', LABEL_RE.sub(' ', rest), flags=re.I)
+    question = re.sub(r'\b(?:dni|nie|c[eé]dula|documento|rut|curp|pasaporte)\b', ' ', LABEL_RE.sub(' ', rest), flags=re.I)
     question = re.sub(r'\s+', ' ', question).strip(' ,;.-:')
     return {'document': document, 'name': name, 'contract_number': contract,
             'has_question': len(remaining) >= 4, 'question': question,

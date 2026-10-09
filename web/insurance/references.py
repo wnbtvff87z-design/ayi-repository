@@ -22,7 +22,8 @@ BACK_RE = re.compile(
     r'la\s+primera\s+pregunta|al\s+principio)', re.I)
 ANSWER_WORDS = re.compile(r'dijiste|comentaste|explicaste|respondiste|mencionaste|exclusion|clausula|anterior', re.I)
 THEME_RE = re.compile(r'^(la|el|lo)\s+(del|de\s+la|de\s+los|de\s+las)\s+(.+)$', re.I)
-YES_RE = re.compile(r'^\W*(s[ií]|vale|ok|claro|por\s+favor|adelante|de\s+acuerdo|correcto|afirmativo|'
+YES_RE = re.compile(r'^\W*(s[ií]|vale|ok|claro|por\s+favor|porfa|adelante|de\s+acuerdo|correcto|afirmativo|'
+                    r'dale|listo|va|de\s+una|seguro|'
                     r'registra(la|lo)?|reg[ií]stra(la|lo)?|hazlo|perfecto)\b', re.I)
 NO_RE = re.compile(r'^\W*(no\b|no\s+gracias|d[eé]jalo|olv[ií]dalo|cancela|mejor\s+no)', re.I)
 ORDINALS = {'1': 0, 'primera': 0, 'primero': 0, 'uno': 0, '2': 1, 'segunda': 1, 'segundo': 1, 'dos': 1,
@@ -52,7 +53,7 @@ def confirmation(text):
     intent = (rf'(?:{action}|(?:quiero|deseo|acepto|autorizo)\s+'
               rf'(?:(?:que\s+)?(?:registres|abras|crees)\s+(?:(?:un|una|el|la|mi)\s+)?'
               rf'(?:caso|consulta|solicitud)|(?:la\s+)?revision|{action}))')
-    if re.fullmatch(rf'(?:si(?:\s+(?:por favor|{intent}))?|{intent})(?:\s+por favor)?', f):
+    if re.fullmatch(rf'(?:(?:si|dale|listo|de una)(?:\s+(?:por favor|porfa|{intent}))?|{intent})(?:\s+(?:por favor|porfa))?', f):
         return 'yes'
     return None
 
@@ -66,7 +67,8 @@ def consent_only(text):
         r'(?:no(?:\s+gracias)?|dejalo|olvidalo|cancela|mejor\s+no|'
         r'no\s+(?:quiero|deseo|autorices|registres|abras|crees)\s+'
         r'(?:(?:un|una|el|la|ningun|ninguna)\s+)?(?:caso|consulta|revision)|'
-        r'si|vale|ok|claro|por\s+favor|adelante|de\s+acuerdo|correcto|afirmativo|'
+        r'si|vale|ok|claro|por\s+favor|porfa|adelante|de\s+acuerdo|correcto|afirmativo|'
+        r'dale|listo|va|de\s+una|seguro|'
         r'registra(?:la|lo)?|hazlo|perfecto)', f))
 
 

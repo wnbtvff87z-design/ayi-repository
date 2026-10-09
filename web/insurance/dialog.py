@@ -41,8 +41,14 @@ ENDED_RE = re.compile(
     r'(?:el\s+)?(?:incendio|fuego|inundaci[oó]n|accidente)\s+(?:termin[oó]|acab[oó]|finaliz[oó])|'
     r'no\s+hay\s+peligro)\b', re.I)
 REVIEW_RE = re.compile(
-    r'\b(?:revis(?:a|á|ar)|comprueba|comprobá|verifica|verificá)\s+'
-    r'(?:lo\s+)?(?:de\s+nuevo|otra\s+vez|nuevamente)\b', re.I)
+    r'\b(?:revis(?:a|á|ar|alo|álo)|comprueba|comprobá|verifica|verificá)\s+'
+    r'(?:lo\s+)?(?:de\s+nuevo|otra\s+vez|nuevamente)\b|'
+    r'\b(?:revis(?:a|á|ar|alo|álo)|comprueba|comprobá|verifica|verificá)\s+(?:vos|t[uú])\b|'
+    r'\b(?:dec[ií]melo|d[ií]melo|decime|dime|cu[eé]ntame|plat[ií]came|respondeme|resp[oó]ndeme|'
+    r'contestame|cont[eé]stame|averigua|aver[ií]guame|f[ií]jate)\s*(?:vos|t[uú])?\s*$|'
+    r'\b(?:intenta|intent[aá]lo|prueba|pru[eé]balo|prob[aá]|prob[aá]lo)\s+(?:de\s+nuevo|otra\s+vez|nuevamente)\b|'
+    r'\b(?:intenta|intent[aá]|prob[aá])\s+(?:vos|t[uú])\b|'
+    r'^\s*(?:reintenta|reintentar|de\s+nuevo|otra\s+vez)\s*$', re.I)
 MISSING_EVIDENCE_RE = re.compile(
     r'\b(?:evidencia|prueba)\s+(?:de|sobre)\s+qu[eé]\b|'
     r'\bno\s+encontraste\s+(?:evidencia|prueba)\s+(?:de|sobre)\s+qu[eé]\b|'
@@ -380,7 +386,7 @@ def _answer(business, state, text, channel, external_id, customer):
             just_verified = False
             st.pop('_identity_diagnostic', None)
             identity_declaration = (not customer_id or (channel == 'Voice' and (
-                identity.NAME_TRIGGER_RE.search(text) or re.search(r'\b(?:dni|nie)\b', text, re.I))))
+                identity.NAME_TRIGGER_RE.search(text) or re.search(r'\b(?:dni|nie|c[eé]dula|documento|rut|curp|pasaporte)\b', text, re.I))))
             if identity_declaration and not customer_id:
                 st['awaiting'] = 'identity'
             decl = (identity.parse_declaration('') if _is_social(text) or explicit_reset else
@@ -1306,6 +1312,60 @@ def _technical_message(code, repeated=False):
     return reply + ' Esto no indica falta de evidencia ni confirma o descarta cobertura.'
 
 
+def _sanitize_llm_explanation(text_out, evidence, policy_id, version_id, contract_number):
+    if not isinstance(text_out, str):
+        return text_out
+    text = text_out.strip()
+    if not text:
+        return text
+    if re.search(r'\bESCALAR\b', text):
+        return 'ESCALAR'
+
+    # Normalize bracket citation markers:
+    # [p. 2] -> [p.2], [e. 1] -> [e.1]
+    text = re.sub(r'\[([pePE])\s*[.:]\s*([1-9][0-9]*)\]', lambda m: f"[{m.group(1).lower()}.{m.group(2)}]", text)
+    # (p. 2) or (p.2) -> [p.2], (e. 1) or (e.1) -> [e.1]
+    text = re.sub(r'\(([pePE])\s*[.:]\s*([1-9][0-9]*)\)', lambda m: f"[{m.group(1).lower()}.{m.group(2)}]", text)
+    # [pág. 2] or [página 2] -> [p.2]
+    text = re.sub(r'\[p[aá]g(?:ina)?\.?\s*([1-9][0-9]*)\]', r'[p.\1]', text, flags=re.I)
+    # Multiple citations in single brackets: [p.1, p.2] -> [p.1] [p.2], [p.1, 2] -> [p.1] [p.2]
+    text = re.sub(r'\[([pePE])\.([1-9][0-9]*)\s*,\s*([pePE])\.([1-9][0-9]*)\]',
+                  lambda m: f"[{m.group(1).lower()}.{m.group(2)}] [{m.group(3).lower()}.{m.group(4)}]", text)
+    text = re.sub(r'\[([pePE])\.([1-9][0-9]*)\s*,\s*([1-9][0-9]*)\]',
+                  lambda m: f"[{m.group(1).lower()}.{m.group(2)}] [{m.group(1).lower()}.{m.group(3)}]", text)
+    # Uppercase [P.2] -> [p.2]
+    text = re.sub(r'\[([PE])\.([1-9][0-9]*)\]', lambda m: f"[{m.group(1).lower()}.{m.group(2)}]", text)
+
+    # Clean leaked internal identifiers (policy_id, version_id, document_id)
+    internal_ids = set()
+    if policy_id and policy_id != contract_number:
+        internal_ids.add(policy_id)
+    if version_id:
+        internal_ids.add(version_id)
+    if isinstance(evidence, (list, tuple)):
+        for item in evidence:
+            if isinstance(item, dict) and item.get('document_id'):
+                internal_ids.add(item['document_id'])
+    internal_ids.discard(contract_number)
+    for identifier in internal_ids:
+        if identifier and len(identifier) >= 3:
+            text = re.sub(r'(?<!\w)' + re.escape(identifier) + r'(?!\w)', '', text, flags=re.I)
+    text = re.sub(r'\b(?:p[óo]liza|documento|versi[óo]n)\s+(?:p[óo]liza|documento|versi[óo]n)\b', 'póliza', text, flags=re.I)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
+    # If no citation markers are in text, check for natural mentions or single-page evidence
+    if not citations._MARKER.search(text) and isinstance(evidence, (list, tuple)) and evidence:
+        pages_in_ev = {item['page'] for item in evidence if isinstance(item, dict) and type(item.get('page')) is int}
+        page_match = re.search(r'\bp[aá]gina\s+([1-9][0-9]*)\b', text, re.I)
+        if page_match and int(page_match.group(1)) in pages_in_ev:
+            p_num = int(page_match.group(1))
+            text = text[:page_match.end()] + f' [p.{p_num}]' + text[page_match.end():]
+        elif len(pages_in_ev) == 1:
+            text = f"{text.rstrip('.')} [p.{next(iter(pages_in_ev))}]."
+
+    return text.strip()
+
+
 def _documental(conn, business, sc, st, text, question, corr, ctx, customer, external_id,
                 intent='question', reviewing=False):
     bid, channel, customer_id = sc.bid, sc.channel, sc.customer_id
@@ -1459,7 +1519,9 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
             text_out = llm_explain(package, package['evidence']) if ev else 'ESCALAR'
             if not isinstance(text_out, str) or not text_out.strip():
                 return _technical_failure(st, 'llm_invalid_response', corr, bid, ev, invoked)
-            text_out = text_out.strip()
+            text_out = _sanitize_llm_explanation(
+                text_out, ev, result.get('policy_id'), result.get('version_id'),
+                st.get('contract_number'))
             st['last_retrieval']['llm_result'] = (
                 'escalated' if text_out.upper() == 'ESCALAR' else 'answered')
         except memory.ContextBudgetExceeded:
