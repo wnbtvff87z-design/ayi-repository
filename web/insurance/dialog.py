@@ -1362,6 +1362,9 @@ def _sanitize_llm_explanation(text_out, evidence, policy_id, version_id, contrac
             text = text[:page_match.end()] + f' [p.{p_num}]' + text[page_match.end():]
         elif len(pages_in_ev) == 1:
             text = f"{text.rstrip('.')} [p.{next(iter(pages_in_ev))}]."
+        elif len(pages_in_ev) > 1:
+            markers = ' '.join(f'[p.{p}]' for p in sorted(pages_in_ev))
+            text = f"{text.rstrip('.')} {markers}."
 
     return text.strip()
 
@@ -1511,6 +1514,7 @@ def _documental(conn, business, sc, st, text, question, corr, ctx, customer, ext
                 recent_turns=recent,
                 summary_text=memory.render_summary(summary, memory.cfg('INSURANCE_SUMMARY_MAX_CHARS')),
                 recalled=[recalled] if recalled else [])
+            package['channel'] = channel
             _diag(corr, 'context', bid, context_chars=package['report']['used'],
                   evidence_count=len(ev), page_count=len({(e['document_id'], e['page']) for e in ev}),
                   fragment_count=len(ev), llm_invoked=False)
