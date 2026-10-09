@@ -33,11 +33,13 @@ class DateSpan:
     end: date | None
     precision: str
     status: str = 'resolved'
+    natural: str | None = None
 
     def as_state(self):
         return {'start': self.start.isoformat() if self.start else None,
                 'end': self.end.isoformat() if self.end else None,
-                'precision': self.precision, 'status': self.status}
+                'precision': self.precision, 'status': self.status,
+                'natural': self.natural}
 
 
 def parse(text, today=None, tz='Europe/Madrid'):
@@ -80,22 +82,22 @@ def parse(text, today=None, tz='Europe/Madrid'):
         add(year, month, day)
     for match in re.finditer(r'\b(hoy|ayer|anteayer)\b', folded):
         value = today - timedelta(days={'hoy': 0, 'ayer': 1, 'anteayer': 2}[match.group(1)])
-        spans.append(DateSpan(value, value, 'day'))
+        spans.append(DateSpan(value, value, 'day', natural=match.group(1)))
     numbers = '|'.join(NUMBERS)
     for match in re.finditer(r'\bhace\s+(\d{1,3}|' + numbers + r')\s+dias?\b', folded):
         count = int(match.group(1)) if match.group(1).isdigit() else NUMBERS[match.group(1)]
         value = today - timedelta(days=count)
-        spans.append(DateSpan(value, value, 'day'))
+        spans.append(DateSpan(value, value, 'day', natural=match.group(0)))
     for match in re.finditer(r'\b(esta\s+semana|la\s+semana\s+pasada)\b', folded):
         start = today - timedelta(days=today.weekday())
         end = today
         if 'pasada' in match.group(1):
             start -= timedelta(days=7)
             end = start + timedelta(days=6)
-        spans.append(DateSpan(start, end, 'week'))
+        spans.append(DateSpan(start, end, 'week', natural=match.group(1)))
     for match in re.finditer(r'\b(?:el\s+)?(' + '|'.join(WEEKDAYS) + r')\b', folded):
         value = today - timedelta(days=(today.weekday() - WEEKDAYS.index(match.group(1))) % 7)
-        spans.append(DateSpan(value, value, 'day'))
+        spans.append(DateSpan(value, value, 'day', natural=f"el {match.group(1)}"))
     day_pattern = (r'\b(?:el\s+)?(\d{1,2})\s+(?:de\s+)?(' + months +
                    r')(?:\s+(?:de\s+)?(\d{4}|este\s+ano|el\s+ano\s+pasado))?\b')
     consumed = []
@@ -133,5 +135,6 @@ def parse(text, today=None, tz='Europe/Madrid'):
         if start > end:
             return DateSpan(None, None, 'unknown', 'ambiguous')
         precision = 'day' if start == end else min(spans, key=lambda span: span.end - span.start).precision
-        return DateSpan(start, end, precision)
+        nat = next((s.natural for s in spans if s.natural), None)
+        return DateSpan(start, end, precision, natural=nat)
     return spans[0] if spans else None
