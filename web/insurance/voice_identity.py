@@ -21,12 +21,15 @@ LETTERS = {
     'eme': 'M', 'ene': 'N', 'o': 'O', 'pe': 'P', 'cu': 'Q', 'erre': 'R',
     'ese': 'S', 'te': 'T', 'u': 'U', 'uve': 'V', 've': 'V', 'equis': 'X',
     'ye': 'Y', 'zeta': 'Z',
+    'ceta': 'Z', 'seta': 'Z', 'ere': 'R', 'eñe': 'Ñ', 'elle': 'L',
 }
 CARDINALS = incident_dates.SPOKEN_NUMBERS
 # Document label, including "número de DNI es el …", "documento (nacional) de identidad …".
 LABEL = re.compile(
     r'\b(?:n[úu]mero\s+de\s+(?:mi\s+)?)?'
-    r'(?:dni|nie|documento(?:\s+(?:nacional\s+)?de\s+identidad|\s+de\s+identificaci[óo]n)?)\b'
+    r'(?:dni|nie|c[eé]dula(?:\s+(?:de\s+)?(?:identidad|ciudadan[ií]a))?|'
+    r'documento(?:\s+(?:nacional\s+)?de\s+identidad|\s+de\s+identificaci[óo]n)?|'
+    r'identificaci[oó]n|rut|curp|pasaporte)\b'
     r'\s*(?:(?:es|n[úu]mero)\b\s*)?(?:(?:el|la)\s+)?[:=-]?\s*', re.I)
 TOKENS = re.compile(r'[^\W_]+|[/?¿,;]', re.UNICODE)
 BUFFER_KEY = 'identity_buffer'
@@ -35,9 +38,22 @@ CORRECTION_RE = re.compile(
     r'^\W*(?:no\b|perd[oó]n\b|me\s+equivoqu[eé]\b|corrige\b|correcci[oó]n\b|'
     r'empiezo\s+de\s+nuevo\b)', re.I)
 LETTER_PAIRS = {
-    ('i', 'griega'): 'Y', ('uve', 'doble'): 'W', ('doble', 'uve'): 'W',
-    ('doble', 've'): 'W', ('be', 'larga'): 'B', ('be', 'alta'): 'B',
+    ('i', 'griega'): 'Y', ('i', 'latina'): 'I',
+    ('uve', 'doble'): 'W', ('doble', 'uve'): 'W',
+    ('doble', 've'): 'W', ('doble', 'u'): 'W',
+    ('be', 'larga'): 'B', ('be', 'alta'): 'B', ('be', 'grande'): 'B',
     ('ve', 'corta'): 'V', ('ve', 'baja'): 'V', ('uve', 'corta'): 'V',
+    ('ve', 'chica'): 'V', ('ve', 'pequena'): 'V', ('ve', 'pequeña'): 'V',
+    ('doble', 'ele'): 'L', ('doble', 'erre'): 'R',
+}
+LETTER_TRIOS = {
+    ('be', 'de', 'burro'): 'B',
+    ('be', 'de', 'bueno'): 'B',
+    ('be', 'de', 'barcelona'): 'B',
+    ('ve', 'de', 'vaca'): 'V',
+    ('ve', 'de', 'victoria'): 'V',
+    ('ve', 'de', 'valencia'): 'V',
+    ('ene', 'con', 'tilde'): 'Ñ',
 }
 LETTER_MARKER = re.compile(r'(?:(?:la\s+)?letra(?:\s+es)?|termina\s+en)\s+', re.I)
 NAME_PARTICLES = {'de', 'del', 'la', 'las', 'los', 'y', 'e'}
@@ -160,7 +176,8 @@ def _document_token(text, spoken):
     return (bool(re.fullmatch(r'\d+[a-z]?|[xyz]\d+[a-z]?', word, re.ASCII))
             or len(word) == 1 and word.isascii() and word.isalpha()
             or spoken and (word in DIGITS or word in LETTERS or word in CARDINALS
-                           or word == 'doble'))
+                           or word in ('doble', 'grande', 'chica', 'larga', 'corta', 'alta', 'baja',
+                                       'pequena', 'pequeña', 'de', 'con', 'tilde')))
 
 
 def _unrelated_numeric_suffix(text):
@@ -210,8 +227,11 @@ def _parts(text, spoken, prefix=''):
                 _fold_word(matches[i + 1].group()) not in DIGITS and
                 not re.match(r'\d', matches[i + 1].group())):
             break
+        trio = (word, _fold_word(matches[i + 1].group()), _fold_word(matches[i + 2].group())) if i + 2 < len(matches) else None
         pair = (word, _fold_word(matches[i + 1].group())) if i + 1 < len(matches) else None
-        if spoken and pair in LETTER_PAIRS:
+        if spoken and trio in LETTER_TRIOS:
+            value, consumed = LETTER_TRIOS[trio], 3
+        elif spoken and pair in LETTER_PAIRS:
             value, consumed = LETTER_PAIRS[pair], 2
         elif re.fullmatch(r'\d+[a-z]?|[xyz]\d+[a-z]?', word, re.ASCII):
             value = word.upper()
@@ -263,7 +283,9 @@ GREETING_PREFIX = re.compile(
     r'^\s*(?:(?:hola|buenas|buenos\s+d[ií]as|buenas\s+(?:tardes|noches|d[ií]as))\b[\s,.!¡]*)+', re.I)
 GIVEN_LABEL = (r'(?:(?:mi\s+)?nombre\s+y\s+apellidos?\s*(?:son\b|es\b|[:=-])?|'
                r'(?:mi\s+)?nombre(?:\s+completo)?\s*(?:es\b|[:=-])|'
-               r'(?:mi\s+)?nombre(?=\s+(?!y\b)[A-ZÁÉÍÓÚÑ])|me\s+llamo\b|soy\b)')
+               r'(?:mi\s+)?nombre(?=\s+(?!y\b)[A-ZÁÉÍÓÚÑ])|me\s+llamo\b|soy\b|'
+               r'(?:por\s+)?ac[aá](?:\s+(?:te\s+|le\s+)?habla)?\b|'
+               r'(?:te\s+|le\s+)?habla\b)')
 SURNAME_LABEL = r'(?:mis?\s+)?apellidos?\s*(?:es\b|son\b|[:=-])'
 COMBINED_NAME = re.compile(
     r'^\s*' + GIVEN_LABEL + r'\s*(?P<given>.+?)\s*(?:,\s*|\s+y\s+|\s+)(?:y\s+)?'

@@ -312,3 +312,59 @@ def test_review_and_evidence_explanation_do_not_repeat_human_offer(client):
     assert 'zyxwvut' in explain and 'no significa que esté cubierto ni excluido' in explain
     assert '¿Quieres que registre' not in explain
     assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_whatsapp_mesa_vidrio_user_query_sanitizes_citations(client, monkeypatch):
+    add_document(client, 'POL-900', 'DOC-GLASS-2', pages=(
+        'Cobertura de cristales de ventanas.',
+        'Se excluyen los tableros de mesa de vidrio y los daños por desgaste.',
+    ))
+    with client() as conn:
+        conn.execute("UPDATE insurance_document_pages SET section='coverage' "
+                     "WHERE document_id='DOC-GLASS-2' AND page_number=1")
+        conn.execute("UPDATE insurance_document_pages SET section='exclusions' "
+                     "WHERE document_id='DOC-GLASS-2' AND page_number=2")
+    verify(client, 'C2')
+
+    # LLM returns minor spacing in citation marker and leaks internal policy ID
+    monkeypatch.setattr(dialog, 'llm_explain', lambda ctx, ev:
+                        'Según la póliza POL-900, los tableros de mesa de vidrio están excluidos [p. 2].')
+
+    reply, out = say('quiero consultar la poliza si me cubre la rotura de la mesa de vidrio que tengo en la sala',
+                     1, channel='WhatsApp')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'POL-900' not in reply
+    assert 'tableros de mesa de vidrio están excluidos' in reply
+    assert_visible_sources(reply, number='900', pages=(2,))
+
+
+@pytest.mark.parametrize('command', [
+    'decimelo vos', 'dímelo tú', 'decime vos', 'revisalo vos', 'intenta de nuevo',
+])
+def test_whatsapp_retry_conversational_commands_preserves_question(client, monkeypatch, command):
+    add_document(client, 'POL-900', 'DOC-GLASS-3', pages=(
+        'Cobertura de cristales de ventanas.',
+        'Se excluyen los tableros de mesa de vidrio.',
+    ))
+    with client() as conn:
+        conn.execute("UPDATE insurance_document_pages SET section='coverage' "
+                     "WHERE document_id='DOC-GLASS-3' AND page_number=1")
+        conn.execute("UPDATE insurance_document_pages SET section='exclusions' "
+                     "WHERE document_id='DOC-GLASS-3' AND page_number=2")
+    verify(client, 'C2')
+
+    # Turn 1: simulate transient failure leaving awaiting='retry'
+    monkeypatch.setattr(dialog, 'llm_explain', lambda ctx, ev: (_ for _ in ()).throw(ValueError('transient')))
+    reply1, out1 = say('quiero consultar la poliza si me cubre la rotura de la mesa de vidrio que tengo en la sala',
+                       1, channel='WhatsApp')
+    assert out1['insurance_result'] == 'technical_error'
+    assert 'problema técnico' in reply1
+
+    # Turn 2: user says "decimelo vos" / "dímelo tú"
+    monkeypatch.setattr(dialog, 'llm_explain', lambda ctx, ev:
+                        'La póliza excluye expresamente los tableros de mesa de vidrio [p.2].')
+    reply2, out2 = say(command, 2, channel='WhatsApp')
+    assert out2['insurance_result'] == 'evidence_backed_explanation'
+    assert 'tableros de mesa de vidrio' in reply2
+    assert_visible_sources(reply2, number='900', pages=(2,))
+

@@ -8,7 +8,7 @@ STOP = set('de la el los las un una y o en que por para con del al se mi me es l
            # Conversational filler: never evidence on its own.
            'como cuando donde cual hasta desde queria quiero quisiera tengo tiene tenemos forma '
            'manera general saber poliza seguro esta este esto pero muy mas hay puede '
-           'puedo sobre favor hola buenas gracias'.split())
+           'puedo sobre favor hola buenas gracias vos tu usted ustedes dime dimelo decime decimelo'.split())
 SUPPORT = ('exclusions', 'general_conditions', 'particular')
 MAX_PAGES = 5
 MAX_FRAGMENTS_PER_PAGE = 2
