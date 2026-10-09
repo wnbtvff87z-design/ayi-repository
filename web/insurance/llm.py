@@ -148,10 +148,13 @@ def explain(question, evidence):
     timeout = _setting('INSURANCE_LLM_TIMEOUT_SECONDS', DEFAULT_TIMEOUT_SECONDS, 1, 120, float)
     max_tokens = _setting('INSURANCE_LLM_MAX_TOKENS', 512, 64, 4096, int)
     context = _context(question, evidence)
+    instructions = memory.INSTRUCTIONS
+    if isinstance(question, dict) and question.get('channel') == 'Voice':
+        instructions += ' CANAL DE VOZ: Sé extremadamente breve, conciso y directo en tu respuesta hablada. No uses más de 50 palabras en total y ve directo al punto.'
     try:
         response = _create(
             api_key, timeout, model=model, temperature=0, max_tokens=max_tokens,
-            messages=[{'role': 'system', 'content': memory.INSTRUCTIONS},
+            messages=[{'role': 'system', 'content': instructions},
                       {'role': 'user', 'content': memory.format_prompt(context)}])
         return _content(response, max_tokens * 16)
     except LLMError:
