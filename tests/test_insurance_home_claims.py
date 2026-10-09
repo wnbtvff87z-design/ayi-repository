@@ -209,3 +209,34 @@ def test_change_of_intention_handling(pg_schema):
         # If user starts a claim, but asks a question during active claim, it is evaluated.
         # Check that we preserved st['active_claim_ref'] correctly.
         assert st['active_claim_ref'] == 'SIN-2026-000001'
+
+
+def test_verification_flow_without_policies_and_with_hogar_policy(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000001"
+    
+    with pg_schema() as conn:
+        # 1. Customer with NO policies: verify that dialogue process never raises IndexError or FK error
+        identity.upsert_customer(conn, bid, cid, "Celia Zorro Condes", "51959566J")
+        
+        reply, out = dialog.process(
+            {'business_id': bid}, {}, [],
+            "mi nombre es Celia Zorro Condes y mi DNi es 51959566J",
+            "WhatsApp", "SM-101", "+34600111222"
+        )
+        assert "He verificado tus datos" in reply
+        assert "problema técnico" not in reply
+        assert out['insurance_result'] == 'missing_information'
+        
+        # 2. Add a Hogar policy
+        claims.add_customer_and_policy(conn, bid, cid, "Celia Zorro Condes", "51959566J", "POL-HOGAR-1", "hogar", "000123")
+        
+        # Fresh turn
+        reply2, out2 = dialog.process(
+            {'business_id': bid}, {}, [],
+            "mi nombre es Celia Zorro Condes y mi DNi es 51959566J",
+            "WhatsApp", "SM-102", "+34600111222"
+        )
+        assert "He verificado tus datos" in reply2
+        assert "Enviar un parte" in reply2
+        assert "problema técnico" not in reply2
