@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 import logging
 import os
@@ -434,19 +435,59 @@ def deliver_real_email(to_email, subject, body, attachments=None):
     except Exception as e:
         log.warning("Failed to write email trace to store: %s", str(e))
 
+    # Helper to load binary bytes from attachment dict (in-memory, local file, or remote URL)
+    def _resolve_attachment_bytes(att):
+        if not att or not isinstance(att, dict):
+            return None
+            
+        # 1. Direct in-memory bytes
+        if att.get('content_bytes'):
+            return att.get('content_bytes')
+            
+        # 2. Local filepath check
+        filepath = att.get('path') or att.get('filepath')
+        fname = att.get('filename') or ''
+        if not filepath and fname and not fname.startswith(('http://', 'https://')):
+            if os.path.exists(fname):
+                filepath = fname
+
+        if filepath and os.path.exists(filepath):
+            try:
+                with open(filepath, 'rb') as f:
+                    return f.read()
+            except Exception as read_err:
+                log.warning("Failed to read local file %s: %s", filepath, read_err)
+
+        # 3. URL download check (e.g. Twilio or public media URL)
+        url = att.get('url') or (fname if fname.startswith(('http://', 'https://')) else None)
+        if url:
+            try:
+                req_att = urllib.request.Request(
+                    url,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-Insurance-Bot/1.0'}
+                )
+                tw_sid = os.getenv('TWILIO_ACCOUNT_SID')
+                tw_token = os.getenv('TWILIO_AUTH_TOKEN')
+                if tw_sid and tw_token and 'twilio.com' in url:
+                    auth_str = base64.b64encode(f"{tw_sid}:{tw_token}".encode()).decode()
+                    req_att.add_header("Authorization", f"Basic {auth_str}")
+                
+                with urllib.request.urlopen(req_att, timeout=15) as att_resp:
+                    return att_resp.read()
+            except Exception as url_err:
+                log.warning("Could not download attachment from URL %s: %s", url, url_err)
+
+        return None
+
+    resend_delivered = False
+
     # 1. Option A: Deliver via Resend REST API (if RESEND_API_KEY is present)
     if resend_api_key:
         try:
             resend_attachments = []
             for att in (attachments or []):
                 filename = att.get('filename') or 'adjunto'
-                content_bytes = None
-                filepath = att.get('path') or att.get('filepath') or att.get('filename')
-                if filepath and os.path.exists(filepath):
-                    with open(filepath, 'rb') as f:
-                        content_bytes = f.read()
-                elif att.get('content_bytes'):
-                    content_bytes = att.get('content_bytes')
+                content_bytes = _resolve_attachment_bytes(att)
                 
                 if content_bytes:
                     encoded = base64.b64encode(content_bytes).decode('utf-8')
@@ -455,11 +496,14 @@ def deliver_real_email(to_email, subject, body, attachments=None):
                         "content": encoded
                     })
 
+            html_body = f"<div style='font-family: sans-serif; white-space: pre-wrap;'>{html.escape(body)}</div>"
+
             payload = {
                 "from": resend_from,
                 "to": [to_email],
                 "subject": subject,
-                "text": body
+                "text": body,
+                "html": html_body
             }
             if resend_attachments:
                 payload["attachments"] = resend_attachments
@@ -476,12 +520,26 @@ def deliver_real_email(to_email, subject, body, attachments=None):
             with urllib.request.urlopen(req, timeout=15) as resp:
                 res_data = json.loads(resp.read().decode('utf-8'))
                 log.info("Real email successfully delivered to %s via Resend API (id: %s)", to_email, res_data.get('id'))
-            return True
+                resend_delivered = True
+                return True
+        except urllib.error.HTTPError as http_err:
+            err_body = ""
+            try:
+                err_body = http_err.read().decode('utf-8')
+            except Exception:
+                pass
+            log.error(
+                "Failed to deliver real email via Resend API to %s (HTTP %s %s): %s",
+                to_email, http_err.code, http_err.reason, err_body
+            )
         except Exception as exc:
             log.error("Failed to deliver real email via Resend API to %s: %s", to_email, str(exc))
 
     # 2. Option B: Fallback to SMTP delivery
     if not smtp_host or not smtp_user or not smtp_pass:
+        if not resend_delivered and resend_api_key:
+            log.warning("Resend API attempt failed and SMTP credentials are missing. Email not delivered to %s.", to_email)
+            return False
         log.info("Neither RESEND_API_KEY nor SMTP credentials set. Email trace saved to simulated_emails.json for %s", to_email)
         return True
 
@@ -612,6 +670,11 @@ def send_human_agent_email(conn, business_id, claim, summary=None):
     subject = f"[REVISIÓN HUMANA - {claim['claim_ref']}] Siniestro {claim['claim_ref']} - {desc}"
     
     attachments = []
+    attachments.append({
+        'filename': f"claim_{claim['claim_ref']}_resumen.txt",
+        'content_bytes': summary.encode('utf-8'),
+        'mimetype': 'text/plain'
+    })
     attachments.extend(claim.get('photos', []))
     attachments.extend(claim.get('invoices', []))
     
