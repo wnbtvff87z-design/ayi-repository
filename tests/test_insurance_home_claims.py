@@ -442,3 +442,37 @@ def test_email_notifications_target_and_human_agent_email(pg_schema):
         assert "factura_pintor.pdf" in summary
 
 
+def test_resend_api_email_delivery(monkeypatch):
+    class MockResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+        def read(self):
+            return b'{"id": "msg_resend_12345"}'
+
+    captured_requests = []
+
+    def mock_urlopen(req, timeout=15):
+        captured_requests.append(req)
+        return MockResponse()
+
+    monkeypatch.setenv('RESEND_API_KEY', 're_test_123456789')
+    monkeypatch.setenv('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
+    monkeypatch.setattr('urllib.request.urlopen', mock_urlopen)
+
+    res = claims.deliver_real_email(
+        to_email="marianodanielcortina88@hotmail.com",
+        subject="[SIN-2026-00001] Test Resend",
+        body="Cuerpo de prueba con Resend API",
+        attachments=[{"filename": "foto1.jpg", "content_bytes": b"fake_image_data"}]
+    )
+
+    assert res is True
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    assert req.headers['Authorization'] == 'Bearer re_test_123456789'
+    assert req.headers['Content-type'] == 'application/json'
+
+
+
