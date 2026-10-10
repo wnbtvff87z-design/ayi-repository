@@ -346,3 +346,99 @@ def test_claim_resume_and_continuation_commands(pg_schema):
         r_cancel, _ = dialog.process({'business_id': bid}, {}, [], "cancelar parte", "WhatsApp", "SM-306", "+34600333444")
         assert "cancelado" in r_cancel.lower()
 
+
+def test_multiple_photos_and_video_attachments(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000003"
+    pid = "POL-HOGAR-003"
+    
+    # Test media validation
+    ok_photo, _ = claims.validate_media_metadata("foto1.jpg", "image/jpeg", 1024 * 500)
+    assert ok_photo is True
+    
+    ok_video, _ = claims.validate_media_metadata("video_daño.mp4", "video/mp4", 1024 * 1024 * 12)
+    assert ok_video is True
+    
+    bad_video, err_video = claims.validate_media_metadata("video_largo.mp4", "video/mp4", 1024 * 1024 * 30)
+    assert bad_video is False
+    assert "25 MB" in err_video
+    
+    analysis_vid = claims.analyze_media_with_llm("video_daño.mp4", "video/mp4", 1024 * 1024 * 12, "Fuga de agua")
+    assert analysis_vid['valid'] is True
+    assert analysis_vid['media_type'] == 'video'
+
+    with pg_schema() as conn:
+        identity.upsert_customer(conn, bid, cid, "Maria Lopez", "99887766B")
+        claims.add_customer_and_policy(conn, bid, cid, "Maria Lopez", "99887766B", pid, "hogar", "998877")
+        
+        dialog.process({'business_id': bid}, {}, [], "mi nombre es Maria Lopez y DNI 99887766B", "WhatsApp", "SM-401", "+34600999888")
+        dialog.process({'business_id': bid}, {}, [], "enviar parte", "WhatsApp", "SM-402", "+34600999888")
+        dialog.process({'business_id': bid}, {}, [], "se ha roto la ventana de la cocina por el viento", "WhatsApp", "SM-403", "+34600999888")
+        
+        # Send multiple media files (2 photos and 1 video) in WhatsApp turn
+        media_files = [
+            {'filename': 'foto_ventana_1.jpg', 'content_type': 'image/jpeg', 'url': 'http://example.com/f1.jpg', 'size_bytes': 1024 * 100},
+            {'filename': 'foto_ventana_2.png', 'content_type': 'image/png', 'url': 'http://example.com/f2.png', 'size_bytes': 1024 * 120},
+            {'filename': 'video_ventana.mp4', 'content_type': 'video/mp4', 'url': 'http://example.com/v1.mp4', 'size_bytes': 1024 * 1024 * 5}
+        ]
+        
+        r_media, _ = dialog.process(
+            {'business_id': bid}, {}, [],
+            "aqui van las fotos y el video",
+            "WhatsApp", "SM-404", "+34600999888", media_list=media_files
+        )
+        assert "2 foto(s) y 1 vídeo(s)" in r_media or "recibido" in r_media.lower()
+        
+        claims_list = claims.list_customer_claims(conn, bid, cid)
+        claim_ref = claims_list[0]['claim_ref']
+        c = claims.get_claim(conn, bid, claim_ref)
+        
+        assert len(c['photos']) == 3
+        types = [p['mimetype'] for p in c['photos']]
+        assert 'video/mp4' in types
+        assert 'image/jpeg' in types
+
+
+def test_email_notifications_target_and_human_agent_email(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000004"
+    pid = "POL-HOGAR-004"
+    
+    with pg_schema() as conn:
+        claims.add_customer_and_policy(conn, bid, cid, "Carlos Gomez", "11112222C", pid, "hogar", "4444")
+        cuuid, cref = claims.create_claim(conn, bid, cid, pid, "V1", "WhatsApp", "Mancha de humedad en techo de salon")
+        
+        interp = {"incident_type": "pintura", "description": "Mancha de humedad en techo de salon"}
+        eval_res = {
+            "status": claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            "explanation": "Daños estéticos y pintura cubiertos.",
+            "service_type": "pintura",
+            "reimbursement_applicable": True
+        }
+        photos = [
+            {"filename": "techo_mancha.jpg", "mimetype": "image/jpeg", "size_bytes": 50000},
+            {"filename": "video_techo.mp4", "mimetype": "video/mp4", "size_bytes": 2000000}
+        ]
+        invoices = [
+            {"filename": "factura_pintor.pdf", "mimetype": "application/pdf", "extracted_fields": {"provider": "Pintores S.L.", "amount": 200}}
+        ]
+        
+        claims.update_claim(conn, cuuid, structured_interpretation=interp, coverage_evaluation=eval_res, photos=photos, invoices=invoices)
+        claim = claims.get_claim(conn, bid, cuuid)
+        
+        # Test service notification email delivery
+        sent_prof = claims.send_service_notification_email(conn, bid, claim)
+        assert sent_prof is True
+        
+        updated_claim = claims.get_claim(conn, bid, cuuid)
+        assert updated_claim['service_notified'] is True
+        assert updated_claim['service_notification_details']['sent_to'] == claims.DEFAULT_TARGET_EMAIL
+        
+        # Test human summary and agent email delivery
+        summary = claims.save_human_summary(conn, bid, updated_claim)
+        assert "RESUMEN DE SINIESTRO DE HOGAR" in summary
+        assert "EVIDENCIAS MULTIMEDIA (FOTOS Y VÍDEOS)" in summary
+        assert "Vídeo 2: video_techo.mp4" in summary
+        assert "factura_pintor.pdf" in summary
+
+
