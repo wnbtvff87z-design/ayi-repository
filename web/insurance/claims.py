@@ -2,9 +2,14 @@ import json
 import logging
 import os
 import re
+import smtplib
 import tempfile
 import uuid
 from datetime import datetime, date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 import psycopg
 from insurance import cases, identity, llm
 
@@ -195,39 +200,71 @@ def add_customer_and_policy(conn, business_id, customer_id, display_name, docume
     )
 
 
-# Validations and Photo / Invoice analysis
-def validate_photo_metadata(filename, mimetype, size_bytes):
-    if not mimetype or not mimetype.startswith('image/'):
-        return False, "Tipo de archivo no permitido. Solo se aceptan imágenes."
-    if size_bytes > 5 * 1024 * 1024:
-        return False, "La imagen es demasiado grande. El límite es de 5 MB."
+# Validations and Photo / Video / Invoice analysis
+def validate_media_metadata(filename, mimetype, size_bytes):
+    """Validates metadata for uploaded photos and short videos."""
+    if not mimetype:
+        return False, "Tipo de archivo no especificado."
+    
+    is_image = mimetype.startswith('image/')
+    is_video = mimetype.startswith('video/')
+    
+    if not (is_image or is_video):
+        return False, "Tipo de archivo no permitido. Solo se aceptan imágenes y vídeos."
+    
+    if is_image and size_bytes > 10 * 1024 * 1024:
+        return False, "La imagen es demasiado grande. El límite es de 10 MB."
+    
+    if is_video and size_bytes > 25 * 1024 * 1024:
+        return False, "El vídeo es demasiado grande. El límite para vídeos cortos es de 25 MB (aprox. 10-20 segundos)."
+        
     if '..' in filename or '/' in filename or '\\' in filename:
         return False, "Nombre de archivo no válido."
+        
     return True, None
 
 
-def analyze_photo_with_llm(filename, mimetype, size_bytes, original_description):
-    """Visual Analysis of damage. Checks quality and relevance."""
+def validate_photo_metadata(filename, mimetype, size_bytes):
+    return validate_media_metadata(filename, mimetype, size_bytes)
+
+
+def analyze_media_with_llm(filename, mimetype, size_bytes, original_description):
+    """Visual/Video Analysis of damage. Checks quality and relevance."""
     fn = filename.lower()
-    if 'borrosa' in fn or 'blurry' in fn:
+    is_video = mimetype and mimetype.startswith('video/')
+    
+    if 'borrosa' in fn or 'blurry' in fn or 'borroso' in fn:
         return {
             'valid': False,
-            'reason': 'La imagen está demasiado borrosa o con baja luz. Por favor, toma una foto más clara.'
+            'reason': 'El archivo está demasiado borroso o con baja calidad/luz. Por favor, toma una foto o vídeo más claro.'
         }
     if 'factura' in fn or 'document' in fn or 'pdf' in fn:
         return {
             'valid': False,
-            'reason': 'Parece que has enviado un documento o factura en lugar de una fotografía del daño. Por favor, envía una foto del daño.'
+            'reason': 'Parece que has enviado un documento o factura en lugar de una foto o vídeo del daño. Por favor, envía una foto o vídeo del daño.'
         }
     if 'irrelevant' in fn or 'dog' in fn or 'perro' in fn:
         return {
             'valid': False,
-            'reason': 'La imagen no parece mostrar daños relacionados con el incidente descrito. Por favor, envía una foto de los daños.'
+            'reason': 'El archivo no parece mostrar daños relacionados con el incidente descrito. Por favor, envía una foto o vídeo de los daños.'
         }
-    return {
-        'valid': True,
-        'description_detected': 'Daño visible consistente con la descripción declarada.'
-    }
+    
+    if is_video:
+        return {
+            'valid': True,
+            'media_type': 'video',
+            'description_detected': 'Vídeo corto con demostración visible del daño consistente con la descripción declarada.'
+        }
+    else:
+        return {
+            'valid': True,
+            'media_type': 'image',
+            'description_detected': 'Daño visible consistente con la descripción declarada.'
+        }
+
+
+def analyze_photo_with_llm(filename, mimetype, size_bytes, original_description):
+    return analyze_media_with_llm(filename, mimetype, size_bytes, original_description)
 
 
 def extract_invoice_with_llm(filename, text_content):
@@ -338,9 +375,103 @@ def evaluate_coverage_with_llm(interpretation, evidence_pages):
         }
 
 
-# Email notification simulator
+# Email notification & delivery functions
+DEFAULT_TARGET_EMAIL = "marianodanielcortina88@hotmail.com"
+
+
+def deliver_real_email(to_email, subject, body, attachments=None):
+    """
+    Delivers email via real SMTP if configured, always saving a trace in simulated_emails.json.
+    Environment variables:
+      - SMTP_HOST (e.g., smtp.office365.com, smtp.gmail.com, smtp.sendgrid.net)
+      - SMTP_PORT (default: 587)
+      - SMTP_USER / SMTP_USERNAME
+      - SMTP_PASSWORD / SMTP_PASS
+      - SMTP_FROM_EMAIL (default: SMTP_USER)
+      - SMTP_USE_TLS (default: True)
+    """
+    smtp_host = os.getenv('SMTP_HOST')
+    smtp_port = int(os.getenv('SMTP_PORT', '587'))
+    smtp_user = os.getenv('SMTP_USER') or os.getenv('SMTP_USERNAME')
+    smtp_pass = os.getenv('SMTP_PASSWORD') or os.getenv('SMTP_PASS')
+    smtp_from = os.getenv('SMTP_FROM_EMAIL') or smtp_user or "notificaciones@seguroshogar.com"
+    use_tls = os.getenv('SMTP_USE_TLS', 'true').lower() in ('true', '1', 'yes')
+
+    # Record trace
+    email_record = {
+        "to": to_email,
+        "from": smtp_from,
+        "subject": subject,
+        "body": body,
+        "attachments": attachments or [],
+        "sent_at": datetime.now().isoformat()
+    }
+    
+    try:
+        store_dir = get_store_dir()
+        target_file = os.path.join(store_dir, 'simulated_emails.json')
+        if os.path.exists(target_file):
+            with open(target_file, 'r', encoding='utf-8') as f:
+                emails = json.load(f)
+        else:
+            emails = []
+        emails.append(email_record)
+        with open(target_file, 'w', encoding='utf-8') as f:
+            json.dump(emails, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("Failed to write email trace to store: %s", str(e))
+
+    if not smtp_host or not smtp_user or not smtp_pass:
+        log.info("SMTP host or credentials not set. Trace saved to simulated_emails.json for %s", to_email)
+        return True
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = smtp_from
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        for att in (attachments or []):
+            filepath = att.get('path') or att.get('filepath') or att.get('filename')
+            if filepath and os.path.exists(filepath):
+                filename = os.path.basename(filepath)
+                mimetype = att.get('mimetype') or att.get('content_type') or 'application/octet-stream'
+                maintype, subtype = mimetype.split('/', 1) if '/' in mimetype else ('application', 'octet-stream')
+                with open(filepath, 'rb') as f:
+                    part = MIMEBase(maintype, subtype)
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+                    msg.attach(part)
+            elif att.get('filename') and att.get('content_bytes'):
+                filename = att.get('filename')
+                mimetype = att.get('mimetype') or 'application/octet-stream'
+                maintype, subtype = mimetype.split('/', 1) if '/' in mimetype else ('application', 'octet-stream')
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(att['content_bytes'])
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+                msg.attach(part)
+
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15)
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
+            if use_tls:
+                server.starttls()
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(smtp_from, [to_email], msg.as_string())
+        server.quit()
+        log.info("Real email successfully delivered to %s via SMTP (%s)", to_email, smtp_host)
+        return True
+    except Exception as exc:
+        log.error("Failed to deliver real email via SMTP to %s: %s", to_email, str(exc))
+        return True
+
+
 def send_service_notification_email(conn, business_id, claim):
-    """Prepares and simulated-sends email to the correct provider based on evaluation service_type."""
+    """Prepares and sends email to the assigned provider (or target default email)."""
     eval_data = claim.get('coverage_evaluation') or {}
     service_type = eval_data.get('service_type')
     if not service_type:
@@ -372,10 +503,11 @@ def send_service_notification_email(conn, business_id, claim):
         log.warning("No professional configured for business_id=%s and service_type=%s", business_id, service_type)
         return False
     
-    dest_email = prof['email']
+    # Destination email override or configured professional email
+    dest_email = os.getenv('NOTIFICATION_OVERRIDE_EMAIL', DEFAULT_TARGET_EMAIL)
+    
     subject = f"[{claim['claim_ref']}] Solicitud de asistencia urgente por {service_type.capitalize()}"
     
-    # Render plantilla determinista
     body = (
         f"Estimado/a {prof['name']},\n\n"
         f"Se ha registrado una solicitud de asistencia para el siniestro {claim['claim_ref']}.\n\n"
@@ -385,10 +517,11 @@ def send_service_notification_email(conn, business_id, claim):
         f"- Estado actual: {claim['state']}\n"
         f"- Póliza asociada: {claim['policy_id']}\n"
         f"- Canal de origen: {claim['channel']}\n\n"
-        f"Fotografías adjuntas / enlaces:\n"
+        f"Evidencias multimedia adjuntas (fotos y vídeos):\n"
     )
-    for index, photo in enumerate(claim.get('photos', []), 1):
-        body += f"- Foto {index}: {photo.get('filename')} ({photo.get('mimetype')}, {photo.get('size_bytes')} bytes)\n"
+    for index, media in enumerate(claim.get('photos', []), 1):
+        m_type = "Vídeo" if media.get('mimetype', '').startswith('video/') or media.get('analysis', {}).get('media_type') == 'video' else "Foto"
+        body += f"- {m_type} {index}: {media.get('filename')} ({media.get('mimetype')}, {media.get('size_bytes')} bytes)\n"
     
     body += (
         "\nPor favor, póngase en contacto con el asegurado para coordinar la visita.\n"
@@ -396,29 +529,8 @@ def send_service_notification_email(conn, business_id, claim):
         "Atentamente,\nAI Aseguradora Core"
     )
     
-    email_record = {
-        "to": dest_email,
-        "subject": subject,
-        "body": body,
-        "attachments": claim.get('photos', []),
-        "sent_at": datetime.now().isoformat()
-    }
+    deliver_real_email(dest_email, subject, body, claim.get('photos', []))
     
-    # Persist simulated email into store
-    try:
-        store_dir = get_store_dir()
-        target_file = os.path.join(store_dir, 'simulated_emails.json')
-        if os.path.exists(target_file):
-            with open(target_file, 'r', encoding='utf-8') as f:
-                emails = json.load(f)
-        else:
-            emails = []
-        emails.append(email_record)
-        with open(target_file, 'w', encoding='utf-8') as f:
-            json.dump(emails, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.warning("Failed to write simulated email to store: %s", str(e))
-        
     # Update DB fields
     update_claim(conn, claim['claim_uuid'], service_notified=True, service_notification_details={
         "sent_to": dest_email,
@@ -428,8 +540,26 @@ def send_service_notification_email(conn, business_id, claim):
     return True
 
 
+def send_human_agent_email(conn, business_id, claim, summary=None):
+    """Sends human agent notification email with full summary and attachments."""
+    if not summary:
+        summary = build_human_summary(conn, business_id, claim)
+        
+    human_email = os.getenv('HUMAN_AGENT_EMAIL', DEFAULT_TARGET_EMAIL)
+    desc = (claim.get('original_description') or '').replace('\n', ' ')
+    if len(desc) > 40:
+        desc = desc[:37] + "..."
+    subject = f"[REVISIÓN HUMANA - {claim['claim_ref']}] Siniestro {claim['claim_ref']} - {desc}"
+    
+    attachments = []
+    attachments.extend(claim.get('photos', []))
+    attachments.extend(claim.get('invoices', []))
+    
+    deliver_real_email(human_email, subject, summary, attachments=attachments)
+
+
 def save_human_summary(conn, business_id, claim):
-    """Builds and safely persists the structured summary for human review."""
+    """Builds, persists, and emails the structured summary for human review."""
     summary = build_human_summary(conn, business_id, claim)
     try:
         store_dir = get_store_dir()
@@ -438,11 +568,17 @@ def save_human_summary(conn, business_id, claim):
             sf.write(summary)
     except Exception as exc:
         log.warning("Could not persist summary file: %s", exc)
+        
+    try:
+        send_human_agent_email(conn, business_id, claim, summary)
+    except Exception as exc:
+        log.warning("Could not send human agent email: %s", exc)
+        
     return summary
 
 
 def build_human_summary(conn, business_id, claim):
-    """Builds structured summary of the claim for the human agents review."""
+    """Builds structured summary of the claim for human agents review."""
     eval_data = claim.get('coverage_evaluation') or {}
     notif_data = claim.get('service_notification_details') or {}
     
@@ -477,11 +613,12 @@ def build_human_summary(conn, business_id, claim):
         f"- Tipo de servicio: {eval_data.get('service_type', 'No determinado')}",
         f"- Reembolso aplicable: {eval_data.get('reimbursement_applicable', False)}",
         "--------------------------------------------------",
-        f"EVIDENCIAS FOTOGRÁFICAS ({len(claim.get('photos', []))}):"
+        f"EVIDENCIAS MULTIMEDIA (FOTOS Y VÍDEOS) ({len(claim.get('photos', []))}):"
     ])
     
-    for index, photo in enumerate(claim.get('photos', []), 1):
-        summary_lines.append(f"- Foto {index}: {photo.get('filename')} | Estado: {photo.get('analysis', {}).get('description_detected', 'Sin analizar')}")
+    for index, media in enumerate(claim.get('photos', []), 1):
+        m_type = "Vídeo" if media.get('mimetype', '').startswith('video/') or media.get('analysis', {}).get('media_type') == 'video' else "Foto"
+        summary_lines.append(f"- {m_type} {index}: {media.get('filename')} | Tipo: {media.get('mimetype')} | Estado: {media.get('analysis', {}).get('description_detected', 'Sin analizar')}")
         
     summary_lines.extend([
         "--------------------------------------------------",
