@@ -523,7 +523,8 @@ def deliver_real_email(to_email, subject, body, attachments=None):
                 data=json.dumps(payload).encode('utf-8'),
                 headers={
                     "Authorization": f"Bearer {resend_api_key}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-Insurance-Bot/1.0"
                 },
                 method="POST"
             )
