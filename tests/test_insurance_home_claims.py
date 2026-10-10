@@ -475,4 +475,52 @@ def test_resend_api_email_delivery(monkeypatch):
     assert req.headers['Content-type'] == 'application/json'
 
 
+def test_resend_api_url_attachment_download(monkeypatch):
+    class MockResponse:
+        def __init__(self, data):
+            self._data = data
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+        def read(self):
+            return self._data
+
+    captured_requests = []
+
+    def mock_urlopen(req, timeout=15):
+        captured_requests.append(req)
+        if isinstance(req, str):
+            url = req
+        else:
+            url = req.full_url
+            
+        if "api.resend.com" in url:
+            return MockResponse(b'{"id": "msg_resend_999"}')
+        else:
+            return MockResponse(b"downloaded_image_bytes")
+
+    monkeypatch.setenv('RESEND_API_KEY', 're_test_999')
+    monkeypatch.setenv('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
+    monkeypatch.setattr('urllib.request.urlopen', mock_urlopen)
+
+    res = claims.deliver_real_email(
+        to_email="marianodanielcortina88@hotmail.com",
+        subject="[SIN-2026-00002] Test URL Attachment",
+        body="Prueba adjunto desde URL",
+        attachments=[{"filename": "media_0.jpg", "url": "https://api.twilio.com/2010-04-01/Accounts/AC123/Media/ME123"}]
+    )
+
+    assert res is True
+    assert len(captured_requests) == 2
+    # First call: downloaded image from URL
+    # Second call: posted payload with base64 encoded image content to Resend
+    resend_req = [r for r in captured_requests if getattr(r, 'full_url', '').startswith("https://api.resend.com")][0]
+    payload = json.loads(resend_req.data.decode('utf-8'))
+    assert len(payload['attachments']) == 1
+    assert payload['attachments'][0]['filename'] == 'media_0.jpg'
+    assert base64.b64decode(payload['attachments'][0]['content']) == b"downloaded_image_bytes"
+
+
+
 
