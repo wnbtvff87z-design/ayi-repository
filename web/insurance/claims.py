@@ -1,9 +1,11 @@
+import base64
 import json
 import logging
 import os
 import re
 import smtplib
 import tempfile
+import urllib.request
 import uuid
 from datetime import datetime, date
 from email.mime.multipart import MIMEMultipart
@@ -381,15 +383,24 @@ DEFAULT_TARGET_EMAIL = "marianodanielcortina88@hotmail.com"
 
 def deliver_real_email(to_email, subject, body, attachments=None):
     """
-    Delivers email via real SMTP if configured, always saving a trace in simulated_emails.json.
-    Environment variables:
-      - SMTP_HOST (e.g., smtp.office365.com, smtp.gmail.com, smtp.sendgrid.net)
+    Delivers email via Resend API (if RESEND_API_KEY is set) or standard SMTP,
+    always saving a trace in simulated_emails.json.
+    
+    Environment variables for Resend API (Recommended):
+      - RESEND_API_KEY (e.g. re_123456789)
+      - RESEND_FROM_EMAIL (default: onboarding@resend.dev or SMTP_FROM_EMAIL)
+      
+    Environment variables for SMTP:
+      - SMTP_HOST (e.g., smtp.resend.com, smtp.office365.com, smtp.gmail.com)
       - SMTP_PORT (default: 587)
       - SMTP_USER / SMTP_USERNAME
       - SMTP_PASSWORD / SMTP_PASS
       - SMTP_FROM_EMAIL (default: SMTP_USER)
       - SMTP_USE_TLS (default: True)
     """
+    resend_api_key = os.getenv('RESEND_API_KEY')
+    resend_from = os.getenv('RESEND_FROM_EMAIL') or os.getenv('SMTP_FROM_EMAIL') or "onboarding@resend.dev"
+
     smtp_host = os.getenv('SMTP_HOST')
     smtp_port = int(os.getenv('SMTP_PORT', '587'))
     smtp_user = os.getenv('SMTP_USER') or os.getenv('SMTP_USERNAME')
@@ -397,10 +408,12 @@ def deliver_real_email(to_email, subject, body, attachments=None):
     smtp_from = os.getenv('SMTP_FROM_EMAIL') or smtp_user or "notificaciones@seguroshogar.com"
     use_tls = os.getenv('SMTP_USE_TLS', 'true').lower() in ('true', '1', 'yes')
 
+    from_addr = resend_from if resend_api_key else smtp_from
+
     # Record trace
     email_record = {
         "to": to_email,
-        "from": smtp_from,
+        "from": from_addr,
         "subject": subject,
         "body": body,
         "attachments": attachments or [],
@@ -421,8 +434,55 @@ def deliver_real_email(to_email, subject, body, attachments=None):
     except Exception as e:
         log.warning("Failed to write email trace to store: %s", str(e))
 
+    # 1. Option A: Deliver via Resend REST API (if RESEND_API_KEY is present)
+    if resend_api_key:
+        try:
+            resend_attachments = []
+            for att in (attachments or []):
+                filename = att.get('filename') or 'adjunto'
+                content_bytes = None
+                filepath = att.get('path') or att.get('filepath') or att.get('filename')
+                if filepath and os.path.exists(filepath):
+                    with open(filepath, 'rb') as f:
+                        content_bytes = f.read()
+                elif att.get('content_bytes'):
+                    content_bytes = att.get('content_bytes')
+                
+                if content_bytes:
+                    encoded = base64.b64encode(content_bytes).decode('utf-8')
+                    resend_attachments.append({
+                        "filename": filename,
+                        "content": encoded
+                    })
+
+            payload = {
+                "from": resend_from,
+                "to": [to_email],
+                "subject": subject,
+                "text": body
+            }
+            if resend_attachments:
+                payload["attachments"] = resend_attachments
+
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=json.dumps(payload).encode('utf-8'),
+                headers={
+                    "Authorization": f"Bearer {resend_api_key}",
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res_data = json.loads(resp.read().decode('utf-8'))
+                log.info("Real email successfully delivered to %s via Resend API (id: %s)", to_email, res_data.get('id'))
+            return True
+        except Exception as exc:
+            log.error("Failed to deliver real email via Resend API to %s: %s", to_email, str(exc))
+
+    # 2. Option B: Fallback to SMTP delivery
     if not smtp_host or not smtp_user or not smtp_pass:
-        log.info("SMTP host or credentials not set. Trace saved to simulated_emails.json for %s", to_email)
+        log.info("Neither RESEND_API_KEY nor SMTP credentials set. Email trace saved to simulated_emails.json for %s", to_email)
         return True
 
     try:
