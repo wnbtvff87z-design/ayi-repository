@@ -878,6 +878,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, '')
                     st['active_claim_ref'] = claim_ref
                     st['awaiting'] = 'claim'
+                    is_query = False
                     reply = "Cuéntame qué ha ocurrido en tu hogar." if channel == 'Voice' else (
                         "Has iniciado la declaración de un parte de hogar.\n"
                         "Por favor, cuéntame qué ha ocurrido (qué se ha dañado, cuándo ocurrió y en qué parte de la casa)."
@@ -885,163 +886,201 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                 if st.get('active_claim_ref'):
-                    folded_incoming = references.fold(incoming).strip(' .?!¿¡')
-                    if folded_incoming in ('cancelar', 'salir', 'reiniciar', 'volver', 'cancelar parte'):
+                    from insurance import claims
+                    claim = claims.get_claim(conn, bid, st['active_claim_ref'])
+                    if not claim:
                         st.pop('active_claim_ref', None)
                         st.pop('awaiting', None)
-                        return finish("Entendido. He cancelado el proceso de declaración de parte. Volvemos al inicio. ¿Qué deseas hacer?",
-                                      {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                    
-                    if is_query:
-                        pass
                     else:
-                        from insurance import claims
-                        claim = claims.get_claim(conn, bid, st['active_claim_ref'])
-                        if not claim:
+                        claim_state = claim['state']
+                        claim_ref = claim['claim_ref']
+
+                        if claim_state in (claims.ClaimState.CLOSED, claims.ClaimState.APPROVED, claims.ClaimState.REJECTED):
                             st.pop('active_claim_ref', None)
+                            st.pop('awaiting', None)
                         else:
-                            claim_state = claim['state']
-                            claim_ref = claim['claim_ref']
-                            
-                            if claim_state == claims.ClaimState.INFORMATION_GATHERING:
-                                desc = claim.get('original_description') or ""
-                                if incoming:
-                                    desc = f"{desc} {incoming}".strip()
-                                
-                                interp = claims.interpret_incident_with_llm(desc)
-                                claims.update_claim(conn, claim['claim_uuid'], original_description=desc, structured_interpretation=interp)
-                                
-                                missing = interp.get('missing_info')
-                                if missing and len(desc.split()) < 15:
-                                    return finish(missing, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                
-                                result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=claim['policy_id'])
-                                if result['status'] == 'no_policy' or not result.get('policy_id'):
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                    return finish(
-                                        f"No he podido acceder a las cláusulas de tu póliza. He registrado tu parte con referencia {claim_ref} para que nuestro equipo lo evalúe manualmente. Nos pondremos en contacto contigo.",
-                                        {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
+                            folded_incoming = references.fold(incoming).strip(' .?!¿¡')
+                            is_cancellation = folded_incoming in (
+                                'cancelar', 'salir', 'reiniciar', 'volver', 'cancelar parte',
+                                'no quiero seguir', 'no quiero continuar', 'anular', 'anular parte'
+                            ) or bool(re.search(r'\b(?:cancelar|anular)\s*(?:el\s*)?(?:parte|siniestro)\b', folded_incoming))
+
+                            if is_cancellation:
+                                st.pop('active_claim_ref', None)
+                                st.pop('awaiting', None)
+                                is_query = False
+                                return finish(
+                                    "Entendido. He cancelado el proceso de declaración de parte. Volvemos al inicio. ¿Qué deseas hacer?",
+                                    {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                )
+
+                            is_resume = bool(re.search(
+                                r'\b(?:seguir|continuar|continuamos|adelante|proseguir|retomar|'
+                                r'al parte|volver al parte|al parte q quiero enviar|al parte que quiero enviar|'
+                                r'continuar con el parte|seguir con el parte)\b',
+                                folded_incoming
+                            )) or folded_incoming in ('si', 'sí', 'vale', 'de acuerdo', 'ok', 'seguir', 'continuar')
+
+                            is_incidental = _is_claim_incidental_query(incoming, claim_state)
+
+                            if is_incidental:
+                                # Incidental question allowed to flow to policy consultation
+                                pass
+                            else:
+                                is_query = False
+
+                                if claim_state == claims.ClaimState.INFORMATION_GATHERING:
+                                    desc = claim.get('original_description') or ""
+                                    is_pure_resume = folded_incoming in (
+                                        'seguir', 'continuar', 'continuamos', 'adelante', 'proseguir',
+                                        'al parte', 'al parte q quiero enviar', 'al parte que quiero enviar',
+                                        'si', 'sí', 'vale', 'de acuerdo', 'ok'
                                     )
-                                
-                                evidence = result.get('evidence', [])
-                                eval_res = claims.evaluate_coverage_with_llm(interp, evidence)
-                                claims.update_claim(conn, claim['claim_uuid'], coverage_evaluation=eval_res)
-                                
-                                status = eval_res.get('status')
-                                service_type = eval_res.get('service_type')
-                                
-                                if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
-                                    explanation = eval_res.get('explanation', '')
-                                    explanation = _sanitize_llm_explanation(explanation, evidence, claim['policy_id'], claim.get('policy_version_id'), claim['policy_id'])
-                                    
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
-                                    reply = (
-                                        f"He verificado tu póliza. El incidente está cubierto / potencialmente cubierto por la garantía de {service_type or 'asistencia'}.\n"
-                                        f"Explicación contractual: {explanation}\n\n"
-                                        f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías de los daños."
-                                    )
-                                    if channel == 'Voice':
+                                    if incoming and not is_pure_resume:
+                                        desc = f"{desc} {incoming}".strip()
+
+                                    if not desc:
                                         reply = (
-                                            f"He verificado tu póliza y tu incidente de {service_type or 'asistencia'} parece cubierto. "
-                                            f"He registrado tu parte con referencia {claim_ref}. "
-                                            f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos de los daños por ahí."
+                                            f"Continuamos con tu declaración de parte {claim_ref}. "
+                                            "Cuéntame qué ha ocurrido en tu hogar." if channel == 'Voice' else
+                                            f"Continuamos con tu declaración de parte {claim_ref}.\n"
+                                            "Por favor, cuéntame qué ha ocurrido (qué se ha dañado, cuándo ocurrió y en qué parte de la casa)."
                                         )
-                                        log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
-                                    return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                else:
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                    reply = (
-                                        f"No he encontrado una cobertura explícita en tu póliza para estos daños o requiere de revisión de un agente.\n"
-                                        f"He registrado el siniestro con la referencia {claim_ref} para que nuestro equipo humano lo revise detenidamente. Nos pondremos en contacto contigo lo antes posible."
-                                    )
-                                    return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
-                            
-                            elif claim_state == claims.ClaimState.PHOTOS_REQUESTED:
-                                if media_list:
-                                    photos_added = []
-                                    for media in media_list:
-                                        ok, err = claims.validate_photo_metadata(media['filename'], media['content_type'], 1024 * 50)
-                                        if not ok:
-                                            return finish(f"Error al procesar la foto: {err}", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                        analysis = claims.analyze_photo_with_llm(media['filename'], media['content_type'], 1024 * 50, claim['original_description'])
-                                        if not analysis['valid']:
-                                            return finish(analysis['reason'], {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                        photos_added.append({
-                                            'filename': media['filename'],
-                                            'mimetype': media['content_type'],
-                                            'size_bytes': 1024 * 50,
-                                            'url': media['url'],
-                                            'analysis': analysis
-                                        })
-                                    current_photos = claim.get('photos') or []
-                                    current_photos.extend(photos_added)
-                                    claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, state=claims.ClaimState.INVOICE_REQUESTED)
-                                    return finish(
-                                        f"He recibido {len(photos_added)} foto(s) correctamente.\n"
-                                        f"¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
-                                        {'insurance_result': ResultKind.MISSING_INFORMATION.value}
-                                    )
-                                else:
-                                    if folded_incoming in ('no', 'no tengo', 'no tengo fotos', 'no puedo'):
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
+                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+
+                                    interp = claims.interpret_incident_with_llm(desc)
+                                    claims.update_claim(conn, claim['claim_uuid'], original_description=desc, structured_interpretation=interp)
+
+                                    missing = interp.get('missing_info')
+                                    if missing and len(desc.split()) < 7 and not is_resume:
+                                        return finish(missing, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+
+                                    result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=claim['policy_id'])
+                                    if result['status'] == 'no_policy' or not result.get('policy_id'):
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
                                         return finish(
-                                            "De acuerdo, continuamos sin fotos. ¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
+                                            f"No he podido acceder a las cláusulas de tu póliza. He registrado tu parte con referencia {claim_ref} para que nuestro equipo lo evalúe manualmente. Nos pondremos en contacto contigo.",
+                                            {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
+                                        )
+
+                                    evidence = result.get('evidence', [])
+                                    eval_res = claims.evaluate_coverage_with_llm(interp, evidence)
+                                    claims.update_claim(conn, claim['claim_uuid'], coverage_evaluation=eval_res)
+
+                                    status = eval_res.get('status')
+                                    service_type = eval_res.get('service_type')
+
+                                    if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
+                                        explanation = eval_res.get('explanation', '')
+                                        explanation = _sanitize_llm_explanation(explanation, evidence, claim['policy_id'], claim.get('policy_version_id'), claim['policy_id'])
+
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
+                                        reply = (
+                                            f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
+                                            f"Explicación contractual: {explanation}\n\n"
+                                            f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías de los daños."
+                                        )
+                                        if channel == 'Voice':
+                                            reply = (
+                                                f"He verificado tu póliza y tu incidente de {service_type or 'asistencia'} parece cubierto. "
+                                                f"He registrado tu parte con referencia {claim_ref}. "
+                                                f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos de los daños por ahí."
+                                            )
+                                            log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
+                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                    else:
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                        reply = (
+                                            f"No he encontrado una cobertura explícita en tu póliza para estos daños o requiere de revisión de un agente.\n"
+                                            f"He registrado el siniestro con la referencia {claim_ref} para que nuestro equipo humano lo revise detenidamente. Nos pondremos en contacto contigo lo antes posible."
+                                        )
+                                        return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
+
+                                elif claim_state == claims.ClaimState.PHOTOS_REQUESTED:
+                                    if media_list:
+                                        photos_added = []
+                                        for media in media_list:
+                                            ok, err = claims.validate_photo_metadata(media['filename'], media['content_type'], 1024 * 50)
+                                            if not ok:
+                                                return finish(f"Error al procesar la foto: {err}", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                            analysis = claims.analyze_photo_with_llm(media['filename'], media['content_type'], 1024 * 50, claim.get('original_description', ''))
+                                            if not analysis['valid']:
+                                                return finish(analysis['reason'], {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                            photos_added.append({
+                                                'filename': media['filename'],
+                                                'mimetype': media['content_type'],
+                                                'size_bytes': 1024 * 50,
+                                                'url': media['url'],
+                                                'analysis': analysis
+                                            })
+                                        current_photos = claim.get('photos') or []
+                                        current_photos.extend(photos_added)
+                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, state=claims.ClaimState.INVOICE_REQUESTED)
+                                        return finish(
+                                            f"He recibido {len(photos_added)} foto(s) correctamente.\n"
+                                            f"¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
                                             {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                                         )
                                     else:
-                                        return finish(
-                                            "Por favor, envíame las fotos de los daños para poder valorar el siniestro, o indica 'no tengo' para continuar.",
-                                            {'insurance_result': ResultKind.MISSING_INFORMATION.value}
-                                        )
-                            
-                            elif claim_state == claims.ClaimState.INVOICE_REQUESTED:
-                                if media_list:
-                                    invoice_media = media_list[0]
-                                    ext_fields = claims.extract_invoice_with_llm(invoice_media['filename'], "Factura por servicios de reparación de fontanería, importe 150 EUR, IVA incluido.")
-                                    invoice_record = {
-                                        'filename': invoice_media['filename'],
-                                        'mimetype': invoice_media['content_type'],
-                                        'extracted_fields': ext_fields
-                                    }
-                                    current_invoices = claim.get('invoices') or []
-                                    current_invoices.append(invoice_record)
-                                    claims.update_claim(conn, claim['claim_uuid'], invoices=current_invoices, state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                elif folded_incoming in ('si', 'sí', 'tengo factura', 'tengo una factura'):
-                                    return finish("Por favor, envía la factura o el justificante de pago en este chat.", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                elif folded_incoming in ('no', 'no tengo', 'eso es todo'):
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                else:
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                
-                                updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
-                                eval_data = updated_claim.get('coverage_evaluation') or {}
-                                status = eval_data.get('status')
-                                service_type = eval_data.get('service_type')
-                                
-                                if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
-                                    sent = claims.send_service_notification_email(conn, bid, updated_claim)
-                                    if sent:
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.CLOSED)
-                                        reply = (
-                                            f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
-                                            f"Basándonos en las coberturas explícitas de tu póliza, he enviado una solicitud de asistencia al profesional de {service_type} directamente. Se pondrán en contacto contigo pronto para coordinar la reparación."
-                                        )
+                                        if folded_incoming in ('no', 'no tengo', 'no tengo fotos', 'no puedo', 'sin fotos', 'no dispongo de fotos', 'no las tengo') or (is_resume and not ('foto' in folded_incoming or 'daño' in folded_incoming)):
+                                            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
+                                            return finish(
+                                                "De acuerdo, continuamos sin fotos. ¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
+                                                {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                            )
+                                        else:
+                                            return finish(
+                                                f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame las fotos de los daños, o escribe 'no tengo' para continuar sin ellas.",
+                                                {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                            )
+
+                                elif claim_state == claims.ClaimState.INVOICE_REQUESTED:
+                                    if media_list:
+                                        invoice_media = media_list[0]
+                                        ext_fields = claims.extract_invoice_with_llm(invoice_media['filename'], "Factura por servicios de reparación de hogar, importe 150 EUR, IVA incluido.")
+                                        invoice_record = {
+                                            'filename': invoice_media['filename'],
+                                            'mimetype': invoice_media['content_type'],
+                                            'extracted_fields': ext_fields
+                                        }
+                                        current_invoices = claim.get('invoices') or []
+                                        current_invoices.append(invoice_record)
+                                        claims.update_claim(conn, claim['claim_uuid'], invoices=current_invoices, state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                    elif folded_incoming in ('si', 'sí', 'tengo factura', 'tengo una factura'):
+                                        return finish("Por favor, envía la factura o el justificante de pago en este chat.", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                    else:
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+
+                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                    eval_data = updated_claim.get('coverage_evaluation') or {}
+                                    status = eval_data.get('status')
+                                    service_type = eval_data.get('service_type')
+
+                                    if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
+                                        sent = claims.send_service_notification_email(conn, bid, updated_claim)
+                                        if sent:
+                                            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.CLOSED)
+                                            reply = (
+                                                f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
+                                                f"Basándonos en las coberturas explícitas de tu póliza, he enviado una solicitud de asistencia al profesional de {service_type} directamente. Se pondrán en contacto contigo pronto para coordinar la reparación."
+                                            )
+                                        else:
+                                            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+                                            reply = (
+                                                f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
+                                                f"Como no tenemos un profesional de {service_type} configurado automáticamente para tu zona, he derivado el caso para que un agente lo asigne manualmente. Se pondrán en contacto contigo pronto."
+                                            )
                                     else:
                                         claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
                                         reply = (
-                                            f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
-                                            f"Como no tenemos un profesional de {service_type} configurado automáticamente para tu zona, he derivado el caso para que un agente lo asigne manualmente. Se pondrán en contacto contigo pronto."
+                                            f"¡Siniestro registrado correctamente con la referencia {claim_ref}!\n"
+                                            f"He enviado toda la documentación a nuestro equipo para su revisión y valoración humana. Nos pondremos en contacto contigo lo antes posible."
                                         )
-                                else:
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
-                                    reply = (
-                                        f"¡Siniestro registrado correctamente con la referencia {claim_ref}!\n"
-                                        f"He enviado toda la documentación a nuestro equipo para su revisión y valoración humana. Nos pondremos en contacto contigo lo antes posible."
-                                    )
-                                    
-                                claims.save_human_summary(conn, bid, updated_claim)
-                                return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
+
+                                    claims.save_human_summary(conn, bid, updated_claim)
+                                    st.pop('active_claim_ref', None)
+                                    st.pop('awaiting', None)
+                                    return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value if updated_claim['state'] != 'CLOSED' else ResultKind.POLICY_INFORMATION.value})
             if just_verified and st.get('question') and not st.get('pending_human'):
                 try:
                     interpretation = orchestrator.interpret(
@@ -1988,6 +2027,56 @@ def _authorized_retry(conn, sc, cached, today=None):
         'AND v.version_id=%s AND v.valid_from<=%s AND (v.valid_to IS NULL OR v.valid_to>=%s)',
         (sc.bid, cached.get('policy_id'), sc.customer_id, cached.get('version_id'), fact, fact)).fetchone()
     return bool(authorized and _reload_pages(conn, sc, cached, cached))
+
+
+def _is_claim_incidental_query(text, claim_state):
+    if not text:
+        return False
+    folded = references.fold(text).strip(' .?!¿¡')
+    # Resuming, confirming continuation, or answering standard prompt
+    if bool(re.search(
+        r'\b(?:seguir|continuar|continuamos|adelante|proseguir|retomar|'
+        r'al parte|volver al parte|al parte q quiero enviar|al parte que quiero enviar|'
+        r'continuar con el parte|seguir con el parte|cancelar|salir)\b',
+        folded
+    )) or folded in ('si', 'sí', 'vale', 'de acuerdo', 'ok', 'seguir', 'continuar', 'no', 'no tengo', 'no puedo'):
+        return False
+
+    # Contract metadata intents
+    if _intent(text) in ('policy_name', 'policy_validity', 'availability', 'summary'):
+        return True
+
+    is_explicit_q = '?' in text or '¿' in text or bool(re.match(r'^(?:que|cuanto|como|cual|quien|donde|cuando|tengo|hay)\b', folded))
+
+    if claim_state == 'INFORMATION_GATHERING':
+        damage_terms = (
+            'romp', 'rotura', 'dañ', 'cristal', 'vidrio', 'fuga', 'gotera', 'agua',
+            'tuberia', 'tubería', 'grifo', 'inund', 'atasco', 'humedad', 'mueble',
+            'mesa', 'silla', 'ventana', 'puerta', 'pared', 'techo', 'suelo',
+            'baño', 'bano', 'cocina', 'salon', 'salón', 'comedor', 'ocurri', 'paso',
+            'pasó', 'ayer', 'hoy', 'tarde', 'declarad'
+        )
+        if any(term in folded for term in damage_terms):
+            return False
+        if is_explicit_q and any(term in folded for term in ('poliza', 'póliza', 'seguro', 'cobertura', 'coberturas', 'limite', 'límite', 'franquicia')):
+            return True
+        return False
+
+    elif claim_state == 'PHOTOS_REQUESTED':
+        if folded in ('no', 'no tengo', 'no tengo fotos', 'no puedo', 'sin fotos', 'no dispongo de fotos'):
+            return False
+        if is_explicit_q:
+            return True
+        return False
+
+    elif claim_state == 'INVOICE_REQUESTED':
+        if folded in ('si', 'sí', 'no', 'no tengo', 'no tengo factura', 'no he pagado nada', 'ninguna'):
+            return False
+        if is_explicit_q:
+            return True
+        return False
+
+    return False
 
 
 def _is_claim_start(text):
