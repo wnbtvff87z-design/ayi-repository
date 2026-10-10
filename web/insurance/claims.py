@@ -400,7 +400,7 @@ def deliver_real_email(to_email, subject, body, attachments=None):
       - SMTP_USE_TLS (default: True)
     """
     resend_api_key = os.getenv('RESEND_API_KEY')
-    resend_from = os.getenv('RESEND_FROM_EMAIL') or os.getenv('SMTP_FROM_EMAIL') or "onboarding@resend.dev"
+    resend_from = os.getenv('RESEND_FROM_EMAIL') or "onboarding@resend.dev"
 
     smtp_host = os.getenv('SMTP_HOST')
     smtp_port = int(os.getenv('SMTP_PORT', '587'))
@@ -411,13 +411,23 @@ def deliver_real_email(to_email, subject, body, attachments=None):
 
     from_addr = resend_from if resend_api_key else smtp_from
 
-    # Record trace
+    # Prepare serializable trace record for simulated_emails.json
+    sanitized_attachments = []
+    for att in (attachments or []):
+        if isinstance(att, dict):
+            att_copy = dict(att)
+            if 'content_bytes' in att_copy and isinstance(att_copy['content_bytes'], bytes):
+                att_copy['content_bytes'] = f"<binary bytes: {len(att_copy['content_bytes'])} bytes>"
+            sanitized_attachments.append(att_copy)
+        else:
+            sanitized_attachments.append(str(att))
+
     email_record = {
         "to": to_email,
         "from": from_addr,
         "subject": subject,
         "body": body,
-        "attachments": attachments or [],
+        "attachments": sanitized_attachments,
         "sent_at": datetime.now().isoformat()
     }
     
