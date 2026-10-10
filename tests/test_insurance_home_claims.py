@@ -240,3 +240,109 @@ def test_verification_flow_without_policies_and_with_hogar_policy(pg_schema):
         assert "He verificado tus datos" in reply2
         assert "Enviar un parte" in reply2
         assert "problema técnico" not in reply2
+
+
+def test_dining_room_glass_table_claim_flow(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000001"
+    pid = "POL-HOGAR-001"
+    
+    with pg_schema() as conn:
+        identity.upsert_customer(conn, bid, cid, "Celia Zorro Condes", "51959566J")
+        claims.add_customer_and_policy(conn, bid, cid, "Celia Zorro Condes", "51959566J", pid, "hogar", "058342561/00000")
+        
+        # Turn 1: Verification
+        r1, out1 = dialog.process(
+            {'business_id': bid}, {}, [],
+            "mi nombre es Celia Zorro Condes y mi DNi es 51959566J",
+            "WhatsApp", "SM-201", "+34600111222"
+        )
+        assert "He verificado tus datos" in r1
+        assert "Enviar un parte" in r1
+        
+        # Turn 2: Start claim with "2 enviar parte"
+        r2, out2 = dialog.process(
+            {'business_id': bid}, {}, [],
+            "2 enviar parte",
+            "WhatsApp", "SM-202", "+34600111222"
+        )
+        assert "Has iniciado la declaración de un parte de hogar" in r2
+        assert "¿Quieres seguir o prefieres cancelar?" not in r2
+        
+        # Verify claim created in DB
+        claims_list = claims.list_customer_claims(conn, bid, cid)
+        assert len(claims_list) == 1
+        claim_ref = claims_list[0]['claim_ref']
+        assert claims_list[0]['state'] == claims.ClaimState.INFORMATION_GATHERING
+        
+        # Turn 3: Describe damage: "Ocurrió hoy a la tarde , se le rompió la mesa de vidrio del comedor"
+        r3, out3 = dialog.process(
+            {'business_id': bid}, {}, [],
+            "Ocurrió hoy a la tarde , se le rompió la mesa de vidrio del comedor",
+            "WhatsApp", "SM-203", "+34600111222"
+        )
+        # MUST NOT ask "¿A qué consulta te refieres?"
+        assert "¿A qué consulta te refieres?" not in r3
+        assert "problema técnico" not in r3
+        assert "cubierto" in r3.lower()
+        assert "cristalería" in r3.lower() or "fotografías" in r3.lower() or "daños" in r3.lower()
+        
+        c3 = claims.get_claim(conn, bid, claim_ref)
+        assert c3['state'] == claims.ClaimState.PHOTOS_REQUESTED
+        
+        # Turn 4: User continues without photos: "no tengo fotos"
+        r4, out4 = dialog.process(
+            {'business_id': bid}, {}, [],
+            "no tengo fotos",
+            "WhatsApp", "SM-204", "+34600111222"
+        )
+        assert "factura" in r4.lower()
+        c4 = claims.get_claim(conn, bid, claim_ref)
+        assert c4['state'] == claims.ClaimState.INVOICE_REQUESTED
+        
+        # Turn 5: User has no invoice: "no"
+        r5, out5 = dialog.process(
+            {'business_id': bid}, {}, [],
+            "no",
+            "WhatsApp", "SM-205", "+34600111222"
+        )
+        assert "¡Todo listo!" in r5
+        assert claim_ref in r5
+        c5 = claims.get_claim(conn, bid, claim_ref)
+        assert c5['state'] == claims.ClaimState.CLOSED
+        assert c5['service_notified'] is True
+
+
+def test_claim_resume_and_continuation_commands(pg_schema):
+    bid = "INS-BIZ-001"
+    cid = "CUS-000002"
+    pid = "POL-HOGAR-002"
+    
+    with pg_schema() as conn:
+        identity.upsert_customer(conn, bid, cid, "Pedro Sánchez", "11223344A")
+        claims.add_customer_and_policy(conn, bid, cid, "Pedro Sánchez", "11223344A", pid, "hogar", "112233")
+        
+        # Verification
+        dialog.process({'business_id': bid}, {}, [], "mi nombre es Pedro Sánchez y DNI 11223344A", "WhatsApp", "SM-301", "+34600333444")
+        
+        # Start claim
+        dialog.process({'business_id': bid}, {}, [], "enviar parte", "WhatsApp", "SM-302", "+34600333444")
+        
+        # User says "Seguir" when description not yet provided: bot gently re-prompts for description
+        r_seg, _ = dialog.process({'business_id': bid}, {}, [], "Seguir", "WhatsApp", "SM-303", "+34600333444")
+        assert "problema técnico" not in r_seg
+        assert "Continuamos con tu declaración de parte" in r_seg
+        
+        # Describe incident
+        r_desc, _ = dialog.process({'business_id': bid}, {}, [], "ayer hubo una fuga de agua en la cocina", "WhatsApp", "SM-304", "+34600333444")
+        assert "cubierto" in r_desc.lower()
+        
+        # User says "Si está declarada , continuamos" in PHOTOS_REQUESTED state
+        r_cont, _ = dialog.process({'business_id': bid}, {}, [], "Si está declarada , continuamos", "WhatsApp", "SM-305", "+34600333444")
+        assert "problema técnico" not in r_cont
+        assert "factura" in r_cont.lower() or "fotos" in r_cont.lower()
+        
+        # User says "cancelar parte"
+        r_cancel, _ = dialog.process({'business_id': bid}, {}, [], "cancelar parte", "WhatsApp", "SM-306", "+34600333444")
+        assert "cancelado" in r_cancel.lower()
+
