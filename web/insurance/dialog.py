@@ -524,6 +524,14 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                 authorized_state = sc.customer_id and sc.customer_id == st.get('customer_id')
                 policy = st.get('policy_id') if authorized_state else None
                 version = st.get('version_id') if authorized_state else None
+                if policy and version:
+                    valid_ver = conn.execute(
+                        'SELECT 1 FROM insurance_policy_versions WHERE business_id=%s AND policy_id=%s AND version_id=%s',
+                        (bid, policy, version)
+                    ).fetchone()
+                    if not valid_ver:
+                        policy, version = None, None
+
                 normalized = st.get('normalized_question')
                 conn.execute(
                     'UPDATE insurance_conversation_turns SET policy_id=%s,version_id=%s,pages=%s::jsonb,'
