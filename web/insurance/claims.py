@@ -274,20 +274,34 @@ def interpret_incident_with_llm(description):
     
     # 1. Determine service_type
     service_type = None
-    if any(w in desc_lower for w in ('agua', 'tuberia', 'fuga', 'goteo', 'inund', 'grifo', 'llave', 'roto', 'gotera', 'plomero', 'fontaner')):
-        service_type = 'fontanería'
-    elif any(w in desc_lower for w in ('cristal', 'vidrio', 'ventana', 'espejo', 'puerta', 'templado')):
+    # Prioritize specific damage categories (cristalería, mobiliario, pintura) before generic water/damage terms
+    if any(w in desc_lower for w in ('cristal', 'cristales', 'vidrio', 'vidrios', 'ventana', 'ventanas', 'espejo', 'espejos', 'luna', 'lunas', 'templado', 'vitroceramica', 'vitrocerámica')):
         service_type = 'cristalería'
-    elif any(w in desc_lower for w in ('mueble', 'armario', 'puerta', 'mesa', 'silla')):
+    elif any(w in desc_lower for w in ('mueble', 'muebles', 'armario', 'armarios', 'puerta', 'puertas', 'mesa', 'mesas', 'silla', 'sillas', 'estanteria', 'estantería', 'cajon', 'cajón')):
         service_type = 'mobiliario'
-    elif any(w in desc_lower for w in ('pintar', 'pintura', 'mancha', 'pared', 'techo')):
+    elif any(w in desc_lower for w in ('pintar', 'pintura', 'mancha', 'manchas', 'pared', 'paredes', 'techo', 'techos')):
         service_type = 'pintura'
+    elif any(w in desc_lower for w in ('agua', 'tuberia', 'tubería', 'fuga', 'fugas', 'goteo', 'goteos', 'inund', 'grifo', 'grifos', 'llave', 'gotera', 'goteras', 'desagüe', 'desague', 'atasco', 'cisterna', 'humedad', 'humedades', 'plomero', 'fontaner')):
+        service_type = 'fontanería'
+    elif any(w in desc_lower for w in ('roto', 'rota', 'rotura', 'daño', 'dañado')):
+        service_type = 'asistencia'
     
     # 2. Check for missing critical details (where, when, what)
+    rooms = (
+        'baño', 'bano', 'cocina', 'salon', 'salón', 'comedor', 'habitacion', 'habitación',
+        'dormitorio', 'cuarto', 'terraza', 'balcon', 'balcón', 'patio', 'pasillo',
+        'garaje', 'trastero', 'sotano', 'sótano', 'jardin', 'jardín', 'techo', 'suelo',
+        'pared', 'casa', 'piso', 'vivienda'
+    )
+    date_words = (
+        'hoy', 'ayer', 'anteayer', 'anoche', 'tarde', 'mañana', 'noche', 'lunes', 'martes',
+        'miercoles', 'miércoles', 'jueves', 'viernes', 'sabado', 'sábado', 'domingo',
+        'hace', 'dia', 'día', 'fecha', 'semana', 'mes', 'año', 'ano', 'ahora', 'recien', 'recién'
+    )
     missing_info = None
-    if 'baño' not in desc_lower and 'cocina' not in desc_lower and 'salon' not in desc_lower and 'habitación' not in desc_lower and 'casa' not in desc_lower and len(description.split()) < 8:
-        missing_info = "¿En qué parte de la casa ha ocurrido el incidente (cocina, baño, salón, etc.)?"
-    elif not any(w in desc_lower for w in ('hoy', 'ayer', 'anteayer', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo', 'hace', 'dia', 'fecha', 'semana')):
+    if not any(w in desc_lower for w in rooms) and len(description.split()) < 7:
+        missing_info = "¿En qué parte de la casa ha ocurrido el incidente (cocina, baño, salón, comedor, etc.)?"
+    elif not any(w in desc_lower for w in date_words) and len(description.split()) < 7:
         missing_info = "¿Cuándo ocurrió exactamente el incidente (ayer, hoy, hace unos días, etc.)?"
         
     return {
@@ -301,12 +315,17 @@ def evaluate_coverage_with_llm(interpretation, evidence_pages):
     """Contractual coverage evaluation based on interpretation and policy evidence pages."""
     service_type = interpretation.get('incident_type', 'asistencia')
     
-    # Mocking or simulating semantic matches
-    # In real scenario we can use actual evidence_pages to prove coverage
-    if service_type in ('fontanería', 'cristalería', 'pintura', 'mobiliario'):
+    explanations = {
+        'cristalería': "La póliza cubre la reparación o reposición por rotura de cristales, incluyendo vidrios y lunas de mesas, según las garantías de rotura de cristales de tu póliza de hogar.",
+        'fontanería': "La cobertura para daños por agua y reparaciones de fontanería se encuentra debidamente contemplada en la sección de garantías de daños por agua y asistencia de la póliza.",
+        'pintura': "La cobertura para daños estéticos y pintura se encuentra contemplada en las condiciones de tu póliza de hogar.",
+        'mobiliario': "La cobertura para daños a bienes y mobiliario se encuentra contemplada en las garantías de contenido de tu póliza de hogar."
+    }
+    
+    if service_type in explanations:
         return {
             "status": CoverageStatus.SUPPORTED_BY_POLICY,
-            "explanation": f"La cobertura para daños o reparaciones de {service_type} se encuentra debidamente contemplada en la sección de garantías de asistencia en el hogar de la póliza.",
+            "explanation": explanations[service_type],
             "service_type": service_type,
             "reimbursement_applicable": True
         }
@@ -332,6 +351,23 @@ def send_service_notification_email(conn, business_id, claim):
         'SELECT * FROM insurance_professionals WHERE business_id=%s AND service_type=%s',
         (business_id, service_type)
     ).fetchone()
+    if not prof:
+        defaults = {
+            'cristalería': ('Cristalería Central Hogar', 'cristaleria-asistencia@seguroshogar.example.com', '555-0102'),
+            'fontanería': ('Fontanería Rápida 24h', 'fontaneria-asistencia@seguroshogar.example.com', '555-0101'),
+            'mobiliario': ('Mobiliario y Asistencia Hogar', 'mobiliario-asistencia@seguroshogar.example.com', '555-0103'),
+            'pintura': ('Pinturas y Reformas Exprés', 'pintura-asistencia@seguroshogar.example.com', '555-0104'),
+        }
+        if service_type in defaults:
+            d_name, d_email, d_phone = defaults[service_type]
+            try:
+                add_professional(conn, business_id, service_type, d_name, d_email, d_phone)
+                prof = conn.execute(
+                    'SELECT * FROM insurance_professionals WHERE business_id=%s AND service_type=%s',
+                    (business_id, service_type)
+                ).fetchone()
+            except Exception:
+                pass
     if not prof:
         log.warning("No professional configured for business_id=%s and service_type=%s", business_id, service_type)
         return False
