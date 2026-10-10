@@ -958,6 +958,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=claim['policy_id'])
                                     if result['status'] == 'no_policy' or not result.get('policy_id'):
                                         claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                        updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                        claims.save_human_summary(conn, bid, updated_c)
                                         return finish(
                                             f"No he podido acceder a las cláusulas de tu póliza. He registrado tu parte con referencia {claim_ref} para que nuestro equipo lo evalúe manualmente. Nos pondremos en contacto contigo.",
                                             {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
@@ -978,18 +980,20 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         reply = (
                                             f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
                                             f"Explicación contractual: {explanation}\n\n"
-                                            f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías de los daños."
+                                            f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño."
                                         )
                                         if channel == 'Voice':
                                             reply = (
                                                 f"He verificado tu póliza y tu incidente de {service_type or 'asistencia'} parece cubierto. "
                                                 f"He registrado tu parte con referencia {claim_ref}. "
-                                                f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos de los daños por ahí."
+                                                f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños por ahí."
                                             )
                                             log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                                     else:
                                         claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                        updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                        claims.save_human_summary(conn, bid, updated_c)
                                         reply = (
                                             f"No he encontrado una cobertura explícita en tu póliza para estos daños o requiere de revisión de un agente.\n"
                                             f"He registrado el siniestro con la referencia {claim_ref} para que nuestro equipo humano lo revise detenidamente. Nos pondremos en contacto contigo lo antes posible."
@@ -1000,52 +1004,81 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     if media_list:
                                         photos_added = []
                                         for media in media_list:
-                                            ok, err = claims.validate_photo_metadata(media['filename'], media['content_type'], 1024 * 50)
+                                            m_size = media.get('size_bytes', 1024 * 50)
+                                            ok, err = claims.validate_media_metadata(media['filename'], media['content_type'], m_size)
                                             if not ok:
-                                                return finish(f"Error al procesar la foto: {err}", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                            analysis = claims.analyze_photo_with_llm(media['filename'], media['content_type'], 1024 * 50, claim.get('original_description', ''))
+                                                return finish(f"Error al procesar el archivo: {err}", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                            analysis = claims.analyze_media_with_llm(media['filename'], media['content_type'], m_size, claim.get('original_description', ''))
                                             if not analysis['valid']:
                                                 return finish(analysis['reason'], {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                                             photos_added.append({
                                                 'filename': media['filename'],
                                                 'mimetype': media['content_type'],
-                                                'size_bytes': 1024 * 50,
-                                                'url': media['url'],
+                                                'size_bytes': m_size,
+                                                'url': media.get('url'),
                                                 'analysis': analysis
                                             })
                                         current_photos = claim.get('photos') or []
                                         current_photos.extend(photos_added)
                                         claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, state=claims.ClaimState.INVOICE_REQUESTED)
+                                        
+                                        p_count = sum(1 for m in photos_added if not m['mimetype'].startswith('video/'))
+                                        v_count = sum(1 for m in photos_added if m['mimetype'].startswith('video/'))
+                                        items_desc = []
+                                        if p_count > 0:
+                                            items_desc.append(f"{p_count} foto(s)")
+                                        if v_count > 0:
+                                            items_desc.append(f"{v_count} vídeo(s)")
+                                        desc_str = " y ".join(items_desc) or f"{len(photos_added)} archivo(s)"
+                                        
                                         return finish(
-                                            f"He recibido {len(photos_added)} foto(s) correctamente.\n"
-                                            f"¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
+                                            f"He recibido {desc_str} correctamente.\n"
+                                            f"¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no, o adjunta la factura.",
                                             {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                                         )
                                     else:
-                                        if folded_incoming in ('no', 'no tengo', 'no tengo fotos', 'no puedo', 'sin fotos', 'no dispongo de fotos', 'no las tengo') or (is_resume and not ('foto' in folded_incoming or 'daño' in folded_incoming)):
+                                        if folded_incoming in ('no', 'no tengo', 'no tengo fotos', 'no puedo', 'sin fotos', 'no dispongo de fotos', 'no las tengo') or (is_resume and not ('foto' in folded_incoming or 'daño' in folded_incoming or 'video' in folded_incoming or 'vídeo' in folded_incoming)):
                                             claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
                                             return finish(
-                                                "De acuerdo, continuamos sin fotos. ¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
+                                                "De acuerdo, continuamos sin fotos o vídeos. ¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
                                                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                                             )
                                         else:
                                             return finish(
-                                                f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame las fotos de los daños, o escribe 'no tengo' para continuar sin ellas.",
+                                                f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame las fotos o vídeo de los daños, o escribe 'no tengo' para continuar sin ellos.",
                                                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                                             )
 
                                 elif claim_state == claims.ClaimState.INVOICE_REQUESTED:
                                     if media_list:
-                                        invoice_media = media_list[0]
-                                        ext_fields = claims.extract_invoice_with_llm(invoice_media['filename'], "Factura por servicios de reparación de hogar, importe 150 EUR, IVA incluido.")
-                                        invoice_record = {
-                                            'filename': invoice_media['filename'],
-                                            'mimetype': invoice_media['content_type'],
-                                            'extracted_fields': ext_fields
-                                        }
+                                        current_photos = claim.get('photos') or []
                                         current_invoices = claim.get('invoices') or []
-                                        current_invoices.append(invoice_record)
-                                        claims.update_claim(conn, claim['claim_uuid'], invoices=current_invoices, state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                        for media in media_list:
+                                            mtype = media.get('content_type', '')
+                                            fname = media.get('filename', '').lower()
+                                            m_size = media.get('size_bytes', 1024 * 50)
+                                            if 'factura' in fname or 'receipt' in fname or 'invoice' in fname or mtype == 'application/pdf':
+                                                ext_fields = claims.extract_invoice_with_llm(media['filename'], "Factura por servicios de reparación de hogar, importe 150 EUR, IVA incluido.")
+                                                invoice_record = {
+                                                    'filename': media['filename'],
+                                                    'mimetype': media['content_type'],
+                                                    'extracted_fields': ext_fields
+                                                }
+                                                current_invoices.append(invoice_record)
+                                            else:
+                                                # Treat as additional photo/video evidence sent at invoice phase
+                                                ok, err = claims.validate_media_metadata(media['filename'], media['content_type'], m_size)
+                                                if ok:
+                                                    analysis = claims.analyze_media_with_llm(media['filename'], media['content_type'], m_size, claim.get('original_description', ''))
+                                                    if analysis['valid']:
+                                                        current_photos.append({
+                                                            'filename': media['filename'],
+                                                            'mimetype': media['content_type'],
+                                                            'size_bytes': m_size,
+                                                            'url': media.get('url'),
+                                                            'analysis': analysis
+                                                        })
+                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, invoices=current_invoices, state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
                                     elif folded_incoming in ('si', 'sí', 'tengo factura', 'tengo una factura'):
                                         return finish("Por favor, envía la factura o el justificante de pago en este chat.", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                                     else:
