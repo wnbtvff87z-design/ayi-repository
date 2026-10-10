@@ -400,7 +400,9 @@ def deliver_real_email(to_email, subject, body, attachments=None):
       - SMTP_USE_TLS (default: True)
     """
     resend_api_key = os.getenv('RESEND_API_KEY')
-    resend_from = os.getenv('RESEND_FROM_EMAIL') or "onboarding@resend.dev"
+    if resend_api_key:
+        resend_api_key = resend_api_key.strip()
+    resend_from = (os.getenv('RESEND_FROM_EMAIL') or "onboarding@resend.dev").strip()
 
     smtp_host = os.getenv('SMTP_HOST')
     smtp_port = int(os.getenv('SMTP_PORT', '587'))
@@ -508,8 +510,10 @@ def deliver_real_email(to_email, subject, body, attachments=None):
 
             html_body = f"<div style='font-family: sans-serif; white-space: pre-wrap;'>{html.escape(body)}</div>"
 
+            resend_from_header = f"Acme <{resend_from}>" if resend_from == "onboarding@resend.dev" else resend_from
+
             payload = {
-                "from": resend_from,
+                "from": resend_from_header,
                 "to": [to_email],
                 "subject": subject,
                 "text": body,
