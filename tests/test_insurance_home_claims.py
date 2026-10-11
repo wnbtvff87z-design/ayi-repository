@@ -910,6 +910,142 @@ def test_human_review_claim_always_requests_photos_and_notifies_agent(pg_schema,
         assert any(f"claim_{claim_ref}_resumen.txt" in fn for fn in att_filenames)
 
 
+def test_dynamic_evidence_matrix_multi_damage_generation():
+    """Generates affected items and evidence matrix for multi-damage incident (leak affecting pipe, furniture, wall)."""
+    desc = "Hubo una fuga de agua en la cocina que dañó el mueble de madera y manchó la pared del salón"
+    interp = claims.interpret_incident_with_llm(desc)
+
+    items = interp['affected_items']
+    assert len(items) >= 3
+    cats = [i['category'] for i in items]
+    assert 'fontanería' in cats
+    assert 'mobiliario' in cats
+    assert 'pintura' in cats
+
+    matrix = interp['evidence_matrix']
+    assert len(matrix) >= 4
+    proof_cats = [r['proof_category'] for r in matrix]
+    assert claims.ProofCategory.FOTO_VIDEO_DANO in proof_cats
+    assert claims.ProofCategory.COMPROBACION_TECNICA in proof_cats
+
+
+def test_evidence_matrix_missing_purchase_invoice_alternative():
+    """Missing original purchase invoice is satisfied via alternative description without hallucinating data."""
+    items = [{
+        "item_id": "item_1",
+        "name": "Mesa de vidrio del comedor",
+        "category": "cristalería",
+        "repair_stage": claims.RepairStage.SIN_REPARAR
+    }]
+    matrix = claims.build_evidence_matrix(items)
+
+    # Evaluate with description containing age/model declaration instead of purchase invoice
+    evaluated = claims.evaluate_received_evidence(
+        matrix,
+        photos=[{"filename": "mesa_rota.jpg", "analysis": {"valid": True}}],
+        invoices=[],
+        description="Mesa de vidrio de comedor comprada en 2022 de marca VidrioDesign por 350 euros"
+    )
+
+    purchase_req = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.FACTURA_COMPRA_ORIGINAL][0]
+    assert purchase_req['status'] == claims.RequirementStatus.ACEPTADO
+    assert "alternativa documental" in purchase_req['status_reason']
+
+
+def test_evidence_matrix_differentiates_proof_categories():
+    """Differentiates repair invoice, replacement invoice, photo evidence, and technical conditions."""
+    items = [{
+        "item_id": "item_1",
+        "name": "Pared con manchas de humedad",
+        "category": "pintura",
+        "repair_stage": claims.RepairStage.TRABAJO_REALIZADO
+    }]
+    matrix = claims.build_evidence_matrix(items)
+
+    # Photos alone CANNOT mark technical condition (dryness) as ACEPTADO automatically
+    evaluated = claims.evaluate_received_evidence(
+        matrix,
+        photos=[{"filename": "pared.jpg", "analysis": {"valid": True}}],
+        invoices=[{
+            "filename": "factura_pintor.pdf",
+            "extracted_fields": {
+                "success": True,
+                "provider": "Pinturas Soler S.L.",
+                "amount": 250.0,
+                "invoice_number": "FAC-101",
+                "date": "2026-10-01"
+            }
+        }],
+        description="Trabajo de pintura de pared completado"
+    )
+
+    tech_req = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.COMPROBACION_TECNICA][0]
+    assert tech_req['status'] == claims.RequirementStatus.PENDIENTE_REVISION
+    assert tech_req['needs_human_review'] is True
+
+    repair_req = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.FACTURA_REPARACION][0]
+    assert repair_req['status'] == claims.RequirementStatus.ACEPTADO
+    assert repair_req['fulfilled_by_file'] == "factura_pintor.pdf"
+
+
+def test_evidence_matrix_unreadable_file_handling():
+    """Unreadable or empty invoice sets requirement status to INSUFICIENTE or ILEGIBLE without fabricating data."""
+    items = [{
+        "item_id": "item_1",
+        "name": "Tubería reparada",
+        "category": "fontanería",
+        "repair_stage": claims.RepairStage.TRABAJO_REALIZADO
+    }]
+    matrix = claims.build_evidence_matrix(items)
+
+    # Empty / unreadable invoice submitted
+    evaluated = claims.evaluate_received_evidence(
+        matrix,
+        photos=[],
+        invoices=[{
+            "filename": "factura_ilegible.pdf",
+            "extracted_fields": {
+                "success": False,
+                "reason": "El documento no contiene texto legible o está vacío.",
+                "amount": None,
+                "provider": None
+            }
+        }],
+        description="Adjunto la factura del fontanero"
+    )
+
+    repair_req = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.FACTURA_REPARACION][0]
+    assert repair_req['status'] == claims.RequirementStatus.INSUFICIENTE
+    assert "insuficiente o ilegible" in repair_req['status_reason']
+
+
+def test_evidence_matrix_persistence_in_postgres(pg_schema):
+    """Verifies that affected_items and evidence_matrix persist cleanly in PostgreSQL."""
+    bid = "INS-BIZ-001"
+    cid = "CUS-000010"
+    pid = "POL-HOGAR-010"
+
+    with pg_schema() as conn:
+        claims.add_customer_and_policy(conn, bid, cid, "Test Matrix User", "12345678Z", pid, "hogar", "010")
+        cuuid, cref = claims.create_claim(conn, bid, cid, pid, "V1", "WhatsApp", "Mesa de vidrio rota en el salón")
+
+        interp = claims.interpret_incident_with_llm("Mesa de vidrio rota en el salón")
+        items = interp['affected_items']
+        matrix = interp['evidence_matrix']
+
+        claims.update_claim(conn, cuuid, affected_items=items, evidence_matrix=matrix)
+
+        fetched = claims.get_claim(conn, bid, cuuid)
+        assert len(fetched['affected_items']) >= 1
+        assert len(fetched['evidence_matrix']) >= 1
+        assert fetched['affected_items'][0]['category'] == 'cristalería'
+
+        summary = claims.build_human_summary(conn, bid, fetched)
+        assert "MATRIZ DINÁMICA DE ACREDITACIÓN (11 PUNTOS TRANSVERSALES)" in summary
+        assert "Mesa de vidrio" in summary
+
+
+
 
 
 
