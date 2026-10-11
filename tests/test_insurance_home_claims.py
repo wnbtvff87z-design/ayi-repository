@@ -824,6 +824,93 @@ def test_claim_invalid_state_transitions():
     assert claims.validate_claim_transition(claims.ClaimState.INFORMATION_GATHERING, claims.ClaimState.PHOTOS_REQUESTED) is True
 
 
+def test_human_review_claim_always_requests_photos_and_notifies_agent(pg_schema, monkeypatch):
+    """When a claim requires human review, the flow MUST still request photos/videos and email them to the human agent."""
+    bid = "INS-BIZ-001"
+    cid = "CUS-000005"
+    pid = "POL-HOGAR-HUMAN"
+
+    agent_emails_sent = []
+
+    def mock_deliver(to_email, subject, body, attachments=None, idempotency_key=None, detailed=False):
+        agent_emails_sent.append({
+            'to': to_email,
+            'subject': subject,
+            'body': body,
+            'attachments': attachments or []
+        })
+        res = {
+            "status": "ACCEPTED",
+            "provider": "resend",
+            "message_id": "msg_agent_999",
+            "sent_to": to_email,
+            "sent_at": "2026-10-11T11:00:00",
+            "error": None
+        }
+        return res if detailed else True
+
+    monkeypatch.setattr('insurance.claims.deliver_real_email', mock_deliver)
+    monkeypatch.setenv('HUMAN_AGENT_EMAIL', 'marianodanielcortina88@hotmail.com')
+
+    with pg_schema() as conn:
+        identity.upsert_customer(conn, bid, cid, "Celia Zorro Condes", "51959566J")
+        claims.add_customer_and_policy(conn, bid, cid, "Celia Zorro Condes", "51959566J", pid, "hogar", "058342561/00000")
+
+        # 1. Verification
+        dialog.process({'business_id': bid}, {}, [], "mi nombre es Celia Zorro Condes y DNI 51959566J", "WhatsApp", "SM-501", "+34600111222")
+
+        # 2. Start claim
+        dialog.process({'business_id': bid}, {}, [], "enviar parte", "WhatsApp", "SM-502", "+34600111222")
+
+        # 3. Incident requiring human review (no direct match)
+        r_desc, _ = dialog.process(
+            {'business_id': bid}, {}, [],
+            "tuvimos un problema en la cañeria y ya se ha arreglado y ahora hay que pintar ,quisiera que me envien a un pintor",
+            "WhatsApp", "SM-503", "+34600111222"
+        )
+        # MUST request photos instead of terminating early
+        assert "fotografías" in r_desc.lower() or "fotos" in r_desc.lower() or "vídeo" in r_desc.lower()
+        assert "SIN-202" in r_desc
+
+        claims_list = claims.list_customer_claims(conn, bid, cid)
+        assert len(claims_list) == 1
+        claim_ref = claims_list[0]['claim_ref']
+        c_state1 = claims.get_claim(conn, bid, claim_ref)
+        assert c_state1['state'] == claims.ClaimState.PHOTOS_REQUESTED
+
+        # 4. Customer sends photos
+        media = [{'filename': 'pared_humedad.jpg', 'content_type': 'image/jpeg', 'size_bytes': 1024 * 60, 'url': 'http://test/f.jpg'}]
+        r_photo, _ = dialog.process(
+            {'business_id': bid}, {}, [],
+            "aqui va la foto de la pared",
+            "WhatsApp", "SM-504", "+34600111222", media_list=media
+        )
+        assert "recibido" in r_photo.lower()
+        assert "factura" in r_photo.lower()
+
+        # 5. Customer has no invoice
+        r_inv, _ = dialog.process(
+            {'business_id': bid}, {}, [],
+            "no tengo factura",
+            "WhatsApp", "SM-505", "+34600111222"
+        )
+        assert "¡Todo listo!" in r_inv or "Siniestro registrado" in r_inv
+        assert claim_ref in r_inv
+
+        # 6. Verify human agent received email with the photo attachment and the report
+        c_final = claims.get_claim(conn, bid, claim_ref)
+        assert c_final['state'] in (claims.ClaimState.HUMAN_REVIEW, claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+        assert len(c_final['photos']) == 1
+
+        assert len(agent_emails_sent) >= 1
+        last_email = agent_emails_sent[-1]
+        assert last_email['to'] == 'marianodanielcortina88@hotmail.com'
+        att_filenames = [a.get('filename') for a in last_email['attachments']]
+        assert any('pared_humedad.jpg' in fn for fn in att_filenames)
+        assert any(f"claim_{claim_ref}_resumen.txt" in fn for fn in att_filenames)
+
+
+
 
 
 
