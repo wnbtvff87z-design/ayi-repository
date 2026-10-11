@@ -587,7 +587,6 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                 except Exception as save_exc:
                     log.warning("Turn state persistence warning: %s", save_exc)
 
-                return reply, out, pages
                 if channel == 'Voice':
                     code = st.get('_identity_diagnostic') or decl.get('diagnostic')
                     if not text.strip():
