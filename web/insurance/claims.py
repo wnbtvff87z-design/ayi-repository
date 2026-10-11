@@ -104,11 +104,15 @@ def ensure_claims_schema(conn):
                 state text NOT NULL DEFAULT 'INFORMATION_GATHERING',
                 photos jsonb NOT NULL DEFAULT '[]'::jsonb,
                 invoices jsonb NOT NULL DEFAULT '[]'::jsonb,
+                affected_items jsonb NOT NULL DEFAULT '[]'::jsonb,
+                evidence_matrix jsonb NOT NULL DEFAULT '[]'::jsonb,
                 service_notified boolean NOT NULL DEFAULT false,
                 service_notification_details jsonb NOT NULL DEFAULT '{}'::jsonb,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 updated_at timestamptz NOT NULL DEFAULT now()
             );
+            ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS affected_items jsonb NOT NULL DEFAULT '[]'::jsonb;
+            ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS evidence_matrix jsonb NOT NULL DEFAULT '[]'::jsonb;
             CREATE INDEX IF NOT EXISTS insurance_claims_ref_idx ON insurance_claims (claim_ref);
             CREATE INDEX IF NOT EXISTS insurance_claims_customer_idx ON insurance_claims (business_id, customer_id);
         """)
@@ -293,7 +297,7 @@ def update_claim(conn, claim_uuid, **fields):
     set_parts = []
     params = []
     for k, v in fields.items():
-        if k in ('structured_interpretation', 'coverage_evaluation', 'photos', 'invoices', 'service_notification_details'):
+        if k in ('structured_interpretation', 'coverage_evaluation', 'photos', 'invoices', 'service_notification_details', 'affected_items', 'evidence_matrix'):
             set_parts.append(f"{k}=%s::jsonb")
             params.append(json.dumps(v, ensure_ascii=False))
         else:
@@ -563,6 +567,510 @@ def extract_invoice_with_llm(filename, text_content):
         }
 
 
+# --- DYNAMIC EVIDENCE MATRIX & ACCREDITATION ENGINE ---
+
+class ProofCategory:
+    FOTO_VIDEO_DANO = 'foto_video_dano'
+    FACTURA_COMPRA_ORIGINAL = 'factura_compra_original'
+    FACTURA_REPARACION = 'factura_reparacion'
+    FACTURA_REPOSICION = 'factura_reposicion'
+    JUSTIFICANTE_PAGO = 'justificante_pago'
+    PRESUPUESTO = 'presupuesto'
+    COMPROBACION_TECNICA = 'comprobacion_tecnica'
+
+
+class RequirementStatus:
+    SOLICITADO = 'SOLICITADO'
+    RECIBIDO = 'RECIBIDO'
+    ILEGIBLE = 'ILEGIBLE'
+    INSUFICIENTE = 'INSUFICIENTE'
+    PENDIENTE_REVISION = 'PENDIENTE_REVISION'
+    ACEPTADO = 'ACEPTADO'
+
+
+class RepairStage:
+    SIN_REPARAR = 'sin_reparar'
+    PROPUESTA_REPARACION = 'propuesta_reparacion'
+    TRABAJO_REALIZADO = 'trabajo_realizado'
+    BIEN_SUSTITUIDO = 'bien_sustituido'
+
+
+ACCREDITATION_POINTS = {
+    1: {"id": "existencia_y_descripcion_dano", "name": "Existencia y descripción del daño"},
+    2: {"id": "identidad_bien", "name": "Identidad del bien afectado y relación con el siniestro"},
+    3: {"id": "adquisicion_propiedad", "name": "Adquisición, propiedad o posesión del bien"},
+    4: {"id": "valor_antiguedad_modelo", "name": "Valor original, antigüedad, modelo o características"},
+    5: {"id": "causa_dano", "name": "Causa del daño para evaluar la cobertura"},
+    6: {"id": "cobertura_contractual", "name": "Cobertura contractual aplicable (límites, exclusiones, franquicias)"},
+    7: {"id": "estado_actual_y_actuaciones", "name": "Estado actual del daño y actuaciones realizadas"},
+    8: {"id": "coste_reclamado", "name": "Coste de reparación, sustitución o reposición reclamado"},
+    9: {"id": "realizacion_efectiva_trabajo", "name": "Realización efectiva del trabajo (si se afirma completado)"},
+    10: {"id": "pago_trabajo", "name": "Pago del trabajo (si lo exige el procedimiento)"},
+    11: {"id": "condicion_tecnica", "name": "Condición técnica a comprobar antes o después de la reparación"}
+}
+
+
+DAMAGE_CATEGORY_SPECIFICATIONS = {
+    'cristalería': {
+        'display_name': 'Cristalería y Vidrios',
+        'default_asset_type': 'bien_dañado',
+        'requires_age_or_model': True,
+        'technical_conditions': [],
+        'standard_acceptable_alternatives': [
+            "fotografía_con_marcado_o_dimensiones",
+            "declaración_de_dimensiones_y_tipo_de_cristal"
+        ]
+    },
+    'fontanería': {
+        'display_name': 'Fontanería y Conducciones',
+        'default_asset_type': 'instalacion_dañada',
+        'requires_age_or_model': False,
+        'technical_conditions': ["localizacion_origen_fuga"],
+        'standard_acceptable_alternatives': [
+            "vídeo_de_agua_en_curso",
+            "informe_de_localización_de_fuga"
+        ]
+    },
+    'pintura': {
+        'display_name': 'Pintura y Daños Estéticos',
+        'default_asset_type': 'superficie_dañada',
+        'requires_age_or_model': False,
+        'technical_conditions': ["comprobacion_secado_humedad"],
+        'standard_acceptable_alternatives': [
+            "medición_de_humedades_o_verificación_técnica_tras_reparación_de_origen"
+        ]
+    },
+    'mobiliario': {
+        'display_name': 'Mobiliario y Enseres',
+        'default_asset_type': 'bien_dañado',
+        'requires_age_or_model': True,
+        'technical_conditions': [],
+        'standard_acceptable_alternatives': [
+            "fotografía_del_mueble_con_marca_modelo",
+            "declaración_de_año_de_compra_y_precio_estimado",
+            "manual_o_certificado_original"
+        ]
+    },
+    'electrodomésticos': {
+        'display_name': 'Electrodomésticos y Equipamiento',
+        'default_asset_type': 'bien_dañado',
+        'requires_age_or_model': True,
+        'technical_conditions': ["comprobacion_averia_electrica"],
+        'standard_acceptable_alternatives': [
+            "fotografía_placa_características_o_número_serie",
+            "manual_o_certificado_garantía_original"
+        ]
+    },
+    'asistencia': {
+        'display_name': 'Asistencia General',
+        'default_asset_type': 'bien_dañado',
+        'requires_age_or_model': False,
+        'technical_conditions': [],
+        'standard_acceptable_alternatives': []
+    }
+}
+
+
+def build_affected_items(interpretation, description):
+    """
+    Identifies all affected assets/elements from incident interpretation and text description.
+    Handles multi-damage incidents (e.g., pipe + furniture + wall).
+    """
+    desc_lower = (description or "").lower()
+    categories = interpretation.get('damage_categories') or interpretation.get('services_needed') or ['asistencia']
+
+    repair_stage = RepairStage.SIN_REPARAR
+    if any(kw in desc_lower for kw in ('compré', 'compre', 'reemplacé', 'reemplace', 'sustituí', 'sustitui', 'nueva mesa', 'nuevo mueble', 'comprado nuevo')):
+        repair_stage = RepairStage.BIEN_SUSTITUIDO
+    elif any(kw in desc_lower for kw in ('ya se arregló', 'ya esta arreglado', 'ya está arreglado', 'ya lo arreglé', 'ya se reparó', 'reparado', 'factura del fontanero', 'pagué al técnico')):
+        repair_stage = RepairStage.TRABAJO_REALIZADO
+    elif any(kw in desc_lower for kw in ('presupuesto', 'estimación', 'cotización')):
+        repair_stage = RepairStage.PROPUESTA_REPARACION
+
+    items = []
+    item_idx = 1
+
+    if 'cristalería' in categories or any(w in desc_lower for w in ('cristal', 'vidrio', 'ventana', 'espejo', 'luna', 'vitroceramica')):
+        item_name = "Cristal / Mesa / Ventana de vidrio"
+        if 'mesa' in desc_lower:
+            item_name = "Mesa de vidrio"
+        elif 'espejo' in desc_lower:
+            item_name = "Espejo"
+        elif 'ventana' in desc_lower:
+            item_name = "Ventana / Luna de vidrio"
+
+        items.append({
+            "item_id": f"item_{item_idx}",
+            "name": item_name,
+            "category": "cristalería",
+            "asset_type": DAMAGE_CATEGORY_SPECIFICATIONS['cristalería']['default_asset_type'],
+            "observed_damage": "Rotura o daño en vidrio/cristal",
+            "known_cause": "Impacto o evento accidental",
+            "repair_stage": repair_stage,
+            "claimed_cost": None,
+            "review_status": "PENDING_REVIEW",
+            "technical_conditions": []
+        })
+        item_idx += 1
+
+    if 'fontanería' in categories or any(w in desc_lower for w in ('tuberia', 'tubería', 'fuga', 'goteo', 'inund', 'grifo', 'cisterna')):
+        items.append({
+            "item_id": f"item_{item_idx}",
+            "name": "Instalación de fontanería / Tubería",
+            "category": "fontanería",
+            "asset_type": DAMAGE_CATEGORY_SPECIFICATIONS['fontanería']['default_asset_type'],
+            "observed_damage": "Fuga, rotura o filtración de agua",
+            "known_cause": "Fuga o avería en conducción de agua",
+            "repair_stage": repair_stage,
+            "claimed_cost": None,
+            "review_status": "PENDING_REVIEW",
+            "technical_conditions": ["localizacion_origen_fuga"]
+        })
+        item_idx += 1
+
+    if 'mobiliario' in categories or any(w in desc_lower for w in ('mueble', 'armario', 'puerta', 'mesa', 'silla', 'estanteria', 'parquet', 'tarima')):
+        item_name = "Mueble / Elemento de mobiliario"
+        if 'mueble' in desc_lower:
+            item_name = "Mueble afectado por agua/daño"
+        elif 'parquet' in desc_lower or 'tarima' in desc_lower:
+            item_name = "Suelo de parquet / tarima"
+        items.append({
+            "item_id": f"item_{item_idx}",
+            "name": item_name,
+            "category": "mobiliario",
+            "asset_type": DAMAGE_CATEGORY_SPECIFICATIONS['mobiliario']['default_asset_type'],
+            "observed_damage": "Afectación por agua, impacto o deformación",
+            "known_cause": "Afectación consecuencial o daño directo",
+            "repair_stage": repair_stage,
+            "claimed_cost": None,
+            "review_status": "PENDING_REVIEW",
+            "technical_conditions": []
+        })
+        item_idx += 1
+
+    if 'pintura' in categories or any(w in desc_lower for w in ('pintura', 'pared', 'techo', 'mancha', 'humedad')):
+        items.append({
+            "item_id": f"item_{item_idx}",
+            "name": "Superficie de pared / techo",
+            "category": "pintura",
+            "asset_type": DAMAGE_CATEGORY_SPECIFICATIONS['pintura']['default_asset_type'],
+            "observed_damage": "Mancha de humedad, desconchón o daño estético",
+            "known_cause": "Filtración o daño estético derivado",
+            "repair_stage": repair_stage,
+            "claimed_cost": None,
+            "review_status": "PENDING_REVIEW",
+            "technical_conditions": ["comprobacion_secado_humedad"]
+        })
+        item_idx += 1
+
+    if not items:
+        items.append({
+            "item_id": "item_1",
+            "name": "Bien / Elemento dañado declarado",
+            "category": "asistencia",
+            "asset_type": "bien_dañado",
+            "observed_damage": description[:100],
+            "known_cause": "Incidente declarado",
+            "repair_stage": repair_stage,
+            "claimed_cost": None,
+            "review_status": "PENDING_REVIEW",
+            "technical_conditions": []
+        })
+
+    return items
+
+
+def build_evidence_matrix(affected_items, claim_purpose='reclamacion_danios', global_repair_stage=None):
+    """
+    Builds dynamic matrix of documentary evidence requirements for a claim and its affected items.
+    Covers the 11 Transversal Points of Accreditation.
+    """
+    matrix = []
+
+    # Mandatory Policy Contractual Coverage check (Point 6)
+    matrix.append({
+        "requirement_id": "req_policy_coverage",
+        "item_id": "global_policy",
+        "demonstrates": "La cobertura contractual aplicable (límites, exclusiones, franquicias) [Punto 6]",
+        "proof_category": "cobertura_contractual",
+        "acceptable_document_types": ["poliza_vigente"],
+        "acceptable_alternatives": ["consulta_en_sistema_de_polizas"],
+        "is_mandatory": True,
+        "reasoning": "Verificación obligatoria de vigencia y garantías de la póliza contratada.",
+        "status": RequirementStatus.SOLICITADO,
+        "status_reason": None,
+        "fulfilled_by_file": None,
+        "needs_human_review": False
+    })
+
+    for item in (affected_items or []):
+        cat = item.get('category', 'asistencia')
+        spec = DAMAGE_CATEGORY_SPECIFICATIONS.get(cat, DAMAGE_CATEGORY_SPECIFICATIONS['asistencia'])
+        stage = global_repair_stage or item.get('repair_stage', RepairStage.SIN_REPARAR)
+        item_id = item.get('item_id', 'item_1')
+        item_name = item.get('name', 'Bien dañado')
+
+        # 1. Damage photo / video requirement (Points 1, 2, 7)
+        matrix.append({
+            "requirement_id": f"req_damage_media_{item_id}",
+            "item_id": item_id,
+            "demonstrates": f"La existencia y descripción del daño, identidad del bien ({item_name}) y su estado actual [Puntos 1, 2, 7]",
+            "proof_category": ProofCategory.FOTO_VIDEO_DANO,
+            "acceptable_document_types": ["image/jpeg", "image/png", "video/mp4", "video/quicktime"],
+            "acceptable_alternatives": ["vídeo_demostrativo_10-20s", "fotografía_con_contexto_y_entorno"],
+            "is_mandatory": True,
+            "reasoning": "Exigido para constatar visualmente el daño declarado y el bien afectado.",
+            "status": RequirementStatus.SOLICITADO,
+            "status_reason": None,
+            "fulfilled_by_file": None,
+            "needs_human_review": False
+        })
+
+        # 2. Original purchase proof requirement (Points 3, 4) - Conditional / Optional
+        if spec.get('requires_age_or_model') or stage == RepairStage.BIEN_SUSTITUIDO:
+            matrix.append({
+                "requirement_id": f"req_purchase_invoice_{item_id}",
+                "item_id": item_id,
+                "demonstrates": f"La adquisición, propiedad, valor original, antigüedad o modelo de {item_name} [Puntos 3, 4]",
+                "proof_category": ProofCategory.FACTURA_COMPRA_ORIGINAL,
+                "acceptable_document_types": ["application/pdf", "image/jpeg", "image/png"],
+                "acceptable_alternatives": spec.get('standard_acceptable_alternatives') or [
+                    "fotografía_de_placa_o_etiqueta_de_marca_modelo",
+                    "declaración_de_año_de_compra_y_precio_estimado",
+                    "manual_de_instrucciones_o_garantía_original"
+                ],
+                "is_mandatory": False,
+                "reasoning": "Permite acreditar el valor original y modelo del bien cuando no se dispone de la factura original.",
+                "status": RequirementStatus.SOLICITADO,
+                "status_reason": None,
+                "fulfilled_by_file": None,
+                "needs_human_review": False
+            })
+
+        # 3. Repair invoice requirement (Points 8, 9) if work completed
+        if stage == RepairStage.TRABAJO_REALIZADO:
+            matrix.append({
+                "requirement_id": f"req_repair_invoice_{item_id}",
+                "item_id": item_id,
+                "demonstrates": f"El coste de reparación reclamado y la realización efectiva del trabajo en {item_name} [Puntos 8, 9]",
+                "proof_category": ProofCategory.FACTURA_REPARACION,
+                "acceptable_document_types": ["application/pdf", "image/jpeg", "image/png"],
+                "acceptable_alternatives": ["factura_desglosada_de_reparación_con_datos_del_proveedor"],
+                "is_mandatory": True,
+                "reasoning": "Requisito obligatorio para justificar el reembolso de un trabajo ya completado.",
+                "status": RequirementStatus.SOLICITADO,
+                "status_reason": None,
+                "fulfilled_by_file": None,
+                "needs_human_review": False
+            })
+
+        # 4. Replacement invoice requirement (Point 8) if item replaced
+        if stage == RepairStage.BIEN_SUSTITUIDO:
+            matrix.append({
+                "requirement_id": f"req_replacement_invoice_{item_id}",
+                "item_id": item_id,
+                "demonstrates": f"El coste de sustitución o reposición del bien {item_name} [Punto 8]",
+                "proof_category": ProofCategory.FACTURA_REPOSICION,
+                "acceptable_document_types": ["application/pdf", "image/jpeg", "image/png"],
+                "acceptable_alternatives": ["ticket_o_factura_de_compra_del_nuevo_bien_reemplazado"],
+                "is_mandatory": True,
+                "reasoning": "Requisito obligatorio para justificar el gasto efectuado en la reposición del bien.",
+                "status": RequirementStatus.SOLICITADO,
+                "status_reason": None,
+                "fulfilled_by_file": None,
+                "needs_human_review": False
+            })
+
+        # 5. Payment proof requirement (Point 10) if claimed as paid
+        if stage in (RepairStage.TRABAJO_REALIZADO, RepairStage.BIEN_SUSTITUIDO):
+            matrix.append({
+                "requirement_id": f"req_payment_proof_{item_id}",
+                "item_id": item_id,
+                "demonstrates": f"El pago efectivo del trabajo o bien de reposición para {item_name} [Punto 10]",
+                "proof_category": ProofCategory.JUSTIFICANTE_PAGO,
+                "acceptable_document_types": ["application/pdf", "image/jpeg", "image/png"],
+                "acceptable_alternatives": [
+                    "indicación_expresa_de_pagado_en_la_factura",
+                    "recibo_bancario_o_comprobante_de_transferencia"
+                ],
+                "is_mandatory": False,
+                "reasoning": "Demostrar que el importe reclamado ha sido efectivamente abonado.",
+                "status": RequirementStatus.SOLICITADO,
+                "status_reason": None,
+                "fulfilled_by_file": None,
+                "needs_human_review": False
+            })
+
+        # 6. Repair estimate requirement (Point 8) if repair proposed
+        if stage == RepairStage.PROPUESTA_REPARACION:
+            matrix.append({
+                "requirement_id": f"req_estimate_{item_id}",
+                "item_id": item_id,
+                "demonstrates": f"El coste de reparación estimado/propuesto para {item_name} [Punto 8]",
+                "proof_category": ProofCategory.PRESUPUESTO,
+                "acceptable_document_types": ["application/pdf", "image/jpeg", "image/png"],
+                "acceptable_alternatives": ["presupuesto_formal_emitido_por_empresa_de_reparaciones"],
+                "is_mandatory": True,
+                "reasoning": "Exigido para valorar y autorizar el importe de la reparación antes de su ejecución.",
+                "status": RequirementStatus.SOLICITADO,
+                "status_reason": None,
+                "fulfilled_by_file": None,
+                "needs_human_review": False
+            })
+
+        # 7. Technical condition requirement (Point 11)
+        for cond in spec.get('technical_conditions', []):
+            matrix.append({
+                "requirement_id": f"req_tech_{cond}_{item_id}",
+                "item_id": item_id,
+                "demonstrates": f"Comprobación técnica: {cond.replace('_', ' ')} en {item_name} [Punto 11]",
+                "proof_category": ProofCategory.COMPROBACION_TECNICA,
+                "acceptable_document_types": ["informe_tecnico", "verificacion_pericial"],
+                "acceptable_alternatives": ["comprobación_y_medición_in_situ_por_el_profesional_asignado"],
+                "is_mandatory": False,
+                "reasoning": f"Condición técnica ({cond}) no verificable únicamente mediante imágenes convencionales.",
+                "status": RequirementStatus.PENDIENTE_REVISION,
+                "status_reason": "Requiere verificación técnica in situ por el profesional o perito.",
+                "fulfilled_by_file": None,
+                "needs_human_review": True
+            })
+
+    return matrix
+
+
+def evaluate_received_evidence(evidence_matrix, photos, invoices, description=''):
+    """
+    Evaluates received photos, videos, invoices, and documents against the dynamic matrix requirements.
+    Updates requirement statuses and fulfilled_by_file in-place.
+    Distinguishes reception from validation (SOLICITADO, RECIBIDO, ILEGIBLE, INSUFICIENTE, PENDIENTE_REVISION, ACEPTADO).
+    """
+    if not evidence_matrix:
+        return []
+
+    photos = photos or []
+    invoices = invoices or []
+    desc_lower = (description or '').lower()
+
+    for req in evidence_matrix:
+        p_cat = req.get('proof_category')
+
+        if p_cat == 'cobertura_contractual':
+            req['status'] = RequirementStatus.ACEPTADO
+            req['status_reason'] = "Verificado en base de datos de pólizas de hogar."
+            continue
+
+        if p_cat == ProofCategory.FOTO_VIDEO_DANO:
+            valid_media = [p for p in photos if p.get('analysis', {}).get('valid')]
+            invalid_media = [p for p in photos if not p.get('analysis', {}).get('valid')]
+
+            if valid_media:
+                req['status'] = RequirementStatus.ACEPTADO
+                req['fulfilled_by_file'] = valid_media[0].get('filename')
+                req['status_reason'] = f"Acreditado mediante archivo multimedia válido: {valid_media[0].get('filename')}"
+            elif invalid_media:
+                reason = invalid_media[0].get('analysis', {}).get('reason', 'Archivo ilegible o no válido.')
+                req['status'] = RequirementStatus.ILEGIBLE if 'borrosa' in reason.lower() else RequirementStatus.INSUFICIENTE
+                req['status_reason'] = reason
+                req['fulfilled_by_file'] = invalid_media[0].get('filename')
+            else:
+                if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
+                    req['status'] = RequirementStatus.SOLICITADO
+
+        elif p_cat == ProofCategory.FACTURA_COMPRA_ORIGINAL:
+            comp_invoices = [inv for inv in invoices if inv.get('extracted_fields', {}).get('success')]
+            if comp_invoices:
+                req['status'] = RequirementStatus.ACEPTADO
+                req['fulfilled_by_file'] = comp_invoices[0].get('filename')
+                req['status_reason'] = "Documento de compra acreditado."
+            elif any(kw in desc_lower for kw in ('comprad', 'año', 'modelo', 'marca', 'antigüedad', 'antiguedad', 'precio')):
+                req['status'] = RequirementStatus.ACEPTADO
+                req['status_reason'] = "Acreditado mediante alternativa documental: declaración de características, marca y modelo."
+            else:
+                if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
+                    req['status'] = RequirementStatus.SOLICITADO
+
+        elif p_cat == ProofCategory.FACTURA_REPARACION:
+            repair_invs = []
+            failed_invs = []
+
+            for inv in invoices:
+                fields = inv.get('extracted_fields') or {}
+                if fields.get('success'):
+                    repair_invs.append(inv)
+                else:
+                    failed_invs.append(inv)
+
+            if repair_invs:
+                f_fields = repair_invs[0].get('extracted_fields', {})
+                req['status'] = RequirementStatus.ACEPTADO
+                req['fulfilled_by_file'] = repair_invs[0].get('filename')
+                req['status_reason'] = f"Factura de reparación válida (Proveedor: {f_fields.get('provider') or 'N/A'}, Importe: {f_fields.get('amount')} {f_fields.get('currency') or ''})."
+            elif failed_invs:
+                err_reason = failed_invs[0].get('extracted_fields', {}).get('reason', 'Factura ilegible o sin campos mínimos de proveedor/importe.')
+                req['status'] = RequirementStatus.INSUFICIENTE
+                req['fulfilled_by_file'] = failed_invs[0].get('filename')
+                req['status_reason'] = f"Documento de reparación insuficiente o ilegible: {err_reason}"
+            else:
+                if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
+                    req['status'] = RequirementStatus.SOLICITADO
+
+        elif p_cat == ProofCategory.FACTURA_REPOSICION:
+            repl_invs = [inv for inv in invoices if inv.get('extracted_fields', {}).get('success')]
+            if repl_invs:
+                req['status'] = RequirementStatus.ACEPTADO
+                req['fulfilled_by_file'] = repl_invs[0].get('filename')
+                req['status_reason'] = "Factura de reposición/sustitución del bien acreditada."
+            else:
+                if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
+                    req['status'] = RequirementStatus.SOLICITADO
+
+        elif p_cat == ProofCategory.JUSTIFICANTE_PAGO:
+            paid_invs = [
+                inv for inv in invoices
+                if inv.get('extracted_fields', {}).get('success') and (
+                    inv.get('extracted_fields', {}).get('taxes_included') is not None
+                    or 'pagad' in str(inv).lower() or 'cobrad' in str(inv).lower() or 'recibo' in str(inv).lower()
+                )
+            ]
+            if paid_invs:
+                req['status'] = RequirementStatus.ACEPTADO
+                req['fulfilled_by_file'] = paid_invs[0].get('filename')
+                req['status_reason'] = "Pago acreditado mediante justificante o anotación en documento."
+            else:
+                if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
+                    req['status'] = RequirementStatus.SOLICITADO
+
+        elif p_cat == ProofCategory.PRESUPUESTO:
+            est_invs = [inv for inv in invoices if inv.get('extracted_fields', {}).get('amount') is not None]
+            if est_invs:
+                req['status'] = RequirementStatus.ACEPTADO
+                req['fulfilled_by_file'] = est_invs[0].get('filename')
+                req['status_reason'] = "Presupuesto formal acreditado."
+            else:
+                if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
+                    req['status'] = RequirementStatus.SOLICITADO
+
+        elif p_cat == ProofCategory.COMPROBACION_TECNICA:
+            req['status'] = RequirementStatus.PENDIENTE_REVISION
+            req['needs_human_review'] = True
+            req['status_reason'] = "Condición técnica que no se puede verificar solo con fotos. Requiere comprobación in situ por el técnico/perito."
+
+    return evidence_matrix
+
+
+def get_pending_matrix_requirements(evidence_matrix):
+    """
+    Returns list of unsatisfied or pending requirements from evidence_matrix.
+    """
+    pending = []
+    for req in (evidence_matrix or []):
+        st = req.get('status')
+        if st in (RequirementStatus.SOLICITADO, RequirementStatus.ILEGIBLE, RequirementStatus.INSUFICIENTE, RequirementStatus.PENDIENTE_REVISION):
+            if req.get('is_mandatory') or st in (RequirementStatus.ILEGIBLE, RequirementStatus.INSUFICIENTE, RequirementStatus.PENDIENTE_REVISION):
+                pending.append(req)
+    return pending
+
+
 # Incident interpretation & multi-damage identification
 def interpret_incident_with_llm(description):
     """Interpret customer description, identifying all damage categories and services needed."""
@@ -629,7 +1137,7 @@ def interpret_incident_with_llm(description):
     elif not any(w in desc_lower for w in date_words) and len(description.split()) < 7:
         missing_info = "¿Cuándo ocurrió exactamente el incidente (ayer, hoy, hace unos días, etc.)?"
 
-    return {
+    interp = {
         "description": description,
         "incident_type": primary_service,
         "primary_service": primary_service,
@@ -638,6 +1146,14 @@ def interpret_incident_with_llm(description):
         "damage_categories": damage_categories or ['asistencia'],
         "missing_info": missing_info
     }
+
+    affected_items = build_affected_items(interp, description)
+    evidence_matrix = build_evidence_matrix(affected_items)
+
+    interp["affected_items"] = affected_items
+    interp["evidence_matrix"] = evidence_matrix
+
+    return interp
 
 
 # Contractual coverage evaluation based on documentary evidence
@@ -1382,6 +1898,36 @@ def build_human_summary(conn, business_id, claim):
         f"  - Servicios secundarios involucrados: {', '.join(interp.get('secondary_services', [])) or 'Ninguno'}",
         f"  - Categorías de daño detectadas: {', '.join(interp.get('damage_categories', [])) or 'No categorizado'}",
         f"  - Información pendiente de recabar: {interp.get('missing_info') or 'Ninguna (datos completos)'}",
+        "",
+        "3.1. MATRIZ DINÁMICA DE ACREDITACIÓN (11 PUNTOS TRANSVERSALES) Y ELEMENTOS AFECTADOS:"
+    ]
+
+    affected_items = claim.get('affected_items') or interp.get('affected_items') or []
+    if affected_items:
+        summary_lines.append("  - Desglose de elementos / bienes afectados:")
+        for item in affected_items:
+            summary_lines.append(
+                f"    * {item.get('name')} [Categoría: {item.get('category')} | Fase: {item.get('repair_stage')}] | "
+                f"Daño: {item.get('observed_damage')} | Causa: {item.get('known_cause')}"
+            )
+    else:
+        summary_lines.append("  - Desglose de elementos / bienes afectados: [No desglosado]")
+
+    evidence_matrix = claim.get('evidence_matrix') or interp.get('evidence_matrix') or []
+    if evidence_matrix:
+        summary_lines.append("  - Matriz de requisitos de acreditación:")
+        for req in evidence_matrix:
+            st_str = req.get('status', 'SOLICITADO')
+            file_str = f" (Archivo: {req.get('fulfilled_by_file')})" if req.get('fulfilled_by_file') else ""
+            summary_lines.append(
+                f"    * [{req.get('proof_category')}] {req.get('demonstrates')}: {st_str}{file_str}"
+            )
+            if req.get('status_reason'):
+                summary_lines.append(f"        Nota/Razón: {req.get('status_reason')}")
+    else:
+        summary_lines.append("  - Matriz de requisitos de acreditación: [No inicializada]")
+
+    summary_lines.extend([
         "",
         "4. EVIDENCIA CONTRACTUAL Y EVALUACIÓN DE COBERTURA:",
         f"  - Estado de Cobertura: {eval_data.get('status', 'PENDIENTE_EVALUACION')}",
