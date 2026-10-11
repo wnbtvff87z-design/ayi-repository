@@ -172,7 +172,7 @@ def availability(b,d,t,n=1):
  return {'available':bool(exact),'alternatives':[] if exact else [{'date':x['date'],'time':x['time']} for x in free[:5]]}
 def lock_slot(c,b,s):
  row=c.execute('SELECT slot_id,status,capacity FROM booking_slots WHERE business_id=%s AND slot_id=%s FOR UPDATE',(b,s['id'])).fetchone()
- if not row or row['status']!='Abierta' or int(row['capacity'])<1:raise BookingError('Esa franja se cerró; consultá alternativas')
+ if not row or row['status']!='Abierta' or int(row['capacity'])<1:raise BookingError('Esa franja se cerró; consulta alternativas')
 def row_for(c,b,pk):return c.execute('SELECT r.*,s.slot_date,s.start_time FROM booking_reservations r JOIN booking_slots s ON r.business_id=s.business_id AND r.slot_id=s.slot_id WHERE r.business_id=%s AND r.id=%s',(b,pk)).fetchone()
 def _mirror_slot_record(row):
  with db() as c:slot=c.execute('SELECT airtable_record_id FROM booking_slots WHERE business_id=%s AND slot_id=%s',(row['business_id'],row['slot_id'])).fetchone()
@@ -239,13 +239,13 @@ def create(data,b):
  d=str(data.get('reservation_date') or '');t=str(data.get('reservation_time') or '')
  if not future(d,t,b.get('timezone') or 'Europe/Madrid'):raise BookingError('Esa fecha y hora ya pasaron')
  selected=next((x for x in slots(b,d,1) if x['date']==d and x['time']==t),None)
- if not selected:raise BookingError('Esa hora no está disponible; consultá alternativas')
+ if not selected:raise BookingError('Esa hora no está disponible; consulta alternativas')
  with db() as c:
   lock_slot(c,bid,selected)
   old=c.execute('SELECT id FROM booking_reservations WHERE business_id=%s AND request_id=%s',(bid,req)).fetchone()
   if old:row=row_for(c,bid,old['id']);raced=True
   else:
-   if occupied(c,b,selected)+n>selected['capacity']:raise BookingError('Esa hora se ocupó; consultá alternativas')
+   if occupied(c,b,selected)+n>selected['capacity']:raise BookingError('Esa hora se ocupó; consulta alternativas')
    code='R-'+secrets.token_hex(5).upper();pk=c.execute('INSERT INTO booking_reservations(business_id,slot_id,request_id,code,name,phone,email,party_size,channel,business_phone) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',(bid,selected['id'],req,code,name,phone,email,n,data.get('channel','Voice'),b['phone'])).fetchone()['id'];row=row_for(c,bid,pk);raced=False
  if raced:
   synced=bool(row['airtable_id']) and not row['airtable_pending'];return {'success':True,'code':row['code'],'airtable_synced':synced if synced else mirror(row),'already_exists':True}

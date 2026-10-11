@@ -1,0 +1,370 @@
+"""End-to-end synthetic checks for the current conversational and Voice changes."""
+import json
+from datetime import date, timedelta
+
+import pytest
+
+from test_insurance_attribution import (
+    pg, rows, BIZ, PHONE, BUSINESS, add_document, verify, evidence_markers, assert_visible_sources,
+)
+from insurance import dialog, identity, llm, orchestrator
+from test_insurance_whatsapp_grounded import grounded, NAME, DNI
+
+
+@pytest.mark.parametrize('text', [
+    'Quería hacer una consulta de la póliza',
+    'Hola, quisiera hacer una consulta sobre mi póliza.',
+    'Me gustaría realizar una consulta acerca de mi seguro',
+    'Tengo una duda sobre el contrato',
+    'Quiero consultar mi póliza',
+    '¿Podría hacer una pregunta respecto a la póliza?',
+])
+def test_generic_consultation_is_not_a_contractual_question(text):
+    assert orchestrator.generic_request(text)
+    assert not dialog._is_question(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Quería hacer una consulta de la póliza: ¿cubre daños por agua?',
+    'Quisiera hacer una consulta sobre mi póliza si se rompe un cristal',
+    'Tengo una duda sobre la cobertura de mi seguro',
+    'Quiero consultar mi póliza sobre una mesa de vidrio',
+    '¿Puedes consultar mi póliza?',
+    '¿Qué cubre mi seguro?',
+    'Quiero cancelar el seguro',
+    '¿Cubre agua y fuego?',
+])
+def test_generic_filter_preserves_real_questions(text):
+    assert not orchestrator.generic_request(text)
+    assert dialog._is_question(text)
+
+
+def say(text, n, channel='Voice'):
+    return dialog.process(BUSINESS, {}, [], text, channel,
+                          f'CA-SYNTHETIC:turn:{n}' if channel == 'Voice' else f'SM-{n}', PHONE)
+
+
+@pytest.fixture
+def client(pg, monkeypatch):
+    with pg() as conn:
+        identity.upsert_customer(conn, BIZ, 'C2', 'Celia Zorro Condes', '51959566J')
+    add_document(pg, 'POL-900', 'DOC-FIRE', pages=(
+        'Incendio fuego cobertura vivienda agua inundación rotura cristal vidrio límites condiciones exclusiones.',
+        'Exclusiones de incendio: desgaste y falta de mantenimiento.'))
+    monkeypatch.setattr(dialog, 'llm_explain', lambda q, ev:
+                        'Según las cláusulas aportadas, hay condiciones y exclusiones. ' + evidence_markers(ev))
+    return pg
+
+
+def test_voice_identity_one_turn_does_not_retrieve_and_trace_is_masked(client, monkeypatch):
+    monkeypatch.setattr(dialog.retrieval, 'retrieve', lambda *a, **kw: pytest.fail('identity is not a query'))
+    reply, out = say('Celia Zorro, DNI cinco uno nueve cinco nueve cinco seis seis jota', 1)
+    assert 'Qué quieres consultar' in reply
+    assert out['insurance_result'] == 'missing_information'
+    trace = rows(client, 'SELECT * FROM insurance_voice_trace')[0]
+    assert trace['diagnostic'] == 'identity_verified'
+    assert '51959566' not in str(dict(trace))
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+@pytest.mark.parametrize('legacy_pending', [False, True])
+def test_reported_generic_query_then_identity_never_calls_provider(
+        client, monkeypatch, channel, legacy_pending):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Generic consultation and identity must not call LLM or retrieval')
+
+    monkeypatch.setattr(llm, 'interpret', forbidden)
+    monkeypatch.setattr(dialog, 'llm_explain', forbidden)
+    monkeypatch.setattr(dialog, 'llm_rewrite', forbidden)
+    monkeypatch.setattr(dialog.retrieval, 'retrieve', forbidden)
+    say('Hola', 1, channel)
+    say('Quería hacer una consulta de la póliza', 2, channel)
+    state = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert not state.get('question')
+    if legacy_pending:
+        state['question'] = state['normalized_question'] = 'Quería hacer una consulta de la póliza'
+        state['question_intent'] = 'question'
+        with client() as conn:
+            identity.save_state(
+                conn, BIZ, channel, identity.conversation_ref(BIZ, channel, PHONE),
+                'CA-SYNTHETIC' if channel == 'Voice' else '', state)
+    reply, out = say('Mi nombre es Celia Zorro Condes y mi DNI es 51959566J', 3, channel)
+    assert reply == dialog.ASK_QUERY
+    assert out == {'insurance_result': 'missing_information'}
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 1
+    state = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['verified'] and not state.get('question')
+    assert not state.get('interpretation_diagnostic')
+    if channel == 'Voice':
+        trace = rows(client, 'SELECT stage,diagnostic,customer_id FROM insurance_voice_trace ORDER BY turn_no')[-1]
+        assert trace == {'stage': 'identity_verified', 'diagnostic': 'identity_verified', 'customer_id': 'C2'}
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_generic_query_identity_flow_through_real_endpoints(grounded, monkeypatch, channel):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Production-shaped generic flow must not call any LLM')
+
+    monkeypatch.setattr(llm, 'interpret', forbidden)
+    monkeypatch.setattr(llm, 'rewrite', forbidden)
+    monkeypatch.setattr(llm, 'explain', forbidden)
+    grounded.turn(channel, 'Hola')
+    grounded.turn(channel, 'Quería hacer una consulta de la póliza')
+    assert not grounded.state().get('question')
+    response = grounded.turn(channel, f'Mi nombre es {NAME} y mi DNI es {DNI}')
+    assert response['reply'] == dialog.ASK_QUERY
+    assert grounded.state()['verified'] is True
+    assert grounded.count('insurance_identity_verifications') == 1
+    assert grounded.count('insurance_cases') == 0
+    assert not grounded.interpretations and not grounded.explanations
+
+
+def test_voice_identity_accumulates_name_and_spoken_document(client):
+    first, _ = say('Celia Zorro', 1)
+    assert 'DNI o NIE' in first
+    second, out = say('Cinco uno nueve cinco nueve cinco seis seis jota', 2)
+    assert 'Qué quieres consultar' in second and out['insurance_result'] == 'missing_information'
+    assert rows(client, 'SELECT customer_id FROM insurance_identity_verifications')[0]['customer_id'] == 'C2'
+    third, out = say('Ayer se produjo un incendio. ¿Qué indica mi póliza?', 3)
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert_visible_sources(third, number='900')
+    state = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert state['fact_date'] == (date.today() - timedelta(days=1)).isoformat()
+    assert state['active_topic'] == 'incendio'
+    reply, out = say('¿Qué exclusiones tiene?', 4)
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']['fact_date'] == state['fact_date']
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+    reply, out = say('Sí, registra la consulta', 5)
+    assert out['insurance_result'] == 'human_case_required' and 'He guardado' in reply
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_glass_answers_documentally_without_default_human_case(client, channel):
+    verify(client, 'C2', channel=channel, session='CA-SYNTHETIC' if channel == 'Voice' else '')
+    reply, out = say('¿Qué dice la póliza sobre rotura de vidrio?', 1, channel)
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert_visible_sources(reply, number='900')
+    assert 'especialista' not in reply
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_fire_without_date_explains_provisionally_and_offers_case(client, monkeypatch):
+    verify(client, 'C2', channel='Voice', session='CA-SYNTHETIC')
+    monkeypatch.setenv('INSURANCE_URGENT_PROTOCOL_TEXT', 'Protocolo sintético aprobado.')
+    reply, out = say('Se me prendió fuego la casa, ¿qué me cubre?', 1)
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert_visible_sources(reply, number='900')
+    assert 'aplicabilidad' in reply
+    assert 'Protocolo sintético' in reply
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_voice_identity_connectors_confirm_once_and_resume_unpunctuated_question(client, monkeypatch):
+    add_document(client, 'POL-900', 'DOC-TABLE', pages=(
+        'Condiciones generales. La cobertura de cristales y vidrios depende del objeto asegurado.',
+        'Exclusiones aplicables a roturas de objetos no enumerados.',
+    ))
+    seen = []
+
+    def explain(context, evidence):
+        seen.append((context, evidence))
+        return 'Las cláusulas no permiten afirmar que una mesa de vidrio esté cubierta. ' + evidence_markers(evidence)
+
+    monkeypatch.setattr(dialog, 'llm_explain', explain)
+    first, _ = say('si me cubre daños en mesas de vidrio', 1)
+    assert 'nombre y apellido' in first
+    reply, out = say(
+        'Celia Zorro Condes con su DNI cinco uno nueve cinco nueve cinco seis seis jota', 2)
+    assert reply.startswith('Gracias. He verificado tus datos.')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert len(seen) == 1 and 'mesas de vidrio' in seen[0][0]['question']
+    assert_visible_sources(reply, number='900')
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 1
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+@pytest.mark.parametrize('channel', ['Voice', 'WhatsApp'])
+def test_persisted_identity_fragments_are_never_retrieved_until_exact_document_completes(
+        client, monkeypatch, channel):
+    add_document(client, 'POL-900', 'DOC-IDENTITY', pages=(
+        'Cobertura de cristales y daños por agua: condiciones y límites.',
+    ))
+    seen = []
+    real_retrieve = dialog.retrieval.retrieve
+
+    def track_retrieval(*args, **kwargs):
+        seen.append(args[3])
+        return real_retrieve(*args, **kwargs)
+
+    monkeypatch.setattr(dialog.retrieval, 'retrieve', track_retrieval)
+    monkeypatch.setattr(dialog, 'llm_explain', lambda context, evidence:
+                        'La póliza tiene límites. ' + evidence_markers(evidence))
+    assert 'nombre y apellido' in say(
+        'si me cubre daños en mesas de vidrio', 1, channel=channel)[0]
+    assert 'DNI o NIE' in say('Celia Zorro Condes', 2, channel=channel)[0]
+    if channel == 'Voice':
+        first_fragment = 'DNI cincuenta y uno, noventa y cinco'
+        second_fragment = 'noventa y cinco, sesenta y seis, jota'
+    else:
+        first_fragment = 'DNI 5195'
+        second_fragment = '9566J'
+    assert 'DNI o NIE' in say(first_fragment, 3, channel=channel)[0]
+    stored = rows(client, 'SELECT state FROM insurance_conversation_state')[0]['state']
+    assert stored['awaiting_document'] is True
+    assert '5195' not in json.dumps(stored) and 'doc_hmac' not in stored
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
+    assert seen == []
+
+    assert 'DNI o NIE' in say('Póliza número 000123', 4, channel=channel)[0]
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 0
+    assert seen == []
+
+    reply, out = say(second_fragment, 5, channel=channel)
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert reply.startswith('Gracias. He verificado tus datos.')
+    assert reply.count('Gracias. He verificado tus datos.') == 1
+    assert len(seen) == 1 and 'mesas de vidrio' in seen[0]
+    assert 'Celia' not in seen[0] and '51959566' not in seen[0] and '000123' not in seen[0]
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_identity_verifications')[0]['n'] == 1
+    assert rows(client, 'SELECT customer_id FROM insurance_identity_verifications')[0]['customer_id'] == 'C2'
+
+
+def test_late_clause_is_retrieved_as_a_positioned_fragment(client, monkeypatch):
+    body = ('Introducción sin cobertura relacionada. ' * 80
+            + 'Cobertura de rotura de vidrio: los daños accidentales del cristal se valoran '
+              'según los límites y condiciones de la póliza. Véase también exclusiones en página 9.')
+    add_document(client, 'POL-900', 'DOC-LATE', pages=(body,))
+    with client() as conn:
+        conn.execute("UPDATE insurance_document_pages SET section='general_conditions' "
+                     "WHERE document_id='DOC-LATE'")
+    verify(client, 'C2')
+    seen = []
+    monkeypatch.setattr(
+        dialog, 'llm_explain',
+        lambda context, evidence: seen.extend(evidence) or
+        'La cláusula menciona límites y condiciones. ' + evidence_markers(evidence))
+    reply, out = say('¿Cubre rotura de vidrio?', 1, channel='WhatsApp')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    fragments = [item for item in seen if item['document_id'] == 'DOC-LATE']
+    assert fragments and any(item['position_start'] > 1500 for item in fragments)
+    assert any('Cobertura de rotura de vidrio' in item['text'] for item in fragments)
+    assert any('Véase también exclusiones en página 9' in item['text'] for item in fragments)
+    assert all(len(item['text']) < len(body) for item in fragments)
+    assert_visible_sources(reply, number='900')
+
+
+def test_glass_retrieval_keeps_another_page_exclusion_and_does_not_generalize(client, monkeypatch):
+    add_document(client, 'POL-900', 'DOC-GLASS', pages=(
+        'Cobertura de rotura accidental de cristales en ventanas.',
+        'Se excluyen los tableros de mesa de vidrio.',
+    ))
+    with client() as conn:
+        conn.execute("UPDATE insurance_document_pages SET section='coverage' "
+                     "WHERE document_id='DOC-GLASS' AND page_number=1")
+        conn.execute("UPDATE insurance_document_pages SET section='exclusions' "
+                     "WHERE document_id='DOC-GLASS' AND page_number=2")
+    verify(client, 'C2')
+    seen = []
+
+    def explain(context, evidence):
+        seen.extend(evidence)
+        assert 'mesa' not in dialog.memory.INSTRUCTIONS
+        assert 'UNA sola pregunta aclaratoria' in dialog.memory.INSTRUCTIONS
+        return ('La póliza excluye tableros de mesa de vidrio y no permite extender la cobertura de ventanas. '
+                + evidence_markers(evidence))
+
+    monkeypatch.setattr(dialog, 'llm_explain', explain)
+    reply, out = say('¿Cubre una mesa de vidrio rota?', 1, channel='WhatsApp')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert {item['page'] for item in seen} == {1, 2}
+    assert any('excluyen' in item['text'] for item in seen)
+    assert_visible_sources(reply, number='900', pages=(1, 2))
+
+
+def test_availability_and_general_summary_are_separate_from_coverage_questions(client, monkeypatch):
+    verify(client, 'C2')
+    calls = []
+    monkeypatch.setattr(dialog, 'llm_explain', lambda context, evidence:
+                        calls.append((context, evidence)) or
+                        'Resumen: se mencionan condiciones generales. ' + evidence_markers(evidence))
+    available, availability_result = say('La podés ver a mi póliza', 1, channel='WhatsApp')
+    assert 'documento listo para consultar' in available
+    assert '¿Quieres que registre' not in available
+    assert not calls
+
+    summary, summary_result = say('Qué me cubre en general', 2, channel='WhatsApp')
+    assert summary_result['insurance_result'] == 'evidence_backed_explanation'
+    assert calls and calls[-1][0]['question'] == 'Qué me cubre en general'
+    assert_visible_sources(summary, number='900')
+    assert 'No extiendas una cobertura a objetos o daños que la cláusula no nombra' in dialog.memory.INSTRUCTIONS
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_review_and_evidence_explanation_do_not_repeat_human_offer(client):
+    verify(client, 'C2')
+    initial, out = say('No me resuelvas zyxwvut', 1, channel='WhatsApp')
+    assert initial == dialog.OFFER_HUMAN
+    assert out['insurance_result'] == 'missing_information'
+    review, _ = say('Revisa de nuevo', 2, channel='WhatsApp')
+    assert review != dialog.OFFER_HUMAN and 'He vuelto a revisar' in review
+    explain, _ = say('No encontraste evidencia de qué', 3, channel='WhatsApp')
+    assert 'zyxwvut' in explain and 'no significa que esté cubierto ni excluido' in explain
+    assert '¿Quieres que registre' not in explain
+    assert rows(client, 'SELECT count(*) AS n FROM insurance_cases')[0]['n'] == 0
+
+
+def test_whatsapp_mesa_vidrio_user_query_sanitizes_citations(client, monkeypatch):
+    add_document(client, 'POL-900', 'DOC-GLASS-2', pages=(
+        'Cobertura de cristales de ventanas.',
+        'Se excluyen los tableros de mesa de vidrio y los daños por desgaste.',
+    ))
+    with client() as conn:
+        conn.execute("UPDATE insurance_document_pages SET section='coverage' "
+                     "WHERE document_id='DOC-GLASS-2' AND page_number=1")
+        conn.execute("UPDATE insurance_document_pages SET section='exclusions' "
+                     "WHERE document_id='DOC-GLASS-2' AND page_number=2")
+    verify(client, 'C2')
+
+    # LLM returns minor spacing in citation marker and leaks internal policy ID
+    monkeypatch.setattr(dialog, 'llm_explain', lambda ctx, ev:
+                        'Según la póliza POL-900, los tableros de mesa de vidrio están excluidos [p. 2].')
+
+    reply, out = say('quiero consultar la poliza si me cubre la rotura de la mesa de vidrio que tengo en la sala',
+                     1, channel='WhatsApp')
+    assert out['insurance_result'] == 'evidence_backed_explanation'
+    assert 'POL-900' not in reply
+    assert 'tableros de mesa de vidrio están excluidos' in reply
+    assert_visible_sources(reply, number='900', pages=(2,))
+
+
+@pytest.mark.parametrize('command', [
+    'decimelo vos', 'dímelo tú', 'decime vos', 'revisalo vos', 'intenta de nuevo',
+])
+def test_whatsapp_retry_conversational_commands_preserves_question(client, monkeypatch, command):
+    add_document(client, 'POL-900', 'DOC-GLASS-3', pages=(
+        'Cobertura de cristales de ventanas.',
+        'Se excluyen los tableros de mesa de vidrio.',
+    ))
+    with client() as conn:
+        conn.execute("UPDATE insurance_document_pages SET section='coverage' "
+                     "WHERE document_id='DOC-GLASS-3' AND page_number=1")
+        conn.execute("UPDATE insurance_document_pages SET section='exclusions' "
+                     "WHERE document_id='DOC-GLASS-3' AND page_number=2")
+    verify(client, 'C2')
+
+    # Turn 1: simulate transient failure leaving awaiting='retry'
+    monkeypatch.setattr(dialog, 'llm_explain', lambda ctx, ev: (_ for _ in ()).throw(ValueError('transient')))
+    reply1, out1 = say('quiero consultar la poliza si me cubre la rotura de la mesa de vidrio que tengo en la sala',
+                       1, channel='WhatsApp')
+    assert out1['insurance_result'] == 'technical_error'
+    assert 'problema técnico' in reply1
+
+    # Turn 2: user says "decimelo vos" / "dímelo tú"
+    monkeypatch.setattr(dialog, 'llm_explain', lambda ctx, ev:
+                        'La póliza excluye expresamente los tableros de mesa de vidrio [p.2].')
+    reply2, out2 = say(command, 2, channel='WhatsApp')
+    assert out2['insurance_result'] == 'evidence_backed_explanation'
+    assert 'tableros de mesa de vidrio' in reply2
+    assert_visible_sources(reply2, number='900', pages=(2,))
+

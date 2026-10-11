@@ -1,55 +1,147 @@
-import hmac,json,logging,os,re,time,threading
+import hmac,json,logging,os,re,time,threading,unicodedata
+import hashlib
 from datetime import timezone, datetime, timedelta
 from urllib.parse import quote,urlparse
 from zoneinfo import ZoneInfo
 import requests
-from flask import Flask,Response,jsonify,request
+from flask import Flask,Response,jsonify,request,has_request_context
+from uuid import uuid4
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
-from dialog import process
+from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
+from insurance.cases import CaseWorkflowError, MIN_KEY_BYTES
 app=Flask(__name__);log=logging.getLogger(__name__)
+_insurance_log_level=getattr(logging,os.getenv('LOG_LEVEL','INFO').strip().upper(),logging.INFO)
+if not isinstance(_insurance_log_level,int):_insurance_log_level=logging.INFO
+_insurance_logger=logging.getLogger('insurance')
+_insurance_logger.setLevel(_insurance_log_level)
+if not _insurance_logger.handlers:
+ _insurance_handler=logging.StreamHandler()
+ _insurance_handler.setFormatter(logging.Formatter('%(levelname)s %(name)s %(message)s'))
+ _insurance_logger.addHandler(_insurance_handler)
+_insurance_logger.propagate=False
+from insurance.admin import bp as insurance_admin_bp
+app.register_blueprint(insurance_admin_bp)
+INSURANCE_HUMAN_AUTH_FAILURE_LIMIT=5
+INSURANCE_HUMAN_AUTH_WINDOW_SECONDS=60
+INSURANCE_HUMAN_API_KEY_MAX_BYTES=256
+_insurance_human_auth_failures={}
+_insurance_human_auth_lock=threading.Lock()
 MODE=os.getenv('TENANT_LOOKUP_MODE','legacy').strip().lower()
 PHONE=os.getenv('TWILIO_PHONE','').strip()
+INSURANCE_DISABLED_REPLY='Este canal no está disponible para esta consulta.'
+class InsuranceDisabledError(BookingError):pass
+class BusinessLookupError(BookingError):
+  def __init__(self,code,message='El registro de negocios no está disponible temporalmente.'):
+    super().__init__(message)
+    self.code=code
+BUSINESS_NOT_FOUND_REPLY='Este número no tiene un negocio activo configurado para este canal.'
+BUSINESS_UNAVAILABLE_REPLY='El servicio está temporalmente no disponible. Inténtalo en un minuto. No he ejecutado ninguna operación.'
+def _lookup_correlation():
+  if not has_request_context():return uuid4().hex[:16]
+  if 'business_lookup_correlation' not in request.environ:
+   payload=request.get_json(silent=True)
+   external=(request.form.get('MessageSid') or request.form.get('CallSid') or
+             (payload.get('external_id') if isinstance(payload,dict) else ''))
+   request.environ['business_lookup_correlation']=hashlib.sha256(str(external or uuid4().hex).encode()).hexdigest()[:16]
+  return request.environ['business_lookup_correlation']
+def _lookup_diagnostic(code):
+  log.warning('business_lookup correlation_id=%s reason_code=%s',_lookup_correlation(),code)
+def _registry_get(target,**kwargs):
+  for attempt in range(3):
+    try:
+      response=requests.get(target,headers=headers(),timeout=(1,2),**kwargs)
+      response.raise_for_status()
+      return response.json()
+    except requests.Timeout:
+      code='business_lookup_timeout'
+    except requests.ConnectionError:
+      code='business_lookup_network_error'
+    except requests.HTTPError as exc:
+      status=exc.response.status_code if exc.response is not None else 0
+      code='business_lookup_rate_limited' if status==429 else (
+           'business_lookup_server_error' if 500<=status<600 else 'business_lookup_failed')
+      if status!=429 and not 500<=status<600:
+        _lookup_diagnostic(code)
+        raise BusinessLookupError(code) from None
+    except (ValueError,requests.RequestException):
+      _lookup_diagnostic('business_lookup_failed')
+      raise BusinessLookupError('business_lookup_failed') from None
+    _lookup_diagnostic(code)
+    if attempt<2:time.sleep(0.1*(attempt+1))
+  raise BusinessLookupError(code) from None
 def phone(v):
   digits=re.sub(r'\D','',str(v or '').removeprefix('whatsapp:'))
   return '+'+digits if digits else ''
+def field(f,*names,default=''):
+  """Airtable column lookup tolerant to accents, case and separators (Menu, Menú, menu_url...)."""
+  def key(k):return re.sub(r'[^a-z0-9]','',unicodedata.normalize('NFKD',str(k).casefold()).encode('ascii','ignore').decode())
+  by={key(k):v for k,v in f.items()}
+  for n in names:
+    v=by.get(key(n))
+    if v not in (None,'',[]):
+      if isinstance(v,list):v=', '.join(str(x.get('url') if isinstance(x,dict) else x) for x in v)
+      return v
+  return default
 def _legacy_lookup(number):
   table=os.getenv('AIRTABLE_RESTAURANTS_TABLE','Restaurantes')
   rows=[];offset=None
   for _ in range(20):
    params={'pageSize':100}
    if offset:params['offset']=offset
-   r=requests.get(url(table),headers=headers(),params=params,timeout=12);r.raise_for_status()
-   data=r.json();rows.extend(data.get('records',[]));offset=data.get('offset')
+   data=_registry_get(url(table),params=params);rows.extend(data.get('records',[]));offset=data.get('offset')
    if not offset:break
   else:raise BookingError('Demasiados negocios para identificar el número con seguridad')
   found=[x.get('fields',{}) for x in rows if any(phone(x.get('fields',{}).get(k))==number for k in ('Twilio_Phone','Voice_Phone','WhatsApp_Phone','Telefono','Teléfono'))]
-  if len(found)>1:raise BookingError('Número duplicado en Restaurantes')
-  if not found:return None
+  if len(found)>1:raise BusinessLookupError('business_lookup_duplicate','Número duplicado en Restaurantes')
+  if not found:
+   _lookup_diagnostic('business_not_found')
+   return None
   f=found[0];name=str(f.get('Nombre') or 'Recepción')
-  return {'business_id':'legacy:'+number,'name':name,'phone':number,'sector':'restaurante','allow_reservations':True,'allow_messages':True,'hours':f.get('Horarios',''),'menu':f.get('Menu',''),'address':f.get('Direccion') or f.get('Dirección') or '','reception':f.get('Recepcion') or f.get('Recepción') or '','timezone':f.get('Timezone') or 'Europe/Madrid'}
+  return {'business_id':'legacy:'+number,'name':name,'phone':number,'sector':'restaurante','allow_reservations':True,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Recepcion','Recepción','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 def _tenant_lookup(number,channel):
   table=os.getenv('AIRTABLE_NUMBERS_TABLE','Numeros')
   formula='AND({Numero_E164}='+json.dumps(number)+',{Canal}='+json.dumps(channel)+',{Estado}="Activo")'
-  r=requests.get(url(table),headers=headers(),params={'filterByFormula':formula,'maxRecords':2},timeout=10);r.raise_for_status();rows=r.json().get('records',[])
-  if len(rows)>1:raise BookingError('Número duplicado en Numeros')
-  if not rows:return None
+  rows=_registry_get(url(table),params={'filterByFormula':formula,'maxRecords':2}).get('records',[])
+  if len(rows)>1:raise BusinessLookupError('business_lookup_duplicate','Número duplicado en Numeros')
+  if not rows:
+   # Diagnostic-only lookup: never authorizes an inactive or different-channel assignment.
+   other=_registry_get(url(table),params={'filterByFormula':'{Numero_E164}='+json.dumps(number),'maxRecords':100}).get('records',[])
+   fields=[row.get('fields',{}) for row in other]
+   same=[f for f in fields if f.get('Canal')==channel]
+   code='business_number_inactive' if same else ('business_channel_mismatch' if fields else 'business_not_found')
+   _lookup_diagnostic(code)
+   return None
   links=rows[0]['fields'].get('Negocio') or []
-  if len(links)!=1:raise BookingError('Número sin negocio único')
-  r=requests.get(url(os.getenv('AIRTABLE_BUSINESSES_TABLE','Negocios'),links[0]),headers=headers(),timeout=10);r.raise_for_status();f=r.json()['fields']
-  if f.get('Estado')!='Activo' or not f.get('Business_ID'):return None
-  return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or 'general').lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':f.get('Horarios',''),'menu':f.get('Menu',''),'address':f.get('Direccion') or f.get('Dirección') or '','reception':f.get('Telefono_Recepcion') or f.get('Recepcion') or '','timezone':f.get('Timezone') or 'Europe/Madrid'}
+  if len(links)!=1:raise BusinessLookupError('business_number_without_business','Número sin negocio único')
+  f=_registry_get(url(os.getenv('AIRTABLE_BUSINESSES_TABLE','Negocios'),links[0]))['fields']
+  if f.get('Estado')!='Activo' or not f.get('Business_ID'):
+   _lookup_diagnostic('business_inactive' if f.get('Estado')!='Activo' else 'business_number_without_business')
+   return None
+  return {'business_id':str(f['Business_ID']),'name':str(f.get('Nombre') or 'Recepción'),'phone':number,'sector':str(f.get('Sector') or '').strip().lower(),'allow_reservations':f.get('Permite_Reservas') or f.get('Permite_Reser') or False,'allow_messages':True,'hours':field(f,'Horarios','Horario'),'menu':field(f,'Menu','Menú','Carta','Menu_URL','Menu_Link'),'address':field(f,'Direccion','Dirección'),'reception':field(f,'Telefono_Recepcion','Teléfono_Recepción','Recepcion','Telefono_Contacto','Teléfono de contacto'),'timezone':f.get('Timezone') or 'Europe/Madrid'}
 _lookup_cache={}
 _lookup_lock=threading.Lock()
-def lookup(number,channel):
+def _raise_sector_lookup_error(exc):
+  error=InsuranceDisabledError if isinstance(exc,DisabledInsuranceSectorError) else BookingError
+  raise error(str(exc)) from exc
+def lookup(number,channel,with_sector=False):
+  if channel not in ('Voice','WhatsApp'):raise BusinessLookupError('business_channel_invalid','Canal no reconocido')
   number=phone(number)
-  if not number:return None
+  if not number:
+   _lookup_diagnostic('business_not_found')
+   return (None,None) if with_sector else None
   key=(number,channel);now=time.monotonic();ttl=int(os.getenv('BUSINESS_CACHE_TTL_SECONDS','60'))
   with _lookup_lock:
    cached=_lookup_cache.get(key)
-   if cached and cached[0]>now:return cached[1]
+   if MODE=='legacy' and cached and cached[0]>now:
+    cached_sector=None
+    if cached[1]:
+     try:cached_sector=sector_of(cached[1])
+     except BusinessSectorError as exc:
+      _raise_sector_lookup_error(exc)
+    if cached_sector!='insurance':return (cached[1],cached_sector) if with_sector else cached[1]
   if MODE=='new':b=_tenant_lookup(number,channel)
   else:
    if MODE not in ('legacy','shadow'):raise BookingError('TENANT_LOOKUP_MODE inválido')
@@ -59,9 +151,17 @@ def lookup(number,channel):
      other=_tenant_lookup(number,channel)
      if other and b and other['name'].casefold()!=b['name'].casefold():log.warning('Shadow lookup mismatch for %s',channel)
     except Exception:log.exception('Shadow lookup failed')
-  with _lookup_lock:_lookup_cache[key]=(now+ttl,b)
-  return b
-def save_conversation(b,customer,question,answer,status):
+  sector=None
+  if b:
+   try:sector=sector_of(b)
+   except BusinessSectorError as exc:
+    _raise_sector_lookup_error(exc)
+  with _lookup_lock:
+   if sector=='insurance' or MODE!='legacy':_lookup_cache.pop(key,None)
+   else:_lookup_cache[key]=(now+ttl,b)
+  return (b,sector) if with_sector else b
+def save_conversation(b,customer,question,answer,status,sector=None):
+  if (sector if sector is not None else sector_of(b))=='insurance':raise BookingError('Las conversaciones de seguros no se espejan en Airtable')
   table=os.getenv('AIRTABLE_CONVERSATIONS_TABLE','Conversaciones')
   f={'Twilio_Phone':phone(b['phone']),'Customer_Phone':phone(customer),'Question':str(question),'Answer':str(answer or ''),'Timestamp':datetime.now(timezone.utc).isoformat(),'Status':status}
   if MODE=='new':f['Business_ID']=b['business_id']
@@ -83,6 +183,60 @@ def open_now(b):
 def authorized():
   key=os.getenv('INTERNAL_API_KEY','');got=request.headers.get('X-Internal-API-Key','')
   return bool(key and got and hmac.compare_digest(key,got))
+def insurance_human_authorized():
+  key=os.getenv('INSURANCE_HUMAN_API_KEY','');got=request.headers.get('X-Insurance-Human-Key','')
+  audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','')
+  key_bytes=key.encode();got_bytes=got.encode()
+  audit_key_bytes=audit_key.encode()
+  if len(key_bytes)<MIN_KEY_BYTES or len(audit_key_bytes)<MIN_KEY_BYTES:
+    log.error('insurance_human_auth_configuration_invalid')
+    return False
+  client_key=hmac.new(
+      audit_key_bytes,(request.remote_addr or 'unknown').encode(),hashlib.sha256
+  ).digest()
+  if _insurance_human_auth_is_limited(client_key):
+    log.warning('insurance_human_auth_rate_limited')
+    return False
+  if not got or len(got_bytes)>INSURANCE_HUMAN_API_KEY_MAX_BYTES:
+    _record_insurance_human_auth_failure(client_key)
+    log.warning('insurance_human_auth_failed')
+    return False
+  if not hmac.compare_digest(key_bytes,got_bytes):
+    _record_insurance_human_auth_failure(client_key)
+    log.warning('insurance_human_auth_failed')
+    return False
+  with _insurance_human_auth_lock:
+    _insurance_human_auth_failures.pop(client_key,None)
+  return True
+
+def _record_insurance_human_auth_failure(client_key):
+  now=time.monotonic()
+  with _insurance_human_auth_lock:
+    _prune_insurance_human_auth_failures(now)
+    failures=_insurance_human_auth_failures.setdefault(client_key,[])
+    failures.append(now)
+
+def _insurance_human_auth_is_limited(client_key):
+  now=time.monotonic()
+  with _insurance_human_auth_lock:
+    _prune_insurance_human_auth_failures(now)
+    return len(_insurance_human_auth_failures.get(client_key,[]))>=INSURANCE_HUMAN_AUTH_FAILURE_LIMIT
+
+def _prune_insurance_human_auth_failures(now):
+  cutoff=now-INSURANCE_HUMAN_AUTH_WINDOW_SECONDS
+  for client_key,failures in list(_insurance_human_auth_failures.items()):
+    recent=[failed_at for failed_at in failures if failed_at>cutoff]
+    if recent:
+      _insurance_human_auth_failures[client_key]=recent
+    else:
+      _insurance_human_auth_failures.pop(client_key,None)
+def insurance_human_actor(credential=None):
+  credential=os.getenv('INSURANCE_HUMAN_API_KEY','') if credential is None else credential
+  key=credential.encode()
+  audit_key=os.getenv('INSURANCE_HUMAN_AUDIT_KEY','').encode()
+  if len(key)<MIN_KEY_BYTES or len(audit_key)<MIN_KEY_BYTES:
+    raise RuntimeError('Insurance human audit keys are not configured safely')
+  return 'shared-key:v1:'+hmac.new(audit_key,key,hashlib.sha256).hexdigest()
 def _twilio_candidates(base,path,query):
   host=request.headers.get('Host','');xh=request.headers.get('X-Forwarded-Host','').split(',')[0].strip();xp=request.headers.get('X-Forwarded-Proto','').split(',')[0].strip()
   rd=os.getenv('RAILWAY_PUBLIC_DOMAIN','').strip();c={}
@@ -135,8 +289,54 @@ def duplicate_turn_reply(c, bid, channel, customer, external_id, text):
   ).fetchone()
   return row['assistant_text'] if row else None
 
-def converse(b,channel,customer,text,external_id):
+def recent_history(c,bid,channel,customer,external_id):
+  if channel=='Voice':
+   call_id=str(external_id).split(':',1)[0]
+   return c.execute(
+    'SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s AND external_id LIKE %s ORDER BY id DESC LIMIT 20',
+    (bid,channel,customer,call_id+':%'),
+   ).fetchall()
+  return c.execute(
+   'SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 20',
+   (bid,channel,customer),
+  ).fetchall()
+
+def insurance_voice_transport(value):
+  if not isinstance(value,dict):return {}
+  safe={}
+  for key in ('last','last_present'):
+   if isinstance(value.get(key),bool):safe[key]=value[key]
+  for key in ('partial_count','fragment_count','final_count'):
+   count=value.get(key)
+   if isinstance(count,int) and not isinstance(count,bool):safe[key]=min(10000,max(0,count))
+  if value.get('event') in ('setup','disconnect','error'):safe['event']=value['event']
+  return safe
+
+def insurance_voice_call_id_valid(external_id):
+  return (isinstance(external_id,str) and
+          re.fullmatch(r'[^\s:]{1,200}',external_id.split(':',1)[0]) is not None)
+
+def insurance_voice_error(stage,exc,external_id,business_id=None):
+  call_sid=str(external_id or '').split(':',1)[0]
+  correlation=hashlib.sha256(('insurance-voice:'+call_sid).encode()).hexdigest()
+  ref=correlation
+  if business_id and call_sid:
+   try:
+    from insurance.voice_trace import call_reference
+    ref=call_reference(business_id,call_sid)
+   except Exception:pass
+  log.error('insurance_voice stage=%s error_type=%s call_ref=%s correlation_id=%s',stage,type(exc).__name__,ref,correlation)
+
+def converse(b,channel,customer,text,external_id,include_end_reason=False,sector=None,voice_transport=None,media_list=None):
   if not customer or not external_id:raise BookingError('Faltan identificadores de la conversación')
+  if (sector if sector is not None else sector_of(b))=='insurance':
+   if channel=='Voice' and not insurance_voice_call_id_valid(external_id):
+    raise BookingError('Falta el identificador técnico de la llamada')
+   if channel=='Voice' and voice_transport is not None:
+    b=dict(b);b['_insurance_voice_transport']=insurance_voice_transport(voice_transport)
+   reply,out=process(b,{},[],text,channel,external_id,customer,resolved_sector=sector,media_list=media_list)
+   end_reason='goodbye' if channel=='Voice' and out.get('should_end_call') else None
+   return (reply,end_reason) if include_end_reason else reply
   init_schema();bid=b['business_id']
   with db() as c:
    c.execute('INSERT INTO customer_sessions(business_id,channel,customer_phone) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING',(bid,channel,customer))
@@ -155,23 +355,20 @@ def converse(b,channel,customer,text,external_id):
     state={}
    duplicate=duplicate_turn_reply(c,bid,channel,customer,external_id,text)
    if duplicate is not None:
-    return duplicate
-   recent=c.execute(
-    'SELECT user_text,assistant_text FROM conversation_turns WHERE business_id=%s AND channel=%s AND customer_phone=%s ORDER BY id DESC LIMIT 20',
-    (bid,channel,customer),
-   ).fetchall()
+    return (duplicate,state.get('_end_call_reason')) if include_end_reason else duplicate
+   recent=recent_history(c,bid,channel,customer,external_id)
    reply,state=process(b,state,list(reversed(recent)),text,channel,external_id,customer)
    state['_sector']=str(b.get('sector') or '').strip().casefold()
    if channel=='Voice':
     state['_voice_call_id']=str(external_id).split(':',1)[0]
-   reply=str(reply or 'No pude responder con seguridad. ¿Podés repetirlo?')
+   reply=str(reply or 'No pude responder con seguridad. ¿Puedes repetirlo?')
    c.execute('UPDATE customer_sessions SET state=%s::jsonb,updated_at=now() WHERE business_id=%s AND channel=%s AND customer_phone=%s',(json.dumps(state,ensure_ascii=False),bid,channel,customer))
    c.execute('INSERT INTO conversation_turns(business_id,channel,customer_phone,external_id,user_text,assistant_text) VALUES(%s,%s,%s,%s,%s,%s)',(bid,channel,customer,external_id,text[:4000],reply[:4000]))
-   return reply
+   return (reply,state.get('_end_call_reason')) if include_end_reason else reply
 @app.get('/')
 def home():return jsonify(name='AI Reservas Core',status='running',version='integracion-piloto+twilio-diag1')
 @app.get('/health')
-def health():return jsonify(status='OK',tenant_mode=MODE,relay_enabled=bool(os.getenv('RELAY_VOICE_URL')),booking_test_mode=os.getenv('BOOKING_TEST_MODE','false').lower()=='true')
+def health():return jsonify(status='OK',tenant_mode=MODE,relay_enabled=bool(os.getenv('RELAY_VOICE_URL')),booking_test_mode=os.getenv('BOOKING_TEST_MODE','false').lower()=='true',restaurant_agent_enabled=os.getenv('RESTAURANT_AGENT','false').strip().lower()=='true')
 @app.get('/booking-health')
 def booking_health():
   if not authorized():return jsonify(status='Unauthorized'),401
@@ -184,24 +381,64 @@ def booking_health():
 def whatsapp():
   if request.method=='GET':return jsonify(status='OK')
   if not twilio_valid():return Response('Forbidden',status=403)
-  tw=MessagingResponse()
+  tw=MessagingResponse();b=None;sector=None;stage='tenant_lookup'
   try:
-   b=lookup(request.form.get('To') or PHONE,'WhatsApp');text=request.form.get('Body','').strip()
-   if not b:answer='No puedo identificar el negocio asociado a este número.'
-   elif not text:answer='No recibí ningún texto. ¿Me lo repetís?'
-   else:answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''))
-   if b and text and answer:
-    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp')
+   b,sector=lookup(request.form.get('To'),'WhatsApp',with_sector=True);text=request.form.get('Body','').strip()
+   media_list = []
+   try:
+       num_media = int(request.form.get('NumMedia', '0'))
+       for i in range(num_media):
+           url = request.form.get(f'MediaUrl{i}')
+           ctype = request.form.get(f'MediaContentType{i}')
+           filename = request.form.get(f'Filename{i}') or f"media_{i}.jpg"
+           if url:
+               media_list.append({'url': url, 'content_type': ctype, 'filename': filename})
+   except Exception:
+       pass
+   if not b:answer=BUSINESS_NOT_FOUND_REPLY
+   elif not text and not media_list:answer='No recibí ningún texto o imagen. ¿Me lo repites?'
+   else:
+    stage='dialogue'
+    answer=converse(b,'WhatsApp',phone(request.form.get('From')),text,request.form.get('MessageSid',''),sector=sector,media_list=media_list)
+   if b and text and answer and sector!='insurance':
+    try:save_conversation(b,request.form.get('From'),text,answer,'Answered through WhatsApp',sector=sector)
     except Exception:log.exception('Conversation mirror failed')
    if answer:tw.message(answer)
-  except Exception:log.exception('WhatsApp error');tw.message('No puedo verificar el resultado ahora. No repitas la operación; consultá con recepción.')
+  except InsuranceDisabledError:tw.message(INSURANCE_DISABLED_REPLY)
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   tw.message(BUSINESS_UNAVAILABLE_REPLY)
+  except Exception as exc:
+   raw=f"{b.get('business_id') if b else 'unresolved'}|WhatsApp|{request.form.get('MessageSid','')}"
+   corr=hashlib.sha256(raw.encode()).hexdigest()[:16]
+   if sector=='insurance':
+    _insurance_logger.error('insurance_diag correlation_id=%s stage=%s reason_code=webhook_failed error_type=%s',corr,stage,type(exc).__name__)
+    tw.message('No pude consultarlo ahora, inténtalo en un minuto.')
+   else:
+    log.error('WhatsApp error correlation_id=%s stage=%s error_type=%s',corr,stage,type(exc).__name__)
+    tw.message('No pude identificar el negocio para atender tu mensaje ahora. No he ejecutado ninguna operación.'
+               if stage=='tenant_lookup' else
+               'No puedo verificar el resultado ahora. No repitas la operación; consulta con recepción.')
   return Response(str(tw),mimetype='application/xml')
 @app.route('/webhook-voice',methods=['GET','POST'])
 def voice():
   if not twilio_valid():return Response('Forbidden',status=403)
   r=VoiceResponse();relay=os.getenv('RELAY_VOICE_URL','')
-  try:b=lookup(request.form.get('To') or PHONE,'Voice')
-  except Exception:log.exception('Voice business lookup failed');b=None
+  try:b=lookup(request.form.get('To'),'Voice')
+  except InsuranceDisabledError:
+   r.say(INSURANCE_DISABLED_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   r.say(BUSINESS_UNAVAILABLE_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
+  except Exception as exc:
+   log.error('business_lookup correlation_id=%s reason_code=business_lookup_failed error_type=%s',_lookup_correlation(),type(exc).__name__)
+   r.say(BUSINESS_UNAVAILABLE_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
+  if not b:
+   r.say(BUSINESS_NOT_FOUND_REPLY,language='es-ES');r.hangup()
+   return Response(str(r),mimetype='application/xml')
   if b and open_now(b) and phone(b.get('reception')):
    dial=r.dial(action='/voice-dial-result',method='POST',timeout=20,answer_on_bridge=True);dial.number(phone(b['reception']))
   elif relay:r.redirect(relay,method='POST')
@@ -245,18 +482,72 @@ def internal_business():
   d=request.get_json(silent=True) or {}
   try:
    b=lookup(d.get('phone'),d.get('channel','Voice'))
-   return (jsonify(success=True,business=b),200) if b else (jsonify(success=False),404)
-  except Exception:log.exception('Lookup failed');return jsonify(success=False),503
+   return (jsonify(success=True,business=b),200) if b else (jsonify(success=False,diagnostic='business_not_found',message=BUSINESS_NOT_FOUND_REPLY),404)
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   return jsonify(success=False,diagnostic=exc.code,message=BUSINESS_UNAVAILABLE_REPLY),503
+  except Exception as exc:
+   log.error('business_lookup correlation_id=%s reason_code=business_lookup_failed error_type=%s',_lookup_correlation(),type(exc).__name__)
+   return jsonify(success=False,diagnostic='business_lookup_failed',message=BUSINESS_UNAVAILABLE_REPLY),503
 @app.post('/internal/turn')
 def internal_turn():
   if not authorized():return jsonify(success=False),401
   d=request.get_json(silent=True) or {}
+  sector=None
   try:
-   channel=d.get('channel','Voice');b=lookup(d.get('business_phone'),channel)
-   if not b or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
-   reply=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''))
-   return jsonify(success=True,reply=reply)
-  except Exception:log.exception('Turn failed');return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
+   channel=d.get('channel','Voice');b,sector=lookup(d.get('business_phone'),channel,with_sector=True)
+   if not b:return jsonify(success=False,diagnostic='business_not_found',message=BUSINESS_NOT_FOUND_REPLY),404
+   if b['business_id']!=d.get('business_id'):return jsonify(success=False),403
+   if sector=='insurance' and channel=='Voice' and not insurance_voice_call_id_valid(d.get('external_id')):
+    insurance_voice_error('technical_call_id_missing',ValueError(),'',b['business_id'])
+    return jsonify(success=False),400
+   if sector=='insurance' and channel=='Voice':
+    transport=d.get('voice_transport')
+    if (isinstance(transport,dict) and 'last' in transport and transport['last'] is not True
+        or d.get('text') is not None and not isinstance(d['text'],str)):
+     return jsonify(success=False),400
+   kwargs={'include_end_reason':True,'sector':sector}
+   if sector=='insurance' and channel=='Voice':kwargs['voice_transport']=d.get('voice_transport')
+   reply,end_reason=converse(b,channel,phone(d.get('customer_phone')),str(d.get('text') or '').strip(),str(d.get('external_id') or ''),**kwargs)
+   end_reason=end_reason if end_reason in ('goodbye','cancelled','verification') else None
+   out=dict(success=True,reply=reply,end_call=end_reason in ('goodbye','cancelled','verification'),end_reason=end_reason)
+   if sector=='insurance' and channel=='Voice':
+    from insurance.speech import render
+    out.update(voice_reply=render(reply),should_end_call=end_reason=='goodbye')
+   return jsonify(out)
+  except BusinessLookupError as exc:
+   _lookup_diagnostic(exc.code)
+   return jsonify(success=False,diagnostic=exc.code,message=BUSINESS_UNAVAILABLE_REPLY),503
+  except Exception as exc:
+   if sector=='insurance':insurance_voice_error('turn',exc,d.get('external_id'),b['business_id'])
+   else:log.exception('Turn failed')
+   return jsonify(success=False,message='No pude responder ni confirmar ninguna operación'),503
+@app.post('/internal/insurance/voice/transport')
+def internal_insurance_voice_transport():
+  if not authorized():return jsonify(success=False),401
+  d=request.get_json(silent=True) or {}
+  if not isinstance(d,dict) or d.get('channel')!='Voice':return jsonify(success=False),400
+  b=None
+  try:
+   b,sector=lookup(d.get('business_phone'),'Voice',with_sector=True)
+   if not b or sector!='insurance' or b['business_id']!=d.get('business_id'):return jsonify(success=False),403
+   call_sid=d.get('CallSid');external_id=d.get('external_id')
+   if not isinstance(call_sid,str) or not re.fullmatch(r'[^\s:]{1,200}',call_sid) or not isinstance(external_id,str) or not external_id.startswith(call_sid+':') or len(external_id)>300:
+    return jsonify(success=False),400
+   diagnostic=d.get('diagnostic')
+   if diagnostic not in ('voice_transcription_missing','voice_transcription_partial'):return jsonify(success=False),400
+   from insurance.cases import db as insurance_db
+   from insurance.voice_trace import record_transport
+   correlation_id=d.get('correlation_id')
+   if not isinstance(correlation_id,str) or not re.fullmatch(r'[0-9a-f]{64}',correlation_id):correlation_id=None
+   with insurance_db() as conn:
+    conn.execute('SET LOCAL statement_timeout=3000')
+    conn.execute('SET LOCAL lock_timeout=3000')
+    record_transport(conn,b['business_id'],call_sid,external_id,str(d.get('text') or '')[:4000],diagnostic,insurance_voice_transport(d.get('transport')),correlation_id)
+   return jsonify(success=True)
+  except Exception as exc:
+   insurance_voice_error('transport',exc,d.get('CallSid'),b['business_id'] if b else None)
+   return jsonify(success=False),503
 @app.post('/internal/reconcile-pending')
 def internal_reconcile_pending():
   if not authorized():return jsonify(success=False),401
@@ -265,6 +556,31 @@ def internal_reconcile_pending():
    result=reconcile_pending((request.get_json(silent=True) or {}).get('limit',25))
    return jsonify(success=True,results=result)
   except Exception:log.exception('Reconciliation failed');return jsonify(success=False),503
+@app.get('/internal/insurance/cases/<uuid:case_id>')
+def insurance_case_detail(case_id):
+  if not insurance_human_authorized():return jsonify(success=False),401
+  # Shared key = no individual identity, no per-business scope, no read audit: not fit for real data.
+  if os.getenv('INSURANCE_HUMAN_SHARED_DETAIL_ENABLED','false').strip().lower()!='true':return jsonify(success=False,message='Use /insurance/admin/cases/<id> with an individual token'),403
+  try:
+   from insurance.cases import get_case
+   case=get_case(case_id)
+   return (jsonify(success=True,**case),200) if case else (jsonify(success=False),404)
+  except Exception:log.exception('Insurance case read failed');return jsonify(success=False),503
+@app.post('/internal/insurance/cases/<uuid:case_id>/resolve')
+def internal_resolve_insurance_case(case_id):
+  if not insurance_human_authorized():return jsonify(success=False),401
+  data=request.get_json(silent=True) or {}
+  try:
+   from insurance.cases import resolve_case
+   resolved=resolve_case(
+       case_id,
+       insurance_human_actor(request.headers.get('X-Insurance-Human-Key','')),
+       data.get('resolution'),
+   )
+   return jsonify(success=True,case_id=resolved)
+  except ValueError:return jsonify(success=False,message='Invalid resolution request'),400
+  except CaseWorkflowError:return jsonify(success=False,message='Pending insurance case not found'),404
+  except Exception:log.exception('Insurance case resolution failed');return jsonify(success=False),503
 @app.post('/internal/booking')
 @app.post('/internal/book-test')
 def internal_booking():
