@@ -963,7 +963,10 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                                     interp = claims.interpret_incident_with_llm(desc)
-                                    claims.update_claim(conn, claim['claim_uuid'], original_description=desc, structured_interpretation=interp)
+                                    aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
+                                    ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
+                                    ev_matrix = claims.evaluate_received_evidence(ev_matrix, claim.get('photos', []), claim.get('invoices', []), desc)
+                                    claims.update_claim(conn, claim['claim_uuid'], original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
 
                                     missing = interp.get('missing_info')
                                     if missing and len(desc.split()) < 7 and not is_resume:
@@ -1051,7 +1054,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                             })
                                         current_photos = claim.get('photos') or []
                                         current_photos.extend(photos_added)
-                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, state=claims.ClaimState.INVOICE_REQUESTED)
+                                        ev_matrix = claims.evaluate_received_evidence(claim.get('evidence_matrix') or [], current_photos, claim.get('invoices') or [], claim.get('original_description', ''))
+                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, evidence_matrix=ev_matrix, state=claims.ClaimState.INVOICE_REQUESTED)
                                         
                                         p_count = sum(1 for m in photos_added if not m['mimetype'].startswith('video/'))
                                         v_count = sum(1 for m in photos_added if m['mimetype'].startswith('video/'))
@@ -1132,7 +1136,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                             'url': media.get('url'),
                                                             'analysis': analysis
                                                         })
-                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, invoices=current_invoices, state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                        ev_matrix = claims.evaluate_received_evidence(claim.get('evidence_matrix') or [], current_photos, current_invoices, claim.get('original_description', ''))
+                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, invoices=current_invoices, evidence_matrix=ev_matrix, state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
                                     elif folded_incoming in ('si', 'sí', 'tengo factura', 'tengo una factura'):
                                         return finish("Por favor, envía la factura o el justificante de pago en este chat.", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                                     else:
