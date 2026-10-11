@@ -906,8 +906,15 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         initial_description = incoming
 
                     try:
+                        claims.ensure_claims_schema(conn)
                         claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, initial_description)
                     except claims.ClaimsSchemaUnavailableError:
+                        return finish(
+                            "En este momento no podemos tramitar la apertura de siniestros por una incidencia técnica en el sistema de gestión. Por favor, inténtalo más tarde o contacta con atención al cliente.",
+                            {'insurance_result': ResultKind.TECHNICAL_ERROR.value}
+                        )
+                    except Exception as claim_exc:
+                        log.error("Error al crear siniestro para customer %s, policy %s: %s", customer_id, target_policy_id, claim_exc)
                         return finish(
                             "En este momento no podemos tramitar la apertura de siniestros por una incidencia técnica en el sistema de gestión. Por favor, inténtalo más tarde o contacta con atención al cliente.",
                             {'insurance_result': ResultKind.TECHNICAL_ERROR.value}
