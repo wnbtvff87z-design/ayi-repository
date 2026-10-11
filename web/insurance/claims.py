@@ -69,10 +69,15 @@ def is_claims_schema_ready(conn):
 def check_claims_readiness(conn):
     """Raises ClaimsSchemaUnavailableError if required tables or sequences are missing."""
     if not is_claims_schema_ready(conn):
-        raise ClaimsSchemaUnavailableError(
-            "El esquema de siniestros de hogar (insurance_claims / insurance_professionals) "
-            "no está disponible en PostgreSQL. Ejecute las migraciones de esquema."
-        )
+        try:
+            ensure_claims_schema(conn)
+        except Exception as exc:
+            log.warning("Auto ensure_claims_schema failed: %s", exc)
+        if not is_claims_schema_ready(conn):
+            raise ClaimsSchemaUnavailableError(
+                "El esquema de siniestros de hogar (insurance_claims / insurance_professionals) "
+                "no está disponible en PostgreSQL. Ejecute las migraciones de esquema."
+            )
 
 
 def ensure_claims_schema(conn):
