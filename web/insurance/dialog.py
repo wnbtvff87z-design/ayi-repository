@@ -872,19 +872,41 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             st['awaiting'] = 'policy'
                             return finish(policy_info.offer(conn, sc, st),
                                           {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                    
-                    prod = _selected_policy_product(conn, bid, st.get('policy_id'))
+
+                    target_policy_id = st.get('policy_id')
+                    if not target_policy_id:
+                        pol_row = conn.execute(
+                            'SELECT policy_id FROM insurance_policies WHERE business_id=%s AND customer_id=%s LIMIT 1',
+                            (bid, customer_id)
+                        ).fetchone()
+                        if pol_row:
+                            target_policy_id = pol_row['policy_id']
+                            st['policy_id'] = target_policy_id
+
+                    if not target_policy_id:
+                        return finish(
+                            "No he localizado ninguna póliza de hogar activa asociada a tus datos para declarar un parte. "
+                            "Por favor, ponte en contacto con nuestro servicio de atención al cliente para verificar tus contratos.",
+                            {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                        )
+
+                    prod = _selected_policy_product(conn, bid, target_policy_id)
                     if prod and prod != 'hogar':
                         return finish(
                             "Lo siento, la declaración de partes online solo está habilitada para pólizas de hogar. "
                             "Para otros productos, por favor ponte en contacto telefónico con nuestro servicio de atención al cliente.",
                             {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                         )
-                    
+
                     from insurance import claims
-                    target_policy_id = st.get('policy_id') or 'POL-DEFAULT'
+                    initial_description = ""
+                    folded = references.fold(incoming).strip(' .?!¿¡')
+                    clean_desc = re.sub(r'^(?:2|dos|enviar un parte|enviar parte|declarar siniestro|dar parte|dar un parte|2\.?\s*enviar\s*(?:un\s*)?part[ew]?|opcion\s*2)\s*', '', folded, flags=re.I).strip()
+                    if len(clean_desc) > 8:
+                        initial_description = incoming
+
                     try:
-                        claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, '')
+                        claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, initial_description)
                     except claims.ClaimsSchemaUnavailableError:
                         return finish(
                             "En este momento no podemos tramitar la apertura de siniestros por una incidencia técnica en el sistema de gestión. Por favor, inténtalo más tarde o contacta con atención al cliente.",
@@ -893,6 +915,41 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     st['active_claim_ref'] = claim_ref
                     st['awaiting'] = 'claim'
                     is_query = False
+
+                    if initial_description:
+                        desc = initial_description
+                        interp = claims.interpret_incident_with_llm(desc)
+                        aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
+                        ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
+                        ev_matrix = claims.evaluate_received_evidence(ev_matrix, [], [], desc)
+                        claims.update_claim(conn, claim_uuid, original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
+
+                        result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=target_policy_id)
+                        evidence = result.get('evidence', [])
+                        eval_res = claims.evaluate_coverage_with_llm(interp, evidence, policy_id=target_policy_id, version_id=st.get('version_id'))
+                        claims.update_claim(conn, claim_uuid, coverage_evaluation=eval_res)
+
+                        status = eval_res.get('status')
+                        service_type = eval_res.get('service_type')
+                        claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
+
+                        if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
+                            explanation = eval_res.get('explanation', '')
+                            explanation = _sanitize_llm_explanation(explanation, evidence, target_policy_id, st.get('version_id'), target_policy_id)
+                            reply = (
+                                f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
+                                f"Explicación contractual: {explanation}\n\n"
+                                f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
+                            )
+                        else:
+                            reply = (
+                                f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
+                                f"Este incidente requiere de valoración técnica y pericial por parte de un agente humano.\n\n"
+                                f"Para que nuestro equipo pericial pueda evaluar la cobertura y tomar las acciones más adecuadas, por favor envíame fotografías o un vídeo (de 10 a 20 segundos) donde se aprecie claramente el daño.\n\n"
+                                f"(Si no dispones de fotos o vídeos en este momento, responde 'no tengo' para continuar con el expediente)."
+                            )
+                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+
                     reply = "Cuéntame qué ha ocurrido en tu hogar." if channel == 'Voice' else (
                         "Has iniciado la declaración de un parte de hogar.\n"
                         "Por favor, cuéntame qué ha ocurrido (qué se ha dañado, cuándo ocurrió y en qué parte de la casa)."
@@ -2182,7 +2239,19 @@ def _is_claim_start(text):
     if not text:
         return False
     folded = references.fold(text).strip(' .?!¿¡')
-    return folded in ('enviar un parte', 'enviar parte', 'declarar siniestro', 'dar parte', 'dar un parte', 'siniestro', 'parte', '2', 'dos') or re.search(r'\b(?:declarar|dar|enviar|nuevo)\s+(?:un\s+)?(?:parte|siniestro)\b', folded)
+    if folded in (
+        'enviar un parte', 'enviar parte', 'declarar siniestro', 'dar parte', 'dar un parte',
+        'siniestro', 'parte', '2', 'dos', 'enviar un partw', 'enviar partw', '2. enviar un parte',
+        '2 enviar parte', '2. enviar parte', 'opcion 2', 'opción 2'
+    ):
+        return True
+    if re.search(r'\b(?:declarar|dar|enviar|nuevo)\s+(?:un\s+)?(?:parte|siniestro|partw)\b', folded):
+        return True
+    if re.search(r'\b(?:tuvimos|tengo|tuve|sufrimos|ha habido|hubo)\s+(?:un|una)?\s*(?:problema|fuga|rotura|averia|avería|daño|daños|incidente|inundacion|inundación|gotera|humedad)\b', folded):
+        return True
+    if re.search(r'\b(?:cañeria|cañería|tuberia|tubería|cristal|vidrio|pintar|pintor|mueble)\b', folded) and any(w in folded for w in ('arreglado', 'arreglar', 'roto', 'fuga', 'dañado', 'enviad', 'envien', 'envíen', 'problema')):
+        return True
+    return False
 
 
 def _is_query_start(text):
