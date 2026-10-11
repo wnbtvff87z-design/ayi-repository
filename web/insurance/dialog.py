@@ -526,13 +526,20 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                 version = st.get('version_id') if authorized_state else None
 
                 try:
-                    if policy and version:
-                        valid_ver = conn.execute(
-                            'SELECT 1 FROM insurance_policy_versions WHERE business_id=%s AND policy_id=%s AND version_id=%s',
-                            (bid, policy, version)
+                    if policy:
+                        valid_pol = conn.execute(
+                            'SELECT 1 FROM insurance_policies WHERE business_id=%s AND policy_id=%s',
+                            (bid, policy)
                         ).fetchone()
-                        if not valid_ver:
+                        if not valid_pol:
                             policy, version = None, None
+                        elif version:
+                            valid_ver = conn.execute(
+                                'SELECT 1 FROM insurance_policy_versions WHERE business_id=%s AND policy_id=%s AND version_id=%s',
+                                (bid, policy, version)
+                            ).fetchone()
+                            if not valid_ver:
+                                version = None
 
                     normalized = st.get('normalized_question')
                     conn.execute(
@@ -954,38 +961,48 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     is_query = False
 
                     if initial_description:
-                        desc = initial_description
-                        interp = claims.interpret_incident_with_llm(desc)
-                        aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
-                        ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
-                        ev_matrix = claims.evaluate_received_evidence(ev_matrix, [], [], desc)
-                        claims.update_claim(conn, claim_uuid, original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
+                        try:
+                            with conn.savepoint():
+                                desc = initial_description
+                                interp = claims.interpret_incident_with_llm(desc)
+                                aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
+                                ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
+                                ev_matrix = claims.evaluate_received_evidence(ev_matrix, [], [], desc)
+                                claims.update_claim(conn, claim_uuid, original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
 
-                        result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=target_policy_id)
-                        evidence = result.get('evidence', [])
-                        eval_res = claims.evaluate_coverage_with_llm(interp, evidence, policy_id=target_policy_id, version_id=st.get('version_id'))
-                        claims.update_claim(conn, claim_uuid, coverage_evaluation=eval_res)
+                                result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=target_policy_id)
+                                evidence = result.get('evidence', [])
+                                eval_res = claims.evaluate_coverage_with_llm(interp, evidence, policy_id=target_policy_id, version_id=st.get('version_id'))
+                                claims.update_claim(conn, claim_uuid, coverage_evaluation=eval_res)
 
-                        status = eval_res.get('status')
-                        service_type = eval_res.get('service_type')
-                        claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
+                                status = eval_res.get('status')
+                                service_type = eval_res.get('service_type')
+                                claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
 
-                        if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
-                            explanation = eval_res.get('explanation', '')
-                            explanation = _sanitize_llm_explanation(explanation, evidence, target_policy_id, st.get('version_id'), target_policy_id)
-                            reply = (
-                                f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
-                                f"Explicación contractual: {explanation}\n\n"
-                                f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
-                            )
-                        else:
+                                if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
+                                    explanation = eval_res.get('explanation', '')
+                                    explanation = _sanitize_llm_explanation(explanation, evidence, target_policy_id, st.get('version_id'), target_policy_id)
+                                    reply = (
+                                        f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
+                                        f"Explicación contractual: {explanation}\n\n"
+                                        f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
+                                    )
+                                else:
+                                    reply = (
+                                        f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
+                                        f"Este incidente requiere de valoración técnica y pericial por parte de un agente humano.\n\n"
+                                        f"Para que nuestro equipo pericial pueda evaluar la cobertura y tomar las acciones más adecuadas, por favor envíame fotografías o un vídeo (de 10 a 20 segundos) donde se aprecie claramente el daño.\n\n"
+                                        f"(Si no dispones de fotos o vídeos en este momento, responde 'no tengo' para continuar con el expediente)."
+                                    )
+                                return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                        except Exception as init_claim_exc:
+                            log.error("Error processing initial claim description: %s", init_claim_exc, exc_info=True)
+                            claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
                             reply = (
                                 f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
-                                f"Este incidente requiere de valoración técnica y pericial por parte de un agente humano.\n\n"
-                                f"Para que nuestro equipo pericial pueda evaluar la cobertura y tomar las acciones más adecuadas, por favor envíame fotografías o un vídeo (de 10 a 20 segundos) donde se aprecie claramente el daño.\n\n"
-                                f"(Si no dispones de fotos o vídeos en este momento, responde 'no tengo' para continuar con el expediente)."
+                                "Por favor, envíame fotografías o un vídeo del daño para continuar con la tramitación."
                             )
-                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                            return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                     reply = "Cuéntame qué ha ocurrido en tu hogar." if channel == 'Voice' else (
                         "Has iniciado la declaración de un parte de hogar.\n"
@@ -1056,25 +1073,27 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         )
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
-                                    interp = claims.interpret_incident_with_llm(desc)
-                                    aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
-                                    ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
-                                    ev_matrix = claims.evaluate_received_evidence(ev_matrix, claim.get('photos', []), claim.get('invoices', []), desc)
-                                    claims.update_claim(conn, claim['claim_uuid'], original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
+                                    try:
+                                        with conn.savepoint():
+                                            interp = claims.interpret_incident_with_llm(desc)
+                                            aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
+                                            ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
+                                            ev_matrix = claims.evaluate_received_evidence(ev_matrix, claim.get('photos', []), claim.get('invoices', []), desc)
+                                            claims.update_claim(conn, claim['claim_uuid'], original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
 
-                                    missing = interp.get('missing_info')
-                                    if missing and len(desc.split()) < 7 and not is_resume:
-                                        return finish(missing, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                            missing = interp.get('missing_info')
+                                            if missing and len(desc.split()) < 7 and not is_resume:
+                                                return finish(missing, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
-                                    result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=claim['policy_id'])
-                                    if result['status'] in ('no_policy', 'policy_not_matched') or not result.get('policy_id'):
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                        updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
-                                        claims.save_human_summary(conn, bid, updated_c)
-                                        return finish(
-                                            f"No he podido acceder a las cláusulas de tu póliza. He registrado tu parte con referencia {claim_ref} para que nuestro equipo lo evalúe manualmente. Nos pondremos en contacto contigo.",
-                                            {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
-                                        )
+                                            result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=claim['policy_id'])
+                                            if result['status'] in ('no_policy', 'policy_not_matched') or not result.get('policy_id'):
+                                                claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                                updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                                claims.save_human_summary(conn, bid, updated_c)
+                                                return finish(
+                                                    f"No he podido acceder a las cláusulas de tu póliza. He registrado tu parte con referencia {claim_ref} para que nuestro equipo lo evalúe manualmente. Nos pondremos en contacto contigo.",
+                                                    {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
+                                                )
 
                                     evidence = result.get('evidence', [])
                                     eval_res = claims.evaluate_coverage_with_llm(
@@ -1126,6 +1145,14 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                 f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños."
                                             )
                                             log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
+                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                    except Exception as claim_proc_exc:
+                                        log.error("Error al procesar siniestro %s: %s", claim_ref, claim_proc_exc, exc_info=True)
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
+                                        reply = (
+                                            f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
+                                            "Para proceder con el trámite, por favor envíame fotografías o un vídeo del daño para continuar con la tramitación."
+                                        )
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                                 elif claim_state == claims.ClaimState.PHOTOS_REQUESTED:
@@ -1479,11 +1506,14 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     reply = f'{policy_info.describe(metadata, metadata_intent)}\n{reply}'
             return finish(reply, out, pages=pages, question=question)
     except Exception as exc:
-        log.error('insurance_lookup_failed correlation_id=%s error_type=%s', corr, type(exc).__name__)
+        log.error('insurance_lookup_failed correlation_id=%s error_type=%s exc=%s', corr, type(exc).__name__, exc, exc_info=True)
         decision = ResultKind.TECHNICAL_ERROR.value if operation_started else 'case_persistence_failed'
-        _diag(corr, 'lookup', bid, reason_code='persistence_failed', identity_verified=False,
-              decision=decision)
-        _turn_diag(corr, bid, decision, False, 'write_failed')
+        try:
+            _diag(corr, 'lookup', bid, reason_code='persistence_failed', identity_verified=False,
+                  decision=decision)
+            _turn_diag(corr, bid, decision, False, 'write_failed')
+        except Exception:
+            pass
         reply = OPERATION_UNKNOWN if operation_started else OPERATION_NOT_STARTED
         if _real_urgent(text):
             protocol = os.getenv('INSURANCE_URGENT_PROTOCOL_TEXT', '').strip() or URGENT_SAFETY_FALLBACK
