@@ -1094,7 +1094,7 @@ def interpret_incident_with_llm(description):
         services_needed.append('cristalería')
 
     # Fontanería / Agua
-    if any(w in desc_lower for w in ('agua', 'tuberia', 'tubería', 'fuga', 'fugas', 'goteo', 'goteos', 'inund', 'grifo', 'grifos', 'llave', 'gotera', 'goteras', 'desagüe', 'desague', 'atasco', 'cisterna', 'humedad', 'humedades', 'plomero', 'fontaner', 'filtración', 'filtracion')):
+    if any(w in desc_lower for w in ('agua', 'tuberia', 'tubería', 'cañeria', 'cañería', 'caño', 'caños', 'fuga', 'fugas', 'goteo', 'goteos', 'inund', 'grifo', 'grifos', 'llave', 'gotera', 'goteras', 'desagüe', 'desague', 'atasco', 'cisterna', 'humedad', 'humedades', 'plomero', 'fontaner', 'filtración', 'filtracion')):
         damage_categories.append('fontanería')
         services_needed.append('fontanería')
 
