@@ -883,7 +883,13 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     
                     from insurance import claims
                     target_policy_id = st.get('policy_id') or 'POL-DEFAULT'
-                    claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, '')
+                    try:
+                        claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, '')
+                    except claims.ClaimsSchemaUnavailableError:
+                        return finish(
+                            "En este momento no podemos tramitar la apertura de siniestros por una incidencia técnica en el sistema de gestión. Por favor, inténtalo más tarde o contacta con atención al cliente.",
+                            {'insurance_result': ResultKind.TECHNICAL_ERROR.value}
+                        )
                     st['active_claim_ref'] = claim_ref
                     st['awaiting'] = 'claim'
                     is_query = False
@@ -964,7 +970,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         return finish(missing, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                                     result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=claim['policy_id'])
-                                    if result['status'] == 'no_policy' or not result.get('policy_id'):
+                                    if result['status'] in ('no_policy', 'policy_not_matched') or not result.get('policy_id'):
                                         claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
                                         updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
                                         claims.save_human_summary(conn, bid, updated_c)
@@ -974,7 +980,11 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         )
 
                                     evidence = result.get('evidence', [])
-                                    eval_res = claims.evaluate_coverage_with_llm(interp, evidence)
+                                    eval_res = claims.evaluate_coverage_with_llm(
+                                        interp, evidence,
+                                        policy_id=claim['policy_id'],
+                                        version_id=claim.get('policy_version_id')
+                                    )
                                     claims.update_claim(conn, claim['claim_uuid'], coverage_evaluation=eval_res)
 
                                     status = eval_res.get('status')
@@ -998,6 +1008,16 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                             )
                                             log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                    elif status == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY:
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                        updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                        claims.save_human_summary(conn, bid, updated_c)
+                                        reply = (
+                                            f"He verificado tu póliza y el incidente no se encuentra cubierto por las condiciones contratadas (o presenta una exclusión contractual expresa).\n"
+                                            f"Explicación contractual: {eval_res.get('explanation', '')}\n\n"
+                                            f"He registrado el expediente con la referencia {claim_ref} para que nuestro equipo técnico lo revise si consideras que hay algún error."
+                                        )
+                                        return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
                                     else:
                                         claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
                                         updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
@@ -1066,10 +1086,33 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                             fname = media.get('filename', '').lower()
                                             m_size = media.get('size_bytes', 1024 * 50)
                                             if 'factura' in fname or 'receipt' in fname or 'invoice' in fname or mtype == 'application/pdf':
-                                                ext_fields = claims.extract_invoice_with_llm(media['filename'], "Factura por servicios de reparación de hogar, importe 150 EUR, IVA incluido.")
+                                                raw_bytes = claims._resolve_attachment_bytes(media)
+                                                extracted_text = ""
+                                                if raw_bytes and mtype == 'application/pdf':
+                                                    try:
+                                                        import pypdfium2
+                                                        pdf = pypdfium2.PdfDocument(raw_bytes)
+                                                        pages_text = []
+                                                        for page in pdf:
+                                                            text_page = page.get_textpage()
+                                                            txt = text_page.get_text_range()
+                                                            if txt:
+                                                                pages_text.append(txt)
+                                                        extracted_text = "\n".join(pages_text).strip()
+                                                    except Exception:
+                                                        extracted_text = ""
+                                                elif raw_bytes and mtype.startswith('text/'):
+                                                    try:
+                                                        extracted_text = raw_bytes.decode('utf-8', errors='ignore')
+                                                    except Exception:
+                                                        extracted_text = ""
+
+                                                ext_fields = claims.extract_invoice_with_llm(media['filename'], extracted_text)
                                                 invoice_record = {
                                                     'filename': media['filename'],
                                                     'mimetype': media['content_type'],
+                                                    'size_bytes': m_size,
+                                                    'url': media.get('url'),
                                                     'extracted_fields': ext_fields
                                                 }
                                                 current_invoices.append(invoice_record)
@@ -1096,8 +1139,9 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     eval_data = updated_claim.get('coverage_evaluation') or {}
                                     status = eval_data.get('status')
                                     service_type = eval_data.get('service_type')
+                                    has_invoices = bool(updated_claim.get('invoices'))
 
-                                    if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
+                                    if status == claims.CoverageStatus.SUPPORTED_BY_POLICY and not has_invoices:
                                         sent = claims.send_service_notification_email(conn, bid, updated_claim)
                                         if sent:
                                             claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.CLOSED)
@@ -1111,6 +1155,12 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                 f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
                                                 f"Como no tenemos un profesional de {service_type} configurado automáticamente para tu zona, he derivado el caso para que un agente lo asigne manualmente. Se pondrán en contacto contigo pronto."
                                             )
+                                    elif status == claims.CoverageStatus.SUPPORTED_BY_POLICY and has_invoices:
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+                                        reply = (
+                                            f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
+                                            f"He adjuntado las facturas aportadas para que nuestro equipo técnico y pericial evalúe la solicitud de reembolso y se ponga en contacto contigo lo antes posible."
+                                        )
                                     else:
                                         claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
                                         reply = (
