@@ -49,18 +49,20 @@ def get_store_dir():
 
 
 def is_claims_schema_ready(conn):
-    """Verifies that essential claims tables and sequences exist in PostgreSQL."""
+    """Verifies that essential claims tables, sequences, and columns exist in PostgreSQL."""
     try:
         row = conn.execute("""
             SELECT 
                 (SELECT count(*) FROM information_schema.tables 
                  WHERE table_name IN ('insurance_claims', 'insurance_professionals')) AS table_count,
                 (SELECT count(*) FROM information_schema.sequences 
-                 WHERE sequence_name = 'insurance_claim_ref_seq') AS seq_count
+                 WHERE sequence_name = 'insurance_claim_ref_seq') AS seq_count,
+                (SELECT count(*) FROM information_schema.columns
+                 WHERE table_name = 'insurance_claims' AND column_name IN ('affected_items', 'evidence_matrix')) AS col_count
         """).fetchone()
         if not row:
             return False
-        return bool(row['table_count'] >= 2 and row['seq_count'] >= 1)
+        return bool(row['table_count'] >= 2 and row['seq_count'] >= 1 and row['col_count'] >= 2)
     except Exception as exc:
         log.warning("Claims schema readiness check failed: %s", exc)
         return False
@@ -122,7 +124,8 @@ def ensure_claims_schema(conn):
     ]
     for stmt in ddl_statements:
         try:
-            conn.execute(stmt)
+            with conn.savepoint():
+                conn.execute(stmt)
         except Exception as stmt_exc:
             log.warning("Statement execution in ensure_claims_schema non-fatal warning: %s", stmt_exc)
 
