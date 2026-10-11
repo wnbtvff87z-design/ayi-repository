@@ -909,7 +909,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         claim_state = claim['state']
                         claim_ref = claim['claim_ref']
 
-                        if claim_state in (claims.ClaimState.CLOSED, claims.ClaimState.APPROVED, claims.ClaimState.REJECTED):
+                        if claim_state in (claims.ClaimState.CLOSED, claims.ClaimState.APPROVED, claims.ClaimState.REJECTED, claims.ClaimState.READY_FOR_HUMAN_REVIEW, claims.ClaimState.HUMAN_REVIEW):
                             st.pop('active_claim_ref', None)
                             st.pop('awaiting', None)
                         else:
@@ -998,7 +998,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         reply = (
                                             f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
                                             f"Explicación contractual: {explanation}\n\n"
-                                            f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño."
+                                            f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
                                         )
                                         if channel == 'Voice':
                                             reply = (
@@ -1008,25 +1008,28 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                             )
                                             log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                    elif status == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY:
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                        updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
-                                        claims.save_human_summary(conn, bid, updated_c)
-                                        reply = (
-                                            f"He verificado tu póliza y el incidente no se encuentra cubierto por las condiciones contratadas (o presenta una exclusión contractual expresa).\n"
-                                            f"Explicación contractual: {eval_res.get('explanation', '')}\n\n"
-                                            f"He registrado el expediente con la referencia {claim_ref} para que nuestro equipo técnico lo revise si consideras que hay algún error."
-                                        )
-                                        return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
                                     else:
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                        updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
-                                        claims.save_human_summary(conn, bid, updated_c)
+                                        # When coverage requires human review or is ambiguous:
+                                        # ALWAYS request photos/videos so that the human agent has evidence to evaluate!
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
+                                        if status == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY:
+                                            coverage_note = "Según las condiciones preliminares, este incidente requiere comprobación pericial personalizada."
+                                        else:
+                                            coverage_note = "Este tipo de daño requiere de valoración técnica y pericial por parte de un agente humano."
+
                                         reply = (
-                                            f"No he encontrado una cobertura explícita en tu póliza para estos daños o requiere de revisión de un agente.\n"
-                                            f"He registrado el siniestro con la referencia {claim_ref} para que nuestro equipo humano lo revise detenidamente. Nos pondremos en contacto contigo lo antes posible."
+                                            f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
+                                            f"{coverage_note}\n\n"
+                                            f"Para que nuestro equipo pericial pueda evaluar la cobertura y tomar las acciones más adecuadas, por favor envíame fotografías o un vídeo (de 10 a 20 segundos) donde se aprecie claramente el daño.\n\n"
+                                            f"(Si no dispones de fotos o vídeos en este momento, responde 'no tengo' para continuar con el expediente)."
                                         )
-                                        return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
+                                        if channel == 'Voice':
+                                            reply = (
+                                                f"He registrado tu siniestro con referencia {claim_ref} para revisión pericial humana. "
+                                                f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños."
+                                            )
+                                            log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
+                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                                 elif claim_state == claims.ClaimState.PHOTOS_REQUESTED:
                                     if media_list:
