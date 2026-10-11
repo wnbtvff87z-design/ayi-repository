@@ -250,6 +250,11 @@ def test_dining_room_glass_table_claim_flow(pg_schema):
     with pg_schema() as conn:
         identity.upsert_customer(conn, bid, cid, "Celia Zorro Condes", "51959566J")
         claims.add_customer_and_policy(conn, bid, cid, "Celia Zorro Condes", "51959566J", pid, "hogar", "058342561/00000")
+        claims.add_professional(conn, bid, "cristalería", "Cristalería Central", "cristaleria@empresa.com")
+        claims.add_policy_document_page(
+            conn, bid, pid, "V1", "DOC-HOGAR-001", 1, "coverage",
+            "Garantía de cristalería: La póliza de hogar cubre la rotura accidental de cristales, vidrios y lunas de mesas en la vivienda asegurada."
+        )
         
         # Turn 1: Verification
         r1, out1 = dialog.process(
@@ -321,6 +326,11 @@ def test_claim_resume_and_continuation_commands(pg_schema):
     with pg_schema() as conn:
         identity.upsert_customer(conn, bid, cid, "Pedro Sánchez", "11223344A")
         claims.add_customer_and_policy(conn, bid, cid, "Pedro Sánchez", "11223344A", pid, "hogar", "112233")
+        claims.add_professional(conn, bid, "fontanería", "Fontanero Gómez", "gomez@example.com")
+        claims.add_policy_document_page(
+            conn, bid, pid, "V1", "DOC-HOGAR-002", 1, "coverage",
+            "Garantía de daños por agua: Quedan cubiertos los daños ocasionados por rotura o fuga de tuberías e instalaciones fijas de fontanería."
+        )
         
         # Verification
         dialog.process({'business_id': bid}, {}, [], "mi nombre es Pedro Sánchez y DNI 11223344A", "WhatsApp", "SM-301", "+34600333444")
@@ -370,6 +380,11 @@ def test_multiple_photos_and_video_attachments(pg_schema):
     with pg_schema() as conn:
         identity.upsert_customer(conn, bid, cid, "Maria Lopez", "99887766B")
         claims.add_customer_and_policy(conn, bid, cid, "Maria Lopez", "99887766B", pid, "hogar", "998877")
+        claims.add_professional(conn, bid, "cristalería", "Cristales Express", "cristales@empresa.com")
+        claims.add_policy_document_page(
+            conn, bid, pid, "V1", "DOC-HOGAR-003", 1, "coverage",
+            "Garantía de rotura de cristales: La póliza cubre la rotura accidental de cristales y ventanas en la vivienda."
+        )
         
         dialog.process({'business_id': bid}, {}, [], "mi nombre es Maria Lopez y DNI 99887766B", "WhatsApp", "SM-401", "+34600999888")
         dialog.process({'business_id': bid}, {}, [], "enviar parte", "WhatsApp", "SM-402", "+34600999888")
@@ -520,6 +535,294 @@ def test_resend_api_url_attachment_download(monkeypatch):
     assert len(payload['attachments']) == 1
     assert payload['attachments'][0]['filename'] == 'media_0.jpg'
     assert base64.b64decode(payload['attachments'][0]['content']) == b"downloaded_image_bytes"
+
+
+def test_coverage_evaluation_requires_contractual_evidence():
+    """Damage category alone (e.g. 'cristal roto') without evidence must NEVER confirm coverage."""
+    interp = {
+        "description": "Se ha roto una mesa de cristal en el salón",
+        "incident_type": "cristalería",
+        "primary_service": "cristalería"
+    }
+    # Case A: No evidence pages provided
+    res_no_ev = claims.evaluate_coverage_with_evidence(interp, [])
+    assert res_no_ev['status'] != claims.CoverageStatus.SUPPORTED_BY_POLICY
+    assert res_no_ev['status'] == claims.CoverageStatus.HUMAN_REVIEW_REQUIRED
+    assert res_no_ev['reimbursement_applicable'] is False
+    assert len(res_no_ev['evidence_citations']) == 0
+
+    # Case B: Irrelevant evidence pages (e.g. fire coverage only)
+    irrelevant_evidence = [{
+        'document_id': 'DOC-001',
+        'page': 1,
+        'section': 'coverage',
+        'text': 'Garantía de Incendio: La póliza cubre los daños producidos por fuego e incendio en el inmueble.'
+    }]
+    res_irrel = claims.evaluate_coverage_with_evidence(interp, irrelevant_evidence)
+    assert res_irrel['status'] != claims.CoverageStatus.SUPPORTED_BY_POLICY
+    assert res_irrel['status'] == claims.CoverageStatus.HUMAN_REVIEW_REQUIRED
+
+
+def test_coverage_evaluation_respects_contractual_exclusions():
+    """Contractual exclusions prevent declaring coverage supported."""
+    interp = {
+        "description": "Se rayó y rompió el cristal de la ventana por desgaste y arañazos",
+        "incident_type": "cristalería",
+        "primary_service": "cristalería"
+    }
+    evidence_with_exclusion = [{
+        'document_id': 'DOC-002',
+        'page': 4,
+        'section': 'exclusions',
+        'text': 'Exclusiones generales: Quedan expresamente excluidas las roturas de cristales o vidrios por rayaduras, arañazos o desgaste natural.'
+    }]
+    res = claims.evaluate_coverage_with_evidence(interp, evidence_with_exclusion)
+    assert res['status'] == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY
+    assert res['reimbursement_applicable'] is False
+    assert len(res['exclusions_found']) > 0
+    assert len(res['evidence_citations']) > 0
+    assert res['evidence_citations'][0]['document_id'] == 'DOC-002'
+
+
+def test_coverage_evaluation_with_valid_contractual_evidence():
+    """Valid contractual coverage clause justifies SUPPORTED_BY_POLICY with documentary citations."""
+    interp = {
+        "description": "Fuga de agua por rotura de tubería en la cocina",
+        "incident_type": "fontanería",
+        "primary_service": "fontanería"
+    }
+    evidence_with_guarantee = [{
+        'document_id': 'DOC-003',
+        'page': 2,
+        'section': 'coverage',
+        'text': 'Garantía de daños por agua: Quedan cubiertos los daños causados por fugas de agua y rotura de tuberías fijas de la vivienda.'
+    }]
+    res = claims.evaluate_coverage_with_evidence(interp, evidence_with_guarantee)
+    assert res['status'] == claims.CoverageStatus.SUPPORTED_BY_POLICY
+    assert res['reimbursement_applicable'] is True
+    assert len(res['evidence_citations']) > 0
+    assert res['evidence_citations'][0]['document_id'] == 'DOC-003'
+    assert res['evidence_citations'][0]['page'] == 2
+
+
+def test_coverage_evaluation_policy_verification(pg_schema):
+    """Verifies that non-existent, inactive, wrong-customer, or non-hogar policies are rejected."""
+    bid = "INS-BIZ-001"
+    cid1 = "CUS-000001"
+    cid2 = "CUS-000002"
+    pid_hogar = "POL-HOGAR-V1"
+    pid_coche = "POL-COCHE-V1"
+
+    with pg_schema() as conn:
+        claims.add_customer_and_policy(conn, bid, cid1, "Ana Pérez", "12345678Z", pid_hogar, "hogar", "111")
+        claims.add_customer_and_policy(conn, bid, cid1, "Ana Pérez", "12345678Z", pid_coche, "coche", "222")
+        claims.add_customer_and_policy(conn, bid, cid2, "Juan Gomez", "87654321A", "POL-HOGAR-JUAN", "hogar", "333")
+
+        # 1. Valid customer and hogar policy
+        ok, ver, err = claims.verify_policy_for_claim(conn, bid, cid1, pid_hogar)
+        assert ok is True
+        assert ver == 'V1'
+        assert err is None
+
+        # 2. Customer 1 cannot use Customer 2's policy
+        ok2, _, err2 = claims.verify_policy_for_claim(conn, bid, cid1, "POL-HOGAR-JUAN")
+        assert ok2 is False
+        assert err2 == 'policy_not_found_or_unauthorized'
+
+        # 3. Non-hogar policy rejected for home claims
+        ok3, _, err3 = claims.verify_policy_for_claim(conn, bid, cid1, pid_coche)
+        assert ok3 is False
+        assert err3 == 'unsupported_product'
+
+        # 4. Out-of-date incident date rejected
+        ok4, _, err4 = claims.verify_policy_for_claim(conn, bid, cid1, pid_hogar, fact_date=date(2020, 1, 1))
+        assert ok4 is False
+        assert err4 == 'version_not_in_force_for_date'
+
+
+def test_invoice_extraction_no_hallucinations(monkeypatch):
+    """Invoice extraction represents unknown fields as None and never hallucinates mock data."""
+    # 1. Empty / unreadable text
+    res_empty = claims.extract_invoice_with_llm("recibo.pdf", "")
+    assert res_empty['success'] is False
+    assert res_empty['is_complete'] is False
+    assert res_empty['amount'] is None
+    assert res_empty['provider'] is None
+    assert res_empty['invoice_number'] is None
+    assert res_empty['date'] is None
+
+    # 2. Complete extraction via LLM
+    def mock_llm_complete(messages):
+        return {
+            "provider": "Fontanería Soler S.L.",
+            "date": "2026-03-15",
+            "invoice_number": "FAC-2026-88",
+            "work_description": "Sustitución de sifón y desatasco",
+            "amount": 185.50,
+            "currency": "EUR",
+            "taxes_included": True
+        }
+    monkeypatch.setattr('insurance.llm.interpret', mock_llm_complete)
+    monkeypatch.setenv('INSURANCE_LLM_MODEL', 'gpt-4o-mini')
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test')
+
+    res_comp = claims.extract_invoice_with_llm("factura.pdf", "Texto de factura real...")
+    assert res_comp['success'] is True
+    assert res_comp['is_complete'] is True
+    assert res_comp['provider'] == "Fontanería Soler S.L."
+    assert res_comp['amount'] == 185.50
+    assert res_comp['invoice_number'] == "FAC-2026-88"
+
+    # 3. Partial extraction (missing invoice number and date)
+    def mock_llm_partial(messages):
+        return {
+            "provider": "Pinturas Rápidas",
+            "date": None,
+            "invoice_number": None,
+            "work_description": "Pintura de techo",
+            "amount": 90.0,
+            "currency": "EUR",
+            "taxes_included": True
+        }
+    monkeypatch.setattr('insurance.llm.interpret', mock_llm_partial)
+
+    res_part = claims.extract_invoice_with_llm("ticket.jpg", "Ticket sin número...")
+    assert res_part['success'] is True
+    assert res_part['is_complete'] is False
+    assert res_part['provider'] == "Pinturas Rápidas"
+    assert res_part['amount'] == 90.0
+    assert res_part['invoice_number'] is None
+    assert res_part['date'] is None
+
+    # 4. LLM Exception returns failed extraction without crash or fake data
+    def mock_llm_error(messages):
+        raise RuntimeError("LLM service unavailable")
+    monkeypatch.setattr('insurance.llm.interpret', mock_llm_error)
+
+    res_err = claims.extract_invoice_with_llm("factura_error.pdf", "Texto...")
+    assert res_err['success'] is False
+    assert res_err['is_complete'] is False
+    assert res_err['amount'] is None
+    assert res_err['provider'] is None
+
+
+def test_service_notification_recipient_selection_and_override(pg_schema, monkeypatch):
+    """Verifies recipient hierarchy: test override > service env > database > unconfigured."""
+    bid = "INS-BIZ-001"
+    with pg_schema() as conn:
+        claims.add_professional(conn, bid, "fontanería", "Fontanero Real", "real-fontanero@taller.es")
+
+        # 1. Database recipient used when no overrides
+        monkeypatch.delenv('NOTIFICATION_OVERRIDE_EMAIL', raising=False)
+        monkeypatch.delenv('SERVICE_FONTANERIA_EMAIL', raising=False)
+        email, prof, src = claims.get_service_professional_recipient(conn, bid, "fontanería")
+        assert email == "real-fontanero@taller.es"
+        assert src == "database"
+
+        # 2. Service-specific env var takes precedence over DB
+        monkeypatch.setenv('SERVICE_FONTANERIA_EMAIL', "fontaneria-env@seguro.es")
+        email_env, _, src_env = claims.get_service_professional_recipient(conn, bid, "fontanería")
+        assert email_env == "fontaneria-env@seguro.es"
+        assert src_env == "env_service"
+
+        # 3. Global test override takes ultimate precedence
+        monkeypatch.setenv('NOTIFICATION_OVERRIDE_EMAIL', "test-tester@test.com")
+        email_ovr, _, src_ovr = claims.get_service_professional_recipient(conn, bid, "fontanería")
+        assert email_ovr == "test-tester@test.com"
+        assert src_ovr == "test_override"
+
+        # 4. Unconfigured service without DB or env returns not_configured
+        monkeypatch.delenv('NOTIFICATION_OVERRIDE_EMAIL', raising=False)
+        monkeypatch.delenv('SERVICE_DEFAULT_EMAIL', raising=False)
+        email_none, _, src_none = claims.get_service_professional_recipient(conn, bid, "asistencia")
+        assert email_none is None
+        assert src_none == "not_configured"
+
+
+def test_service_notification_real_status_and_idempotency(pg_schema, monkeypatch):
+    """Verifies that email delivery status is tracked and idempotent."""
+    bid = "INS-BIZ-001"
+    cid = "CUS-000001"
+    pid = "POL-000123"
+
+    with pg_schema() as conn:
+        claims.add_professional(conn, bid, "fontanería", "Fontanero Gómez", "gomez@taller.es")
+        claims.add_customer_and_policy(conn, bid, cid, "Ana Pérez", "12345678Z", pid, "hogar", "001")
+        cuuid, cref = claims.create_claim(conn, bid, cid, pid, "V1", "WhatsApp", "Fuga en baño")
+
+        eval_res = {
+            "status": claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            "explanation": "Cubierto por póliza",
+            "service_type": "fontanería"
+        }
+        claims.update_claim(conn, cuuid, coverage_evaluation=eval_res)
+        claim = claims.get_claim(conn, bid, cuuid)
+
+        deliver_count = 0
+
+        def mock_deliver(to_email, subject, body, attachments=None, idempotency_key=None, detailed=False):
+            nonlocal deliver_count
+            deliver_count += 1
+            res = {
+                "status": "ACCEPTED",
+                "provider": "resend",
+                "message_id": "msg_idem_123",
+                "sent_to": to_email,
+                "sent_at": "2026-10-11T10:00:00",
+                "error": None
+            }
+            return res if detailed else True
+
+        monkeypatch.setattr('insurance.claims.deliver_real_email', mock_deliver)
+
+        # First call: delivers email and updates claim
+        sent1 = claims.send_service_notification_email(conn, bid, claim)
+        assert sent1 is True
+        assert deliver_count == 1
+
+        c_updated = claims.get_claim(conn, bid, cuuid)
+        assert c_updated['service_notified'] is True
+        assert c_updated['service_notification_details']['status'] == 'ACCEPTED'
+        assert c_updated['service_notification_details']['provider_message_id'] == 'msg_idem_123'
+
+        # Second call (idempotency): does NOT re-deliver
+        sent2 = claims.send_service_notification_email(conn, bid, c_updated)
+        assert sent2 is True
+        assert deliver_count == 1  # count did not increase!
+
+
+def test_multi_damage_incident_interpretation():
+    """Identifies multiple damages and services in a single incident description."""
+    desc = "Hubo una fuga de tubería en el baño que manchó la pintura del techo y rompió un espejo de cristal"
+    interp = claims.interpret_incident_with_llm(desc)
+    assert interp['primary_service'] == 'fontanería'
+    assert 'pintura' in interp['services_needed']
+    assert 'cristalería' in interp['services_needed']
+    assert len(interp['damage_categories']) >= 3
+
+
+def test_claims_schema_readiness_and_guard(pg_schema):
+    """Schema readiness check fails cleanly when required tables are missing."""
+    with pg_schema() as conn:
+        assert claims.is_claims_schema_ready(conn) is True
+
+        # Drop table temporarily in test schema to verify guard
+        conn.execute("DROP TABLE insurance_claims CASCADE")
+        assert claims.is_claims_schema_ready(conn) is False
+
+        with pytest.raises(claims.ClaimsSchemaUnavailableError):
+            claims.create_claim(conn, "BIZ", "CUS", "POL", "V1", "WhatsApp", "Desc")
+
+
+def test_claim_invalid_state_transitions():
+    """Validates that illegal claim transitions raise ClaimTransitionError."""
+    # Cannot jump directly from INFORMATION_GATHERING to CLOSED
+    with pytest.raises(claims.ClaimTransitionError):
+        claims.validate_claim_transition(claims.ClaimState.INFORMATION_GATHERING, claims.ClaimState.CLOSED)
+
+    # Valid transition succeeds
+    assert claims.validate_claim_transition(claims.ClaimState.INFORMATION_GATHERING, claims.ClaimState.PHOTOS_REQUESTED) is True
+
 
 
 
