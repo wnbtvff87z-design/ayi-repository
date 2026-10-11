@@ -997,7 +997,11 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                 return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                         except Exception as init_claim_exc:
                             log.error("Error processing initial claim description: %s", init_claim_exc, exc_info=True)
-                            claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
+                            try:
+                                with conn.savepoint():
+                                    claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
+                            except Exception:
+                                pass
                             reply = (
                                 f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
                                 "Por favor, envíame fotografías o un vídeo del daño para continuar con la tramitación."
@@ -1095,60 +1099,64 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                     {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
                                                 )
 
-                                    evidence = result.get('evidence', [])
-                                    eval_res = claims.evaluate_coverage_with_llm(
-                                        interp, evidence,
-                                        policy_id=claim['policy_id'],
-                                        version_id=claim.get('policy_version_id')
-                                    )
-                                    claims.update_claim(conn, claim['claim_uuid'], coverage_evaluation=eval_res)
-
-                                    status = eval_res.get('status')
-                                    service_type = eval_res.get('service_type')
-
-                                    if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
-                                        explanation = eval_res.get('explanation', '')
-                                        explanation = _sanitize_llm_explanation(explanation, evidence, claim['policy_id'], claim.get('policy_version_id'), claim['policy_id'])
-
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
-                                        reply = (
-                                            f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
-                                            f"Explicación contractual: {explanation}\n\n"
-                                            f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
-                                        )
-                                        if channel == 'Voice':
-                                            reply = (
-                                                f"He verificado tu póliza y tu incidente de {service_type or 'asistencia'} parece cubierto. "
-                                                f"He registrado tu parte con referencia {claim_ref}. "
-                                                f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños por ahí."
+                                            evidence = result.get('evidence', [])
+                                            eval_res = claims.evaluate_coverage_with_llm(
+                                                interp, evidence,
+                                                policy_id=claim['policy_id'],
+                                                version_id=claim.get('policy_version_id')
                                             )
-                                            log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
-                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                    else:
-                                        # When coverage requires human review or is ambiguous:
-                                        # ALWAYS request photos/videos so that the human agent has evidence to evaluate!
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
-                                        if status == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY:
-                                            coverage_note = "Según las condiciones preliminares, este incidente requiere comprobación pericial personalizada."
-                                        else:
-                                            coverage_note = "Este tipo de daño requiere de valoración técnica y pericial por parte de un agente humano."
+                                            claims.update_claim(conn, claim['claim_uuid'], coverage_evaluation=eval_res)
 
-                                        reply = (
-                                            f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
-                                            f"{coverage_note}\n\n"
-                                            f"Para que nuestro equipo pericial pueda evaluar la cobertura y tomar las acciones más adecuadas, por favor envíame fotografías o un vídeo (de 10 a 20 segundos) donde se aprecie claramente el daño.\n\n"
-                                            f"(Si no dispones de fotos o vídeos en este momento, responde 'no tengo' para continuar con el expediente)."
-                                        )
-                                        if channel == 'Voice':
-                                            reply = (
-                                                f"He registrado tu siniestro con referencia {claim_ref} para revisión pericial humana. "
-                                                f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños."
-                                            )
-                                            log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
-                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                            status = eval_res.get('status')
+                                            service_type = eval_res.get('service_type')
+
+                                            if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
+                                                explanation = eval_res.get('explanation', '')
+                                                explanation = _sanitize_llm_explanation(explanation, evidence, claim['policy_id'], claim.get('policy_version_id'), claim['policy_id'])
+
+                                                claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
+                                                reply = (
+                                                    f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
+                                                    f"Explicación contractual: {explanation}\n\n"
+                                                    f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
+                                                )
+                                                if channel == 'Voice':
+                                                    reply = (
+                                                        f"He verificado tu póliza y tu incidente de {service_type or 'asistencia'} parece cubierto. "
+                                                        f"He registrado tu parte con referencia {claim_ref}. "
+                                                        f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños por ahí."
+                                                    )
+                                                    log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
+                                                return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                            else:
+                                                # When coverage requires human review or is ambiguous:
+                                                # ALWAYS request photos/videos so that the human agent has evidence to evaluate!
+                                                claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
+                                                if status == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY:
+                                                    coverage_note = "Según las condiciones preliminares, este incidente requiere comprobación pericial personalizada."
+                                                else:
+                                                    coverage_note = "Este tipo de daño requiere de valoración técnica y pericial por parte de un agente humano."
+
+                                                reply = (
+                                                    f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
+                                                    f"{coverage_note}\n\n"
+                                                    f"Para que nuestro equipo pericial pueda evaluar la cobertura y tomar las acciones más adecuadas, por favor envíame fotografías o un vídeo (de 10 a 20 segundos) donde se aprecie claramente el daño.\n\n"
+                                                    f"(Si no dispones de fotos o vídeos en este momento, responde 'no tengo' para continuar con el expediente)."
+                                                )
+                                                if channel == 'Voice':
+                                                    reply = (
+                                                        f"He registrado tu siniestro con referencia {claim_ref} para revisión pericial humana. "
+                                                        f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños."
+                                                    )
+                                                    log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
+                                                return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                                     except Exception as claim_proc_exc:
                                         log.error("Error al procesar siniestro %s: %s", claim_ref, claim_proc_exc, exc_info=True)
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
+                                        try:
+                                            with conn.savepoint():
+                                                claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
+                                        except Exception:
+                                            pass
                                         reply = (
                                             f"He registrado la apertura de tu siniestro con la referencia {claim_ref}.\n"
                                             "Para proceder con el trámite, por favor envíame fotografías o un vídeo del daño para continuar con la tramitación."
