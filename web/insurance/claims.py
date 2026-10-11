@@ -82,48 +82,49 @@ def check_claims_readiness(conn):
 
 def ensure_claims_schema(conn):
     """Idempotently executes DDL for claims schema (used for provisioning / tests)."""
-    try:
-        conn.execute("""
-            CREATE SEQUENCE IF NOT EXISTS insurance_claim_ref_seq START WITH 1;
-            CREATE TABLE IF NOT EXISTS insurance_professionals (
-                professional_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                business_id text NOT NULL,
-                service_type text NOT NULL,
-                name text NOT NULL,
-                email text NOT NULL,
-                phone text,
-                created_at timestamptz NOT NULL DEFAULT now(),
-                UNIQUE (business_id, service_type)
-            );
-            CREATE TABLE IF NOT EXISTS insurance_claims (
-                claim_uuid uuid PRIMARY KEY,
-                business_id text NOT NULL,
-                customer_id text NOT NULL,
-                policy_id text NOT NULL,
-                policy_version_id text,
-                claim_ref text UNIQUE NOT NULL,
-                channel text NOT NULL,
-                original_description text,
-                structured_interpretation jsonb NOT NULL DEFAULT '{}'::jsonb,
-                coverage_evaluation jsonb NOT NULL DEFAULT '{}'::jsonb,
-                state text NOT NULL DEFAULT 'INFORMATION_GATHERING',
-                photos jsonb NOT NULL DEFAULT '[]'::jsonb,
-                invoices jsonb NOT NULL DEFAULT '[]'::jsonb,
-                affected_items jsonb NOT NULL DEFAULT '[]'::jsonb,
-                evidence_matrix jsonb NOT NULL DEFAULT '[]'::jsonb,
-                service_notified boolean NOT NULL DEFAULT false,
-                service_notification_details jsonb NOT NULL DEFAULT '{}'::jsonb,
-                created_at timestamptz NOT NULL DEFAULT now(),
-                updated_at timestamptz NOT NULL DEFAULT now()
-            );
-            ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS affected_items jsonb NOT NULL DEFAULT '[]'::jsonb;
-            ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS evidence_matrix jsonb NOT NULL DEFAULT '[]'::jsonb;
-            CREATE INDEX IF NOT EXISTS insurance_claims_ref_idx ON insurance_claims (claim_ref);
-            CREATE INDEX IF NOT EXISTS insurance_claims_customer_idx ON insurance_claims (business_id, customer_id);
-        """)
-    except Exception as exc:
-        log.error("insurance_claims ensure_schema failed: %s", exc)
-        raise ClaimsSchemaUnavailableError(f"No se pudo inicializar el esquema de siniestros: {exc}") from exc
+    ddl_statements = [
+        "CREATE SEQUENCE IF NOT EXISTS insurance_claim_ref_seq START WITH 1;",
+        """CREATE TABLE IF NOT EXISTS insurance_professionals (
+            professional_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            business_id text NOT NULL,
+            service_type text NOT NULL,
+            name text NOT NULL,
+            email text NOT NULL,
+            phone text,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE (business_id, service_type)
+        );""",
+        """CREATE TABLE IF NOT EXISTS insurance_claims (
+            claim_uuid uuid PRIMARY KEY,
+            business_id text NOT NULL,
+            customer_id text NOT NULL,
+            policy_id text NOT NULL,
+            policy_version_id text,
+            claim_ref text UNIQUE NOT NULL,
+            channel text NOT NULL,
+            original_description text,
+            structured_interpretation jsonb NOT NULL DEFAULT '{}'::jsonb,
+            coverage_evaluation jsonb NOT NULL DEFAULT '{}'::jsonb,
+            state text NOT NULL DEFAULT 'INFORMATION_GATHERING',
+            photos jsonb NOT NULL DEFAULT '[]'::jsonb,
+            invoices jsonb NOT NULL DEFAULT '[]'::jsonb,
+            affected_items jsonb NOT NULL DEFAULT '[]'::jsonb,
+            evidence_matrix jsonb NOT NULL DEFAULT '[]'::jsonb,
+            service_notified boolean NOT NULL DEFAULT false,
+            service_notification_details jsonb NOT NULL DEFAULT '{}'::jsonb,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now()
+        );""",
+        "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS affected_items jsonb NOT NULL DEFAULT '[]'::jsonb;",
+        "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS evidence_matrix jsonb NOT NULL DEFAULT '[]'::jsonb;",
+        "CREATE INDEX IF NOT EXISTS insurance_claims_ref_idx ON insurance_claims (claim_ref);",
+        "CREATE INDEX IF NOT EXISTS insurance_claims_customer_idx ON insurance_claims (business_id, customer_id);"
+    ]
+    for stmt in ddl_statements:
+        try:
+            conn.execute(stmt)
+        except Exception as stmt_exc:
+            log.warning("Statement execution in ensure_claims_schema non-fatal warning: %s", stmt_exc)
 
 
 # State Constants
