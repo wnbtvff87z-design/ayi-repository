@@ -524,60 +524,70 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                 authorized_state = sc.customer_id and sc.customer_id == st.get('customer_id')
                 policy = st.get('policy_id') if authorized_state else None
                 version = st.get('version_id') if authorized_state else None
-                if policy and version:
-                    valid_ver = conn.execute(
-                        'SELECT 1 FROM insurance_policy_versions WHERE business_id=%s AND policy_id=%s AND version_id=%s',
-                        (bid, policy, version)
-                    ).fetchone()
-                    if not valid_ver:
-                        policy, version = None, None
 
-                normalized = st.get('normalized_question')
-                conn.execute(
-                    'UPDATE insurance_conversation_turns SET policy_id=%s,version_id=%s,pages=%s::jsonb,'
-                    'decision=%s WHERE turn_id=%s',
-                    (policy, version, json.dumps(list(pages)), decision, user_id))
-                if (pages or decision == ResultKind.POLICY_INFORMATION.value) and st.get(
-                        'question_turn_id') and st['question_turn_id'] != user_id:
+                try:
+                    if policy and version:
+                        valid_ver = conn.execute(
+                            'SELECT 1 FROM insurance_policy_versions WHERE business_id=%s AND policy_id=%s AND version_id=%s',
+                            (bid, policy, version)
+                        ).fetchone()
+                        if not valid_ver:
+                            policy, version = None, None
+
+                    normalized = st.get('normalized_question')
                     conn.execute(
                         'UPDATE insurance_conversation_turns SET policy_id=%s,version_id=%s,pages=%s::jsonb,'
-                        'decision=%s WHERE turn_id=%s AND business_id=%s AND customer_id=%s',
-                        (policy, version, json.dumps(list(pages)), decision, st['question_turn_id'],
-                         bid, sc.customer_id))
-                if is_query and normalized:
-                    memory.set_user_kind(conn, user_id, 'question', incoming, normalized)
-                reply_to = user_id if _is_social(incoming) else st.get('question_turn_id') or user_id
-                if reply_to != user_id:
-                    owned = conn.execute(
-                        'SELECT 1 FROM insurance_conversation_turns WHERE turn_id=%s AND business_id=%s '
-                        'AND channel=%s AND conversation_ref=%s AND session_ref=%s '
-                        'AND customer_id IS NOT DISTINCT FROM %s',
-                        (reply_to, sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id)).fetchone()
-                    if not owned:
-                        reply_to = user_id
-                assistant_id = memory.record_assistant(
-                    conn, sc, external_id, reply, decision, reply_to, corr,
-                    kind=kind or ('answer' if decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value
-                                 else 'clarification'),
-                    policy_id=policy, version_id=version,
-                    pages=list(pages) or st.pop('_policy_disclosure', []))
-                if sc.customer_id and not _is_social(incoming):
-                    pending_text = st.get('question') if st.get('awaiting') else None
-                    if st.get('change_pending') and st.get('requested_policy'):
-                        pending_text = f"Póliza solicitada sin confirmar: {st['requested_policy']}"
-                        if st.get('question'):
-                            pending_text += f"\nPregunta pendiente: {st['question']}"
-                    memory.update_summary(
-                        conn, sc, user_turn_id=st.get('question_turn_id') or user_id,
-                        assistant_turn_id=assistant_id, question=question or incoming, answer=reply,
-                        decision='answer' if decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value else decision,
-                        policy_id=policy, version_id=version, pages=list(pages),
-                        event_date=st.get('fact_date'), fact=user_fact, pending=pending_text,
-                        open_issue=st.get('awaiting'))
-                if not st.get('awaiting'):
-                    for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent',
-                                'recalled_id', 'explain_prior'):
-                        st.pop(key, None)
+                        'decision=%s WHERE turn_id=%s',
+                        (policy, version, json.dumps(list(pages)), decision, user_id))
+                    if (pages or decision == ResultKind.POLICY_INFORMATION.value) and st.get(
+                            'question_turn_id') and st['question_turn_id'] != user_id:
+                        conn.execute(
+                            'UPDATE insurance_conversation_turns SET policy_id=%s,version_id=%s,pages=%s::jsonb,'
+                            'decision=%s WHERE turn_id=%s AND business_id=%s AND customer_id=%s',
+                            (policy, version, json.dumps(list(pages)), decision, st['question_turn_id'],
+                             bid, sc.customer_id))
+                    if is_query and normalized:
+                        memory.set_user_kind(conn, user_id, 'question', incoming, normalized)
+                    reply_to = user_id if _is_social(incoming) else st.get('question_turn_id') or user_id
+                    if reply_to != user_id:
+                        owned = conn.execute(
+                            'SELECT 1 FROM insurance_conversation_turns WHERE turn_id=%s AND business_id=%s '
+                            'AND channel=%s AND conversation_ref=%s AND session_ref=%s '
+                            'AND customer_id IS NOT DISTINCT FROM %s',
+                            (reply_to, sc.bid, sc.channel, sc.ref, sc.sess, sc.customer_id)).fetchone()
+                        if not owned:
+                            reply_to = user_id
+                    assistant_id = memory.record_assistant(
+                        conn, sc, external_id, reply, decision, reply_to, corr,
+                        kind=kind or ('answer' if decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value
+                                     else 'clarification'),
+                        policy_id=policy, version_id=version,
+                        pages=list(pages) or st.pop('_policy_disclosure', []))
+                    if sc.customer_id and not _is_social(incoming):
+                        pending_text = st.get('question') if st.get('awaiting') else None
+                        if st.get('change_pending') and st.get('requested_policy'):
+                            pending_text = f"Póliza solicitada sin confirmar: {st['requested_policy']}"
+                            if st.get('question'):
+                                pending_text += f"\nPregunta pendiente: {st['question']}"
+                        memory.update_summary(
+                            conn, sc, user_turn_id=st.get('question_turn_id') or user_id,
+                            assistant_turn_id=assistant_id, question=question or incoming, answer=reply,
+                            decision='answer' if decision == ResultKind.EVIDENCE_BACKED_EXPLANATION.value else decision,
+                            policy_id=policy, version_id=version, pages=list(pages),
+                            event_date=st.get('fact_date'), fact=user_fact, pending=pending_text,
+                            open_issue=st.get('awaiting'))
+                    if not st.get('awaiting'):
+                        for key in ('question', 'normalized_question', 'question_turn_id', 'question_intent',
+                                    'recalled_id', 'explain_prior'):
+                            st.pop(key, None)
+                    st['last_reply'] = reply
+                    st['last_result_kind'] = decision
+                    st['customer_id'] = customer_id
+                    identity.save_state(conn, bid, sc.channel, sc.ref, sc.sess, st)
+                except Exception as save_exc:
+                    log.warning("Turn state persistence warning: %s", save_exc)
+
+                return reply, out, pages
                 if channel == 'Voice':
                     code = st.get('_identity_diagnostic') or decl.get('diagnostic')
                     if not text.strip():
