@@ -607,7 +607,10 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                        correlation_id=corr,
                                        llm_diagnostic=(out.get('diagnostic_code')
                                                        or st.get('interpretation_diagnostic')))
-                identity.save_state(conn, bid, channel, ref, sess, st, user_activity=True)
+                try:
+                    identity.save_state(conn, bid, channel, ref, sess, st, user_activity=True)
+                except Exception as save_exc:
+                    log.warning("Save state warning: %s", save_exc)
                 _turn_diag(corr, bid, decision, sc.customer_id, 'write_pending_commit')
                 return reply, out
 
@@ -883,7 +886,13 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                           {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                     target_policy_id = st.get('policy_id')
-                    if not target_policy_id:
+                    valid_pol = None
+                    if target_policy_id:
+                        valid_pol = conn.execute(
+                            'SELECT policy_id FROM insurance_policies WHERE business_id=%s AND customer_id=%s AND policy_id=%s LIMIT 1',
+                            (bid, customer_id, target_policy_id)
+                        ).fetchone()
+                    if not valid_pol:
                         pol_row = conn.execute(
                             'SELECT policy_id FROM insurance_policies WHERE business_id=%s AND customer_id=%s LIMIT 1',
                             (bid, customer_id)
@@ -891,6 +900,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         if pol_row:
                             target_policy_id = pol_row['policy_id']
                             st['policy_id'] = target_policy_id
+                        else:
+                            target_policy_id = None
 
                     if not target_policy_id:
                         return finish(
@@ -898,6 +909,15 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             "Por favor, ponte en contacto con nuestro servicio de atención al cliente para verificar tus contratos.",
                             {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                         )
+
+                    if not st.get('version_id'):
+                        ver_row = conn.execute(
+                            'SELECT version_id FROM insurance_policy_versions '
+                            'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
+                            'AND (valid_to IS NULL OR valid_to>=%s) ORDER BY valid_from DESC LIMIT 1',
+                            (bid, target_policy_id, _business_date(business), _business_date(business))).fetchone()
+                        if ver_row:
+                            st['version_id'] = ver_row['version_id']
 
                     prod = _selected_policy_product(conn, bid, target_policy_id)
                     if prod and prod != 'hogar':
@@ -915,8 +935,9 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         initial_description = incoming
 
                     try:
-                        claims.ensure_claims_schema(conn)
-                        claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, initial_description)
+                        with conn.savepoint():
+                            claims.ensure_claims_schema(conn)
+                            claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, initial_description)
                     except claims.ClaimsSchemaUnavailableError:
                         return finish(
                             "En este momento no podemos tramitar la apertura de siniestros por una incidencia técnica en el sistema de gestión. Por favor, inténtalo más tarde o contacta con atención al cliente.",
