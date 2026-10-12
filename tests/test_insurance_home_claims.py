@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import sys
 import uuid
@@ -28,12 +30,13 @@ def pg_schema(monkeypatch):
         conn.execute(f'CREATE SCHEMA "{schema}"')
 
     def connect():
-        conn = psycopg.connect(dsn, row_factory=dict_row)
+        conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
         conn.execute(f'SET search_path TO "{schema}"')
         return conn
 
     monkeypatch.setattr(cases, 'db', connect)
     monkeypatch.setenv('INSURANCE_CASE_HMAC_KEY', 'x' * 40)
+    monkeypatch.setenv('INSURANCE_ADMIN_TOKEN_KEY', 'x' * 40)
     
     # We also adopt existing HMAC keys to make tests robust
     monkeypatch.setenv('INSURANCE_HMAC_ADOPT_EXISTING', 'true')
@@ -952,7 +955,7 @@ def test_evidence_matrix_missing_purchase_invoice_alternative():
     # pero nunca se auto-aprueba como ACEPTADO; queda en PENDIENTE_REVISION (needs_human_review=True) para peritaje.
     assert purchase_req['status'] == claims.RequirementStatus.PENDIENTE_REVISION
     assert purchase_req['needs_human_review'] is True
-    assert "alternativa documental" in purchase_req['status_reason']
+    assert "alternativa documental" in purchase_req['status_reason'].lower()
 
 
 def test_evidence_matrix_differentiates_proof_categories():
