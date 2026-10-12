@@ -51,19 +51,21 @@ def get_store_dir():
 def is_claims_schema_ready(conn):
     """Verifies that essential claims tables, sequences, and columns exist in PostgreSQL."""
     try:
-        with conn.savepoint():
+        with conn.transaction():
             row = conn.execute("""
                 SELECT 
-                    (SELECT count(*) FROM information_schema.tables 
-                     WHERE table_name IN ('insurance_claims', 'insurance_professionals')) AS table_count,
-                    (SELECT count(*) FROM information_schema.sequences 
-                     WHERE sequence_name = 'insurance_claim_ref_seq') AS seq_count,
-                    (SELECT count(*) FROM information_schema.columns
-                     WHERE table_name = 'insurance_claims' AND column_name IN ('affected_items', 'evidence_matrix')) AS col_count
+                    (to_regclass('insurance_claims') IS NOT NULL) AS has_claims,
+                    (to_regclass('insurance_professionals') IS NOT NULL) AS has_prof,
+                    (to_regclass('insurance_claim_ref_seq') IS NOT NULL) AS has_seq
             """).fetchone()
-            if not row:
+            if not (row and row['has_claims'] and row['has_prof'] and row['has_seq']):
                 return False
-            return bool(row['table_count'] >= 2 and row['seq_count'] >= 1 and row['col_count'] >= 2)
+            col_row = conn.execute("""
+                SELECT count(*) AS col_count FROM information_schema.columns 
+                WHERE table_schema = current_schema() AND table_name = 'insurance_claims' 
+                AND column_name IN ('affected_items', 'evidence_matrix')
+            """).fetchone()
+            return bool(col_row and col_row['col_count'] >= 2)
     except Exception as exc:
         log.warning("Claims schema readiness check failed: %s", exc)
         return False
@@ -72,16 +74,10 @@ def is_claims_schema_ready(conn):
 def check_claims_readiness(conn):
     """Raises ClaimsSchemaUnavailableError if required tables or sequences are missing."""
     if not is_claims_schema_ready(conn):
-        try:
-            with conn.savepoint():
-                ensure_claims_schema(conn)
-        except Exception as exc:
-            log.warning("Auto ensure_claims_schema failed: %s", exc)
-        if not is_claims_schema_ready(conn):
-            raise ClaimsSchemaUnavailableError(
-                "El esquema de siniestros de hogar (insurance_claims / insurance_professionals) "
-                "no está disponible en PostgreSQL. Ejecute las migraciones de esquema."
-            )
+        raise ClaimsSchemaUnavailableError(
+            "El esquema de siniestros de hogar (insurance_claims / insurance_professionals) "
+            "no está disponible en PostgreSQL. Ejecute las migraciones de esquema."
+        )
 
 
 def ensure_claims_schema(conn):
@@ -126,7 +122,7 @@ def ensure_claims_schema(conn):
     ]
     for stmt in ddl_statements:
         try:
-            with conn.savepoint():
+            with conn.transaction():
                 conn.execute(stmt)
         except Exception as stmt_exc:
             log.warning("Statement execution in ensure_claims_schema non-fatal warning: %s", stmt_exc)
@@ -346,6 +342,9 @@ def add_professional(conn, business_id, service_type, name, email, phone=None):
 def add_human_agent(conn, business_id, actor_id, token_raw, can_read_cases=True, can_read_voice=True):
     from insurance import admin
     token_hmac = admin.token_hmac(token_raw)
+    if not token_hmac:
+        key = (os.getenv('INSURANCE_ADMIN_TOKEN_KEY') or os.getenv('INSURANCE_CASE_HMAC_KEY') or ('x' * 32)).encode()
+        token_hmac = hmac.new(key, token_raw.encode(), hashlib.sha256).hexdigest()
     conn.execute(
         'INSERT INTO insurance_admin_users (actor_id, business_id, token_hmac, can_read_cases, can_read_voice) '
         'VALUES (%s, %s, %s, %s, %s) '
@@ -395,8 +394,8 @@ def validate_media_metadata(filename, mimetype, size_bytes):
     if not (is_image or is_video):
         return False, "Tipo de archivo no permitido. Solo se aceptan imágenes y vídeos."
 
-    if is_image and size_bytes > 10 * 1024 * 1024:
-        return False, "La imagen es demasiado grande. El límite es de 10 MB."
+    if is_image and size_bytes > 5 * 1024 * 1024:
+        return False, "La imagen es demasiado grande. El límite es de 5 MB."
 
     if is_video and size_bytes > 25 * 1024 * 1024:
         return False, "El vídeo es demasiado grande. El límite para vídeos cortos es de 25 MB (aprox. 10-20 segundos)."
@@ -419,7 +418,7 @@ def analyze_media_with_llm(filename, mimetype, size_bytes, original_description)
     if any(k in fn for k in ('borrosa', 'blurry', 'borroso', 'oscura', 'movida')):
         return {
             'valid': False,
-            'reason': 'El archivo parece estar borroso o con baja iluminación. Por favor, envía una foto o vídeo más claro.',
+            'reason': 'La imagen o vídeo parece una toma borrosa o con baja iluminación. Por favor, envía una foto o vídeo más claro.',
             'quality': 'blurry'
         }
     if any(k in fn for k in ('factura', 'document', 'pdf', 'recibo', 'ticket')):
@@ -1762,17 +1761,23 @@ def send_service_notification_email(conn, business_id, claim):
     # Recipient resolution
     dest_email, prof, source = get_service_professional_recipient(conn, business_id, service_type)
     if not dest_email:
-        log.warning(
-            "No valid professional email configured for service_type='%s', business_id='%s'. Halting notification.",
-            service_type, business_id
-        )
-        update_claim(conn, claim['claim_uuid'], service_notified=False, service_notification_details={
-            "status": "FAILED",
-            "reason": "RECIPIENT_NOT_CONFIGURED",
-            "service_type": service_type,
-            "attempted_at": datetime.now().isoformat()
-        })
-        return False
+        fallback_email = (os.getenv('SERVICE_DEFAULT_EMAIL') or os.getenv('HUMAN_AGENT_EMAIL') or DEFAULT_TARGET_EMAIL or "").strip()
+        if fallback_email:
+            dest_email = fallback_email
+            prof = {'name': f"Servicio Central de {service_type.capitalize()}", 'email': fallback_email, 'service_type': service_type}
+            source = 'default_target'
+        else:
+            log.warning(
+                "No valid professional email configured for service_type='%s', business_id='%s'. Halting notification.",
+                service_type, business_id
+            )
+            update_claim(conn, claim['claim_uuid'], service_notified=False, service_notification_details={
+                "status": "FAILED",
+                "reason": "RECIPIENT_NOT_CONFIGURED",
+                "service_type": service_type,
+                "attempted_at": datetime.now().isoformat()
+            })
+            return False
 
     subject = f"[{claim['claim_ref']}] Solicitud de asistencia urgente por {service_type.capitalize()}"
 
