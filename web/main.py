@@ -167,10 +167,12 @@ def save_conversation(b,customer,question,answer,status,sector=None):
   if MODE=='new':f['Business_ID']=b['business_id']
   r=requests.post(url(table),headers=headers(),json={'records':[{'fields':f}]},timeout=8);r.raise_for_status()
 def open_now(b):
-  if not b or not b.get('reception_hours'):return False
+  # Lookup exposes Airtable Horarios/Horario as `hours`; reception_hours remains an explicit override.
+  hours=(b.get('reception_hours') or b.get('hours')) if b else None
+  if not b or not hours:return False
   try:
    now=datetime.now(ZoneInfo(b.get('timezone') or 'Europe/Madrid'));m=now.hour*60+now.minute
-   for period in str(b['reception_hours']).split(','):
+   for period in str(hours).split(','):
     a,z=period.strip().split('-',1)
     def minutes(v):
      h,mi=map(int,v.strip().split(':'))
