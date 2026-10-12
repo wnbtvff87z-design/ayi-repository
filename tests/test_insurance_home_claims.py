@@ -1051,7 +1051,103 @@ def test_evidence_matrix_persistence_in_postgres(pg_schema):
         assert "Mesa de vidrio" in summary
 
 
+@pytest.mark.parametrize('message,expected', [
+    ('2', ''),
+    ('2 enviar parte', ''),
+    ('2. enviar parte', ''),
+    ('dos', ''),
+    ('opcion 2', ''),
+    ('opción 2', ''),
+    ('enviar un parte', ''),
+    ('2 enviar parte: se rompió la mesa de vidrio', 'se rompio la mesa de vidrio'),
+    ('2. enviar parte, gotera en el baño desde ayer', 'gotera en el bano desde ayer'),
+    ('declarar siniestro: fuga de agua en la cocina', 'fuga de agua en la cocina'),
+])
+def test_claim_opening_description_strips_menu_prefix(message, expected):
+    """Menu/command prefix is stripped once; remainder is the damage description."""
+    assert dialog._extract_claim_opening_description(message) == expected
 
+
+@pytest.mark.parametrize('message', [
+    'Se me ha roto el cristal del comedor esta tarde',
+    'Hubo una fuga de agua en la cocina anoche',
+    'quiero informar de daños por humedad en el techo',
+])
+def test_claim_opening_natural_language_keeps_full_description(message):
+    """Natural claim starts without a menu prefix keep the full customer text."""
+    assert dialog._extract_claim_opening_description(message) == message
+    assert dialog._is_claim_start(message) or 'quiero informar' in message
+
+
+def test_claim_opening_does_not_store_menu_command_as_description():
+    """Regression: previously initial_description = incoming kept '2 enviar parte: ...' intact."""
+    desc = dialog._extract_claim_opening_description(
+        '2 enviar parte: se rompió la mesa de vidrio del comedor'
+    )
+    assert desc == 'se rompio la mesa de vidrio del comedor'
+    assert 'enviar parte' not in desc
+
+
+def test_repair_invoice_mandatory_when_work_already_done_blocks_autoclose():
+    """Repair already completed requires factura_reparacion; missing it blocks auto-closure."""
+    items = [{
+        'item_id': 'item_1',
+        'name': 'Tubería de cocina',
+        'category': 'fontanería',
+        'repair_stage': claims.RepairStage.TRABAJO_REALIZADO,
+    }]
+    matrix = claims.build_evidence_matrix(items)
+    repair_reqs = [r for r in matrix if r['proof_category'] == claims.ProofCategory.FACTURA_REPARACION]
+    assert repair_reqs and repair_reqs[0]['is_mandatory'] is True
+
+    evaluated = claims.evaluate_received_evidence(matrix, photos=[], invoices=[], description='ya está arreglado')
+    blocking = claims.get_blocking_mandatory_requirements(evaluated)
+    assert any(r['proof_category'] == claims.ProofCategory.FACTURA_REPARACION for r in blocking)
+
+
+def test_pending_repair_does_not_require_nonexistent_repair_invoice():
+    """Unrepaired damage must not demand a repair invoice that does not exist yet."""
+    items = [{
+        'item_id': 'item_1',
+        'name': 'Mesa de vidrio',
+        'category': 'cristalería',
+        'repair_stage': claims.RepairStage.SIN_REPARAR,
+    }]
+    matrix = claims.build_evidence_matrix(items)
+    assert not any(r['proof_category'] == claims.ProofCategory.FACTURA_REPARACION for r in matrix)
+    blocking = claims.get_blocking_mandatory_requirements(matrix)
+    assert blocking == []
+
+
+def test_purchase_invoice_alternative_does_not_block_autoclose():
+    """Textual purchase alternative stays PENDIENTE_REVISION and must not block assistance close."""
+    items = [{
+        'item_id': 'item_1',
+        'name': 'Mesa de vidrio',
+        'category': 'cristalería',
+        'repair_stage': claims.RepairStage.SIN_REPARAR,
+    }]
+    matrix = claims.build_evidence_matrix(items)
+    evaluated = claims.evaluate_received_evidence(
+        matrix,
+        photos=[{'filename': 'mesa.jpg', 'analysis': {'valid': True}}],
+        invoices=[],
+        description='Mesa comprada en 2022 modelo VidrioX precio 300',
+    )
+    purchase = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.FACTURA_COMPRA_ORIGINAL][0]
+    assert purchase['status'] == claims.RequirementStatus.PENDIENTE_REVISION
+    assert claims.get_blocking_mandatory_requirements(evaluated) == []
+
+
+def test_analyze_media_is_filename_heuristic_not_vision():
+    """Document honesty: media 'analysis' is filename heuristics, not a vision model."""
+    good = claims.analyze_media_with_llm('dano_cocina.jpg', 'image/jpeg', 1000, 'fuga')
+    assert good['valid'] is True
+    blurry = claims.analyze_media_with_llm('foto_borrosa.jpg', 'image/jpeg', 1000, 'fuga')
+    assert blurry['valid'] is False
+    # Same bytes conceptually; only the filename changes the verdict
+    sneaky = claims.analyze_media_with_llm('evidencia_clara.jpg', 'image/jpeg', 1000, 'fuga')
+    assert sneaky['valid'] is True
 
 
 
