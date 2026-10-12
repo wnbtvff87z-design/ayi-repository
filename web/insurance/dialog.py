@@ -935,14 +935,9 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         )
 
                     from insurance import claims
-                    initial_description = ""
-                    folded = references.fold(incoming).strip(' .?!¿¡')
-                    clean_desc = re.sub(
-                        r'^(?:2\.?\s*(?:enviar|declarar|dar)?\s*(?:un\s*)?part[ew]?|opcion\s*2|enviar\s*(?:un\s*)?part[ew]?|declarar\s*siniestro|dar\s*(?:un\s*)?parte|2|dos)\s*[:,-]?\s*',
-                        '', folded, flags=re.I
-                    ).strip()
-                    if len(clean_desc) > 8:
-                        initial_description = incoming
+                    # Root cause: never store the raw menu/command text as the damage description.
+                    # Strip the opening intent once and keep only the remainder (may be empty).
+                    initial_description = _extract_claim_opening_description(incoming)
 
                     try:
                         with conn.transaction():
@@ -1269,17 +1264,62 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                             'analysis': analysis
                                                         })
                                         ev_matrix = claims.evaluate_received_evidence(claim.get('evidence_matrix') or [], current_photos, current_invoices, claim.get('original_description', ''))
-                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, invoices=current_invoices, evidence_matrix=ev_matrix, state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, invoices=current_invoices, evidence_matrix=ev_matrix)
                                     elif folded_incoming in ('si', 'sí', 'tengo factura', 'tengo una factura'):
                                         return finish("Por favor, envía la factura o el justificante de pago en este chat.", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                    else:
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
 
                                     updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
                                     eval_data = updated_claim.get('coverage_evaluation') or {}
                                     status = eval_data.get('status')
                                     service_type = eval_data.get('service_type')
                                     has_invoices = bool(updated_claim.get('invoices'))
+                                    blocking = claims.get_blocking_mandatory_requirements(
+                                        updated_claim.get('evidence_matrix') or []
+                                    )
+
+                                    if blocking and not media_list:
+                                        # Keep collecting: do not close while mandatory repair/replacement docs are missing.
+                                        docs = '; '.join(
+                                            (r.get('demonstrates') or r.get('proof_category') or 'documento obligatorio')
+                                            for r in blocking[:3]
+                                        )
+                                        if folded_incoming in (
+                                            'no', 'no tengo', 'no tengo factura', 'no he pagado nada', 'ninguna',
+                                            'no la tengo', 'no dispongo'
+                                        ):
+                                            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+                                            reply = (
+                                                f"He registrado tu parte con referencia {claim_ref}. "
+                                                f"Faltan documentos obligatorios ({docs}), así que no puedo cerrar "
+                                                f"el expediente automáticamente. Lo he derivado a revisión humana."
+                                            )
+                                            claims.save_human_summary(conn, bid, updated_claim)
+                                            st.pop('active_claim_ref', None)
+                                            st.pop('awaiting', None)
+                                            return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
+                                        reply = (
+                                            f"Para este siniestro {claim_ref} aún son obligatorios estos documentos:\n"
+                                            f"{docs}\n\n"
+                                            f"Adjunta la factura o el justificante, o escribe 'no tengo' para "
+                                            f"derivarlo a revisión humana sin cerrar el expediente."
+                                        )
+                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                                    if blocking and media_list:
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
+                                        docs = '; '.join(
+                                            (r.get('demonstrates') or r.get('proof_category') or 'documento obligatorio')
+                                            for r in blocking[:3]
+                                        )
+                                        reply = (
+                                            f"He recibido el archivo, pero siguen pendientes requisitos obligatorios "
+                                            f"para el siniestro {claim_ref}:\n{docs}\n\n"
+                                            f"Por favor, envía un documento válido o escribe 'no tengo'."
+                                        )
+                                        return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+
+                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
 
                                     if status == claims.CoverageStatus.SUPPORTED_BY_POLICY and not has_invoices:
                                         sent = claims.send_service_notification_email(conn, bid, updated_claim)
@@ -1311,6 +1351,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     claims.save_human_summary(conn, bid, updated_claim)
                                     st.pop('active_claim_ref', None)
                                     st.pop('awaiting', None)
+                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid']) or updated_claim
                                     return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value if updated_claim['state'] != 'CLOSED' else ResultKind.POLICY_INFORMATION.value})
             if just_verified and st.get('question') and not st.get('pending_human'):
                 try:
@@ -2313,6 +2354,36 @@ def _is_claim_incidental_query(text, claim_state):
     return False
 
 
+# Menu/command prefix for opening a home claim. Kept structural (option number / verb+parte)
+# rather than an ever-growing keyword list; description is whatever remains after one strip.
+_CLAIM_OPEN_PREFIX_RE = re.compile(
+    r'^(?:'
+    r'2\.?\s*(?:enviar|declarar|dar)?\s*(?:un\s*)?part[ew]?'
+    r'|opci[oó]n\s*2'
+    r'|enviar\s*(?:un\s*)?part[ew]?'
+    r'|declarar\s*(?:un\s*)?siniestro'
+    r'|dar\s*(?:un\s*)?parte'
+    r'|2|dos'
+    r')\s*[:,-]?\s*',
+    re.I,
+)
+
+
+def _extract_claim_opening_description(text):
+    """Return damage description after stripping a leading claim-open command, if any.
+
+    Pure menu selections yield ''. Natural-language claim starts (no menu prefix) yield the
+    full message. Never returns the raw command text as if it were the incident description.
+    """
+    if not text:
+        return ''
+    folded = references.fold(text).strip(' .?!¿¡')
+    match = _CLAIM_OPEN_PREFIX_RE.match(folded)
+    if match:
+        return folded[match.end():].strip(' :,-.')
+    return text.strip()
+
+
 def _is_claim_start(text):
     if not text:
         return False
@@ -2322,6 +2393,8 @@ def _is_claim_start(text):
         'siniestro', 'parte', '2', 'dos', 'enviar un partw', 'enviar partw', '2. enviar un parte',
         '2 enviar parte', '2. enviar parte', 'opcion 2', 'opción 2'
     ):
+        return True
+    if _CLAIM_OPEN_PREFIX_RE.match(folded):
         return True
     if re.search(r'\b(?:declarar|dar|enviar|nuevo)\s+(?:un\s+)?(?:parte|siniestro|partw)\b', folded):
         return True
