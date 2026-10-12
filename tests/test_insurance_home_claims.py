@@ -948,7 +948,10 @@ def test_evidence_matrix_missing_purchase_invoice_alternative():
     )
 
     purchase_req = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.FACTURA_COMPRA_ORIGINAL][0]
-    assert purchase_req['status'] == claims.RequirementStatus.ACEPTADO
+    # Regla de negocio auditada (Hito 5): La descripción libre del cliente se registra como alternativa documental,
+    # pero nunca se auto-aprueba como ACEPTADO; queda en PENDIENTE_REVISION (needs_human_review=True) para peritaje.
+    assert purchase_req['status'] == claims.RequirementStatus.PENDIENTE_REVISION
+    assert purchase_req['needs_human_review'] is True
     assert "alternativa documental" in purchase_req['status_reason']
 
 
