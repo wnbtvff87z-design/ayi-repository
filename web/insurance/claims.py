@@ -1082,6 +1082,34 @@ def get_pending_matrix_requirements(evidence_matrix):
     return pending
 
 
+def get_blocking_mandatory_requirements(evidence_matrix):
+    """
+    Mandatory documentary requirements that must block auto-closure / auto-dispatch.
+
+    Photos/videos are collected conversationally (and may be waived with "no tengo");
+    contractual coverage is resolved separately. Optional purchase-invoice alternatives in
+    PENDIENTE_REVISION never block. Repair/replacement invoices and estimates do.
+    """
+    blocking_statuses = (
+        RequirementStatus.SOLICITADO,
+        RequirementStatus.ILEGIBLE,
+        RequirementStatus.INSUFICIENTE,
+    )
+    non_blocking_categories = {
+        ProofCategory.FOTO_VIDEO_DANO,
+        'cobertura_contractual',
+        ProofCategory.FACTURA_COMPRA_ORIGINAL,
+        ProofCategory.COMPROBACION_TECNICA,
+        ProofCategory.JUSTIFICANTE_PAGO,
+    }
+    return [
+        req for req in (evidence_matrix or [])
+        if req.get('is_mandatory')
+        and req.get('status') in blocking_statuses
+        and req.get('proof_category') not in non_blocking_categories
+    ]
+
+
 # Incident interpretation & multi-damage identification
 def interpret_incident_with_llm(description):
     """Interpret customer description, identifying all damage categories and services needed."""
