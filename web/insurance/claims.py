@@ -51,18 +51,19 @@ def get_store_dir():
 def is_claims_schema_ready(conn):
     """Verifies that essential claims tables, sequences, and columns exist in PostgreSQL."""
     try:
-        row = conn.execute("""
-            SELECT 
-                (SELECT count(*) FROM information_schema.tables 
-                 WHERE table_name IN ('insurance_claims', 'insurance_professionals')) AS table_count,
-                (SELECT count(*) FROM information_schema.sequences 
-                 WHERE sequence_name = 'insurance_claim_ref_seq') AS seq_count,
-                (SELECT count(*) FROM information_schema.columns
-                 WHERE table_name = 'insurance_claims' AND column_name IN ('affected_items', 'evidence_matrix')) AS col_count
-        """).fetchone()
-        if not row:
-            return False
-        return bool(row['table_count'] >= 2 and row['seq_count'] >= 1 and row['col_count'] >= 2)
+        with conn.savepoint():
+            row = conn.execute("""
+                SELECT 
+                    (SELECT count(*) FROM information_schema.tables 
+                     WHERE table_name IN ('insurance_claims', 'insurance_professionals')) AS table_count,
+                    (SELECT count(*) FROM information_schema.sequences 
+                     WHERE sequence_name = 'insurance_claim_ref_seq') AS seq_count,
+                    (SELECT count(*) FROM information_schema.columns
+                     WHERE table_name = 'insurance_claims' AND column_name IN ('affected_items', 'evidence_matrix')) AS col_count
+            """).fetchone()
+            if not row:
+                return False
+            return bool(row['table_count'] >= 2 and row['seq_count'] >= 1 and row['col_count'] >= 2)
     except Exception as exc:
         log.warning("Claims schema readiness check failed: %s", exc)
         return False
@@ -72,7 +73,8 @@ def check_claims_readiness(conn):
     """Raises ClaimsSchemaUnavailableError if required tables or sequences are missing."""
     if not is_claims_schema_ready(conn):
         try:
-            ensure_claims_schema(conn)
+            with conn.savepoint():
+                ensure_claims_schema(conn)
         except Exception as exc:
             log.warning("Auto ensure_claims_schema failed: %s", exc)
         if not is_claims_schema_ready(conn):
@@ -992,8 +994,9 @@ def evaluate_received_evidence(evidence_matrix, photos, invoices, description=''
                 req['fulfilled_by_file'] = comp_invoices[0].get('filename')
                 req['status_reason'] = "Documento de compra acreditado."
             elif any(kw in desc_lower for kw in ('comprad', 'año', 'modelo', 'marca', 'antigüedad', 'antiguedad', 'precio')):
-                req['status'] = RequirementStatus.ACEPTADO
-                req['status_reason'] = "Acreditado mediante alternativa documental: declaración de características, marca y modelo."
+                req['status'] = RequirementStatus.PENDIENTE_REVISION
+                req['needs_human_review'] = True
+                req['status_reason'] = "Alternativa documental registrada (declaración de características, marca y modelo); pendiente de revisión pericial por ausencia de factura original."
             else:
                 if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
                     req['status'] = RequirementStatus.SOLICITADO
@@ -1942,7 +1945,7 @@ def build_human_summary(conn, business_id, claim):
         f"  - Estado de Cobertura: {eval_data.get('status', 'PENDIENTE_EVALUACION')}",
         f"  - Fundamentación técnica: {eval_data.get('explanation', 'Sin fundamentación disponible')}",
         f"  - Reembolso aplicable: {'SÍ' if eval_data.get('reimbursement_applicable') else 'NO'}",
-    ]
+    ])
 
     citations = eval_data.get('evidence_citations') or []
     if citations:
