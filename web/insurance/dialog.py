@@ -937,12 +937,15 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     from insurance import claims
                     initial_description = ""
                     folded = references.fold(incoming).strip(' .?!¿¡')
-                    clean_desc = re.sub(r'^(?:2|dos|enviar un parte|enviar parte|declarar siniestro|dar parte|dar un parte|2\.?\s*enviar\s*(?:un\s*)?part[ew]?|opcion\s*2)\s*', '', folded, flags=re.I).strip()
+                    clean_desc = re.sub(
+                        r'^(?:2\.?\s*(?:enviar|declarar|dar)?\s*(?:un\s*)?part[ew]?|opcion\s*2|enviar\s*(?:un\s*)?part[ew]?|declarar\s*siniestro|dar\s*(?:un\s*)?parte|2|dos)\s*[:,-]?\s*',
+                        '', folded, flags=re.I
+                    ).strip()
                     if len(clean_desc) > 8:
                         initial_description = incoming
 
                     try:
-                        with conn.savepoint():
+                        with conn.transaction():
                             claims.ensure_claims_schema(conn)
                             claim_uuid, claim_ref = claims.create_claim(conn, bid, customer_id, target_policy_id, st.get('version_id'), channel, initial_description)
                     except claims.ClaimsSchemaUnavailableError:
@@ -962,7 +965,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
 
                     if initial_description:
                         try:
-                            with conn.savepoint():
+                            with conn.transaction():
                                 desc = initial_description
                                 interp = claims.interpret_incident_with_llm(desc)
                                 aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
@@ -998,7 +1001,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         except Exception as init_claim_exc:
                             log.error("Error processing initial claim description: %s", init_claim_exc, exc_info=True)
                             try:
-                                with conn.savepoint():
+                                with conn.transaction():
                                     claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
                             except Exception:
                                 pass
@@ -1078,7 +1081,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                                     try:
-                                        with conn.savepoint():
+                                        with conn.transaction():
                                             interp = claims.interpret_incident_with_llm(desc)
                                             aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
                                             ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
@@ -1153,7 +1156,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     except Exception as claim_proc_exc:
                                         log.error("Error al procesar siniestro %s: %s", claim_ref, claim_proc_exc, exc_info=True)
                                         try:
-                                            with conn.savepoint():
+                                            with conn.transaction():
                                                 claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
                                         except Exception:
                                             pass
