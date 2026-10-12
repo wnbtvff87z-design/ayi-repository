@@ -86,7 +86,7 @@ def test_enabled_insurance_agent_returns_only_identity_boundary(monkeypatch):
     monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: pytest.fail('automatic case write'))
     calls = []
 
-    def identity_boundary(business, state, text, channel, external_id, customer):
+    def identity_boundary(business, state, text, channel, external_id, customer, media_list=None):
         calls.append((text, channel, external_id, customer))
         return insurance_dialog.ASK_IDENTITY, {'insurance_result': 'identity_not_verified'}
 
@@ -102,7 +102,7 @@ def test_enabled_insurance_agent_returns_only_identity_boundary(monkeypatch):
 def test_insurance_turn_does_not_use_shared_conversation_storage(monkeypatch):
     monkeypatch.setenv('INSURANCE_ENABLED', 'true')
     monkeypatch.setattr(insurance_dialog, 'create_or_update_case', lambda **kwargs: pytest.fail('automatic case write'))
-    monkeypatch.setattr(insurance_dialog, '_answer', lambda *args: (
+    monkeypatch.setattr(insurance_dialog, '_answer', lambda *args, **kwargs: (
         insurance_dialog.ASK_IDENTITY, {'insurance_result': 'identity_not_verified'}))
     monkeypatch.setattr(main, 'init_schema', lambda: pytest.fail('shared schema accessed'))
     reply, end_reason = main.converse(
@@ -376,6 +376,63 @@ def test_existing_voice_webhook_routes_valid_restaurant_number_to_reception(monk
     assert 'No puedo identificar' not in body
 
 
+def test_open_now_uses_hours_from_airtable_lookup_when_reception_hours_absent():
+    """Root-cause regression: lookup returns `hours`, open_now previously only read reception_hours."""
+    assert main.open_now({'hours': '00:00-23:59', 'timezone': 'UTC'}) is True
+    assert main.open_now({'hours': None}) is False
+    assert main.open_now({}) is False
+    assert main.open_now(None) is False
+    # Explicit reception_hours still wins over hours
+    assert main.open_now({'reception_hours': '00:00-23:59', 'hours': '23:58-23:59', 'timezone': 'UTC'}) is True
+    # Invalid / non HH:MM-HH:MM Airtable prose fails closed (relay path)
+    assert main.open_now({'hours': 'Lun-Dom 13:00-16:00 y 20:00-23:30', 'timezone': 'Europe/Madrid'}) is False
+
+
+def test_voice_webhook_dials_reception_when_hours_open(monkeypatch):
+    number = '+34600111222'
+    configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['restaurant']}}],
+        {'restaurant': {
+            'Estado': 'Activo',
+            'Business_ID': 'REST-1',
+            'Sector': 'restaurante',
+            'Telefono_Recepcion': '+34911112222',
+            'Horarios': '00:00-23:59',
+            'Timezone': 'UTC',
+        }},
+    )
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    monkeypatch.setenv('RELAY_VOICE_URL', 'https://relay.example/voice')
+    # Do NOT mock open_now — exercise real hours→reception routing
+    response = main.app.test_client().post('/webhook-voice', data={'To': number})
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert '<Dial' in body
+    assert '+34911112222' in body
+
+
+def test_voice_webhook_uses_relay_when_hours_missing(monkeypatch):
+    number = '+34600111222'
+    configure_registry(
+        monkeypatch,
+        [{'fields': {'Numero_E164': number, 'Canal': 'Voice', 'Estado': 'Activo', 'Negocio': ['restaurant']}}],
+        {'restaurant': {
+            'Estado': 'Activo',
+            'Business_ID': 'REST-1',
+            'Sector': 'restaurante',
+            'Telefono_Recepcion': '+34911112222',
+        }},
+    )
+    monkeypatch.setattr(main, 'twilio_valid', lambda: True)
+    monkeypatch.setenv('RELAY_VOICE_URL', 'https://relay.example/voice')
+    response = main.app.test_client().post('/webhook-voice', data={'To': number})
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert '<Redirect' in body or 'relay.example' in body
+    assert '<Dial' not in body
+
+
 def test_disabled_insurance_whatsapp_responds_without_shared_storage_or_general_dialog(monkeypatch):
     number = '+34600111222'
     configure_registry(
@@ -437,7 +494,7 @@ def test_whatsapp_uses_one_resolved_sector_for_the_entire_request(monkeypatch):
     monkeypatch.setattr(main, 'twilio_valid', lambda: True)
     routed_sectors = []
 
-    def process(business, state, history, text, channel, external_id, customer, resolved_sector=None):
+    def process(business, state, history, text, channel, external_id, customer, resolved_sector=None, media_list=None):
         routed_sectors.append(resolved_sector)
         monkeypatch.setenv('INSURANCE_ENABLED', 'false')
         return 'stored safely', {}
