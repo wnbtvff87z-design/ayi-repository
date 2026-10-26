@@ -292,3 +292,181 @@ def _read_voice(call_ref=None):
     except Exception as exc:
         log.error('insurance_voice_read_failed error_type=%s', type(exc).__name__)
         return jsonify(error='unavailable'), 503
+
+
+def _admin_actor(conn, digest):
+    if not digest:
+        return None
+    return conn.execute(
+        'SELECT actor_id,business_id,can_read_cases FROM insurance_admin_users '
+        'WHERE token_hmac=%s AND active', (digest,)
+    ).fetchone()
+
+
+@bp.get('/insurance/admin/claims/<claim_ref>')
+def read_claim(claim_ref):
+    """Human review package for a home claim (business-scoped, audited)."""
+    if os.getenv('INSURANCE_ADMIN_ENABLED', 'false').strip().lower() != 'true':
+        return jsonify(error='not_found'), 404
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.startswith('Bearer ') else ''
+    digest = token_hmac(token) if token and len(token) <= 256 else None
+    if not digest:
+        return jsonify(error='unauthorized'), 401
+    try:
+        from insurance import claims
+        with _cases.db() as conn:
+            conn.execute(f'SET statement_timeout={PG_STATEMENT_TIMEOUT_MS}')
+            admin = _admin_actor(conn, digest)
+            if not admin:
+                return jsonify(error='unauthorized'), 401
+            if not admin['can_read_cases']:
+                outcome, body, code = 'forbidden', {'error': 'forbidden'}, 403
+            else:
+                claim = claims.get_claim(conn, admin['business_id'], claim_ref)
+                if not claim:
+                    outcome, body, code = 'not_found', {'error': 'not_found'}, 404
+                else:
+                    summary = claims.build_human_summary(conn, admin['business_id'], claim)
+                    body = {
+                        'claim': {
+                            'claim_ref': claim.get('claim_ref'),
+                            'claim_uuid': str(claim.get('claim_uuid')),
+                            'state': claim.get('state'),
+                            'customer_id': claim.get('customer_id'),
+                            'policy_id': claim.get('policy_id'),
+                            'policy_version_id': claim.get('policy_version_id'),
+                            'original_description': claim.get('original_description'),
+                            'structured_interpretation': claim.get('structured_interpretation'),
+                            'coverage_evaluation': claim.get('coverage_evaluation'),
+                            'evidence_matrix': claim.get('evidence_matrix'),
+                            'affected_items': claim.get('affected_items'),
+                            'photos': [
+                                {k: v for k, v in p.items() if k != 'content_bytes'}
+                                for p in (claim.get('photos') or [])
+                            ],
+                            'invoices': [
+                                {k: v for k, v in i.items() if k != 'content_bytes'}
+                                for i in (claim.get('invoices') or [])
+                            ],
+                            'dispatch_authorization': claim.get('dispatch_authorization'),
+                            'service_notification_details': claim.get('service_notification_details'),
+                            'service_notified': claim.get('service_notified'),
+                            'review_package': claim.get('review_package'),
+                            'human_review_notes': claim.get('human_review_notes'),
+                        },
+                        'summary': summary,
+                        'required_action': (
+                            'authorize_dispatch | request_more_info | reject'
+                        ),
+                    }
+                    outcome, code = 'ok', 200
+            conn.execute(
+                'INSERT INTO insurance_audit_log(actor_id,business_id,action,target,outcome) '
+                "VALUES(%s,%s,'claim_read',%s,%s)",
+                (admin['actor_id'], admin['business_id'], str(claim_ref)[:120], outcome))
+        return jsonify(body), code
+    except Exception as exc:
+        log.error('insurance_claim_read_failed error_type=%s', type(exc).__name__)
+        return jsonify(error='unavailable'), 503
+
+
+@bp.post('/insurance/admin/claims/<claim_ref>/authorize-dispatch')
+def authorize_claim_dispatch(claim_ref):
+    """Explicit human authorization required before professional email."""
+    if os.getenv('INSURANCE_ADMIN_ENABLED', 'false').strip().lower() != 'true':
+        return jsonify(error='not_found'), 404
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.startswith('Bearer ') else ''
+    digest = token_hmac(token) if token and len(token) <= 256 else None
+    if not digest:
+        return jsonify(error='unauthorized'), 401
+    if (request.content_length or 0) > MAX_BODY_BYTES:
+        return jsonify(error='payload_too_large'), 413
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    try:
+        from insurance import claims
+        with _cases.db() as conn:
+            conn.execute(f'SET statement_timeout={PG_STATEMENT_TIMEOUT_MS}')
+            admin = _admin_actor(conn, digest)
+            if not admin:
+                return jsonify(error='unauthorized'), 401
+            if not admin['can_read_cases']:
+                outcome, resp, code = 'forbidden', {'error': 'forbidden'}, 403
+            else:
+                try:
+                    updated = claims.authorize_professional_dispatch(
+                        conn, admin['business_id'], claim_ref,
+                        actor_id=admin['actor_id'],
+                        service_type=body.get('service_type'),
+                        notes=body.get('notes'),
+                        dest_email=body.get('dest_email'),
+                    )
+                    send_now = bool(body.get('send_now'))
+                    sent = False
+                    if send_now:
+                        sent = claims.send_service_notification_email(
+                            conn, admin['business_id'], updated, require_authorization=True
+                        )
+                        updated = claims.get_claim(conn, admin['business_id'], claim_ref)
+                    resp = {
+                        'claim_ref': updated.get('claim_ref'),
+                        'state': updated.get('state'),
+                        'dispatch_authorization': updated.get('dispatch_authorization'),
+                        'service_notified': updated.get('service_notified'),
+                        'service_notification_details': updated.get('service_notification_details'),
+                        'sent': sent,
+                    }
+                    outcome, code = 'ok', 200
+                except ValueError as exc:
+                    outcome, resp, code = str(exc), {'error': str(exc)}, 422
+            conn.execute(
+                'INSERT INTO insurance_audit_log(actor_id,business_id,action,target,outcome) '
+                "VALUES(%s,%s,'claim_authorize_dispatch',%s,%s)",
+                (admin['actor_id'], admin['business_id'], str(claim_ref)[:120], outcome))
+        return jsonify(resp), code
+    except Exception as exc:
+        log.error('insurance_claim_authorize_failed error_type=%s', type(exc).__name__)
+        return jsonify(error='unavailable'), 503
+
+
+@bp.post('/insurance/admin/claims/<claim_ref>/request-more-info')
+def claim_request_more_info(claim_ref):
+    if os.getenv('INSURANCE_ADMIN_ENABLED', 'false').strip().lower() != 'true':
+        return jsonify(error='not_found'), 404
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.startswith('Bearer ') else ''
+    digest = token_hmac(token) if token and len(token) <= 256 else None
+    if not digest:
+        return jsonify(error='unauthorized'), 401
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    message = body.get('message')
+    if not isinstance(message, str) or not message.strip() or len(message) > 2000:
+        return jsonify(error='invalid_request'), 400
+    try:
+        from insurance import claims
+        with _cases.db() as conn:
+            conn.execute(f'SET statement_timeout={PG_STATEMENT_TIMEOUT_MS}')
+            admin = _admin_actor(conn, digest)
+            if not admin or not admin['can_read_cases']:
+                return jsonify(error='unauthorized' if not admin else 'forbidden'), 401 if not admin else 403
+            updated = claims.request_more_info_from_review(
+                conn, admin['business_id'], claim_ref,
+                actor_id=admin['actor_id'], message=message.strip(),
+            )
+            conn.execute(
+                'INSERT INTO insurance_audit_log(actor_id,business_id,action,target,outcome) '
+                "VALUES(%s,%s,'claim_request_more_info',%s,%s)",
+                (admin['actor_id'], admin['business_id'], str(claim_ref)[:120], 'ok'))
+            return jsonify({
+                'claim_ref': updated.get('claim_ref'),
+                'state': updated.get('state'),
+                'human_review_notes': updated.get('human_review_notes'),
+            }), 200
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 422
+    except Exception as exc:
+        log.error('insurance_claim_more_info_failed error_type=%s', type(exc).__name__)
+        return jsonify(error='unavailable'), 503

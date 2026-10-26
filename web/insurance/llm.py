@@ -177,7 +177,7 @@ def explain(question, evidence):
         raise LLMError('llm_error') from None
 
 
-def interpret(messages):
+def interpret(messages, *, max_tokens=256, max_chars=4096):
     """Return a JSON proposal, never a tool call or an authorization decision."""
     _suppress_provider_logs()
     model = os.getenv('INSURANCE_LLM_MODEL', '').strip()
@@ -186,11 +186,73 @@ def interpret(messages):
         raise LLMError('llm_not_configured')
     _validate_endpoint()
     timeout = _setting('INSURANCE_LLM_TIMEOUT_SECONDS', DEFAULT_TIMEOUT_SECONDS, 1, 120, float)
+    max_tokens = max(64, min(int(max_tokens), 4096))
+    max_chars = max(512, min(int(max_chars), 32768))
     try:
         response = _create(
-            api_key, timeout, model=model, temperature=0, max_tokens=256,
+            api_key, timeout, model=model, temperature=0, max_tokens=max_tokens,
             response_format={'type': 'json_object'}, messages=messages)
-        return json.loads(_content(response, 4096))
+        return json.loads(_content(response, max_chars))
+    except LLMError:
+        raise
+    except openai.APITimeoutError:
+        raise LLMError('llm_timeout') from None
+    except openai.RateLimitError:
+        raise LLMError('llm_rate_limited') from None
+    except (openai.AuthenticationError, openai.PermissionDeniedError):
+        raise LLMError('llm_auth_failed') from None
+    except openai.APIStatusError as exc:
+        raise LLMError(_status_code(exc)) from None
+    except openai.APIConnectionError:
+        raise LLMError('llm_network_error') from None
+    except Exception:
+        raise LLMError('llm_invalid_response') from None
+
+
+def _vision_model():
+    return (
+        os.getenv('INSURANCE_VISION_MODEL', '').strip()
+        or os.getenv('INSURANCE_LLM_MODEL', '').strip()
+    )
+
+
+def analyze_vision(system_prompt, user_text, image_bytes, mime_type, *, max_tokens=700):
+    """Multimodal JSON analysis of a single image. Never invents unseen facts.
+
+    Requires INSURANCE_VISION_MODEL or INSURANCE_LLM_MODEL plus OPENAI_API_KEY.
+    image_bytes must be real media bytes; filename heuristics are not accepted.
+    """
+    import base64
+
+    _suppress_provider_logs()
+    model = _vision_model()
+    api_key = os.getenv('OPENAI_API_KEY', '').strip()
+    if not model or not api_key:
+        raise LLMError('llm_not_configured')
+    if not image_bytes or not isinstance(image_bytes, (bytes, bytearray)):
+        raise LLMError('llm_invalid_response')
+    mime = (mime_type or 'image/jpeg').split(';', 1)[0].strip().lower()
+    if not mime.startswith('image/'):
+        raise LLMError('llm_invalid_response')
+    _validate_endpoint()
+    timeout = _setting('INSURANCE_LLM_TIMEOUT_SECONDS', DEFAULT_TIMEOUT_SECONDS, 1, 120, float)
+    max_tokens = max(128, min(int(max_tokens), 2048))
+    data_url = f"data:{mime};base64,{base64.b64encode(bytes(image_bytes)).decode('ascii')}"
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+        {
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': user_text},
+                {'type': 'image_url', 'image_url': {'url': data_url}},
+            ],
+        },
+    ]
+    try:
+        response = _create(
+            api_key, timeout, model=model, temperature=0, max_tokens=max_tokens,
+            response_format={'type': 'json_object'}, messages=messages)
+        return json.loads(_content(response, 8192))
     except LLMError:
         raise
     except openai.APITimeoutError:
