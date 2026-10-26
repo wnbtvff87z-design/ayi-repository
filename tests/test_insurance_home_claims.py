@@ -20,6 +20,142 @@ from insurance import identity
 MIGRATIONS = sorted((WEB / 'insurance' / 'migrations').glob('*.sql'))
 
 
+def _enable_test_llm(monkeypatch):
+    monkeypatch.setenv('INSURANCE_LLM_MODEL', 'gpt-test')
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test')
+
+
+def _vision_ok_payload(**overrides):
+    base = {
+        'observed': 'pared con mancha',
+        'related_to_incident': True,
+        'visible_damage': 'mancha humedad',
+        'clarity_ok': True,
+        'perspective_ok': True,
+        'helps_prove': 'estado actual pared',
+        'cannot_determine': ['si está seca'],
+        'is_document_not_damage_photo': False,
+        'follow_up_needed': 'none',
+        'valid_for_claim': True,
+        'reason_if_invalid': None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _multi_damage_llm_payload(**overrides):
+    base = {
+        'what_happened': 'Fuga de tubería que manchó pintura y rompió un espejo',
+        'affected_zone': 'baño',
+        'described_damages': ['fuga tubería', 'mancha techo', 'espejo roto'],
+        'known_or_possible_cause': 'rotura de tubería',
+        'intervention_type': 'reparacion',
+        'primary_service': 'fontanería',
+        'secondary_services': ['pintura', 'cristalería'],
+        'damage_categories': ['fontanería', 'pintura', 'cristalería'],
+        'repair_stage': 'sin_reparar',
+        'affected_items': [
+            {'name': 'Tubería', 'category': 'fontanería', 'observed_damage': 'fuga', 'known_cause': 'rotura', 'repair_stage': 'sin_reparar'},
+            {'name': 'Techo', 'category': 'pintura', 'observed_damage': 'mancha', 'known_cause': 'humedad', 'repair_stage': 'sin_reparar'},
+            {'name': 'Espejo', 'category': 'cristalería', 'observed_damage': 'roto', 'known_cause': 'golpe por agua', 'repair_stage': 'sin_reparar'},
+        ],
+        'missing_info': [],
+        'uncertainties': [],
+        'contradictions': [],
+        'uncertainty_level': 'medium',
+        'suggested_evidence': ['foto_video_dano'],
+        'asserted_by_customer': ['fuga de tubería'],
+        'verified_documentally': [],
+    }
+    base.update(overrides)
+    return base
+
+
+def _messages_blob(messages):
+    try:
+        return json.dumps(messages, ensure_ascii=False)
+    except Exception:
+        return str(messages)
+
+
+def _coverage_llm_response(decision, document_id, page, section='coverage', excerpt='cláusula aplicable', **extra):
+    payload = {
+        'decision': decision,
+        'explanation': extra.pop('explanation', 'Evaluación contractual de prueba.'),
+        'citations': [{
+            'document_id': document_id,
+            'page': page,
+            'section': section,
+            'relevant_excerpt': excerpt,
+        }],
+        'exclusions': extra.pop('exclusions', []),
+        'limits': None,
+        'deductible': None,
+        'conditions': [],
+    }
+    payload.update(extra)
+    return payload
+
+
+def _mock_deliver_accepted(to_email, subject, body, attachments=None, idempotency_key=None, detailed=False):
+    res = {
+        'status': 'ACCEPTED',
+        'provider': 'resend',
+        'message_id': 'msg_test_accepted',
+        'sent_to': to_email,
+        'sent_at': '2026-10-11T10:00:00',
+        'error': None,
+    }
+    return res if detailed else True
+
+
+def _patch_dialog_llm_for_service(monkeypatch, *, primary_service, document_id, page=1,
+                                  decision='covered', item_name='Elemento dañado',
+                                  secondary=None, repair_stage='sin_reparar'):
+    """Monkeypatch llm.interpret for dialog e2e: interpretation + coverage in one dispatcher."""
+    _enable_test_llm(monkeypatch)
+    secondary = list(secondary or [])
+
+    def mock_interpret(messages, **kwargs):
+        blob = _messages_blob(messages)
+        if 'Evalúa la cobertura' in blob or 'covered|excluded|insufficient|conflict' in blob:
+            return _coverage_llm_response(
+                decision, document_id, page,
+                section='coverage' if decision == 'covered' else 'exclusions',
+                excerpt='texto contractual de prueba',
+                explanation=f'Cobertura {decision} para {primary_service}',
+            )
+        return _multi_damage_llm_payload(
+            what_happened=f'Daño de {primary_service}',
+            primary_service=primary_service,
+            secondary_services=secondary,
+            damage_categories=[primary_service] + secondary,
+            repair_stage=repair_stage,
+            affected_items=[{
+                'name': item_name,
+                'category': primary_service,
+                'observed_damage': 'daño declarado',
+                'known_cause': 'causa declarada',
+                'repair_stage': repair_stage,
+            }],
+            described_damages=[f'daño {primary_service}'],
+        )
+
+    monkeypatch.setattr('insurance.llm.interpret', mock_interpret)
+    monkeypatch.setattr(
+        'insurance.claims.analyze_media_with_llm',
+        lambda *a, **k: {
+            'valid': True,
+            'media_type': 'image' if not str(k.get('mimetype') or (a[1] if len(a) > 1 else '')).startswith('video/') else 'video',
+            'reason': None,
+            'observed': 'daño visible en prueba',
+            'related_to_incident': True,
+            'clarity_ok': True,
+            'analysis_source': 'vision_llm_mock',
+        },
+    )
+
+
 @pytest.fixture
 def pg_schema(monkeypatch):
     dsn = os.getenv('INSURANCE_TEST_DATABASE_URL')
@@ -94,8 +230,8 @@ def test_claims_crud_and_status(pg_schema):
         assert claim2['state'] == claims.ClaimState.PHOTOS_REQUESTED
 
 
-def test_photo_and_invoice_validations():
-    # Photographic validation
+def test_photo_and_invoice_validations(monkeypatch):
+    # Photographic validation (metadata only)
     ok, err = claims.validate_photo_metadata("daño.jpg", "image/jpeg", 1024 * 500)
     assert ok is True
     assert err is None
@@ -110,24 +246,46 @@ def test_photo_and_invoice_validations():
     assert ok is False
     assert "demasiado grande" in err
 
-    # AI photo analysis simulations
-    analysis_good = claims.analyze_photo_with_llm("baño_roto.jpg", "image/jpeg", 50000, "Inundación en baño")
+    # Vision analysis: fail-closed without bytes; success / reject via mocked vision
+    analysis_no_bytes = claims.analyze_photo_with_llm("baño_roto.jpg", "image/jpeg", 50000, "Inundación en baño")
+    assert analysis_no_bytes['valid'] is False
+
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr('insurance.llm.analyze_vision', lambda *a, **k: _vision_ok_payload())
+    analysis_good = claims.analyze_photo_with_llm(
+        "baño_roto.jpg", "image/jpeg", 50000, "Inundación en baño", content_bytes=b'fake-image'
+    )
     assert analysis_good['valid'] is True
-    
-    analysis_blurry = claims.analyze_photo_with_llm("borrosa.jpg", "image/jpeg", 50000, "Inundación")
+
+    monkeypatch.setattr(
+        'insurance.llm.analyze_vision',
+        lambda *a, **k: _vision_ok_payload(
+            clarity_ok=False, valid_for_claim=False, reason_if_invalid='La imagen está borrosa.'
+        ),
+    )
+    analysis_blurry = claims.analyze_photo_with_llm(
+        "borrosa.jpg", "image/jpeg", 50000, "Inundación", content_bytes=b'fake-image'
+    )
     assert analysis_blurry['valid'] is False
-    assert "borrosa" in analysis_blurry['reason']
-    
-    analysis_doc = claims.analyze_photo_with_llm("factura.png", "image/png", 50000, "Inundación")
+    assert "borrosa" in (analysis_blurry.get('reason') or '').lower() or analysis_blurry.get('clarity_ok') is False
+
+    monkeypatch.setattr(
+        'insurance.llm.analyze_vision',
+        lambda *a, **k: _vision_ok_payload(is_document_not_damage_photo=True, related_to_incident=False),
+    )
+    analysis_doc = claims.analyze_photo_with_llm(
+        "factura.png", "image/png", 50000, "Inundación", content_bytes=b'fake-image'
+    )
     assert analysis_doc['valid'] is False
     assert "documento o factura" in analysis_doc['reason']
 
 
-def test_email_notifications_and_human_reports(pg_schema):
+def test_email_notifications_and_human_reports(pg_schema, monkeypatch):
     bid = "INS-BIZ-001"
     cid = "CUS-000001"
     pid = "POL-000123"
     vid = "V1"
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
     
     with pg_schema() as conn:
         # Register a plumber
@@ -160,6 +318,9 @@ def test_email_notifications_and_human_reports(pg_schema):
         claims.update_claim(conn, cuuid, structured_interpretation=interp, coverage_evaluation=eval_res, photos=photos)
         
         claim_data = claims.get_claim(conn, bid, cuuid)
+        # P0: professional email requires explicit human authorization
+        claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='agent-test')
+        claim_data = claims.get_claim(conn, bid, cuuid)
         
         # Test sending service email
         sent = claims.send_service_notification_email(conn, bid, claim_data)
@@ -168,6 +329,7 @@ def test_email_notifications_and_human_reports(pg_schema):
         updated_claim = claims.get_claim(conn, bid, cuuid)
         assert updated_claim['service_notified'] is True
         assert updated_claim['service_notification_details']['sent_to'] == "gomez@example.com"
+        assert updated_claim['service_notification_details']['status'] == 'ACCEPTED'
         
         # Test building human summary
         report = claims.build_human_summary(conn, bid, updated_claim)
@@ -245,10 +407,18 @@ def test_verification_flow_without_policies_and_with_hogar_policy(pg_schema):
         assert "problema técnico" not in reply2
 
 
-def test_dining_room_glass_table_claim_flow(pg_schema):
+def test_dining_room_glass_table_claim_flow(pg_schema, monkeypatch):
     bid = "INS-BIZ-001"
     cid = "CUS-000001"
     pid = "POL-HOGAR-001"
+    monkeypatch.setenv('HUMAN_AGENT_EMAIL', 'agent-review@seguro.test')
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
+    _patch_dialog_llm_for_service(
+        monkeypatch,
+        primary_service='cristalería',
+        document_id='DOC-HOGAR-001',
+        item_name='Mesa de vidrio del comedor',
+    )
     
     with pg_schema() as conn:
         identity.upsert_customer(conn, bid, cid, "Celia Zorro Condes", "51959566J")
@@ -292,8 +462,7 @@ def test_dining_room_glass_table_claim_flow(pg_schema):
         # MUST NOT ask "¿A qué consulta te refieres?"
         assert "¿A qué consulta te refieres?" not in r3
         assert "problema técnico" not in r3
-        assert "cubierto" in r3.lower()
-        assert "cristalería" in r3.lower() or "fotografías" in r3.lower() or "daños" in r3.lower()
+        assert "fotografías" in r3.lower() or "fotos" in r3.lower() or "vídeo" in r3.lower() or "preliminar" in r3.lower()
         
         c3 = claims.get_claim(conn, bid, claim_ref)
         assert c3['state'] == claims.ClaimState.PHOTOS_REQUESTED
@@ -308,23 +477,29 @@ def test_dining_room_glass_table_claim_flow(pg_schema):
         c4 = claims.get_claim(conn, bid, claim_ref)
         assert c4['state'] == claims.ClaimState.INVOICE_REQUESTED
         
-        # Turn 5: User has no invoice: "no"
+        # Turn 5: User has no invoice: "no" — dialog never auto-sends professional email
         r5, out5 = dialog.process(
             {'business_id': bid}, {}, [],
             "no",
             "WhatsApp", "SM-205", "+34600111222"
         )
-        assert "¡Todo listo!" in r5
+        assert "revisión humana" in r5.lower() or "siniestro registrado" in r5.lower() or "¡Todo listo" in r5
         assert claim_ref in r5
         c5 = claims.get_claim(conn, bid, claim_ref)
-        assert c5['state'] == claims.ClaimState.CLOSED
-        assert c5['service_notified'] is True
+        assert c5['state'] in (claims.ClaimState.HUMAN_REVIEW, claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+        assert c5['service_notified'] is not True
 
 
-def test_claim_resume_and_continuation_commands(pg_schema):
+def test_claim_resume_and_continuation_commands(pg_schema, monkeypatch):
     bid = "INS-BIZ-001"
     cid = "CUS-000002"
     pid = "POL-HOGAR-002"
+    _patch_dialog_llm_for_service(
+        monkeypatch,
+        primary_service='fontanería',
+        document_id='DOC-HOGAR-002',
+        item_name='Tubería de cocina',
+    )
     
     with pg_schema() as conn:
         identity.upsert_customer(conn, bid, cid, "Pedro Sánchez", "11223344A")
@@ -348,7 +523,7 @@ def test_claim_resume_and_continuation_commands(pg_schema):
         
         # Describe incident
         r_desc, _ = dialog.process({'business_id': bid}, {}, [], "ayer hubo una fuga de agua en la cocina", "WhatsApp", "SM-304", "+34600333444")
-        assert "cubierto" in r_desc.lower()
+        assert "preliminar" in r_desc.lower() or "fotografías" in r_desc.lower() or "fotos" in r_desc.lower() or "fontaner" in r_desc.lower()
         
         # User says "Si está declarada , continuamos" in PHOTOS_REQUESTED state
         r_cont, _ = dialog.process({'business_id': bid}, {}, [], "Si está declarada , continuamos", "WhatsApp", "SM-305", "+34600333444")
@@ -360,7 +535,7 @@ def test_claim_resume_and_continuation_commands(pg_schema):
         assert "cancelado" in r_cancel.lower()
 
 
-def test_multiple_photos_and_video_attachments(pg_schema):
+def test_multiple_photos_and_video_attachments(pg_schema, monkeypatch):
     bid = "INS-BIZ-001"
     cid = "CUS-000003"
     pid = "POL-HOGAR-003"
@@ -376,9 +551,30 @@ def test_multiple_photos_and_video_attachments(pg_schema):
     assert bad_video is False
     assert "25 MB" in err_video
     
+    # P0: videos fail closed without extractable frames (no filename heuristic)
     analysis_vid = claims.analyze_media_with_llm("video_daño.mp4", "video/mp4", 1024 * 1024 * 12, "Fuga de agua")
-    assert analysis_vid['valid'] is True
+    assert analysis_vid['valid'] is False
     assert analysis_vid['media_type'] == 'video'
+
+    _patch_dialog_llm_for_service(
+        monkeypatch,
+        primary_service='cristalería',
+        document_id='DOC-HOGAR-003',
+        item_name='Ventana de cocina',
+    )
+    # Dialog path: accept mixed media via mocked analyzer (bytes/vision otherwise required)
+    def mock_analyze(filename, mimetype, size_bytes, original_description, content_bytes=None, media=None):
+        is_video = bool(mimetype and mimetype.startswith('video/'))
+        return {
+            'valid': True,
+            'media_type': 'video' if is_video else 'image',
+            'reason': None,
+            'observed': 'ventana dañada',
+            'related_to_incident': True,
+            'clarity_ok': True,
+            'analysis_source': 'vision_llm_mock',
+        }
+    monkeypatch.setattr('insurance.claims.analyze_media_with_llm', mock_analyze)
 
     with pg_schema() as conn:
         identity.upsert_customer(conn, bid, cid, "Maria Lopez", "99887766B")
@@ -395,9 +591,9 @@ def test_multiple_photos_and_video_attachments(pg_schema):
         
         # Send multiple media files (2 photos and 1 video) in WhatsApp turn
         media_files = [
-            {'filename': 'foto_ventana_1.jpg', 'content_type': 'image/jpeg', 'url': 'http://example.com/f1.jpg', 'size_bytes': 1024 * 100},
-            {'filename': 'foto_ventana_2.png', 'content_type': 'image/png', 'url': 'http://example.com/f2.png', 'size_bytes': 1024 * 120},
-            {'filename': 'video_ventana.mp4', 'content_type': 'video/mp4', 'url': 'http://example.com/v1.mp4', 'size_bytes': 1024 * 1024 * 5}
+            {'filename': 'foto_ventana_1.jpg', 'content_type': 'image/jpeg', 'url': 'http://example.com/f1.jpg', 'size_bytes': 1024 * 100, 'content_bytes': b'img1'},
+            {'filename': 'foto_ventana_2.png', 'content_type': 'image/png', 'url': 'http://example.com/f2.png', 'size_bytes': 1024 * 120, 'content_bytes': b'img2'},
+            {'filename': 'video_ventana.mp4', 'content_type': 'video/mp4', 'url': 'http://example.com/v1.mp4', 'size_bytes': 1024 * 1024 * 5, 'content_bytes': b'vid1'}
         ]
         
         r_media, _ = dialog.process(
@@ -417,13 +613,17 @@ def test_multiple_photos_and_video_attachments(pg_schema):
         assert 'image/jpeg' in types
 
 
-def test_email_notifications_target_and_human_agent_email(pg_schema):
+def test_email_notifications_target_and_human_agent_email(pg_schema, monkeypatch):
     bid = "INS-BIZ-001"
     cid = "CUS-000004"
     pid = "POL-HOGAR-004"
+    monkeypatch.setenv('HUMAN_AGENT_EMAIL', 'agent-review@seguro.test')
+    monkeypatch.setenv('SERVICE_DEFAULT_EMAIL', 'pintura-default@seguro.test')
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
     
     with pg_schema() as conn:
         claims.add_customer_and_policy(conn, bid, cid, "Carlos Gomez", "11112222C", pid, "hogar", "4444")
+        claims.add_professional(conn, bid, "pintura", "Pintores Express", "pintor@taller.es")
         cuuid, cref = claims.create_claim(conn, bid, cid, pid, "V1", "WhatsApp", "Mancha de humedad en techo de salon")
         
         interp = {"incident_type": "pintura", "description": "Mancha de humedad en techo de salon"}
@@ -442,15 +642,19 @@ def test_email_notifications_target_and_human_agent_email(pg_schema):
         ]
         
         claims.update_claim(conn, cuuid, structured_interpretation=interp, coverage_evaluation=eval_res, photos=photos, invoices=invoices)
+        # P0: no personal hotmail DEFAULT_TARGET_EMAIL; use DB/env recipient + authorization
+        claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='agent-test')
         claim = claims.get_claim(conn, bid, cuuid)
         
-        # Test service notification email delivery
         sent_prof = claims.send_service_notification_email(conn, bid, claim)
         assert sent_prof is True
         
         updated_claim = claims.get_claim(conn, bid, cuuid)
         assert updated_claim['service_notified'] is True
-        assert updated_claim['service_notification_details']['sent_to'] == claims.DEFAULT_TARGET_EMAIL
+        assert updated_claim['service_notification_details']['sent_to'] in (
+            "pintor@taller.es", "pintura-default@seguro.test"
+        )
+        assert claims.DEFAULT_TARGET_EMAIL == ""
         
         # Test human summary and agent email delivery
         summary = claims.save_human_summary(conn, bid, updated_claim)
@@ -540,8 +744,10 @@ def test_resend_api_url_attachment_download(monkeypatch):
     assert base64.b64decode(payload['attachments'][0]['content']) == b"downloaded_image_bytes"
 
 
-def test_coverage_evaluation_requires_contractual_evidence():
+def test_coverage_evaluation_requires_contractual_evidence(monkeypatch):
     """Damage category alone (e.g. 'cristal roto') without evidence must NEVER confirm coverage."""
+    monkeypatch.delenv('INSURANCE_LLM_MODEL', raising=False)
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
     interp = {
         "description": "Se ha roto una mesa de cristal en el salón",
         "incident_type": "cristalería",
@@ -554,7 +760,7 @@ def test_coverage_evaluation_requires_contractual_evidence():
     assert res_no_ev['reimbursement_applicable'] is False
     assert len(res_no_ev['evidence_citations']) == 0
 
-    # Case B: Irrelevant evidence pages (e.g. fire coverage only)
+    # Case B: Pages present but no LLM → fail closed to HUMAN_REVIEW (never keyword-confirm)
     irrelevant_evidence = [{
         'document_id': 'DOC-001',
         'page': 1,
@@ -566,8 +772,18 @@ def test_coverage_evaluation_requires_contractual_evidence():
     assert res_irrel['status'] == claims.CoverageStatus.HUMAN_REVIEW_REQUIRED
 
 
-def test_coverage_evaluation_respects_contractual_exclusions():
-    """Contractual exclusions prevent declaring coverage supported."""
+def test_coverage_evaluation_respects_contractual_exclusions(monkeypatch):
+    """Contractual exclusions prevent declaring coverage supported (LLM-grounded citations)."""
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr(
+        'insurance.llm.interpret',
+        lambda messages, **kwargs: _coverage_llm_response(
+            'excluded', 'DOC-002', 4, section='exclusions',
+            excerpt='excluidas las roturas por rayaduras',
+            explanation='Exclusión por desgaste/arañazos.',
+            exclusions=['rayaduras', 'desgaste natural'],
+        ),
+    )
     interp = {
         "description": "Se rayó y rompió el cristal de la ventana por desgaste y arañazos",
         "incident_type": "cristalería",
@@ -587,8 +803,17 @@ def test_coverage_evaluation_respects_contractual_exclusions():
     assert res['evidence_citations'][0]['document_id'] == 'DOC-002'
 
 
-def test_coverage_evaluation_with_valid_contractual_evidence():
+def test_coverage_evaluation_with_valid_contractual_evidence(monkeypatch):
     """Valid contractual coverage clause justifies SUPPORTED_BY_POLICY with documentary citations."""
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr(
+        'insurance.llm.interpret',
+        lambda messages, **kwargs: _coverage_llm_response(
+            'covered', 'DOC-003', 2, section='coverage',
+            excerpt='cubiertos los daños por fugas de agua',
+            explanation='Garantía de daños por agua aplicable.',
+        ),
+    )
     interp = {
         "description": "Fuga de agua por rotura de tubería en la cocina",
         "incident_type": "fontanería",
@@ -602,7 +827,8 @@ def test_coverage_evaluation_with_valid_contractual_evidence():
     }]
     res = claims.evaluate_coverage_with_evidence(interp, evidence_with_guarantee)
     assert res['status'] == claims.CoverageStatus.SUPPORTED_BY_POLICY
-    assert res['reimbursement_applicable'] is True
+    # P0: preliminary coverage does not authorize reimbursement/payment
+    assert res['reimbursement_applicable'] is False
     assert len(res['evidence_citations']) > 0
     assert res['evidence_citations'][0]['document_id'] == 'DOC-003'
     assert res['evidence_citations'][0]['page'] == 2
@@ -655,8 +881,9 @@ def test_invoice_extraction_no_hallucinations(monkeypatch):
     assert res_empty['date'] is None
 
     # 2. Complete extraction via LLM
-    def mock_llm_complete(messages):
+    def mock_llm_complete(messages, **kwargs):
         return {
+            "document_type": "factura_reparacion",
             "provider": "Fontanería Soler S.L.",
             "date": "2026-03-15",
             "invoice_number": "FAC-2026-88",
@@ -666,8 +893,7 @@ def test_invoice_extraction_no_hallucinations(monkeypatch):
             "taxes_included": True
         }
     monkeypatch.setattr('insurance.llm.interpret', mock_llm_complete)
-    monkeypatch.setenv('INSURANCE_LLM_MODEL', 'gpt-4o-mini')
-    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test')
+    _enable_test_llm(monkeypatch)
 
     res_comp = claims.extract_invoice_with_llm("factura.pdf", "Texto de factura real...")
     assert res_comp['success'] is True
@@ -677,8 +903,9 @@ def test_invoice_extraction_no_hallucinations(monkeypatch):
     assert res_comp['invoice_number'] == "FAC-2026-88"
 
     # 3. Partial extraction (missing invoice number and date)
-    def mock_llm_partial(messages):
+    def mock_llm_partial(messages, **kwargs):
         return {
+            "document_type": "factura_reparacion",
             "provider": "Pinturas Rápidas",
             "date": None,
             "invoice_number": None,
@@ -698,7 +925,7 @@ def test_invoice_extraction_no_hallucinations(monkeypatch):
     assert res_part['date'] is None
 
     # 4. LLM Exception returns failed extraction without crash or fake data
-    def mock_llm_error(messages):
+    def mock_llm_error(messages, **kwargs):
         raise RuntimeError("LLM service unavailable")
     monkeypatch.setattr('insurance.llm.interpret', mock_llm_error)
 
@@ -777,6 +1004,8 @@ def test_service_notification_real_status_and_idempotency(pg_schema, monkeypatch
             return res if detailed else True
 
         monkeypatch.setattr('insurance.claims.deliver_real_email', mock_deliver)
+        claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='agent-test')
+        claim = claims.get_claim(conn, bid, cuuid)
 
         # First call: delivers email and updates claim
         sent1 = claims.send_service_notification_email(conn, bid, claim)
@@ -794,14 +1023,20 @@ def test_service_notification_real_status_and_idempotency(pg_schema, monkeypatch
         assert deliver_count == 1  # count did not increase!
 
 
-def test_multi_damage_incident_interpretation():
+def test_multi_damage_incident_interpretation(monkeypatch):
     """Identifies multiple damages and services in a single incident description."""
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr(
+        'insurance.llm.interpret',
+        lambda messages, **kwargs: _multi_damage_llm_payload(),
+    )
     desc = "Hubo una fuga de tubería en el baño que manchó la pintura del techo y rompió un espejo de cristal"
     interp = claims.interpret_incident_with_llm(desc)
     assert interp['primary_service'] == 'fontanería'
     assert 'pintura' in interp['services_needed']
     assert 'cristalería' in interp['services_needed']
     assert len(interp['damage_categories']) >= 3
+    assert interp.get('interpretation_failed') is not True
 
 
 def test_claims_schema_readiness_and_guard(pg_schema):
@@ -853,7 +1088,17 @@ def test_human_review_claim_always_requests_photos_and_notifies_agent(pg_schema,
         return res if detailed else True
 
     monkeypatch.setattr('insurance.claims.deliver_real_email', mock_deliver)
-    monkeypatch.setenv('HUMAN_AGENT_EMAIL', 'marianodanielcortina88@hotmail.com')
+    monkeypatch.setenv('HUMAN_AGENT_EMAIL', 'agent-review@seguro.test')
+    # No policy pages → coverage stays HUMAN_REVIEW; still gather photos
+    _patch_dialog_llm_for_service(
+        monkeypatch,
+        primary_service='pintura',
+        document_id='DOC-NONE',
+        decision='insufficient',
+        item_name='Pared con humedad',
+        repair_stage='trabajo_realizado',
+        secondary=['fontanería'],
+    )
 
     with pg_schema() as conn:
         identity.upsert_customer(conn, bid, cid, "Celia Zorro Condes", "51959566J")
@@ -865,7 +1110,7 @@ def test_human_review_claim_always_requests_photos_and_notifies_agent(pg_schema,
         # 2. Start claim
         dialog.process({'business_id': bid}, {}, [], "enviar parte", "WhatsApp", "SM-502", "+34600111222")
 
-        # 3. Incident requiring human review (no direct match)
+        # 3. Incident requiring human review (no contractual pages)
         r_desc, _ = dialog.process(
             {'business_id': bid}, {}, [],
             "tuvimos un problema en la cañeria y ya se ha arreglado y ahora hay que pintar ,quisiera que me envien a un pintor",
@@ -881,8 +1126,14 @@ def test_human_review_claim_always_requests_photos_and_notifies_agent(pg_schema,
         c_state1 = claims.get_claim(conn, bid, claim_ref)
         assert c_state1['state'] == claims.ClaimState.PHOTOS_REQUESTED
 
-        # 4. Customer sends photos
-        media = [{'filename': 'pared_humedad.jpg', 'content_type': 'image/jpeg', 'size_bytes': 1024 * 60, 'url': 'http://test/f.jpg'}]
+        # 4. Customer sends photos (mocked vision analyzer via _patch_dialog_llm_for_service)
+        media = [{
+            'filename': 'pared_humedad.jpg',
+            'content_type': 'image/jpeg',
+            'size_bytes': 1024 * 60,
+            'url': 'http://test/f.jpg',
+            'content_bytes': b'fake-photo',
+        }]
         r_photo, _ = dialog.process(
             {'business_id': bid}, {}, [],
             "aqui va la foto de la pared",
@@ -891,13 +1142,18 @@ def test_human_review_claim_always_requests_photos_and_notifies_agent(pg_schema,
         assert "recibido" in r_photo.lower()
         assert "factura" in r_photo.lower()
 
-        # 5. Customer has no invoice
+        # 5. Customer has no invoice — stays in human review (may block on mandatory repair invoice)
         r_inv, _ = dialog.process(
             {'business_id': bid}, {}, [],
             "no tengo factura",
             "WhatsApp", "SM-505", "+34600111222"
         )
-        assert "¡Todo listo!" in r_inv or "Siniestro registrado" in r_inv
+        assert (
+            "revisión humana" in r_inv.lower()
+            or "¡Todo listo" in r_inv
+            or "Siniestro registrado" in r_inv
+            or "documentos obligatorios" in r_inv.lower()
+        )
         assert claim_ref in r_inv
 
         # 6. Verify human agent received email with the photo attachment and the report
@@ -907,14 +1163,29 @@ def test_human_review_claim_always_requests_photos_and_notifies_agent(pg_schema,
 
         assert len(agent_emails_sent) >= 1
         last_email = agent_emails_sent[-1]
-        assert last_email['to'] == 'marianodanielcortina88@hotmail.com'
+        assert last_email['to'] == 'agent-review@seguro.test'
         att_filenames = [a.get('filename') for a in last_email['attachments']]
-        assert any('pared_humedad.jpg' in fn for fn in att_filenames)
-        assert any(f"claim_{claim_ref}_resumen.txt" in fn for fn in att_filenames)
+        assert any('pared_humedad.jpg' in (fn or '') for fn in att_filenames)
+        assert any(f"claim_{claim_ref}_resumen.txt" in (fn or '') for fn in att_filenames)
 
 
-def test_dynamic_evidence_matrix_multi_damage_generation():
+def test_dynamic_evidence_matrix_multi_damage_generation(monkeypatch):
     """Generates affected items and evidence matrix for multi-damage incident (leak affecting pipe, furniture, wall)."""
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr(
+        'insurance.llm.interpret',
+        lambda messages, **kwargs: _multi_damage_llm_payload(
+            what_happened='Fuga que dañó mueble y pared',
+            primary_service='fontanería',
+            secondary_services=['mobiliario', 'pintura'],
+            damage_categories=['fontanería', 'mobiliario', 'pintura'],
+            affected_items=[
+                {'name': 'Tubería', 'category': 'fontanería', 'observed_damage': 'fuga', 'known_cause': 'rotura', 'repair_stage': 'sin_reparar'},
+                {'name': 'Mueble de madera', 'category': 'mobiliario', 'observed_damage': 'hinchado', 'known_cause': 'agua', 'repair_stage': 'sin_reparar'},
+                {'name': 'Pared del salón', 'category': 'pintura', 'observed_damage': 'mancha', 'known_cause': 'humedad', 'repair_stage': 'sin_reparar'},
+            ],
+        ),
+    )
     desc = "Hubo una fuga de agua en la cocina que dañó el mueble de madera y manchó la pared del salón"
     interp = claims.interpret_incident_with_llm(desc)
 
@@ -976,6 +1247,7 @@ def test_evidence_matrix_differentiates_proof_categories():
             "filename": "factura_pintor.pdf",
             "extracted_fields": {
                 "success": True,
+                "document_type": "factura_reparacion",
                 "provider": "Pinturas Soler S.L.",
                 "amount": 250.0,
                 "invoice_number": "FAC-101",
@@ -1025,11 +1297,28 @@ def test_evidence_matrix_unreadable_file_handling():
     assert "insuficiente o ilegible" in repair_req['status_reason']
 
 
-def test_evidence_matrix_persistence_in_postgres(pg_schema):
+def test_evidence_matrix_persistence_in_postgres(pg_schema, monkeypatch):
     """Verifies that affected_items and evidence_matrix persist cleanly in PostgreSQL."""
     bid = "INS-BIZ-001"
     cid = "CUS-000010"
     pid = "POL-HOGAR-010"
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr(
+        'insurance.llm.interpret',
+        lambda messages, **kwargs: _multi_damage_llm_payload(
+            what_happened='Mesa de vidrio rota en el salón',
+            primary_service='cristalería',
+            secondary_services=[],
+            damage_categories=['cristalería'],
+            affected_items=[{
+                'name': 'Mesa de vidrio',
+                'category': 'cristalería',
+                'observed_damage': 'rota',
+                'known_cause': 'accidente',
+                'repair_stage': 'sin_reparar',
+            }],
+        ),
+    )
 
     with pg_schema() as conn:
         claims.add_customer_and_policy(conn, bid, cid, "Test Matrix User", "12345678Z", pid, "hogar", "010")
@@ -1139,16 +1428,269 @@ def test_purchase_invoice_alternative_does_not_block_autoclose():
     assert claims.get_blocking_mandatory_requirements(evaluated) == []
 
 
-def test_analyze_media_is_filename_heuristic_not_vision():
-    """Document honesty: media 'analysis' is filename heuristics, not a vision model."""
-    good = claims.analyze_media_with_llm('dano_cocina.jpg', 'image/jpeg', 1000, 'fuga')
+def test_analyze_media_fail_closed_without_bytes():
+    """Without image bytes, analysis fails closed (no filename heuristics)."""
+    no_bytes = claims.analyze_media_with_llm('evidencia_clara.jpg', 'image/jpeg', 1000, 'fuga')
+    assert no_bytes['valid'] is False
+    assert 'bytes' in (no_bytes.get('quality') or no_bytes.get('reason') or '').lower() or 'leer' in (no_bytes.get('reason') or '').lower()
+
+    blurry_name = claims.analyze_media_with_llm('foto_borrosa.jpg', 'image/jpeg', 1000, 'fuga')
+    assert blurry_name['valid'] is False  # same fail-closed path regardless of filename
+
+
+def test_analyze_media_uses_vision_mock(monkeypatch):
+    """With bytes + mocked vision, analysis can succeed."""
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr('insurance.llm.analyze_vision', lambda *a, **k: _vision_ok_payload())
+    good = claims.analyze_media_with_llm(
+        'dano_cocina.jpg', 'image/jpeg', 1000, 'fuga', content_bytes=b'fake-img'
+    )
     assert good['valid'] is True
-    blurry = claims.analyze_media_with_llm('foto_borrosa.jpg', 'image/jpeg', 1000, 'fuga')
-    assert blurry['valid'] is False
-    # Same bytes conceptually; only the filename changes the verdict
-    sneaky = claims.analyze_media_with_llm('evidencia_clara.jpg', 'image/jpeg', 1000, 'fuga')
-    assert sneaky['valid'] is True
+    assert good.get('analysis_source') == 'vision_llm' or good.get('observed')
 
 
+# --- P0 additive coverage -----------------------------------------------------
+
+def test_interpret_incident_uses_llm_not_keywords(monkeypatch):
+    """Semantic multi-damage interpretation comes from llm.interpret, not keyword lists."""
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr(
+        'insurance.llm.interpret',
+        lambda messages, **kwargs: _multi_damage_llm_payload(),
+    )
+    interp = claims.interpret_incident_with_llm(
+        "Hubo una fuga de tubería en el baño que manchó la pintura del techo y rompió un espejo de cristal"
+    )
+    assert interp['primary_service'] == 'fontanería'
+    assert set(interp['damage_categories']) >= {'fontanería', 'pintura', 'cristalería'}
+    assert len(interp['affected_items']) >= 3
+    assert interp.get('interpretation_failed') is False
+    assert interp.get('analysis_source') == 'llm'
+
+
+def test_interpret_incident_fails_closed_without_llm(monkeypatch):
+    monkeypatch.delenv('INSURANCE_LLM_MODEL', raising=False)
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    interp = claims.interpret_incident_with_llm("Se me rompió el cristal del comedor")
+    assert interp.get('interpretation_failed') is True
+    assert interp.get('primary_service') is None
+    assert interp.get('incident_type') is None
+    assert interp.get('affected_items') == []
+
+
+def test_coverage_requires_llm_grounding_not_keywords(monkeypatch):
+    """Matching coverage pages without LLM never yield SUPPORTED_BY_POLICY."""
+    monkeypatch.delenv('INSURANCE_LLM_MODEL', raising=False)
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    interp = {
+        'description': 'Fuga de agua por rotura de tubería',
+        'incident_type': 'fontanería',
+        'primary_service': 'fontanería',
+    }
+    pages = [{
+        'document_id': 'DOC-WATER',
+        'page': 2,
+        'section': 'coverage',
+        'text': 'Garantía de daños por agua: cubiertos fugas y rotura de tuberías.',
+    }]
+    res = claims.evaluate_coverage_with_evidence(interp, pages)
+    assert res['status'] == claims.CoverageStatus.HUMAN_REVIEW_REQUIRED
+    assert res['status'] != claims.CoverageStatus.SUPPORTED_BY_POLICY
+
+
+def test_coverage_excluded_via_llm_citations(monkeypatch):
+    _enable_test_llm(monkeypatch)
+    monkeypatch.setattr(
+        'insurance.llm.interpret',
+        lambda messages, **kwargs: _coverage_llm_response(
+            'excluded', 'DOC-EXCL', 3, section='exclusions',
+            excerpt='excluido desgaste',
+            exclusions=['desgaste'],
+            explanation='Exclusión contractual aplicable.',
+        ),
+    )
+    interp = {
+        'description': 'Cristal rayado por desgaste',
+        'incident_type': 'cristalería',
+        'primary_service': 'cristalería',
+    }
+    pages = [{
+        'document_id': 'DOC-EXCL',
+        'page': 3,
+        'section': 'exclusions',
+        'text': 'Quedan excluidas roturas por desgaste.',
+    }]
+    res = claims.evaluate_coverage_with_evidence(interp, pages)
+    assert res['status'] == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY
+    assert res['evidence_citations'][0]['document_id'] == 'DOC-EXCL'
+    assert res['evidence_citations'][0]['page'] == 3
+
+
+def test_invoice_classifies_presupuesto_vs_factura(monkeypatch):
+    _enable_test_llm(monkeypatch)
+
+    def mock_extract(messages, **kwargs):
+        blob = _messages_blob(messages)
+        # Classify from document body markers (schema text always mentions both types)
+        if 'DOC_KIND=PRESUPUESTO' in blob:
+            return {
+                'document_type': 'presupuesto',
+                'provider': 'Obras Rápidas',
+                'amount': 120.0,
+                'invoice_number': 'PRE-1',
+                'date': '2026-01-10',
+                'work_description': 'Estimación pintura',
+                'currency': 'EUR',
+            }
+        return {
+            'document_type': 'factura_reparacion',
+            'provider': 'Obras Rápidas',
+            'amount': 120.0,
+            'invoice_number': 'FAC-1',
+            'date': '2026-01-10',
+            'work_description': 'Pintura realizada',
+            'currency': 'EUR',
+        }
+
+    monkeypatch.setattr('insurance.llm.interpret', mock_extract)
+    presupuesto = claims.extract_invoice_with_llm(
+        'presupuesto.pdf', 'DOC_KIND=PRESUPUESTO nº PRE-1 importe 120'
+    )
+    factura = claims.extract_invoice_with_llm(
+        'factura.pdf', 'DOC_KIND=FACTURA nº FAC-1 importe 120'
+    )
+    assert presupuesto['document_type'] == 'presupuesto'
+    assert factura['document_type'] == 'factura_reparacion'
+    assert presupuesto['success'] is True
+    assert factura['success'] is True
+
+
+def test_professional_email_blocked_without_authorization(pg_schema, monkeypatch):
+    bid = 'INS-BIZ-001'
+    cid = 'CUS-AUTH-1'
+    pid = 'POL-AUTH-1'
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
+    with pg_schema() as conn:
+        claims.add_professional(conn, bid, 'fontanería', 'Fontanero', 'f@taller.es')
+        claims.add_customer_and_policy(conn, bid, cid, 'Ana', '12345678Z', pid, 'hogar', '1')
+        cuuid, _ = claims.create_claim(conn, bid, cid, pid, 'V1', 'WhatsApp', 'Fuga')
+        claims.update_claim(conn, cuuid, coverage_evaluation={
+            'status': claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            'service_type': 'fontanería',
+        })
+        claim = claims.get_claim(conn, bid, cuuid)
+        sent = claims.send_service_notification_email(conn, bid, claim)
+        assert sent is False
+        updated = claims.get_claim(conn, bid, cuuid)
+        assert updated['service_notified'] is not True
+        assert (updated.get('service_notification_details') or {}).get('status') == 'BLOCKED'
+
+
+def test_professional_email_after_authorization(pg_schema, monkeypatch):
+    bid = 'INS-BIZ-001'
+    cid = 'CUS-AUTH-2'
+    pid = 'POL-AUTH-2'
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
+    with pg_schema() as conn:
+        claims.add_professional(conn, bid, 'fontanería', 'Fontanero', 'f@taller.es')
+        claims.add_customer_and_policy(conn, bid, cid, 'Ana', '12345678Z', pid, 'hogar', '1')
+        cuuid, _ = claims.create_claim(conn, bid, cid, pid, 'V1', 'WhatsApp', 'Fuga')
+        claims.update_claim(conn, cuuid, coverage_evaluation={
+            'status': claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            'service_type': 'fontanería',
+        })
+        claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='gestor-1')
+        claim = claims.get_claim(conn, bid, cuuid)
+        sent = claims.send_service_notification_email(conn, bid, claim)
+        assert sent is True
+        updated = claims.get_claim(conn, bid, cuuid)
+        assert updated['service_notified'] is True
+        assert updated['service_notification_details']['sent_to'] == 'f@taller.es'
+        assert updated['service_notification_details']['status'] == 'ACCEPTED'
+
+
+def test_stale_authorization_invalidated_by_new_evidence(pg_schema, monkeypatch):
+    bid = 'INS-BIZ-001'
+    cid = 'CUS-AUTH-3'
+    pid = 'POL-AUTH-3'
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
+    with pg_schema() as conn:
+        claims.add_professional(conn, bid, 'fontanería', 'Fontanero', 'f@taller.es')
+        claims.add_customer_and_policy(conn, bid, cid, 'Ana', '12345678Z', pid, 'hogar', '1')
+        cuuid, _ = claims.create_claim(conn, bid, cid, pid, 'V1', 'WhatsApp', 'Fuga')
+        claims.update_claim(conn, cuuid, coverage_evaluation={
+            'status': claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            'service_type': 'fontanería',
+        }, photos=[{'filename': 'antes.jpg', 'analysis': {'valid': True}}])
+        claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='gestor-1')
+        # New evidence changes fingerprint → authorization becomes stale
+        claims.update_claim(conn, cuuid, photos=[
+            {'filename': 'antes.jpg', 'analysis': {'valid': True}},
+            {'filename': 'despues.jpg', 'analysis': {'valid': True}},
+        ])
+        claim = claims.get_claim(conn, bid, cuuid)
+        ok, reason = claims.is_dispatch_authorization_valid(claim, 'f@taller.es', 'fontanería')
+        assert ok is False
+        assert reason == 'stale_authorization'
+        sent = claims.send_service_notification_email(conn, bid, claim)
+        assert sent is False
+
+
+def test_no_default_personal_email_fallback():
+    assert claims.DEFAULT_TARGET_EMAIL == ""
+    assert 'hotmail' not in (claims.DEFAULT_TARGET_EMAIL or '').lower()
+
+
+def test_mandatory_repair_invoice_blocks_ready_for_review():
+    """Unit matrix: trabajo_realizado without factura blocks; with factura does not."""
+    items = [{
+        'item_id': 'item_1',
+        'name': 'Tubería',
+        'category': 'fontanería',
+        'repair_stage': claims.RepairStage.TRABAJO_REALIZADO,
+    }]
+    matrix = claims.build_evidence_matrix(items)
+    evaluated_missing = claims.evaluate_received_evidence(matrix, photos=[], invoices=[], description='ya arreglado')
+    blocking_missing = claims.get_blocking_mandatory_requirements(evaluated_missing)
+    assert any(r['proof_category'] == claims.ProofCategory.FACTURA_REPARACION for r in blocking_missing)
+
+    evaluated_ok = claims.evaluate_received_evidence(
+        matrix,
+        photos=[],
+        invoices=[{
+            'filename': 'fac.pdf',
+            'extracted_fields': {
+                'success': True,
+                'document_type': 'factura_reparacion',
+                'provider': 'Fontanero',
+                'amount': 80.0,
+                'invoice_number': 'F-1',
+                'date': '2026-02-01',
+            },
+        }],
+        description='factura adjunta',
+    )
+    assert claims.get_blocking_mandatory_requirements(evaluated_ok) == []
+
+
+def test_wall_repair_not_proven_by_photos_alone():
+    """Technical dryness/repair condition stays PENDIENTE_REVISION with photos only."""
+    items = [{
+        'item_id': 'item_1',
+        'name': 'Pared con manchas de humedad',
+        'category': 'pintura',
+        'repair_stage': claims.RepairStage.SIN_REPARAR,
+    }]
+    matrix = claims.build_evidence_matrix(items)
+    evaluated = claims.evaluate_received_evidence(
+        matrix,
+        photos=[{'filename': 'pared.jpg', 'analysis': {'valid': True, 'observed': 'mancha'}}],
+        invoices=[],
+        description='Foto de la pared manchada',
+    )
+    tech = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.COMPROBACION_TECNICA]
+    assert tech
+    assert tech[0]['status'] == claims.RequirementStatus.PENDIENTE_REVISION
+    assert tech[0].get('needs_human_review') is True
 
 
