@@ -874,7 +874,16 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     )
                     return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
-                if _is_claim_start(incoming) and not st.get('active_claim_ref'):
+                if (_is_claim_start(incoming) or st.get('claim_start_pending')) and not st.get('active_claim_ref'):
+                    # After multi-policy selection, resume pending claim start without forcing the user to restate intent.
+                    if st.get('claim_start_pending') and st.get('policy_id') and not _is_claim_start(incoming):
+                        if _is_query_start(incoming):
+                            st.pop('claim_start_pending', None)
+                        elif st.get('awaiting') == 'policy':
+                            pass
+                        else:
+                            incoming = incoming or 'enviar parte'
+
                     if not st.get('policy_id'):
                         policies, _ = policy_info.authorized_page(conn, bid, customer_id)
                         if len(policies) == 1:
@@ -893,48 +902,70 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                           {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                     target_policy_id = st.get('policy_id')
-                    valid_pol = None
+                    from insurance import claims
                     if target_policy_id:
-                        valid_pol = conn.execute(
-                            'SELECT policy_id FROM insurance_policies WHERE business_id=%s AND customer_id=%s AND policy_id=%s LIMIT 1',
-                            (bid, customer_id, target_policy_id)
-                        ).fetchone()
-                    if not valid_pol:
-                        pol_row = conn.execute(
-                            'SELECT policy_id FROM insurance_policies WHERE business_id=%s AND customer_id=%s LIMIT 1',
+                        ok_pol, ver_id, pol_err = claims.verify_policy_for_claim(
+                            conn, bid, customer_id, target_policy_id, fact_date=_business_date(business)
+                        )
+                        if not ok_pol:
+                            if pol_err == 'unsupported_product':
+                                st.pop('claim_start_pending', None)
+                                return finish(
+                                    "Lo siento, la declaración de partes online solo está habilitada para pólizas de hogar. "
+                                    "Para otros productos, por favor ponte en contacto telefónico con nuestro servicio de atención al cliente.",
+                                    {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                )
+                            if pol_err == 'policy_not_found_or_unauthorized':
+                                target_policy_id = None
+                            else:
+                                st.pop('claim_start_pending', None)
+                                return finish(
+                                    "No he podido validar una póliza de hogar vigente autorizada para declarar el parte. "
+                                    "Contacta con atención al cliente si el problema continúa.",
+                                    {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                )
+                        else:
+                            st['version_id'] = ver_id
+                    if not target_policy_id:
+                        # Prefer an authorized hogar policy; never open claims on null/unknown product.
+                        hogar_row = conn.execute(
+                            "SELECT p.policy_id FROM insurance_policies p "
+                            "JOIN insurance_authorizations a ON a.business_id=p.business_id "
+                            "AND a.customer_id=p.customer_id AND a.policy_id=p.policy_id "
+                            "WHERE p.business_id=%s AND p.customer_id=%s AND p.product='hogar' "
+                            "AND a.revoked_at IS NULL AND a.valid_from<=now() "
+                            "AND (a.valid_to IS NULL OR a.valid_to>now()) LIMIT 1",
                             (bid, customer_id)
                         ).fetchone()
-                        if pol_row:
-                            target_policy_id = pol_row['policy_id']
+                        if hogar_row:
+                            target_policy_id = hogar_row['policy_id']
                             st['policy_id'] = target_policy_id
-                        else:
-                            target_policy_id = None
+                            ok_pol, ver_id, pol_err = claims.verify_policy_for_claim(
+                                conn, bid, customer_id, target_policy_id, fact_date=_business_date(business)
+                            )
+                            if ok_pol:
+                                st['version_id'] = ver_id
+                            else:
+                                target_policy_id = None
 
                     if not target_policy_id:
+                        st.pop('claim_start_pending', None)
                         return finish(
                             "No he localizado ninguna póliza de hogar activa asociada a tus datos para declarar un parte. "
                             "Por favor, ponte en contacto con nuestro servicio de atención al cliente para verificar tus contratos.",
                             {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                         )
 
-                    if not st.get('version_id'):
-                        ver_row = conn.execute(
-                            'SELECT version_id FROM insurance_policy_versions '
-                            'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
-                            'AND (valid_to IS NULL OR valid_to>=%s) ORDER BY valid_from DESC LIMIT 1',
-                            (bid, target_policy_id, _business_date(business), _business_date(business))).fetchone()
-                        if ver_row:
-                            st['version_id'] = ver_row['version_id']
-
                     prod = _selected_policy_product(conn, bid, target_policy_id)
-                    if prod and prod != 'hogar':
+                    if prod != 'hogar':
+                        st.pop('claim_start_pending', None)
                         return finish(
                             "Lo siento, la declaración de partes online solo está habilitada para pólizas de hogar. "
                             "Para otros productos, por favor ponte en contacto telefónico con nuestro servicio de atención al cliente.",
                             {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                         )
 
-                    from insurance import claims
+                    st.pop('claim_start_pending', None)
                     # Root cause: never store the raw menu/command text as the damage description.
                     # Strip the opening intent once and keep only the remainder (may be empty).
                     initial_description = _extract_claim_opening_description(incoming)
@@ -963,27 +994,53 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             with conn.transaction():
                                 desc = initial_description
                                 interp = claims.interpret_incident_with_llm(desc)
+                                if interp.get('interpretation_failed'):
+                                    claims.update_claim(
+                                        conn, claim_uuid,
+                                        original_description=desc,
+                                        structured_interpretation=interp,
+                                        state=claims.ClaimState.MORE_INFO_REQUIRED,
+                                    )
+                                    return finish(
+                                        interp.get('missing_info')
+                                        or "Necesito más detalle del incidente para continuar con el parte.",
+                                        {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                    )
                                 aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
                                 ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
                                 ev_matrix = claims.evaluate_received_evidence(ev_matrix, [], [], desc)
-                                claims.update_claim(conn, claim_uuid, original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
+                                claims.update_claim(
+                                    conn, claim_uuid,
+                                    original_description=desc,
+                                    structured_interpretation=interp,
+                                    affected_items=aff_items,
+                                    evidence_matrix=ev_matrix,
+                                    state=claims.ClaimState.INCIDENT_INTERPRETED,
+                                )
 
                                 result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=target_policy_id)
                                 evidence = result.get('evidence', [])
                                 eval_res = claims.evaluate_coverage_with_llm(interp, evidence, policy_id=target_policy_id, version_id=st.get('version_id'))
-                                claims.update_claim(conn, claim_uuid, coverage_evaluation=eval_res)
+                                claims.update_claim(
+                                    conn, claim_uuid,
+                                    coverage_evaluation=eval_res,
+                                    state=claims.ClaimState.COVERAGE_CHECK,
+                                )
 
                                 status = eval_res.get('status')
                                 service_type = eval_res.get('service_type')
                                 claims.update_claim(conn, claim_uuid, state=claims.ClaimState.PHOTOS_REQUESTED)
 
-                                if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
+                                if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
                                     explanation = eval_res.get('explanation', '')
                                     explanation = _sanitize_llm_explanation(explanation, evidence, target_policy_id, st.get('version_id'), target_policy_id)
                                     reply = (
-                                        f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
-                                        f"Explicación contractual: {explanation}\n\n"
-                                        f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
+                                        f"He realizado una evaluación preliminar de tu póliza. "
+                                        f"Hay respaldo contractual preliminar para {service_type or 'asistencia'}.\n"
+                                        f"Fundamento: {explanation}\n\n"
+                                        f"Esto no autoriza aún el envío a un profesional ni un pago. "
+                                        f"Para el siniestro {claim_ref}, envíame fotografías o un vídeo del daño "
+                                        f"(o escribe 'no tengo' si no dispones de ellos)."
                                     )
                                 else:
                                     reply = (
@@ -1056,7 +1113,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             else:
                                 is_query = False
 
-                                if claim_state == claims.ClaimState.INFORMATION_GATHERING:
+                                if claim_state in (claims.ClaimState.INFORMATION_GATHERING, claims.ClaimState.MORE_INFO_REQUIRED):
                                     desc = claim.get('original_description') or ""
                                     is_pure_resume = folded_incoming in (
                                         'seguir', 'continuar', 'continuamos', 'adelante', 'proseguir',
@@ -1078,13 +1135,33 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     try:
                                         with conn.transaction():
                                             interp = claims.interpret_incident_with_llm(desc)
+                                            if interp.get('interpretation_failed'):
+                                                claims.update_claim(
+                                                    conn, claim['claim_uuid'],
+                                                    original_description=desc,
+                                                    structured_interpretation=interp,
+                                                    state=claims.ClaimState.MORE_INFO_REQUIRED,
+                                                )
+                                                return finish(
+                                                    interp.get('missing_info')
+                                                    or "Necesito más detalle del incidente para continuar.",
+                                                    {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                                )
                                             aff_items = interp.get('affected_items') or claims.build_affected_items(interp, desc)
                                             ev_matrix = interp.get('evidence_matrix') or claims.build_evidence_matrix(aff_items)
                                             ev_matrix = claims.evaluate_received_evidence(ev_matrix, claim.get('photos', []), claim.get('invoices', []), desc)
-                                            claims.update_claim(conn, claim['claim_uuid'], original_description=desc, structured_interpretation=interp, affected_items=aff_items, evidence_matrix=ev_matrix)
+                                            claims.update_claim(
+                                                conn, claim['claim_uuid'],
+                                                original_description=desc,
+                                                structured_interpretation=interp,
+                                                affected_items=aff_items,
+                                                evidence_matrix=ev_matrix,
+                                                state=claims.ClaimState.INCIDENT_INTERPRETED,
+                                            )
 
                                             missing = interp.get('missing_info')
                                             if missing and len(desc.split()) < 7 and not is_resume:
+                                                claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.MORE_INFO_REQUIRED)
                                                 return finish(missing, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                                             result = retrieval.retrieve(conn, bid, customer_id, desc, _business_date(business), policy_hint=claim['policy_id'])
@@ -1092,6 +1169,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                 claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
                                                 updated_c = claims.get_claim(conn, bid, claim['claim_uuid'])
                                                 claims.save_human_summary(conn, bid, updated_c)
+                                                st.pop('active_claim_ref', None)
+                                                st.pop('awaiting', None)
                                                 return finish(
                                                     f"No he podido acceder a las cláusulas de tu póliza. He registrado tu parte con referencia {claim_ref} para que nuestro equipo lo evalúe manualmente. Nos pondremos en contacto contigo.",
                                                     {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
@@ -1103,33 +1182,35 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                 policy_id=claim['policy_id'],
                                                 version_id=claim.get('policy_version_id')
                                             )
-                                            claims.update_claim(conn, claim['claim_uuid'], coverage_evaluation=eval_res)
+                                            claims.update_claim(
+                                                conn, claim['claim_uuid'],
+                                                coverage_evaluation=eval_res,
+                                                state=claims.ClaimState.COVERAGE_CHECK,
+                                            )
 
                                             status = eval_res.get('status')
                                             service_type = eval_res.get('service_type')
+                                            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
 
-                                            if status in (claims.CoverageStatus.SUPPORTED_BY_POLICY, claims.CoverageStatus.POTENTIAL_COVERAGE):
+                                            if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
                                                 explanation = eval_res.get('explanation', '')
                                                 explanation = _sanitize_llm_explanation(explanation, evidence, claim['policy_id'], claim.get('policy_version_id'), claim['policy_id'])
-
-                                                claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
                                                 reply = (
-                                                    f"He verificado tu póliza. El incidente está cubierto por la garantía de {service_type or 'asistencia'}.\n"
-                                                    f"Explicación contractual: {explanation}\n\n"
-                                                    f"Para proceder con el trámite del siniestro {claim_ref}, por favor envíame fotografías o un vídeo del daño (o escribe 'no tengo' si no dispones de ellos)."
+                                                    f"He realizado una evaluación preliminar de tu póliza. "
+                                                    f"Hay respaldo contractual preliminar para {service_type or 'asistencia'}.\n"
+                                                    f"Fundamento: {explanation}\n\n"
+                                                    f"Esto no autoriza el envío a un profesional ni un pago. "
+                                                    f"Para el siniestro {claim_ref}, envíame fotografías o un vídeo del daño "
+                                                    f"(o escribe 'no tengo' si no dispones de ellos)."
                                                 )
                                                 if channel == 'Voice':
                                                     reply = (
-                                                        f"He verificado tu póliza y tu incidente de {service_type or 'asistencia'} parece cubierto. "
-                                                        f"He registrado tu parte con referencia {claim_ref}. "
-                                                        f"Te acabo de enviar un mensaje de WhatsApp para que puedas adjuntarme las fotos o un vídeo de los daños por ahí."
+                                                        f"Evaluación preliminar de cobertura para {service_type or 'asistencia'} registrada. "
+                                                        f"Parte {claim_ref}. Te indico por WhatsApp cómo adjuntar fotos o un vídeo."
                                                     )
                                                     log.info("Simulated outbound WhatsApp photos request sent to %s for claim %s", customer, claim_ref)
                                                 return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                                             else:
-                                                # When coverage requires human review or is ambiguous:
-                                                # ALWAYS request photos/videos so that the human agent has evidence to evaluate!
-                                                claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.PHOTOS_REQUESTED)
                                                 if status == claims.CoverageStatus.NOT_SUPPORTED_BY_POLICY:
                                                     coverage_note = "Según las condiciones preliminares, este incidente requiere comprobación pericial personalizada."
                                                 else:
@@ -1169,20 +1250,33 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                             ok, err = claims.validate_media_metadata(media['filename'], media['content_type'], m_size)
                                             if not ok:
                                                 return finish(f"Error al procesar el archivo: {err}", {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                            analysis = claims.analyze_media_with_llm(media['filename'], media['content_type'], m_size, claim.get('original_description', ''))
-                                            if not analysis['valid']:
-                                                return finish(analysis['reason'], {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-                                            photos_added.append({
+                                            raw_bytes = claims._resolve_attachment_bytes(media)
+                                            analysis = claims.analyze_media_with_llm(
+                                                media['filename'], media['content_type'], m_size,
+                                                claim.get('original_description', ''),
+                                                content_bytes=raw_bytes, media=media,
+                                            )
+                                            if not analysis.get('valid'):
+                                                return finish(
+                                                    analysis.get('reason')
+                                                    or "La imagen no es suficiente. Envía otra foto más clara del daño.",
+                                                    {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+                                                )
+                                            photo_rec = {
                                                 'filename': media['filename'],
                                                 'mimetype': media['content_type'],
                                                 'size_bytes': m_size,
                                                 'url': media.get('url'),
-                                                'analysis': analysis
-                                            })
+                                                'analysis': analysis,
+                                            }
+                                            if raw_bytes:
+                                                photo_rec['content_bytes'] = raw_bytes
+                                            photos_added.append(photo_rec)
                                         current_photos = claim.get('photos') or []
                                         current_photos.extend(photos_added)
                                         ev_matrix = claims.evaluate_received_evidence(claim.get('evidence_matrix') or [], current_photos, claim.get('invoices') or [], claim.get('original_description', ''))
-                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, evidence_matrix=ev_matrix, state=claims.ClaimState.INVOICE_REQUESTED)
+                                        claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, evidence_matrix=ev_matrix, state=claims.ClaimState.PHOTOS_RECEIVED)
+                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
                                         
                                         p_count = sum(1 for m in photos_added if not m['mimetype'].startswith('video/'))
                                         v_count = sum(1 for m in photos_added if m['mimetype'].startswith('video/'))
@@ -1217,12 +1311,18 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         current_invoices = claim.get('invoices') or []
                                         for media in media_list:
                                             mtype = media.get('content_type', '')
-                                            fname = media.get('filename', '').lower()
                                             m_size = media.get('size_bytes', 1024 * 50)
-                                            if 'factura' in fname or 'receipt' in fname or 'invoice' in fname or mtype == 'application/pdf':
-                                                raw_bytes = claims._resolve_attachment_bytes(media)
+                                            raw_bytes = claims._resolve_attachment_bytes(media)
+                                            is_image = mtype.startswith('image/')
+                                            is_pdf = mtype == 'application/pdf'
+                                            is_text = mtype.startswith('text/')
+                                            # Prefer document analysis for PDFs/text; images may be invoices or damage photos.
+                                            treat_as_document = is_pdf or is_text or (
+                                                is_image and media.get('as_document')
+                                            )
+                                            if treat_as_document or is_pdf or is_text:
                                                 extracted_text = ""
-                                                if raw_bytes and mtype == 'application/pdf':
+                                                if raw_bytes and is_pdf:
                                                     try:
                                                         import pypdfium2
                                                         pdf = pypdfium2.PdfDocument(raw_bytes)
@@ -1235,34 +1335,71 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                                         extracted_text = "\n".join(pages_text).strip()
                                                     except Exception:
                                                         extracted_text = ""
-                                                elif raw_bytes and mtype.startswith('text/'):
+                                                elif raw_bytes and is_text:
                                                     try:
                                                         extracted_text = raw_bytes.decode('utf-8', errors='ignore')
                                                     except Exception:
                                                         extracted_text = ""
 
-                                                ext_fields = claims.extract_invoice_with_llm(media['filename'], extracted_text)
-                                                invoice_record = {
-                                                    'filename': media['filename'],
-                                                    'mimetype': media['content_type'],
-                                                    'size_bytes': m_size,
-                                                    'url': media.get('url'),
-                                                    'extracted_fields': ext_fields
-                                                }
-                                                current_invoices.append(invoice_record)
-                                            else:
-                                                # Treat as additional photo/video evidence sent at invoice phase
+                                                ext_fields = claims.extract_invoice_with_llm(
+                                                    media['filename'], extracted_text,
+                                                    incident_description=claim.get('original_description'),
+                                                    content_bytes=raw_bytes if is_image else None,
+                                                    mimetype=mtype,
+                                                )
+                                                if not ext_fields.get('success') and is_image and not treat_as_document:
+                                                    # Fall through: try as damage photo if document extraction failed.
+                                                    pass
+                                                else:
+                                                    invoice_record = {
+                                                        'filename': media['filename'],
+                                                        'mimetype': media['content_type'],
+                                                        'size_bytes': m_size,
+                                                        'url': media.get('url'),
+                                                        'extracted_fields': ext_fields,
+                                                    }
+                                                    if raw_bytes:
+                                                        invoice_record['content_bytes'] = raw_bytes
+                                                    current_invoices.append(invoice_record)
+                                                    continue
+
+                                            if is_image or mtype.startswith('video/'):
                                                 ok, err = claims.validate_media_metadata(media['filename'], media['content_type'], m_size)
                                                 if ok:
-                                                    analysis = claims.analyze_media_with_llm(media['filename'], media['content_type'], m_size, claim.get('original_description', ''))
-                                                    if analysis['valid']:
-                                                        current_photos.append({
+                                                    analysis = claims.analyze_media_with_llm(
+                                                        media['filename'], media['content_type'], m_size,
+                                                        claim.get('original_description', ''),
+                                                        content_bytes=raw_bytes, media=media,
+                                                    )
+                                                    if analysis.get('valid'):
+                                                        photo_rec = {
                                                             'filename': media['filename'],
                                                             'mimetype': media['content_type'],
                                                             'size_bytes': m_size,
                                                             'url': media.get('url'),
-                                                            'analysis': analysis
-                                                        })
+                                                            'analysis': analysis,
+                                                        }
+                                                        if raw_bytes:
+                                                            photo_rec['content_bytes'] = raw_bytes
+                                                        current_photos.append(photo_rec)
+                                                    elif is_image:
+                                                        # Last resort: attempt invoice vision classification on the image.
+                                                        ext_fields = claims.extract_invoice_with_llm(
+                                                            media['filename'], "",
+                                                            incident_description=claim.get('original_description'),
+                                                            content_bytes=raw_bytes,
+                                                            mimetype=mtype,
+                                                        )
+                                                        invoice_record = {
+                                                            'filename': media['filename'],
+                                                            'mimetype': media['content_type'],
+                                                            'size_bytes': m_size,
+                                                            'url': media.get('url'),
+                                                            'extracted_fields': ext_fields,
+                                                        }
+                                                        if raw_bytes:
+                                                            invoice_record['content_bytes'] = raw_bytes
+                                                        current_invoices.append(invoice_record)
                                         ev_matrix = claims.evaluate_received_evidence(claim.get('evidence_matrix') or [], current_photos, current_invoices, claim.get('original_description', ''))
                                         claims.update_claim(conn, claim['claim_uuid'], photos=current_photos, invoices=current_invoices, evidence_matrix=ev_matrix)
                                     elif folded_incoming in ('si', 'sí', 'tengo factura', 'tengo una factura'):
@@ -1271,14 +1408,11 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
                                     eval_data = updated_claim.get('coverage_evaluation') or {}
                                     status = eval_data.get('status')
-                                    service_type = eval_data.get('service_type')
-                                    has_invoices = bool(updated_claim.get('invoices'))
                                     blocking = claims.get_blocking_mandatory_requirements(
                                         updated_claim.get('evidence_matrix') or []
                                     )
 
                                     if blocking and not media_list:
-                                        # Keep collecting: do not close while mandatory repair/replacement docs are missing.
                                         docs = '; '.join(
                                             (r.get('demonstrates') or r.get('proof_category') or 'documento obligatorio')
                                             for r in blocking[:3]
@@ -1287,11 +1421,13 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                             'no', 'no tengo', 'no tengo factura', 'no he pagado nada', 'ninguna',
                                             'no la tengo', 'no dispongo'
                                         ):
+                                            # Keep case open for human review; never pretend it is complete.
                                             claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
                                             reply = (
                                                 f"He registrado tu parte con referencia {claim_ref}. "
-                                                f"Faltan documentos obligatorios ({docs}), así que no puedo cerrar "
-                                                f"el expediente automáticamente. Lo he derivado a revisión humana."
+                                                f"Faltan documentos obligatorios ({docs}), así que no puedo "
+                                                f"dar el expediente por completo. Queda en revisión humana "
+                                                f"y puedes aportar la documentación más adelante."
                                             )
                                             claims.save_human_summary(conn, bid, updated_claim)
                                             st.pop('active_claim_ref', None)
@@ -1318,41 +1454,37 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         )
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
+                                    # Evidence complete enough for human package — never auto-notify professionals.
                                     claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                    package = {
+                                        'prepared_at': datetime.now().isoformat(),
+                                        'awaiting_action': 'approve_reject_or_request_more_info',
+                                        'professional_dispatch_allowed': False,
+                                        'coverage_preliminary': status,
+                                        'note': 'La notificación al profesional requiere autorización humana explícita.',
+                                    }
+                                    claims.update_claim(conn, claim['claim_uuid'], review_package=package)
                                     updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
 
-                                    if status == claims.CoverageStatus.SUPPORTED_BY_POLICY and not has_invoices:
-                                        sent = claims.send_service_notification_email(conn, bid, updated_claim)
-                                        if sent:
-                                            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.CLOSED)
-                                            reply = (
-                                                f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
-                                                f"Basándonos en las coberturas explícitas de tu póliza, he enviado una solicitud de asistencia al profesional de {service_type} directamente. Se pondrán en contacto contigo pronto para coordinar la reparación."
-                                            )
-                                        else:
-                                            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
-                                            reply = (
-                                                f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
-                                                f"Como no tenemos un profesional de {service_type} configurado automáticamente para tu zona, he derivado el caso para que un agente lo asigne manualmente. Se pondrán en contacto contigo pronto."
-                                            )
-                                    elif status == claims.CoverageStatus.SUPPORTED_BY_POLICY and has_invoices:
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+                                    if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
                                         reply = (
-                                            f"¡Todo listo! He registrado tu parte de siniestro con referencia {claim_ref}.\n"
-                                            f"He adjuntado las facturas aportadas para que nuestro equipo técnico y pericial evalúe la solicitud de reembolso y se ponga en contacto contigo lo antes posible."
+                                            f"¡Todo listo para revisión humana! He registrado tu parte con referencia {claim_ref}.\n"
+                                            f"La evaluación de cobertura es preliminar. Un agente autorizado revisará el expediente "
+                                            f"antes de cualquier envío a un profesional o decisión de reembolso."
                                         )
                                     else:
-                                        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
                                         reply = (
                                             f"¡Siniestro registrado correctamente con la referencia {claim_ref}!\n"
-                                            f"He enviado toda la documentación a nuestro equipo para su revisión y valoración humana. Nos pondremos en contacto contigo lo antes posible."
+                                            f"He enviado toda la documentación a nuestro equipo para su revisión y valoración humana. "
+                                            f"Nos pondremos en contacto contigo lo antes posible."
                                         )
 
                                     claims.save_human_summary(conn, bid, updated_claim)
                                     st.pop('active_claim_ref', None)
                                     st.pop('awaiting', None)
-                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid']) or updated_claim
-                                    return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value if updated_claim['state'] != 'CLOSED' else ResultKind.POLICY_INFORMATION.value})
+                                    return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
             if just_verified and st.get('question') and not st.get('pending_human'):
                 try:
                     interpretation = orchestrator.interpret(
