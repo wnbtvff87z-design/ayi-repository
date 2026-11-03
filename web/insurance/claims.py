@@ -18,7 +18,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-from insurance import cases, identity, llm
+from insurance import cases, identity, llm, products
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +173,10 @@ class ClaimState:
     INVOICE_RECEIVED = 'INVOICE_RECEIVED'
     ADDITIONAL_DOCUMENTS_REQUIRED = 'ADDITIONAL_DOCUMENTS_REQUIRED'
     MORE_INFO_REQUIRED = 'MORE_INFO_REQUIRED'
+    EVIDENCE_VALIDATION = 'EVIDENCE_VALIDATION'
+    READY_FOR_AUTO_DISPATCH = 'READY_FOR_AUTO_DISPATCH'
+    DISPATCH_PENDING = 'DISPATCH_PENDING'
+    DISPATCHED_TO_PROFESSIONAL = 'DISPATCHED_TO_PROFESSIONAL'
 
 
 # Coverage Statuses
@@ -219,13 +223,42 @@ VALID_TRANSITIONS = {
     },
     ClaimState.INVOICE_REQUESTED: {
         ClaimState.INVOICE_RECEIVED,
+        ClaimState.EVIDENCE_VALIDATION,
+        ClaimState.READY_FOR_AUTO_DISPATCH,
         ClaimState.READY_FOR_HUMAN_REVIEW,
         ClaimState.HUMAN_REVIEW,
         ClaimState.CLOSED,
         ClaimState.MORE_INFO_REQUIRED,
     },
     ClaimState.INVOICE_RECEIVED: {
+        ClaimState.EVIDENCE_VALIDATION,
+        ClaimState.READY_FOR_AUTO_DISPATCH,
         ClaimState.READY_FOR_HUMAN_REVIEW,
+        ClaimState.HUMAN_REVIEW,
+        ClaimState.MORE_INFO_REQUIRED,
+    },
+    ClaimState.EVIDENCE_VALIDATION: {
+        ClaimState.READY_FOR_AUTO_DISPATCH,
+        ClaimState.INVOICE_REQUESTED,
+        ClaimState.PHOTOS_REQUESTED,
+        ClaimState.READY_FOR_HUMAN_REVIEW,
+        ClaimState.HUMAN_REVIEW,
+        ClaimState.MORE_INFO_REQUIRED,
+    },
+    ClaimState.READY_FOR_AUTO_DISPATCH: {
+        ClaimState.DISPATCH_PENDING,
+        ClaimState.READY_FOR_HUMAN_REVIEW,
+        ClaimState.HUMAN_REVIEW,
+        ClaimState.MORE_INFO_REQUIRED,
+    },
+    ClaimState.DISPATCH_PENDING: {
+        ClaimState.DISPATCHED_TO_PROFESSIONAL,
+        ClaimState.READY_FOR_HUMAN_REVIEW,
+        ClaimState.HUMAN_REVIEW,
+        ClaimState.MORE_INFO_REQUIRED,
+    },
+    ClaimState.DISPATCHED_TO_PROFESSIONAL: {
+        ClaimState.CLOSED,
         ClaimState.HUMAN_REVIEW,
         ClaimState.MORE_INFO_REQUIRED,
     },
@@ -236,6 +269,8 @@ VALID_TRANSITIONS = {
         ClaimState.REJECTED,
         ClaimState.MORE_INFO_REQUIRED,
         ClaimState.ADDITIONAL_DOCUMENTS_REQUIRED,
+        ClaimState.READY_FOR_AUTO_DISPATCH,
+        ClaimState.DISPATCH_PENDING,
     },
     ClaimState.HUMAN_REVIEW: {
         ClaimState.APPROVED,
@@ -243,6 +278,8 @@ VALID_TRANSITIONS = {
         ClaimState.CLOSED,
         ClaimState.MORE_INFO_REQUIRED,
         ClaimState.ADDITIONAL_DOCUMENTS_REQUIRED,
+        ClaimState.READY_FOR_AUTO_DISPATCH,
+        ClaimState.DISPATCH_PENDING,
     },
     ClaimState.MORE_INFO_REQUIRED: {
         ClaimState.INFORMATION_GATHERING,
@@ -252,17 +289,23 @@ VALID_TRANSITIONS = {
         ClaimState.PHOTOS_RECEIVED,
         ClaimState.INVOICE_REQUESTED,
         ClaimState.INVOICE_RECEIVED,
+        ClaimState.EVIDENCE_VALIDATION,
+        ClaimState.READY_FOR_AUTO_DISPATCH,
         ClaimState.READY_FOR_HUMAN_REVIEW,
         ClaimState.HUMAN_REVIEW,
     },
     ClaimState.ADDITIONAL_DOCUMENTS_REQUIRED: {
         ClaimState.READY_FOR_HUMAN_REVIEW,
         ClaimState.HUMAN_REVIEW,
+        ClaimState.EVIDENCE_VALIDATION,
     },
     ClaimState.APPROVED: {
         ClaimState.CLOSED,
         ClaimState.ADDITIONAL_DOCUMENTS_REQUIRED,
         ClaimState.HUMAN_REVIEW,
+        ClaimState.READY_FOR_AUTO_DISPATCH,
+        ClaimState.DISPATCH_PENDING,
+        ClaimState.DISPATCHED_TO_PROFESSIONAL,
     },
     ClaimState.REJECTED: set(),
     ClaimState.CLOSED: set(),
@@ -394,13 +437,14 @@ def add_human_agent(conn, business_id, actor_id, token_raw, can_read_cases=True,
     )
 
 
-def add_customer_and_policy(conn, business_id, customer_id, display_name, document, policy_id, product, contract_number):
+def add_customer_and_policy(conn, business_id, customer_id, display_name, document, policy_id, product,
+                            contract_number, vehicle_registration=None):
     from insurance.provision import provision
     provision(
         conn, actor='ops', business_id=business_id, customer_id=customer_id,
         display_name=display_name, document=document, policy_id=policy_id,
         product=product, contract_number=contract_number, version_id='V1',
-        valid_from=date(2025, 1, 1)
+        valid_from=date(2025, 1, 1), vehicle_registration=vehicle_registration,
     )
 
 
@@ -639,6 +683,16 @@ DOCUMENT_TYPES = (
 )
 
 
+class InvoiceValidationStatus:
+    """Extraction ≠ validation. These govern whether a document satisfies evidence rules."""
+    VALIDA = 'VALIDA'
+    INCOMPLETA = 'INCOMPLETA'
+    ILEGIBLE = 'ILEGIBLE'
+    TIPO_DOCUMENTAL_INCORRECTO = 'TIPO_DOCUMENTAL_INCORRECTO'
+    NO_COHERENTE_CON_EL_INCIDENTE = 'NO_COHERENTE_CON_EL_INCIDENTE'
+    PENDIENTE_DE_REVISION_HUMANA = 'PENDIENTE_DE_REVISION_HUMANA'
+
+
 def _clean_llm_str(value):
     if value is None or not isinstance(value, str):
         return None
@@ -646,6 +700,66 @@ def _clean_llm_str(value):
     if not value or value.lower() in ('null', 'none', 'n/a', 'desconocido', 'no especificado'):
         return None
     return value
+
+
+def classify_invoice_validation(fields, *, expected_types=None):
+    """Derive a validation status from extracted fields. Never treats filename as proof."""
+    fields = fields or {}
+    doc_type = fields.get('document_type') or 'ilegible'
+    conf = fields.get('document_type_confidence')
+    coherent = fields.get('coherent_with_incident')
+    expected = set(expected_types or ())
+
+    if doc_type == 'ilegible' or fields.get('error') in (
+        'unreadable_or_empty_document', 'extraction_error'
+    ):
+        return InvoiceValidationStatus.ILEGIBLE, fields.get('reason') or 'Documento ilegible o vacío.'
+
+    if expected and doc_type not in expected:
+        return (
+            InvoiceValidationStatus.TIPO_DOCUMENTAL_INCORRECTO,
+            f"Tipo documental '{doc_type}' no acredita el requisito ({', '.join(sorted(expected))}).",
+        )
+
+    if coherent is False:
+        return (
+            InvoiceValidationStatus.NO_COHERENTE_CON_EL_INCIDENTE,
+            'El documento no es coherente con el incidente declarado.',
+        )
+
+    if conf is not None:
+        try:
+            if float(conf) < 0.45:
+                return (
+                    InvoiceValidationStatus.PENDIENTE_DE_REVISION_HUMANA,
+                    'Confianza insuficiente en la clasificación documental.',
+                )
+        except (TypeError, ValueError):
+            pass
+
+    # A mere company name or amount is not enough to accept a document.
+    if not fields.get('success'):
+        return InvoiceValidationStatus.ILEGIBLE, fields.get('reason') or 'Extracción insuficiente.'
+
+    if not fields.get('is_complete'):
+        return (
+            InvoiceValidationStatus.INCOMPLETA,
+            'Faltan campos obligatorios (emisor, fecha, número e importe).',
+        )
+
+    if doc_type == 'presupuesto' and expected and 'presupuesto' not in expected:
+        return (
+            InvoiceValidationStatus.TIPO_DOCUMENTAL_INCORRECTO,
+            'Un presupuesto no demuestra que el trabajo se haya ejecutado.',
+        )
+
+    if doc_type == 'justificante_pago' and expected and 'justificante_pago' not in expected:
+        return (
+            InvoiceValidationStatus.TIPO_DOCUMENTAL_INCORRECTO,
+            'Un justificante de pago no sustituye automáticamente a una factura.',
+        )
+
+    return InvoiceValidationStatus.VALIDA, None
 
 
 def _empty_invoice_result(error, reason):
@@ -669,6 +783,9 @@ def _empty_invoice_result(error, reason):
         "currency": None,
         "taxes_included": None,
         "related_element": None,
+        "has_logo_or_letterhead": None,
+        "validation_status": InvoiceValidationStatus.ILEGIBLE,
+        "validation_reason": reason,
     }
 
 
@@ -695,7 +812,8 @@ def extract_invoice_with_llm(filename, text_content, incident_description=None, 
             '  "provider": null, "provider_id": null, "date": null, "invoice_number": null,\n'
             '  "work_description": null, "line_items": [], "base_amount": null, "tax_amount": null,\n'
             '  "amount": null, "currency": null, "taxes_included": null, "related_element": null,\n'
-            '  "coherent_with_incident": null, "ocr_text": "texto legible o null"\n'
+            '  "coherent_with_incident": null, "has_logo_or_letterhead": null,\n'
+            '  "ocr_text": "texto legible o null"\n'
             "}"
         )
         user = (
@@ -758,7 +876,8 @@ def extract_invoice_with_llm(filename, text_content, incident_description=None, 
         '  "currency": "EUR"/null,\n'
         '  "taxes_included": true/false/null,\n'
         '  "related_element": "elemento al que corresponde o null",\n'
-        '  "coherent_with_incident": true/false/null\n'
+        '  "coherent_with_incident": true/false/null,\n'
+        '  "has_logo_or_letterhead": true/false/null\n'
         "}"
     )
     messages = [
@@ -845,12 +964,21 @@ def _normalize_invoice_fields(res, filename, source='text_llm'):
         coherent = None
 
     has_meaningful_data = bool(provider or amount is not None or invoice_number or work_desc)
-    is_complete = bool(provider and amount is not None and invoice_number and date_val)
+    # Repair invoices must acredit the work performed (description and/or line items).
+    if doc_type == 'factura_reparacion':
+        has_work = bool(work_desc or cleaned_items)
+        is_complete = bool(provider and amount is not None and invoice_number and date_val and has_work)
+    else:
+        is_complete = bool(provider and amount is not None and invoice_number and date_val)
     if doc_type == 'ilegible':
         has_meaningful_data = False
         is_complete = False
 
-    return {
+    logo = res.get('has_logo_or_letterhead')
+    if not isinstance(logo, bool):
+        logo = None
+
+    out = {
         "success": has_meaningful_data and doc_type != 'ilegible',
         "is_complete": is_complete,
         "document_type": doc_type,
@@ -868,10 +996,15 @@ def _normalize_invoice_fields(res, filename, source='text_llm'):
         "currency": currency or ("EUR" if amount is not None else None),
         "taxes_included": taxes_inc,
         "related_element": _clean_llm_str(res.get('related_element')),
+        "has_logo_or_letterhead": logo,
         "reason": None if has_meaningful_data else "No se detectaron campos suficientes en el documento.",
         "analysis_source": source,
         "filename_meta": filename,
     }
+    status, status_reason = classify_invoice_validation(out)
+    out['validation_status'] = status
+    out['validation_reason'] = status_reason
+    return out
 
 
 # --- DYNAMIC EVIDENCE MATRIX & ACCREDITATION ENGINE ---
@@ -1183,7 +1316,7 @@ def build_evidence_matrix(affected_items, claim_purpose='reclamacion_danios', gl
                 "acceptable_document_types": ["application/pdf", "image/jpeg", "image/png"],
                 "acceptable_alternatives": ["factura_desglosada_de_reparación_con_datos_del_proveedor"],
                 "is_mandatory": True,
-                "reasoning": "Requisito obligatorio para justificar el reembolso de un trabajo ya completado.",
+                "reasoning": "Requisito obligatorio para acreditar un trabajo de reparación ya completado.",
                 "status": RequirementStatus.SOLICITADO,
                 "status_reason": None,
                 "fulfilled_by_file": None,
@@ -1303,59 +1436,82 @@ def evaluate_received_evidence(evidence_matrix, photos, invoices, description=''
                     req['status'] = RequirementStatus.SOLICITADO
 
         elif p_cat == ProofCategory.FACTURA_COMPRA_ORIGINAL:
-            comp_invoices = [
-                inv for inv in invoices
-                if (inv.get('extracted_fields') or {}).get('success')
-                and (inv.get('extracted_fields') or {}).get('document_type') in (
-                    None, 'factura_compra', 'factura_reposicion', 'otro'
-                )
-                and (inv.get('extracted_fields') or {}).get('document_type') != 'presupuesto'
-            ]
-            # Prefer explicitly classified purchase invoices; accept legacy extracts without type.
-            typed = [
-                inv for inv in invoices
-                if (inv.get('extracted_fields') or {}).get('success')
-                and (inv.get('extracted_fields') or {}).get('document_type') == 'factura_compra'
-            ]
-            chosen = typed or comp_invoices
-            wrong = [
-                inv for inv in invoices
-                if (inv.get('extracted_fields') or {}).get('document_type') == 'presupuesto'
-            ]
+            expected = {'factura_compra', 'factura_reposicion'}
+            chosen, wrong, incomplete, incoherent, human = [], [], [], [], []
+            for inv in invoices:
+                fields = inv.get('extracted_fields') or {}
+                status, reason = classify_invoice_validation(fields, expected_types=expected)
+                fields['validation_status'] = status
+                fields['validation_reason'] = reason
+                inv['extracted_fields'] = fields
+                if status == InvoiceValidationStatus.VALIDA:
+                    chosen.append(inv)
+                elif status == InvoiceValidationStatus.TIPO_DOCUMENTAL_INCORRECTO:
+                    wrong.append(inv)
+                elif status == InvoiceValidationStatus.NO_COHERENTE_CON_EL_INCIDENTE:
+                    incoherent.append(inv)
+                elif status == InvoiceValidationStatus.PENDIENTE_DE_REVISION_HUMANA:
+                    human.append(inv)
+                elif status in (InvoiceValidationStatus.INCOMPLETA, InvoiceValidationStatus.ILEGIBLE):
+                    incomplete.append(inv)
             if chosen:
                 req['status'] = RequirementStatus.ACEPTADO
                 req['fulfilled_by_file'] = chosen[0].get('filename')
-                req['status_reason'] = "Documento de compra acreditado."
+                req['status_reason'] = "Documento de compra acreditado y validado."
+            elif incoherent:
+                req['status'] = RequirementStatus.INSUFICIENTE
+                req['fulfilled_by_file'] = incoherent[0].get('filename')
+                req['status_reason'] = incoherent[0]['extracted_fields'].get('validation_reason')
+                req['needs_human_review'] = True
             elif wrong:
                 req['status'] = RequirementStatus.INSUFICIENTE
                 req['fulfilled_by_file'] = wrong[0].get('filename')
-                req['status_reason'] = "Se recibió un presupuesto; no sustituye a una factura de compra."
+                req['status_reason'] = wrong[0]['extracted_fields'].get('validation_reason') or (
+                    "Se recibió un documento que no sustituye a una factura de compra."
+                )
+            elif incomplete:
+                f = incomplete[0].get('extracted_fields') or {}
+                req['status'] = (
+                    RequirementStatus.ILEGIBLE
+                    if f.get('validation_status') == InvoiceValidationStatus.ILEGIBLE
+                    else RequirementStatus.INSUFICIENTE
+                )
+                req['fulfilled_by_file'] = incomplete[0].get('filename')
+                req['status_reason'] = f.get('validation_reason') or 'Factura de compra incompleta o ilegible.'
+            elif human:
+                req['status'] = RequirementStatus.PENDIENTE_REVISION
+                req['needs_human_review'] = True
+                req['fulfilled_by_file'] = human[0].get('filename')
+                req['status_reason'] = human[0]['extracted_fields'].get('validation_reason')
             elif any(kw in desc_lower for kw in ('comprad', 'año', 'modelo', 'marca', 'antigüedad', 'antiguedad', 'precio')):
                 req['status'] = RequirementStatus.PENDIENTE_REVISION
                 req['needs_human_review'] = True
-                req['status_reason'] = "Alternativa documental registrada (declaración de características, marca y modelo); pendiente de revisión pericial por ausencia de factura original."
+                req['status_reason'] = (
+                    "Alternativa documental registrada (declaración de características, marca y modelo); "
+                    "pendiente de revisión pericial por ausencia de factura original."
+                )
             else:
                 if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
                     req['status'] = RequirementStatus.SOLICITADO
 
         elif p_cat == ProofCategory.FACTURA_REPARACION:
-            repair_invs = []
-            failed_invs = []
-            wrong_type = []
-
+            expected = {'factura_reparacion'}
+            repair_invs, failed_invs, wrong_type, incoherent, human = [], [], [], [], []
             for inv in invoices:
                 fields = inv.get('extracted_fields') or {}
-                doc_type = fields.get('document_type')
-                if doc_type == 'presupuesto':
-                    wrong_type.append(inv)
-                    continue
-                if doc_type in ('factura_compra',) and doc_type != 'factura_reparacion':
-                    # Purchase invoice does not prove repair work.
-                    wrong_type.append(inv)
-                    continue
-                if fields.get('success') and doc_type in (None, 'factura_reparacion', 'otro'):
+                status, reason = classify_invoice_validation(fields, expected_types=expected)
+                fields['validation_status'] = status
+                fields['validation_reason'] = reason
+                inv['extracted_fields'] = fields
+                if status == InvoiceValidationStatus.VALIDA:
                     repair_invs.append(inv)
-                elif fields.get('success') is False:
+                elif status == InvoiceValidationStatus.TIPO_DOCUMENTAL_INCORRECTO:
+                    wrong_type.append(inv)
+                elif status == InvoiceValidationStatus.NO_COHERENTE_CON_EL_INCIDENTE:
+                    incoherent.append(inv)
+                elif status == InvoiceValidationStatus.PENDIENTE_DE_REVISION_HUMANA:
+                    human.append(inv)
+                else:
                     failed_invs.append(inv)
 
             if repair_invs:
@@ -1366,19 +1522,36 @@ def evaluate_received_evidence(evidence_matrix, photos, invoices, description=''
                     f"Factura de reparación válida (Proveedor: {f_fields.get('provider') or 'N/A'}, "
                     f"Importe: {f_fields.get('amount')} {f_fields.get('currency') or ''})."
                 )
+            elif incoherent:
+                req['status'] = RequirementStatus.INSUFICIENTE
+                req['needs_human_review'] = True
+                req['fulfilled_by_file'] = incoherent[0].get('filename')
+                req['status_reason'] = incoherent[0]['extracted_fields'].get('validation_reason')
             elif wrong_type:
                 wfields = wrong_type[0].get('extracted_fields') or {}
                 req['status'] = RequirementStatus.INSUFICIENTE
                 req['fulfilled_by_file'] = wrong_type[0].get('filename')
-                req['status_reason'] = (
+                req['status_reason'] = wfields.get('validation_reason') or (
                     f"El documento clasificado como '{wfields.get('document_type')}' no acredita "
                     f"una factura de reparación del trabajo declarado."
                 )
+            elif human:
+                req['status'] = RequirementStatus.PENDIENTE_REVISION
+                req['needs_human_review'] = True
+                req['fulfilled_by_file'] = human[0].get('filename')
+                req['status_reason'] = human[0]['extracted_fields'].get('validation_reason')
             elif failed_invs:
-                err_reason = failed_invs[0].get('extracted_fields', {}).get(
-                    'reason', 'Factura ilegible o sin campos mínimos de proveedor/importe.'
+                err_reason = (failed_invs[0].get('extracted_fields') or {}).get(
+                    'validation_reason'
+                ) or (failed_invs[0].get('extracted_fields') or {}).get(
+                    'reason', 'Factura ilegible o incompleta.'
                 )
-                req['status'] = RequirementStatus.INSUFICIENTE
+                fstat = (failed_invs[0].get('extracted_fields') or {}).get('validation_status')
+                req['status'] = (
+                    RequirementStatus.ILEGIBLE
+                    if fstat == InvoiceValidationStatus.ILEGIBLE
+                    else RequirementStatus.INSUFICIENTE
+                )
                 req['fulfilled_by_file'] = failed_invs[0].get('filename')
                 req['status_reason'] = f"Documento de reparación insuficiente o ilegible: {err_reason}"
             else:
@@ -1386,62 +1559,72 @@ def evaluate_received_evidence(evidence_matrix, photos, invoices, description=''
                     req['status'] = RequirementStatus.SOLICITADO
 
         elif p_cat == ProofCategory.FACTURA_REPOSICION:
-            repl_invs = [
-                inv for inv in invoices
-                if (inv.get('extracted_fields') or {}).get('success')
-                and (inv.get('extracted_fields') or {}).get('document_type') in (
-                    None, 'factura_reposicion', 'factura_compra', 'otro'
-                )
-                and (inv.get('extracted_fields') or {}).get('document_type') != 'presupuesto'
-            ]
+            expected = {'factura_reposicion', 'factura_compra'}
+            repl_invs = []
+            for inv in invoices:
+                fields = inv.get('extracted_fields') or {}
+                status, reason = classify_invoice_validation(fields, expected_types=expected)
+                fields['validation_status'] = status
+                fields['validation_reason'] = reason
+                inv['extracted_fields'] = fields
+                if status == InvoiceValidationStatus.VALIDA:
+                    repl_invs.append(inv)
             if repl_invs:
                 req['status'] = RequirementStatus.ACEPTADO
                 req['fulfilled_by_file'] = repl_invs[0].get('filename')
-                req['status_reason'] = "Factura de reposición/sustitución del bien acreditada."
+                req['status_reason'] = "Factura de reposición/sustitución del bien acreditada y validada."
             else:
                 if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
                     req['status'] = RequirementStatus.SOLICITADO
 
         elif p_cat == ProofCategory.JUSTIFICANTE_PAGO:
-            paid_invs = [
-                inv for inv in invoices
-                if (inv.get('extracted_fields') or {}).get('success') and (
-                    (inv.get('extracted_fields') or {}).get('document_type') == 'justificante_pago'
-                    or (inv.get('extracted_fields') or {}).get('taxes_included') is not None
-                    or 'pagad' in str(inv).lower()
-                    or 'cobrad' in str(inv).lower()
-                    or 'recibo' in str(inv).lower()
-                )
-            ]
+            expected = {'justificante_pago'}
+            paid_invs = []
+            for inv in invoices:
+                fields = inv.get('extracted_fields') or {}
+                # Explicit justificante type preferred; do not infer from keywords alone.
+                if fields.get('document_type') != 'justificante_pago':
+                    continue
+                status, reason = classify_invoice_validation(fields, expected_types=expected)
+                fields['validation_status'] = status
+                fields['validation_reason'] = reason
+                inv['extracted_fields'] = fields
+                if status == InvoiceValidationStatus.VALIDA:
+                    paid_invs.append(inv)
             if paid_invs:
                 req['status'] = RequirementStatus.ACEPTADO
                 req['fulfilled_by_file'] = paid_invs[0].get('filename')
-                req['status_reason'] = "Pago acreditado mediante justificante o anotación en documento."
+                req['status_reason'] = "Pago acreditado mediante justificante validado."
             else:
                 if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
                     req['status'] = RequirementStatus.SOLICITADO
 
         elif p_cat == ProofCategory.PRESUPUESTO:
-            est_invs = [
-                inv for inv in invoices
-                if (inv.get('extracted_fields') or {}).get('document_type') == 'presupuesto'
-                or (
-                    (inv.get('extracted_fields') or {}).get('amount') is not None
-                    and (inv.get('extracted_fields') or {}).get('document_type') in (None, 'presupuesto')
-                )
-            ]
-            repair_confused = [
-                inv for inv in invoices
-                if (inv.get('extracted_fields') or {}).get('document_type') == 'factura_reparacion'
-            ]
+            expected = {'presupuesto'}
+            est_invs, repair_confused = [], []
+            for inv in invoices:
+                fields = inv.get('extracted_fields') or {}
+                doc_type = fields.get('document_type')
+                if doc_type == 'factura_reparacion':
+                    repair_confused.append(inv)
+                    continue
+                status, reason = classify_invoice_validation(fields, expected_types=expected)
+                fields['validation_status'] = status
+                fields['validation_reason'] = reason
+                inv['extracted_fields'] = fields
+                if status == InvoiceValidationStatus.VALIDA:
+                    est_invs.append(inv)
             if est_invs:
                 req['status'] = RequirementStatus.ACEPTADO
                 req['fulfilled_by_file'] = est_invs[0].get('filename')
-                req['status_reason'] = "Presupuesto formal acreditado."
+                req['status_reason'] = "Presupuesto formal acreditado y validado."
             elif repair_confused:
                 req['status'] = RequirementStatus.INSUFICIENTE
                 req['fulfilled_by_file'] = repair_confused[0].get('filename')
-                req['status_reason'] = "Se recibió una factura de reparación; se necesita un presupuesto cuando el trabajo aún no está autorizado/ejecutado."
+                req['status_reason'] = (
+                    "Se recibió una factura de reparación; se necesita un presupuesto cuando el "
+                    "trabajo aún no está autorizado/ejecutado."
+                )
             else:
                 if req.get('status') not in (RequirementStatus.ACEPTADO, RequirementStatus.PENDIENTE_REVISION):
                     req['status'] = RequirementStatus.SOLICITADO
@@ -1469,11 +1652,13 @@ def get_pending_matrix_requirements(evidence_matrix):
 
 def get_blocking_mandatory_requirements(evidence_matrix):
     """
-    Mandatory documentary requirements that must block auto-closure / auto-dispatch.
+    Mandatory documentary requirements that block conversational completion of the claim.
 
     Photos/videos are collected conversationally (and may be waived with "no tengo");
     contractual coverage is resolved separately. Optional purchase-invoice alternatives in
     PENDIENTE_REVISION never block. Repair/replacement invoices and estimates do.
+
+    Auto-dispatch uses requirements_blocking_auto_dispatch(), which is stricter on photos.
     """
     blocking_statuses = (
         RequirementStatus.SOLICITADO,
@@ -1493,6 +1678,23 @@ def get_blocking_mandatory_requirements(evidence_matrix):
         and req.get('status') in blocking_statuses
         and req.get('proof_category') not in non_blocking_categories
     ]
+
+
+def requirements_blocking_auto_dispatch(evidence_matrix):
+    """Mandatory evidence that is not ACEPTADO blocks automatic professional dispatch."""
+    out = []
+    for req in evidence_matrix or []:
+        if not req.get('is_mandatory'):
+            continue
+        cat = req.get('proof_category')
+        if cat in ('cobertura_contractual', ProofCategory.COMPROBACION_TECNICA):
+            continue
+        if cat == ProofCategory.FACTURA_COMPRA_ORIGINAL and req.get('status') == RequirementStatus.PENDIENTE_REVISION:
+            # Optional purchase alternative pending human review does not block dispatch of repair.
+            continue
+        if req.get('status') != RequirementStatus.ACEPTADO:
+            out.append(req)
+    return out
 
 
 def _failed_interpretation(description, error_code, missing_info=None):
@@ -1699,7 +1901,7 @@ def verify_policy_for_claim(conn, business_id, customer_id, policy_id, fact_date
         return False, None, 'policy_not_found_or_unauthorized'
     if not row['active']:
         return False, None, 'customer_inactive'
-    if row['product'] != 'hogar':
+    if not products.is_home_product(row['product']):
         return False, None, 'unsupported_product'
 
     # Check active authorization
@@ -2430,11 +2632,116 @@ def request_more_info_from_review(conn, business_id, claim_ref_or_uuid, *, actor
     return get_claim(conn, business_id, claim['claim_uuid'])
 
 
-def send_service_notification_email(conn, business_id, claim, *, require_authorization=True):
+def auto_dispatch_readiness(conn, business_id, claim):
+    """Check conditions for automatic professional email (no universal human gate).
+
+    Returns (ready: bool, reason_code: str|None, context: dict).
+    """
+    check_claims_readiness(conn)
+    claim = claim or {}
+    eval_data = claim.get('coverage_evaluation') or {}
+    interp = claim.get('structured_interpretation') or {}
+    ctx = {'service_type': eval_data.get('service_type'), 'dest_email': None}
+
+    if not claim.get('customer_id') or not claim.get('policy_id'):
+        return False, 'identity_or_policy_missing', ctx
+    if interp.get('interpretation_failed'):
+        return False, 'incident_interpretation_failed', ctx
+    if not interp.get('primary_service') and not eval_data.get('service_type'):
+        return False, 'incident_ambiguous', ctx
+    if eval_data.get('status') != CoverageStatus.SUPPORTED_BY_POLICY:
+        return False, 'coverage_not_confirmed', ctx
+    blocking = requirements_blocking_auto_dispatch(claim.get('evidence_matrix') or [])
+    if blocking:
+        ctx['blocking'] = [
+            {'proof_category': r.get('proof_category'), 'status': r.get('status')}
+            for r in blocking[:8]
+        ]
+        return False, 'mandatory_evidence_incomplete', ctx
+    service_type = eval_data.get('service_type')
+    if not service_type:
+        return False, 'service_type_missing', ctx
+    dest_email, prof, source = get_service_professional_recipient(conn, business_id, service_type)
+    ctx.update(dest_email=dest_email, recipient_source=source, professional=prof)
+    if not dest_email:
+        return False, 'recipient_not_configured', ctx
+
+    # Contact / address: prefer customer columns when present; incomplete → human exception.
+    phone = address = None
+    try:
+        crow = conn.execute(
+            'SELECT phone, address, display_name FROM insurance_customers '
+            'WHERE business_id=%s AND customer_id=%s',
+            (business_id, claim.get('customer_id')),
+        ).fetchone()
+        if crow:
+            phone, address = crow.get('phone'), crow.get('address')
+            ctx['customer_name'] = crow.get('display_name')
+    except Exception:
+        pass
+    ctx['customer_phone'] = phone
+    ctx['risk_address'] = address
+    # If schema exposes contact fields and both are empty, block auto-dispatch.
+    # When columns are absent (legacy), do not invent data but allow dispatch.
+    try:
+        cols = {
+            r['column_name']
+            for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='insurance_customers' AND column_name IN ('phone','address')"
+            ).fetchall()
+        }
+        if 'phone' in cols and 'address' in cols and not (phone and address):
+            return False, 'contact_or_address_incomplete', ctx
+    except Exception:
+        pass
+
+    # Unanalyzed videos that were offered as evidence and are the only media → block.
+    photos = claim.get('photos') or []
+    only_unanalyzed_video = photos and all(
+        (p.get('analysis') or {}).get('analysis_source') == 'video_not_supported_p0'
+        or (
+            (p.get('mimetype') or '').startswith('video/')
+            and (p.get('analysis') or {}).get('valid') is not True
+        )
+        for p in photos
+    )
+    if only_unanalyzed_video:
+        return False, 'video_not_analyzed', ctx
+
+    return True, None, ctx
+
+
+def try_auto_dispatch_professional(conn, business_id, claim):
+    """Send professional email automatically when readiness conditions hold.
+
+    Human authorization is NOT required. On failure or unreadiness, returns
+    (False, reason) so the caller can route to human review.
+    """
+    ready, reason, ctx = auto_dispatch_readiness(conn, business_id, claim)
+    if not ready:
+        return False, reason, ctx
+    update_claim(conn, claim['claim_uuid'], state=ClaimState.READY_FOR_AUTO_DISPATCH)
+    update_claim(conn, claim['claim_uuid'], state=ClaimState.DISPATCH_PENDING)
+    refreshed = get_claim(conn, business_id, claim['claim_uuid'])
+    sent = send_service_notification_email(
+        conn, business_id, refreshed, require_authorization=False, dispatch_mode='automatic',
+    )
+    if sent:
+        update_claim(conn, claim['claim_uuid'], state=ClaimState.DISPATCHED_TO_PROFESSIONAL)
+        return True, None, ctx
+    details = (get_claim(conn, business_id, claim['claim_uuid']) or {}).get('service_notification_details') or {}
+    return False, details.get('reason') or details.get('status') or 'dispatch_failed', ctx
+
+
+def send_service_notification_email(conn, business_id, claim, *, require_authorization=False,
+                                    dispatch_mode='automatic'):
     """
     Prepares and sends email to assigned professional.
-    Requires explicit human authorization (unless require_authorization=False for legacy tests —
-    production dialog always keeps the default True).
+
+    Business rule: human authorization is NOT universally required. Automatic dispatch
+    proceeds when coverage and mandatory evidence are validated. Set
+    require_authorization=True for the admin authorize-then-send exception path.
     Never uses a hardcoded personal mailbox as emergency recipient.
     """
     check_claims_readiness(conn)
@@ -2502,6 +2809,20 @@ def send_service_notification_email(conn, business_id, claim, *, require_authori
                 "attempted_at": datetime.now().isoformat(),
             })
             return False
+    elif dispatch_mode == 'automatic':
+        ready, reason, _ctx = auto_dispatch_readiness(conn, business_id, claim)
+        if not ready:
+            log.warning(
+                "Automatic service notification blocked for claim %s: %s",
+                claim.get('claim_ref'), reason,
+            )
+            update_claim(conn, claim['claim_uuid'], service_notified=False, service_notification_details={
+                "status": "BLOCKED",
+                "reason": reason or "AUTO_DISPATCH_NOT_READY",
+                "service_type": service_type,
+                "attempted_at": datetime.now().isoformat(),
+            })
+            return False
 
     customer_name = None
     customer_phone = None
@@ -2528,30 +2849,54 @@ def send_service_notification_email(conn, business_id, claim, *, require_authori
         except Exception:
             pass
 
+    policy_product = None
+    try:
+        prow = conn.execute(
+            'SELECT product, contract_number FROM insurance_policies '
+            'WHERE business_id=%s AND policy_id=%s',
+            (business_id, claim.get('policy_id')),
+        ).fetchone()
+        if prow:
+            policy_product = prow.get('product')
+            contract_number = prow.get('contract_number')
+        else:
+            contract_number = None
+    except Exception:
+        contract_number = None
+
     subject = f"[{claim['claim_ref']}] Solicitud de asistencia por {service_type.capitalize()}"
     prof_name = prof.get('name') if prof else f"Profesional de {service_type.capitalize()}"
     interp = claim.get('structured_interpretation') or {}
+    dispatch_label = (
+        "Notificación automática tras validación de cobertura y evidencias"
+        if dispatch_mode == 'automatic' and not require_authorization
+        else "Notificación autorizada por gestor humano"
+    )
 
     body_lines = [
         f"Estimado/a {prof_name},",
         "",
-        f"Autorización humana recibida para notificar asistencia del siniestro {claim['claim_ref']}.",
+        f"{dispatch_label} del siniestro {claim['claim_ref']}.",
         "",
         "Datos del asegurado / actuación:",
         f"- Nombre: {customer_name or '[no disponible en sistema]'}",
         f"- Teléfono: {customer_phone or '[no disponible en sistema]'}",
         f"- Dirección del riesgo/trabajo: {risk_address or '[no disponible en sistema]'}",
         f"- Referencia siniestro: {claim['claim_ref']}",
-        f"- Póliza: {claim.get('policy_id')}",
+        f"- Tipo de póliza: {policy_product or 'hogar'}",
+        f"- Póliza / referencia: {claim.get('policy_id')}"
+        + (f" (contrato {contract_number})" if contract_number else ""),
         f"- Canal: {claim.get('channel')}",
         "",
         "Resumen práctico del incidente:",
         f"- Declaración del cliente: {claim.get('original_description')}",
-        f"- Interpretación IA: {interp.get('what_happened') or interp.get('primary_service') or '[n/d]'}",
+        f"- Interpretación: {interp.get('what_happened') or interp.get('primary_service') or '[n/d]'}",
         f"- Zona afectada: {interp.get('affected_zone') or '[n/d]'}",
+        f"- Daños identificados: {', '.join(interp.get('described_damages') or []) or '[n/d]'}",
+        f"- Trabajo aparente: {interp.get('intervention_type') or service_type}",
         f"- Causa conocida/posible: {interp.get('known_or_possible_cause') or '[n/d]'}",
-        f"- Evaluación preliminar de cobertura: {(claim.get('coverage_evaluation') or {}).get('status')}",
-        f"- Fundamento preliminar: {(claim.get('coverage_evaluation') or {}).get('explanation')}",
+        f"- Evaluación de cobertura: {(claim.get('coverage_evaluation') or {}).get('status')}",
+        f"- Fundamento: {(claim.get('coverage_evaluation') or {}).get('explanation')}",
         "",
         "Trabajos previos / aspectos a comprobar:",
     ]
@@ -2819,18 +3164,19 @@ def build_human_summary(conn, business_id, claim):
     auth = claim.get('dispatch_authorization') or {}
     summary_lines.extend([
         "",
-        "8. AUTORIZACIÓN HUMANA DE ENVÍO AL PROFESIONAL:",
-        f"  - Autorizado: {'SÍ' if auth.get('authorized') and not auth.get('revoked') else 'NO'}",
-        f"  - Actor: {auth.get('actor_id') or '[pendiente]'}",
-        f"  - Destinatario autorizado: {auth.get('dest_email') or '[pendiente]'}",
-        f"  - Servicio autorizado: {auth.get('service_type') or '[pendiente]'}",
-        f"  - Huella de autorización: {auth.get('fingerprint') or '[n/d]'}",
-        f"  - Notas: {auth.get('notes') or '[ninguna]'}",
+        "8. ENVÍO AL PROFESIONAL (AUTOMÁTICO O EXCEPCIÓN HUMANA):",
+        f"  - Notificado: {'SÍ' if claim.get('service_notified') else 'NO'}",
+        f"  - Autorización humana excepcional: {'SÍ' if auth.get('authorized') and not auth.get('revoked') else 'NO'}",
+        f"  - Actor (si hubo revisión): {auth.get('actor_id') or '[n/d]'}",
+        f"  - Destinatario: {auth.get('dest_email') or notif_data.get('sent_to') or '[pendiente]'}",
+        f"  - Servicio: {auth.get('service_type') or eval_data.get('service_type') or '[pendiente]'}",
+        f"  - Notas de revisión: {auth.get('notes') or '[ninguna]'}",
         "",
         "9. LÍMITES DE PROCESAMIENTO Y ACCIÓN REQUERIDA:",
-        "  - Aviso legal: La evaluación de cobertura automatizada es informativa y preliminar.",
-        "  - La autorización final de pago, indemnización o envío al profesional requiere conformidad humana explícita.",
-        "  - Acción del revisor: aprobar envío (authorize-dispatch), solicitar más información, o rechazar.",
+        "  - Aviso: la evaluación de cobertura automatizada es preliminar.",
+        "  - El envío al profesional NO implica autorización de pago, reembolso ni indemnización.",
+        "  - Revisión humana solo ante excepciones (evidencias dudosas, cobertura ambigua, sin profesional, errores).",
+        "  - Acción del revisor si aplica: authorize-dispatch, solicitar más información, o rechazar.",
         "=================================================================="
     ])
 
