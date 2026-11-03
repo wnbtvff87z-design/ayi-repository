@@ -56,7 +56,16 @@ ATTRIBUTION_STATES = {
 }
 
 
-AIRTABLE_PRODUCTS = {'vida': 'Vida', 'hogar': 'Hogar', 'auto': 'Auto', 'coche': 'Auto'}
+AIRTABLE_PRODUCTS = {
+    'vida': 'Vida',
+    'hogar': 'Hogar',
+    'auto': 'Auto',
+    'coche': 'Auto',
+    'automovil': 'Auto',
+    'automóvil': 'Auto',
+    'moto': 'Moto',
+    'motocicleta': 'Moto',
+}
 AIRTABLE_URGENCIES = {'normal': 'Normal', 'high': 'Alta', 'critical': 'Crítica'}
 AIRTABLE_STATUSES = {'pending': 'Pendiente', 'resolved': 'Resuelto'}
 

@@ -1,7 +1,7 @@
 """Authorized contractual metadata, independent of document readiness and the model."""
 import re
 
-from insurance import references, retrieval
+from insurance import products, references, retrieval
 
 PAGE_SIZE = 5
 
@@ -21,11 +21,24 @@ def list_action(text):
     return None
 
 
+def _policy_select_sql():
+    # vehicle_registration is optional (added in migration 018); fall back if absent.
+    return (
+        'SELECT p.policy_id,p.product,p.contract_number,'
+        'p.vehicle_registration,p.vehicle_registration_normalized '
+        'FROM insurance_policies p WHERE '
+    )
+
+
 def authorized_page(conn, bid, customer_id, offset=0):
-    rows = conn.execute(
-        'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
-        + retrieval.AUTHORIZED + ' ORDER BY p.policy_id LIMIT %s OFFSET %s',
-        (bid, customer_id, PAGE_SIZE + 1, max(0, offset))).fetchall()
+    sql = _policy_select_sql() + retrieval.AUTHORIZED + ' ORDER BY p.policy_id LIMIT %s OFFSET %s'
+    try:
+        rows = conn.execute(sql, (bid, customer_id, PAGE_SIZE + 1, max(0, offset))).fetchall()
+    except Exception:
+        rows = conn.execute(
+            'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+            + retrieval.AUTHORIZED + ' ORDER BY p.policy_id LIMIT %s OFFSET %s',
+            (bid, customer_id, PAGE_SIZE + 1, max(0, offset))).fetchall()
     return [dict(row) for row in rows[:PAGE_SIZE]], len(rows) > PAGE_SIZE
 
 
@@ -54,11 +67,18 @@ def offer(conn, scope, state, action='list'):
          'contract_number': row.get('contract_number')} for row in rows]
     if not rows:
         return 'No he podido confirmar una póliza autorizada para esta consulta.'
-    lines = ['Para continuar, selecciona la póliza correspondiente indicando el producto o su posición en la lista:']
+    lines = ['Para continuar, selecciona la póliza correspondiente indicando el producto, la matrícula o su posición en la lista:']
     for n, row in enumerate(rows, 1):
-        prod = str(row.get('product') or 'Producto no registrado').capitalize()
+        prod_code = products.normalize_product_or_none(row.get('product')) or row.get('product')
+        prod = products.product_label(prod_code).capitalize()
         mask = mask_contract_number(row.get('contract_number'))
-        lines.append(f"{n}. {prod} — {mask}")
+        plate = row.get('vehicle_registration')
+        if products.is_vehicle_product(prod_code) and plate:
+            lines.append(f"{n}. {prod} — matrícula {plate} — {mask}")
+        elif products.is_vehicle_product(prod_code):
+            lines.append(f"{n}. {prod} — matrícula no registrada — {mask}")
+        else:
+            lines.append(f"{n}. {prod} — {mask}")
     if more:
         lines.append('Di «siguiente» para ver más pólizas.')
     if offset:
@@ -81,13 +101,41 @@ def selection(conn, scope, state, text, number=None):
         if ordinal > len(options):
             return None
         number = options[ordinal - 1]
-    rows = conn.execute(
-        'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
-        + retrieval.AUTHORIZED +
-        ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s) '
-        "OR translate(lower(normalize(p.product,NFC)),'áéíóúüñ','aeiouun')=lower(%s)) "
-        'ORDER BY p.policy_id LIMIT 2',
-        (scope.bid, scope.customer_id, number or candidate, number or candidate, candidate)).fetchall()
+    plate_candidate = candidate
+    _, plate_norm = products.normalize_vehicle_registration(text)
+    params_base = (scope.bid, scope.customer_id, number or candidate, number or candidate, candidate)
+    try:
+        rows = conn.execute(
+            _policy_select_sql() + retrieval.AUTHORIZED +
+            ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s) '
+            "OR translate(lower(normalize(p.product,NFC)),'áéíóúüñ','aeiouun')=lower(%s) "
+            'OR (p.vehicle_registration_normalized IS NOT NULL AND p.vehicle_registration_normalized=%s) '
+            'OR (p.vehicle_registration IS NOT NULL AND lower(p.vehicle_registration)=lower(%s))) '
+            'ORDER BY p.policy_id LIMIT 2',
+            params_base + (plate_norm or plate_candidate.upper().replace(' ', ''), number or candidate),
+        ).fetchall()
+    except Exception:
+        rows = conn.execute(
+            'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+            + retrieval.AUTHORIZED +
+            ' AND (lower(p.policy_id)=lower(%s) OR lower(p.contract_number)=lower(%s) '
+            "OR translate(lower(normalize(p.product,NFC)),'áéíóúüñ','aeiouun')=lower(%s)) "
+            'ORDER BY p.policy_id LIMIT 2',
+            params_base).fetchall()
+    # Also allow selecting by product aliases (coche → auto).
+    if not rows:
+        alias = products.normalize_product_or_none(candidate)
+        if alias:
+            try:
+                rows = conn.execute(
+                    _policy_select_sql() + retrieval.AUTHORIZED +
+                    ' AND p.product=%s ORDER BY p.policy_id LIMIT 2',
+                    (scope.bid, scope.customer_id, alias)).fetchall()
+            except Exception:
+                rows = conn.execute(
+                    'SELECT p.policy_id,p.product,p.contract_number FROM insurance_policies p WHERE '
+                    + retrieval.AUTHORIZED + ' AND p.product=%s ORDER BY p.policy_id LIMIT 2',
+                    (scope.bid, scope.customer_id, alias)).fetchall()
     if len(rows) > 1:
         return {'reason_code': 'multiple_policies'}
     return dict(rows[0]) if rows else None

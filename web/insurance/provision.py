@@ -18,14 +18,15 @@ import sys
 from datetime import date
 
 from insurance import cases as _cases
-from insurance import identity, storage
+from insurance import identity, products, storage
 from insurance.documents import ID_RE, RegistrationError, register_existing_object
 from insurance.master_sync import ensure_hmac_key, revoke_customer
 
 
 def provision(conn, *, actor, business_id, customer_id, display_name, document, policy_id, product,
               version_id, valid_from, valid_to=None, contract_number=None, full_name=None,
-              document_id=None, sha256=None, given_name=None, first_surname=None):
+              document_id=None, sha256=None, given_name=None, first_surname=None,
+              vehicle_registration=None):
     for label, v in (('business_id', business_id), ('customer_id', customer_id),
                      ('policy_id', policy_id), ('version_id', version_id)):
         if not isinstance(v, str) or not ID_RE.fullmatch(v):
@@ -37,6 +38,11 @@ def provision(conn, *, actor, business_id, customer_id, display_name, document, 
     if not identity.document_hmac(business_id, document) or not identity.name_hmac(
             business_id, full_name or display_name):
         raise ValueError('INSURANCE_CASE_HMAC_KEY (>=32 bytes), a document and name+surname are required')
+    try:
+        product = products.normalize_product(product, allow_unknown=True)
+    except products.UnknownProductError as exc:
+        raise ValueError(str(exc) or 'invalid_product') from exc
+    plate_original, plate_norm = products.normalize_vehicle_registration(vehicle_registration)
     ensure_hmac_key(conn, business_id)
     if conn.execute(
             'SELECT 1 FROM insurance_customers WHERE business_id=%s AND document_hmac=%s '
@@ -67,11 +73,24 @@ def provision(conn, *, actor, business_id, customer_id, display_name, document, 
         revoke_customer(conn, business_id, customer_id)
     identity.upsert_customer(conn, business_id, customer_id, display_name, document, full_name,
                              given_name, first_surname)
-    conn.execute(
-        'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) '
-        'VALUES(%s,%s,%s,%s,%s) ON CONFLICT (business_id,policy_id) DO UPDATE SET '
-        'customer_id=EXCLUDED.customer_id,product=EXCLUDED.product,contract_number=EXCLUDED.contract_number',
-        (business_id, policy_id, customer_id, product, contract_number))
+    try:
+        conn.execute(
+            'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number,'
+            'vehicle_registration,vehicle_registration_normalized) '
+            'VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (business_id,policy_id) DO UPDATE SET '
+            'customer_id=EXCLUDED.customer_id,product=EXCLUDED.product,'
+            'contract_number=EXCLUDED.contract_number,'
+            'vehicle_registration=COALESCE(EXCLUDED.vehicle_registration, insurance_policies.vehicle_registration),'
+            'vehicle_registration_normalized=COALESCE(EXCLUDED.vehicle_registration_normalized, '
+            'insurance_policies.vehicle_registration_normalized)',
+            (business_id, policy_id, customer_id, product, contract_number, plate_original, plate_norm))
+    except Exception:
+        # Pre-migration schemas without vehicle_registration columns remain usable.
+        conn.execute(
+            'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) '
+            'VALUES(%s,%s,%s,%s,%s) ON CONFLICT (business_id,policy_id) DO UPDATE SET '
+            'customer_id=EXCLUDED.customer_id,product=EXCLUDED.product,contract_number=EXCLUDED.contract_number',
+            (business_id, policy_id, customer_id, product, contract_number))
     conn.execute(
         'INSERT INTO insurance_policy_versions(business_id,policy_id,version_id,valid_from,valid_to) '
         'VALUES(%s,%s,%s,%s,%s) ON CONFLICT (business_id,policy_id,version_id) DO UPDATE SET '

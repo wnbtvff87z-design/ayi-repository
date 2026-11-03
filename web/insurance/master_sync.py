@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import requests
 
-from insurance import identity, storage
+from insurance import identity, products, storage
 from insurance.documents import ID_RE
 
 
@@ -27,10 +27,15 @@ REQUIRED = {
 }
 OPTIONAL = {
     'customers': {'id', 'given_name', 'first_surname'},
-    'policies': {'id', 'authorization_from', 'authorization_to'},
+    'policies': {'id', 'authorization_from', 'authorization_to', 'vehicle_registration'},
     'versions': {'id', 'valid_to'},
     'documents': {'id'},
 }
+
+# Recommended Airtable field types (documentation / ops; not enforced by API shape alone):
+# - active: Single Select with options active|inactive (Checkbox also accepted when explicitly true/false)
+# - authorized: Single Select with options granted|revoked (Checkbox also accepted when explicitly true/false)
+# Missing required boolean fields fail closed; absence is never treated as authorized/active.
 
 
 def _fingerprint(business_id):
@@ -172,10 +177,26 @@ def stable_id(config, entity, record_id):
 
 
 def _boolean(value):
-    if value is True or value in ('true', 'active', 'granted'):
+    """Parse Airtable Single Select / Checkbox / string flags. Never default missing → True.
+
+    Accepted truths: True, 'true', 'active', 'granted' (case-insensitive), and checkbox checked.
+    Accepted falses: False, 'false', 'inactive', 'revoked' (case-insensitive), and checkbox unchecked
+    when the API returns an explicit false (not when the field is omitted — omission is handled
+    upstream as required_field_missing).
+    """
+    if value is True:
         return True
-    if value is False or value in ('false', 'inactive', 'revoked'):
+    if value is False:
         return False
+    if isinstance(value, (int, float)) and value in (0, 1) and type(value) is not bool:
+        # Reject bare numerics — they are ambiguous for authorization.
+        raise MasterSyncError('explicit_boolean_required')
+    if isinstance(value, str):
+        folded = value.strip().casefold()
+        if folded in ('true', 'active', 'granted', 'yes', 'sí', 'si'):
+            return True
+        if folded in ('false', 'inactive', 'revoked', 'no'):
+            return False
     raise MasterSyncError('explicit_boolean_required')
 
 
@@ -247,12 +268,30 @@ def prepare_snapshot(config, snapshot):
                     raise MasterSyncError('invalid_contract_number')
                 if not isinstance(values['product'], str) or not values['product'].strip() or len(values['product']) > 80:
                     raise MasterSyncError('invalid_product')
+                try:
+                    # Persist canonical codes (hogar/vida/auto/moto). Unknown products stay folded,
+                    # never rewritten to hogar.
+                    values['product'] = products.normalize_product(values['product'], allow_unknown=True)
+                except products.UnknownProductError:
+                    raise MasterSyncError('invalid_product') from None
+                if values['product'] not in products.KNOWN_PRODUCTS:
+                    raise MasterSyncError('unknown_product')
                 values['authorized'] = _boolean(values['authorized'])
                 values['authorization_from'] = _timestamp(values.get('authorization_from'))
                 values['authorization_to'] = _timestamp(values.get('authorization_to'))
                 if values['authorization_from'] and values['authorization_to'] and \
                         values['authorization_to'] <= values['authorization_from']:
                     raise MasterSyncError('invalid_authorization_range')
+                plate_raw = values.get('vehicle_registration')
+                if plate_raw in (None, ''):
+                    values['vehicle_registration'] = None
+                    values['vehicle_registration_normalized'] = None
+                elif not isinstance(plate_raw, str):
+                    raise MasterSyncError('invalid_vehicle_registration')
+                else:
+                    original, normalized = products.normalize_vehicle_registration(plate_raw)
+                    values['vehicle_registration'] = original
+                    values['vehicle_registration_normalized'] = normalized
             elif entity == 'versions':
                 values['valid_from'] = _date(values['valid_from'])
                 values['valid_to'] = _date(values['valid_to']) if values.get('valid_to') else None
@@ -394,11 +433,24 @@ def apply_snapshot(conn, config, snapshot, *, actor='insurance-master-sync'):
                                      (bid, row['contract_number'], pid)).fetchone()
             if duplicate:
                 raise MasterSyncError('duplicate_contract')
-            conn.execute(
-                'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) '
-                'VALUES(%s,%s,%s,%s,%s) ON CONFLICT(business_id,policy_id) DO UPDATE SET '
-                'customer_id=EXCLUDED.customer_id,product=EXCLUDED.product,contract_number=EXCLUDED.contract_number',
-                (bid, pid, cid, row['product'], row['contract_number']))
+            try:
+                conn.execute(
+                    'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number,'
+                    'vehicle_registration,vehicle_registration_normalized) '
+                    'VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(business_id,policy_id) DO UPDATE SET '
+                    'customer_id=EXCLUDED.customer_id,product=EXCLUDED.product,'
+                    'contract_number=EXCLUDED.contract_number,'
+                    'vehicle_registration=EXCLUDED.vehicle_registration,'
+                    'vehicle_registration_normalized=EXCLUDED.vehicle_registration_normalized',
+                    (bid, pid, cid, row['product'], row['contract_number'],
+                     row.get('vehicle_registration'), row.get('vehicle_registration_normalized')))
+            except Exception:
+                conn.execute(
+                    'INSERT INTO insurance_policies(business_id,policy_id,customer_id,product,contract_number) '
+                    'VALUES(%s,%s,%s,%s,%s) ON CONFLICT(business_id,policy_id) DO UPDATE SET '
+                    'customer_id=EXCLUDED.customer_id,product=EXCLUDED.product,'
+                    'contract_number=EXCLUDED.contract_number',
+                    (bid, pid, cid, row['product'], row['contract_number']))
             active = customers[cid]['active']
             _authorization(conn, bid, row, row['authorized'] and active, actor)
         for row in rows['versions'].values():
