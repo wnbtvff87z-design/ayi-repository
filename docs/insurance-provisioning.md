@@ -61,7 +61,8 @@ Example mapping (all table/field names are owner-supplied, not autodetected):
         "fields": {
           "customer": "Customer", "product": "Product", "contract_number": "Contract number",
           "authorized": "Authorization", "authorization_from": "Authorization from",
-          "authorization_to": "Authorization to"
+          "authorization_to": "Authorization to",
+          "vehicle_registration": "Vehicle registration"
         }
       },
       "versions": {
@@ -88,16 +89,23 @@ Names and DNI/NIE are processed only in memory; imported customers store HMACs
 and NULL display_name. Optional `given_name` and `first_surname` mappings must be
 supplied together for compound-name boundaries.
 
-`active` and `authorized` must be explicitly populated text/select values:
-`true`/`false`, `active`/`inactive`, or `granted`/`revoked` (case-sensitive).
-An absent field is an error, **not false**: unchecked Airtable checkboxes omit
-the field, so use explicit select/text columns instead. Policy contract numbers
-must be strings (preserve leading zeros), never derived from customer DNI,
-document ID, PDF name or attachment URL. Version dates use `YYYY-MM-DD`;
-optional authorization times use ISO 8601 with timezone. An absent optional
-authorization start means first grant at database `now()`; repeated syncs do
-not extend it. A mapped authorization end that becomes empty explicitly removes
-that end. A revoked flag or inactive customer revokes access.
+`active` and `authorized` must be explicitly populated. Preferred Airtable types:
+Single Select (`active`/`inactive` and `granted`/`revoked`). Checkbox is also
+accepted when the API returns an explicit boolean. Recognized string values are
+case-insensitive: `true`/`false`, `active`/`inactive`, `granted`/`revoked`.
+An absent required field is an error, **not false** and **never authorized**:
+unchecked Airtable checkboxes often omit the field, so prefer explicit select
+columns. Product values are normalized to canonical codes (`hogar`, `vida`,
+`auto`, `moto`) before PostgreSQL persistence (aliases such as `Coche`→`auto`,
+`Motocicleta`→`moto`). Unknown products fail closed. Optional
+`vehicle_registration` on policies stores the plate on the policy row (never on
+the customer). Policy contract numbers must be strings (preserve leading zeros),
+never derived from customer DNI, document ID, PDF name or attachment URL.
+Version dates use `YYYY-MM-DD`; optional authorization times use ISO 8601 with
+timezone. An absent optional authorization start means first grant at database
+`now()`; repeated syncs do not extend it. A mapped authorization end that
+becomes empty explicitly removes that end. A revoked flag or inactive customer
+revokes access.
 
 ### Stable IDs and immutable document bindings
 
