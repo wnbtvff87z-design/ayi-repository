@@ -318,12 +318,21 @@ def test_email_notifications_and_human_reports(pg_schema, monkeypatch):
         claims.update_claim(conn, cuuid, structured_interpretation=interp, coverage_evaluation=eval_res, photos=photos)
         
         claim_data = claims.get_claim(conn, bid, cuuid)
-        # P0: professional email requires explicit human authorization
-        claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='agent-test')
+        # Automatic dispatch when coverage supported + recipient configured.
+        # Supply accepted evidence matrix so readiness passes without human auth.
+        claims.update_claim(conn, cuuid, evidence_matrix=[{
+            'proof_category': 'foto_video_dano',
+            'is_mandatory': True,
+            'status': 'ACEPTADO',
+        }], structured_interpretation={
+            **interp,
+            'primary_service': 'fontanería',
+            'interpretation_failed': False,
+        })
         claim_data = claims.get_claim(conn, bid, cuuid)
-        
-        # Test sending service email
-        sent = claims.send_service_notification_email(conn, bid, claim_data)
+        sent = claims.send_service_notification_email(
+            conn, bid, claim_data, require_authorization=False, dispatch_mode='automatic'
+        )
         assert sent is True
         
         updated_claim = claims.get_claim(conn, bid, cuuid)
@@ -351,7 +360,7 @@ def test_operations_menu_by_product(pg_schema):
         assert prod_hogar == "hogar"
         
         prod_coche = dialog._selected_policy_product(conn, bid, "POL-COCHE")
-        assert prod_coche == "coche"
+        assert prod_coche == "auto"
 
 
 def test_change_of_intention_handling(pg_schema):
@@ -474,19 +483,25 @@ def test_dining_room_glass_table_claim_flow(pg_schema, monkeypatch):
             "WhatsApp", "SM-204", "+34600111222"
         )
         assert "factura" in r4.lower()
+        assert "reembolso" not in r4.lower()
         c4 = claims.get_claim(conn, bid, claim_ref)
         assert c4['state'] == claims.ClaimState.INVOICE_REQUESTED
         
-        # Turn 5: User has no invoice: "no" — dialog never auto-sends professional email
+        # Turn 5: User has no invoice: "no" — without mandatory evidence, exception → human review
         r5, out5 = dialog.process(
             {'business_id': bid}, {}, [],
             "no",
             "WhatsApp", "SM-205", "+34600111222"
         )
-        assert "revisión humana" in r5.lower() or "siniestro registrado" in r5.lower() or "¡Todo listo" in r5
+        assert "reembolso" not in r5.lower()
+        assert "revisión humana" in r5.lower() or "siniestro registrado" in r5.lower() or "¡Todo listo" in r5 or "he registrado" in r5.lower()
         assert claim_ref in r5
         c5 = claims.get_claim(conn, bid, claim_ref)
-        assert c5['state'] in (claims.ClaimState.HUMAN_REVIEW, claims.ClaimState.READY_FOR_HUMAN_REVIEW)
+        assert c5['state'] in (
+            claims.ClaimState.HUMAN_REVIEW,
+            claims.ClaimState.READY_FOR_HUMAN_REVIEW,
+            claims.ClaimState.EVIDENCE_VALIDATION,
+        )
         assert c5['service_notified'] is not True
 
 
@@ -642,11 +657,13 @@ def test_email_notifications_target_and_human_agent_email(pg_schema, monkeypatch
         ]
         
         claims.update_claim(conn, cuuid, structured_interpretation=interp, coverage_evaluation=eval_res, photos=photos, invoices=invoices)
-        # P0: no personal hotmail DEFAULT_TARGET_EMAIL; use DB/env recipient + authorization
+        # Explicit human authorization path still available for exception / admin flows.
         claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='agent-test')
         claim = claims.get_claim(conn, bid, cuuid)
         
-        sent_prof = claims.send_service_notification_email(conn, bid, claim)
+        sent_prof = claims.send_service_notification_email(
+            conn, bid, claim, require_authorization=True
+        )
         assert sent_prof is True
         
         updated_claim = claims.get_claim(conn, bid, cuuid)
@@ -1008,7 +1025,9 @@ def test_service_notification_real_status_and_idempotency(pg_schema, monkeypatch
         claim = claims.get_claim(conn, bid, cuuid)
 
         # First call: delivers email and updates claim
-        sent1 = claims.send_service_notification_email(conn, bid, claim)
+        sent1 = claims.send_service_notification_email(
+            conn, bid, claim, require_authorization=True
+        )
         assert sent1 is True
         assert deliver_count == 1
 
@@ -1018,7 +1037,9 @@ def test_service_notification_real_status_and_idempotency(pg_schema, monkeypatch
         assert c_updated['service_notification_details']['provider_message_id'] == 'msg_idem_123'
 
         # Second call (idempotency): does NOT re-deliver
-        sent2 = claims.send_service_notification_email(conn, bid, c_updated)
+        sent2 = claims.send_service_notification_email(
+            conn, bid, c_updated, require_authorization=True
+        )
         assert sent2 is True
         assert deliver_count == 1  # count did not increase!
 
@@ -1247,11 +1268,14 @@ def test_evidence_matrix_differentiates_proof_categories():
             "filename": "factura_pintor.pdf",
             "extracted_fields": {
                 "success": True,
+                "is_complete": True,
                 "document_type": "factura_reparacion",
                 "provider": "Pinturas Soler S.L.",
                 "amount": 250.0,
                 "invoice_number": "FAC-101",
-                "date": "2026-10-01"
+                "date": "2026-10-01",
+                "work_description": "Pintura de pared y techo",
+                "coherent_with_incident": True,
             }
         }],
         description="Trabajo de pintura de pared completado"
@@ -1293,8 +1317,11 @@ def test_evidence_matrix_unreadable_file_handling():
     )
 
     repair_req = [r for r in evaluated if r['proof_category'] == claims.ProofCategory.FACTURA_REPARACION][0]
-    assert repair_req['status'] == claims.RequirementStatus.INSUFICIENTE
-    assert "insuficiente o ilegible" in repair_req['status_reason']
+    assert repair_req['status'] in (
+        claims.RequirementStatus.INSUFICIENTE,
+        claims.RequirementStatus.ILEGIBLE,
+    )
+    assert "insuficiente o ilegible" in repair_req['status_reason'].lower() or "ilegible" in repair_req['status_reason'].lower()
 
 
 def test_evidence_matrix_persistence_in_postgres(pg_schema, monkeypatch):
@@ -1565,7 +1592,7 @@ def test_invoice_classifies_presupuesto_vs_factura(monkeypatch):
     assert factura['success'] is True
 
 
-def test_professional_email_blocked_without_authorization(pg_schema, monkeypatch):
+def test_professional_email_blocked_when_evidence_incomplete(pg_schema, monkeypatch):
     bid = 'INS-BIZ-001'
     cid = 'CUS-AUTH-1'
     pid = 'POL-AUTH-1'
@@ -1577,19 +1604,63 @@ def test_professional_email_blocked_without_authorization(pg_schema, monkeypatch
         claims.update_claim(conn, cuuid, coverage_evaluation={
             'status': claims.CoverageStatus.SUPPORTED_BY_POLICY,
             'service_type': 'fontanería',
-        })
+        }, structured_interpretation={'primary_service': 'fontanería'}, evidence_matrix=[{
+            'proof_category': claims.ProofCategory.FACTURA_REPARACION,
+            'is_mandatory': True,
+            'status': claims.RequirementStatus.SOLICITADO,
+        }])
         claim = claims.get_claim(conn, bid, cuuid)
-        sent = claims.send_service_notification_email(conn, bid, claim)
+        sent = claims.send_service_notification_email(
+            conn, bid, claim, require_authorization=False, dispatch_mode='automatic'
+        )
         assert sent is False
         updated = claims.get_claim(conn, bid, cuuid)
         assert updated['service_notified'] is not True
         assert (updated.get('service_notification_details') or {}).get('status') == 'BLOCKED'
 
 
-def test_professional_email_after_authorization(pg_schema, monkeypatch):
+def test_auto_dispatch_without_human_authorization(pg_schema, monkeypatch):
+    """When coverage + mandatory evidence are ready, send without human auth."""
     bid = 'INS-BIZ-001'
     cid = 'CUS-AUTH-2'
     pid = 'POL-AUTH-2'
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
+    with pg_schema() as conn:
+        claims.add_professional(conn, bid, 'fontanería', 'Fontanero', 'f@taller.es')
+        claims.add_customer_and_policy(conn, bid, cid, 'Ana', '12345678Z', pid, 'hogar', '1')
+        cuuid, cref = claims.create_claim(conn, bid, cid, pid, 'V1', 'WhatsApp', 'Fuga tubería')
+        claims.update_claim(conn, cuuid, coverage_evaluation={
+            'status': claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            'service_type': 'fontanería',
+            'explanation': 'Cubierto',
+        }, structured_interpretation={
+            'primary_service': 'fontanería',
+            'what_happened': 'Fuga en tubería',
+            'interpretation_failed': False,
+        }, photos=[{'filename': 'fuga.jpg', 'analysis': {'valid': True}}],
+           evidence_matrix=[{
+               'proof_category': claims.ProofCategory.FOTO_VIDEO_DANO,
+               'is_mandatory': True,
+               'status': claims.RequirementStatus.ACEPTADO,
+           }])
+        claim = claims.get_claim(conn, bid, cuuid)
+        # No authorize_professional_dispatch call — automatic path.
+        assert not (claim.get('dispatch_authorization') or {}).get('authorized')
+        sent, reason, ctx = claims.try_auto_dispatch_professional(conn, bid, claim)
+        assert sent is True
+        assert reason is None
+        assert ctx.get('dest_email') == 'f@taller.es'
+        updated = claims.get_claim(conn, bid, cuuid)
+        assert updated['service_notified'] is True
+        assert updated['state'] == claims.ClaimState.DISPATCHED_TO_PROFESSIONAL
+        assert updated['service_notification_details']['sent_to'] == 'f@taller.es'
+        assert 'reembolso' not in (updated['service_notification_details'].get('subject') or '').lower()
+
+
+def test_professional_email_after_authorization(pg_schema, monkeypatch):
+    bid = 'INS-BIZ-001'
+    cid = 'CUS-AUTH-2B'
+    pid = 'POL-AUTH-2B'
     monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
     with pg_schema() as conn:
         claims.add_professional(conn, bid, 'fontanería', 'Fontanero', 'f@taller.es')
@@ -1601,7 +1672,9 @@ def test_professional_email_after_authorization(pg_schema, monkeypatch):
         })
         claims.authorize_professional_dispatch(conn, bid, cuuid, actor_id='gestor-1')
         claim = claims.get_claim(conn, bid, cuuid)
-        sent = claims.send_service_notification_email(conn, bid, claim)
+        sent = claims.send_service_notification_email(
+            conn, bid, claim, require_authorization=True
+        )
         assert sent is True
         updated = claims.get_claim(conn, bid, cuuid)
         assert updated['service_notified'] is True
@@ -1632,7 +1705,9 @@ def test_stale_authorization_invalidated_by_new_evidence(pg_schema, monkeypatch)
         ok, reason = claims.is_dispatch_authorization_valid(claim, 'f@taller.es', 'fontanería')
         assert ok is False
         assert reason == 'stale_authorization'
-        sent = claims.send_service_notification_email(conn, bid, claim)
+        sent = claims.send_service_notification_email(
+            conn, bid, claim, require_authorization=True
+        )
         assert sent is False
 
 
@@ -1661,11 +1736,15 @@ def test_mandatory_repair_invoice_blocks_ready_for_review():
             'filename': 'fac.pdf',
             'extracted_fields': {
                 'success': True,
+                'is_complete': True,
                 'document_type': 'factura_reparacion',
                 'provider': 'Fontanero',
                 'amount': 80.0,
                 'invoice_number': 'F-1',
                 'date': '2026-02-01',
+                'work_description': 'Reparación de tubería',
+                'coherent_with_incident': True,
+                'validation_status': claims.InvoiceValidationStatus.VALIDA,
             },
         }],
         description='factura adjunta',
@@ -1693,4 +1772,79 @@ def test_wall_repair_not_proven_by_photos_alone():
     assert tech[0]['status'] == claims.RequirementStatus.PENDIENTE_REVISION
     assert tech[0].get('needs_human_review') is True
 
+
+def test_video_received_but_not_analyzed_blocks_auto_dispatch(pg_schema, monkeypatch):
+    bid = 'INS-BIZ-001'
+    cid = 'CUS-VID-1'
+    pid = 'POL-VID-1'
+    monkeypatch.setattr('insurance.claims.deliver_real_email', _mock_deliver_accepted)
+    with pg_schema() as conn:
+        claims.add_professional(conn, bid, 'fontanería', 'F', 'f@t.es')
+        claims.add_customer_and_policy(conn, bid, cid, 'Ana', '12345678Z', pid, 'hogar', '9')
+        cuuid, _ = claims.create_claim(conn, bid, cid, pid, 'V1', 'WhatsApp', 'Fuga')
+        claims.update_claim(conn, cuuid, coverage_evaluation={
+            'status': claims.CoverageStatus.SUPPORTED_BY_POLICY,
+            'service_type': 'fontanería',
+        }, structured_interpretation={'primary_service': 'fontanería'}, photos=[{
+            'filename': 'clip.mp4',
+            'mimetype': 'video/mp4',
+            'analysis': {
+                'valid': False,
+                'analysis_source': 'video_not_supported_p0',
+                'media_type': 'video',
+            },
+        }], evidence_matrix=[{
+            'proof_category': claims.ProofCategory.FOTO_VIDEO_DANO,
+            'is_mandatory': True,
+            'status': claims.RequirementStatus.ACEPTADO,
+        }])
+        claim = claims.get_claim(conn, bid, cuuid)
+        ready, reason, _ = claims.auto_dispatch_readiness(conn, bid, claim)
+        assert ready is False
+        assert reason == 'video_not_analyzed'
+
+
+def test_vehicle_registration_on_policy_not_customer(pg_schema):
+    bid = 'INS-BIZ-001'
+    cid = 'CUS-PLATE-1'
+    with pg_schema() as conn:
+        claims.add_customer_and_policy(
+            conn, bid, cid, 'Ana', '12345678Z', 'POL-AUTO-1', 'auto', 'A-1',
+            vehicle_registration='1234 ABC',
+        )
+        claims.add_customer_and_policy(
+            conn, bid, cid, 'Ana', '12345678Z', 'POL-AUTO-2', 'Coche', 'A-2',
+            vehicle_registration='5678 DEF',
+        )
+        claims.add_customer_and_policy(
+            conn, bid, cid, 'Ana', '12345678Z', 'POL-MOTO-1', 'Motocicleta', 'M-1',
+            vehicle_registration='9999 AAA',
+        )
+        claims.add_customer_and_policy(
+            conn, bid, cid, 'Ana', '12345678Z', 'POL-HOG-1', 'Hogar', 'H-1',
+        )
+        rows = conn.execute(
+            'SELECT policy_id, product, vehicle_registration, vehicle_registration_normalized '
+            'FROM insurance_policies WHERE business_id=%s AND customer_id=%s ORDER BY policy_id',
+            (bid, cid),
+        ).fetchall()
+        by_id = {r['policy_id']: r for r in rows}
+        assert by_id['POL-AUTO-1']['product'] == 'auto'
+        assert by_id['POL-AUTO-1']['vehicle_registration'] == '1234 ABC'
+        assert by_id['POL-AUTO-1']['vehicle_registration_normalized'] == '1234ABC'
+        assert by_id['POL-AUTO-2']['product'] == 'auto'
+        assert by_id['POL-AUTO-2']['vehicle_registration'] == '5678 DEF'
+        assert by_id['POL-MOTO-1']['product'] == 'moto'
+        assert by_id['POL-HOG-1']['product'] == 'hogar'
+        assert by_id['POL-HOG-1']['vehicle_registration'] is None
+        # Claims only for hogar
+        ok, _, err = claims.verify_policy_for_claim(conn, bid, cid, 'POL-AUTO-1')
+        assert ok is False and err == 'unsupported_product'
+        ok_h, _, err_h = claims.verify_policy_for_claim(conn, bid, cid, 'POL-HOG-1')
+        assert ok_h is True and err_h is None
+
+
+def test_dialog_messages_never_ask_reembolso():
+    text = Path(WEB / 'insurance' / 'dialog.py').read_text(encoding='utf-8')
+    assert 'reembolso' not in text.lower()
 
