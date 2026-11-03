@@ -8,7 +8,7 @@ from datetime import date, datetime
 from enum import Enum
 from zoneinfo import ZoneInfo
 
-from insurance import cases as _cases, identity, memory, references, retrieval, citations
+from insurance import cases as _cases, identity, memory, products, references, retrieval, citations
 from insurance import incident_context, incident_dates, policy_info, voice_identity, voice_trace, orchestrator
 
 from insurance.cases import CasePersistenceError, create_or_update_case
@@ -776,6 +776,10 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             'policy_switch_required', 'awaiting', 'version_id', 'pending_human',
                             'reference_policy', 'reference_version_id'):
                     st.pop(key, None)
+                prod_sel = _selected_policy_product(conn, bid, selected_id)
+                plate_hint = _policy_registration_prompt(conn, bid, selected_id, prod_sel, st)
+                if plate_hint:
+                    return finish(plate_hint, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
             elif awaiting_at_start == 'policy_confirmation' and policy_control:
                 confirmation = references.confirmation(incoming)
                 if confirmation == 'yes':
@@ -790,6 +794,10 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                 'policy_switch_required', 'awaiting', 'pending_human',
                                 'reference_policy', 'reference_version_id'):
                         st.pop(key, None)
+                    prod_sel = _selected_policy_product(conn, bid, candidate['policy_id'])
+                    plate_hint = _policy_registration_prompt(conn, bid, candidate['policy_id'], prod_sel, st)
+                    if plate_hint:
+                        return finish(plate_hint, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                 elif confirmation == 'no':
                     for key in ('requested_policy', 'contract_number', 'change_pending',
                                 'policy_switch_required', 'awaiting'):
@@ -819,17 +827,20 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     if policies:
                         pol_id = policies[0]['policy_id']
                         prod = _selected_policy_product(conn, bid, pol_id)
-                        if prod == 'hogar':
-                            st['policy_id'] = pol_id
-                            ver_row = conn.execute(
-                                'SELECT version_id FROM insurance_policy_versions '
-                                'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
-                                'AND (valid_to IS NULL OR valid_to>=%s) ORDER BY valid_from DESC LIMIT 1',
-                                (bid, pol_id, _business_date(business), _business_date(business))).fetchone()
-                            if ver_row:
-                                st['version_id'] = ver_row['version_id']
-                            else:
-                                st.pop('version_id', None)
+                        st['policy_id'] = pol_id
+                        ver_row = conn.execute(
+                            'SELECT version_id FROM insurance_policy_versions '
+                            'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
+                            'AND (valid_to IS NULL OR valid_to>=%s) ORDER BY valid_from DESC LIMIT 1',
+                            (bid, pol_id, _business_date(business), _business_date(business))).fetchone()
+                        if ver_row:
+                            st['version_id'] = ver_row['version_id']
+                        else:
+                            st.pop('version_id', None)
+                        plate_hint = _policy_registration_prompt(conn, bid, pol_id, prod, st)
+                        if plate_hint:
+                            return finish(plate_hint, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                        if products.is_home_product(prod):
                             menu_reply = (
                                 "¿En qué puedo ayudarte? Puedes decir: «uno» para consultar coberturas de tu póliza, o «dos» para enviar un parte de siniestro."
                                 if channel == 'Voice' else
@@ -837,8 +848,34 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                 "1. Consultar mi póliza (coberturas, límites y exclusiones).\n"
                                 "2. Enviar un parte (declarar un siniestro)."
                             )
-                            return finish(menu_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+                        else:
+                            label = products.product_label(prod)
+                            menu_reply = (
+                                f"Puedo ayudarte a consultar tu póliza de {label}. ¿Qué quieres saber?"
+                                if channel == 'Voice' else
+                                f"¿Qué deseas consultar sobre tu póliza de {label}?\n"
+                                "1. Consultar mi póliza (coberturas, límites y exclusiones).\n"
+                                "La declaración de partes online solo está disponible para pólizas de hogar."
+                            )
+                        return finish(menu_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                     return finish(ASK_QUERY, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+
+            # Vehicle plate confirmation / capture (auto & moto). Never writes master data.
+            if customer_id and st.get('awaiting') in (
+                'vehicle_registration', 'vehicle_registration_confirm', 'human_plate_mismatch'
+            ):
+                if st.get('awaiting') == 'human_plate_mismatch':
+                    folded = references.fold(incoming or '').strip(' .?!¿¡')
+                    if folded in ('si', 'sí', 'revisar', 'agente', 'humano'):
+                        return finish(
+                            "De acuerdo, queda pendiente de revisión humana por discrepancia de matrícula. "
+                            "No he modificado los datos contractuales.",
+                            {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value},
+                        )
+                    st['awaiting'] = 'vehicle_registration'
+                plate_reply = _handle_vehicle_registration_turn(conn, bid, st, incoming, channel)
+                if plate_reply:
+                    return finish(plate_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
             # --- CLAIMING FLOW INTERCEPTION ---
             if customer_id:
@@ -854,7 +891,13 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             'COVERAGE_CHECK': 'Evaluando cobertura.',
                             'PHOTOS_REQUESTED': 'Pendiente de recibir fotografías de los daños.',
                             'PHOTOS_RECEIVED': 'Fotografías recibidas, procesando.',
-                            'READY_FOR_HUMAN_REVIEW': 'Preparado para revisión humana.',
+                            'INVOICE_REQUESTED': 'Pendiente de documentación / facturas.',
+                            'INVOICE_RECEIVED': 'Documentación recibida, validando evidencias.',
+                            'EVIDENCE_VALIDATION': 'Validando evidencias aportadas.',
+                            'READY_FOR_AUTO_DISPATCH': 'Preparado para envío automático al profesional.',
+                            'DISPATCH_PENDING': 'Envío al profesional pendiente.',
+                            'DISPATCHED_TO_PROFESSIONAL': 'Enviado al profesional.',
+                            'READY_FOR_HUMAN_REVIEW': 'Preparado para revisión humana (excepción).',
                             'HUMAN_REVIEW': 'En revisión por nuestro equipo de agentes.',
                             'APPROVED': 'Aprobado y resuelto.',
                             'REJECTED': 'Rechazado.',
@@ -868,9 +911,18 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                       {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
                 if _is_query_start(incoming) and not st.get('active_claim_ref'):
+                    prod = _selected_policy_product(conn, bid, st.get('policy_id'))
+                    label = products.product_label(prod) if prod else 'póliza'
+                    examples = {
+                        'hogar': 'daños por agua, cristales, límites o exclusiones',
+                        'auto': 'cobertura a terceros, lunas, asistencia en viaje',
+                        'moto': 'cobertura a terceros, robo, asistencia',
+                        'vida': 'capital asegurado, beneficiarios, exclusiones',
+                    }.get(products.normalize_product_or_none(prod) or '', 'coberturas, límites o exclusiones')
                     reply = (
-                        "¿Qué quieres consultar sobre tu póliza de hogar?" if channel == 'Voice' else
-                        "Perfecto. ¿Qué quieres consultar sobre tu póliza de hogar (por ejemplo: daños por agua, cristales, límites o exclusiones)?"
+                        f"¿Qué quieres consultar sobre tu póliza de {label}?"
+                        if channel == 'Voice' else
+                        f"Perfecto. ¿Qué quieres consultar sobre tu póliza de {label} (por ejemplo: {examples})?"
                     )
                     return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
@@ -932,7 +984,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             "SELECT p.policy_id FROM insurance_policies p "
                             "JOIN insurance_authorizations a ON a.business_id=p.business_id "
                             "AND a.customer_id=p.customer_id AND a.policy_id=p.policy_id "
-                            "WHERE p.business_id=%s AND p.customer_id=%s AND p.product='hogar' "
+                            "WHERE p.business_id=%s AND p.customer_id=%s AND lower(trim(p.product)) IN ('hogar') "
                             "AND a.revoked_at IS NULL AND a.valid_from<=now() "
                             "AND (a.valid_to IS NULL OR a.valid_to>now()) LIMIT 1",
                             (bid, customer_id)
@@ -957,7 +1009,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         )
 
                     prod = _selected_policy_product(conn, bid, target_policy_id)
-                    if prod != 'hogar':
+                    if not products.is_home_product(prod):
                         st.pop('claim_start_pending', None)
                         return finish(
                             "Lo siento, la declaración de partes online solo está habilitada para pólizas de hogar. "
@@ -1289,14 +1341,16 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         
                                         return finish(
                                             f"He recibido {desc_str} correctamente.\n"
-                                            f"¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no, o adjunta la factura.",
+                                            f"Si dispones de factura de reparación, presupuesto o justificante relacionado con el incidente, "
+                                            f"adjúntalo ahora. Si no, responde «no tengo».",
                                             {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                                         )
                                     else:
                                         if folded_incoming in ('no', 'no tengo', 'no tengo fotos', 'no puedo', 'sin fotos', 'no dispongo de fotos', 'no las tengo') or (is_resume and not ('foto' in folded_incoming or 'daño' in folded_incoming or 'video' in folded_incoming or 'vídeo' in folded_incoming)):
                                             claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
                                             return finish(
-                                                "De acuerdo, continuamos sin fotos o vídeos. ¿Has pagado alguna factura de reparación o gasto que quieras adjuntar para el reembolso? Responde sí o no.",
+                                                "De acuerdo, continuamos sin fotos o vídeos. "
+                                                "Si tienes factura de reparación u otro documento del incidente, adjúntalo; si no, responde «no tengo».",
                                                 {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                                             )
                                         else:
@@ -1454,30 +1508,71 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         )
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
-                                    # Evidence complete enough for human package — never auto-notify professionals.
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.READY_FOR_HUMAN_REVIEW)
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+                                    # Evidence conversationally complete: attempt automatic professional
+                                    # dispatch when coverage + mandatory evidence allow it. Human review
+                                    # is reserved for exceptions — never ask about reimbursements.
+                                    claims.update_claim(
+                                        conn, claim['claim_uuid'], state=claims.ClaimState.EVIDENCE_VALIDATION
+                                    )
                                     updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                    auto_ok, auto_reason, auto_ctx = claims.try_auto_dispatch_professional(
+                                        conn, bid, updated_claim
+                                    )
+                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                    if auto_ok:
+                                        package = {
+                                            'prepared_at': datetime.now().isoformat(),
+                                            'awaiting_action': None,
+                                            'professional_dispatch_allowed': True,
+                                            'dispatch_mode': 'automatic',
+                                            'coverage_preliminary': status,
+                                            'note': 'Envío automático al profesional tras validación de evidencias y cobertura.',
+                                            'recipient': (auto_ctx or {}).get('dest_email'),
+                                        }
+                                        claims.update_claim(conn, claim['claim_uuid'], review_package=package)
+                                        reply = (
+                                            f"He registrado tu parte con referencia {claim_ref}.\n"
+                                            f"La cobertura preliminar es compatible y las evidencias obligatorias están validadas, "
+                                            f"así que he notificado automáticamente al profesional correspondiente "
+                                            f"({(auto_ctx or {}).get('service_type') or 'asistencia'}). "
+                                            f"Se pondrá en contacto contigo para valorar la intervención. "
+                                            f"Esto no implica autorización de pago ni indemnización."
+                                        )
+                                        claims.save_human_summary(conn, bid, updated_claim)
+                                        st.pop('active_claim_ref', None)
+                                        st.pop('awaiting', None)
+                                        return finish(reply, {'insurance_result': ResultKind.POLICY_INFORMATION.value})
+
                                     package = {
                                         'prepared_at': datetime.now().isoformat(),
                                         'awaiting_action': 'approve_reject_or_request_more_info',
                                         'professional_dispatch_allowed': False,
+                                        'dispatch_blocked_reason': auto_reason,
                                         'coverage_preliminary': status,
-                                        'note': 'La notificación al profesional requiere autorización humana explícita.',
+                                        'note': (
+                                            'Revisión humana por excepción: no se cumplen las condiciones '
+                                            'de envío automático al profesional.'
+                                        ),
                                     }
-                                    claims.update_claim(conn, claim['claim_uuid'], review_package=package)
+                                    claims.update_claim(
+                                        conn, claim['claim_uuid'],
+                                        review_package=package,
+                                        state=claims.ClaimState.READY_FOR_HUMAN_REVIEW,
+                                    )
+                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
                                     updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
-
                                     if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
                                         reply = (
-                                            f"¡Todo listo para revisión humana! He registrado tu parte con referencia {claim_ref}.\n"
-                                            f"La evaluación de cobertura es preliminar. Un agente autorizado revisará el expediente "
-                                            f"antes de cualquier envío a un profesional o decisión de reembolso."
+                                            f"He registrado tu parte con referencia {claim_ref}.\n"
+                                            f"La evaluación de cobertura es preliminar, pero el expediente requiere "
+                                            f"revisión humana antes de continuar "
+                                            f"({auto_reason or 'condiciones de envío automático no cumplidas'}). "
+                                            f"Nos pondremos en contacto contigo si hace falta más información."
                                         )
                                     else:
                                         reply = (
                                             f"¡Siniestro registrado correctamente con la referencia {claim_ref}!\n"
-                                            f"He enviado toda la documentación a nuestro equipo para su revisión y valoración humana. "
+                                            f"He enviado toda la documentación a nuestro equipo para su revisión. "
                                             f"Nos pondremos en contacto contigo lo antes posible."
                                         )
 
@@ -2548,12 +2643,108 @@ def _selected_policy_product(conn, bid, policy_id):
     if not policy_id:
         return None
     try:
-        row = conn.execute('SELECT product FROM insurance_policies WHERE business_id=%s AND policy_id=%s', (bid, policy_id)).fetchone()
+        row = conn.execute(
+            'SELECT product FROM insurance_policies WHERE business_id=%s AND policy_id=%s',
+            (bid, policy_id),
+        ).fetchone()
         if row and row.get('product'):
-            return str(row['product']).strip().lower()
+            return products.normalize_product(row['product'], allow_unknown=True)
+    except products.UnknownProductError:
+        return None
     except Exception:
         pass
     return None
+
+
+def _policy_vehicle_registration(conn, bid, policy_id):
+    if not policy_id:
+        return None, None
+    try:
+        row = conn.execute(
+            'SELECT vehicle_registration, vehicle_registration_normalized '
+            'FROM insurance_policies WHERE business_id=%s AND policy_id=%s',
+            (bid, policy_id),
+        ).fetchone()
+        if row:
+            return row.get('vehicle_registration'), row.get('vehicle_registration_normalized')
+    except Exception:
+        pass
+    return None, None
+
+
+def _policy_registration_prompt(conn, bid, policy_id, prod, state):
+    """Ask for / confirm vehicle plate for auto/moto without writing master data."""
+    if not products.is_vehicle_product(prod):
+        return None
+    plate, _norm = _policy_vehicle_registration(conn, bid, policy_id)
+    label = products.product_label(prod)
+    if plate:
+        state['awaiting'] = 'vehicle_registration_confirm'
+        state['expected_vehicle_registration'] = plate
+        return (
+            f"He seleccionado tu póliza de {label} con matrícula {plate}. "
+            f"¿Confirmas que es el vehículo correcto? Responde sí o no."
+        )
+    state['awaiting'] = 'vehicle_registration'
+    return (
+        f"He encontrado una póliza de {label} asociada a tus datos. "
+        f"Para identificar correctamente el vehículo, ¿puedes indicar su matrícula?"
+    )
+
+
+def _handle_vehicle_registration_turn(conn, bid, st, incoming, channel):
+    """Conversation helpers for plate disambiguation. Never mutates master policy data."""
+    awaiting = st.get('awaiting')
+    if awaiting not in ('vehicle_registration', 'vehicle_registration_confirm'):
+        return None
+    folded = references.fold(incoming or '').strip(' .?!¿¡')
+    prod = _selected_policy_product(conn, bid, st.get('policy_id'))
+    label = products.product_label(prod) if prod else 'vehículo'
+    if awaiting == 'vehicle_registration_confirm':
+        if folded in ('si', 'sí', 'correcto', 'afirmativo', 'ok', 'vale'):
+            st.pop('awaiting', None)
+            st['vehicle_registration_confirmed'] = st.get('expected_vehicle_registration')
+            if products.is_home_product(prod):
+                return None
+            return (
+                f"Perfecto. ¿Qué quieres consultar sobre tu póliza de {label}?"
+                if channel == 'Voice' else
+                f"Perfecto. Puedes consultar coberturas de tu póliza de {label}. "
+                f"La declaración de partes online solo está disponible para hogar."
+            )
+        if folded in ('no', 'incorrecto', 'otro', 'otra'):
+            st['awaiting'] = 'vehicle_registration'
+            st.pop('expected_vehicle_registration', None)
+            return (
+                "De acuerdo. Indica la matrícula del vehículo que quieres consultar. "
+                "No modificaré los datos contractuales registrados."
+            )
+        return "¿Confirmas la matrícula indicada? Responde sí o no."
+
+    original, normalized = products.normalize_vehicle_registration(incoming)
+    if not normalized:
+        return "No he podido interpretar la matrícula. Indícala de nuevo, por favor."
+    registered, registered_norm = _policy_vehicle_registration(conn, bid, st.get('policy_id'))
+    if registered_norm and registered_norm != normalized:
+        st['awaiting'] = 'human_plate_mismatch'
+        return (
+            f"La matrícula indicada ({original}) no coincide con la registrada "
+            f"({registered}) para esta póliza. No seleccionaré otra póliza automáticamente. "
+            f"Un agente revisará la discrepancia o puedes indicar de nuevo la matrícula correcta."
+        )
+    # Session-only association — never write back to insurance_policies from the dialog.
+    st['vehicle_registration_confirmed'] = original
+    st['vehicle_registration_provided'] = original
+    st.pop('awaiting', None)
+    if registered_norm:
+        return (
+            f"Matrícula {original} confirmada para tu póliza de {label}. "
+            f"¿Qué quieres consultar?"
+        )
+    return (
+        f"He anotado la matrícula {original} para esta conversación (no actualiza los datos maestros). "
+        f"¿Qué quieres consultar sobre tu póliza de {label}?"
+    )
 
 
 def process(business, state, history, text, channel, external_id, customer, resolved_sector=None, media_list=None):
