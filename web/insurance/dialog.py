@@ -170,6 +170,23 @@ def _identity_redeclaration(text):
         r'nombre\s+(?:y\s+apellidos?|completo)|(?:mi\s+)?(?:dni|nie)\b)', text, re.I))
 
 
+def _suppress_identity_redeclaration(st) -> bool:
+    """While collecting claim/cancellation contact or mid-expediente, treat DNI/name as data, not reset."""
+    if not st:
+        return False
+    if st.get('active_claim_ref') or st.get('claim_start_pending'):
+        return True
+    return st.get('awaiting') in (
+        'claim_contact',
+        'policy_cancellation_contact',
+        'claim',
+        'date',
+        'vehicle_registration',
+        'vehicle_registration_confirm',
+        'human_plate_mismatch',
+    )
+
+
 def _diag(corr, stage, business_id=None, **fields):
     """Structured stage log. Whitelisted enum/counter/boolean fields only: never name, DNI/NIE,
     phone, policy number, question text, PDF text, tokens or URLs."""
@@ -261,6 +278,8 @@ def _merge_declaration(state, decl, business_id):
     if decl['document']:
         state['doc_hmac'] = identity.document_hmac(business_id, decl['document'])
         state['doc_tail'] = decl['document'][-3:]
+        # Session-only plaintext for later claim emails; cleared never re-prompted once verified.
+        state['_pending_document'] = str(decl['document']).strip().upper()[:32]
     if decl['name']:
         state['name'] = decl['name'][:160]
     if decl['contract_number']:
@@ -372,7 +391,11 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                 _turn_diag(corr, bid, decision, customer_id, 'read_only')
                 return cached['content'], out
             explicit_reset = _identity_reset(text)
+            # "mi nombre es / mi dni es" during claim contact must NOT wipe verification —
+            # that caused the WhatsApp loop (ask DNI → user repeats → re-verify → menu).
             redeclaration = bool(customer_id and _identity_redeclaration(text))
+            if redeclaration and _suppress_identity_redeclaration(st):
+                redeclaration = False
             if explicit_reset or redeclaration:
                 identity.revoke_verifications(conn, bid, channel, ref, sess)
                 st = {'awaiting': 'identity'}
@@ -1066,6 +1089,15 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     st['active_claim_ref'] = claim_ref
                     st['awaiting'] = 'claim'
                     is_query = False
+                    # Seed contact with already-verified identity; never re-ask name/DNI.
+                    try:
+                        seeded = _contact_from_session(st, channel, external_id)
+                        if any(seeded.get(k) for k in ('full_name', 'document', 'phone', 'address', 'email')):
+                            claims.update_claim(
+                                conn, claim_uuid, operational_contact=seeded,
+                            )
+                    except Exception:
+                        pass
 
                     if initial_description:
                         try:
@@ -1201,7 +1233,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                 or _is_claim_incidental_query(incoming, claim_state)
                             ) and turn_claim_intent != 'continue_claim'
 
-                            # Mid/late claim states: continue/finalize instead of coverage Q&A.
+                            # Finalize only when evidence stage is done or we are collecting contact.
+                            # Do NOT auto-finalize HUMAN_REVIEW on every message (causes DNI loops).
                             mid_finalize_states = (
                                 claims.ClaimState.PHOTOS_RECEIVED,
                                 claims.ClaimState.INVOICE_RECEIVED,
@@ -1209,17 +1242,20 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                 claims.ClaimState.READY_FOR_AUTO_DISPATCH,
                                 claims.ClaimState.DISPATCH_PENDING,
                                 claims.ClaimState.DISPATCHED_TO_PROFESSIONAL,
-                                claims.ClaimState.READY_FOR_HUMAN_REVIEW,
-                                claims.ClaimState.HUMAN_REVIEW,
                                 claims.ClaimState.ADDITIONAL_DOCUMENTS_REQUIRED,
                             )
                             if (
                                 claim_state in mid_finalize_states
                                 or st.get('awaiting') == 'claim_contact'
-                                or (turn_claim_intent == 'continue_claim' and claim_state not in (
-                                    claims.ClaimState.INFORMATION_GATHERING,
-                                    claims.ClaimState.PHOTOS_REQUESTED,
-                                ))
+                                or (
+                                    turn_claim_intent == 'continue_claim'
+                                    and claim_state in (
+                                        claims.ClaimState.INVOICE_REQUESTED,
+                                        claims.ClaimState.READY_FOR_HUMAN_REVIEW,
+                                        claims.ClaimState.HUMAN_REVIEW,
+                                        *mid_finalize_states,
+                                    )
+                                )
                             ) and not is_incidental:
                                 is_query = False
                                 if media_list and claim_state in (
@@ -1260,8 +1296,11 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         ),
                                     })
                                 elif not media_list and claim_state != claims.ClaimState.INVOICE_REQUESTED:
+                                    # Prefer raw text so name/DNI/phone/address tokens are not stripped.
+                                    contact_text = text if st.get('awaiting') == 'claim_contact' else incoming
                                     reply, out = _finalize_open_claim_dispatch(
-                                        conn, bid, st, claim, customer_id, channel, incoming,
+                                        conn, bid, st, claim, customer_id, channel, contact_text,
+                                        external_id=external_id,
                                     )
                                     return finish(reply, out)
 
@@ -1651,7 +1690,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
 
                                     # Evidence conversationally complete → dual notify (profesional + humano).
                                     reply, out = _finalize_open_claim_dispatch(
-                                        conn, bid, st, updated_claim, customer_id, channel, incoming,
+                                        conn, bid, st, updated_claim, customer_id, channel, text or incoming,
+                                        external_id=external_id,
                                     )
                                     return finish(reply, out)
             if just_verified and st.get('question') and not st.get('pending_human'):
@@ -2060,6 +2100,12 @@ def _verify(conn, bid, channel, ref, sess, st, corr, completed_this_turn=True):
     if len(found) == 1:
         st['_identity_diagnostic'] = 'identity_verified'
         identity.create_verification(conn, bid, channel, ref, sess, found[0])
+        # Keep session-scoped identity facts for claim contact (never re-ask name/DNI).
+        if st.get('name'):
+            st['verified_display_name'] = st['name']
+        pending_doc = st.pop('_pending_document', None)
+        if pending_doc:
+            st['verified_document'] = pending_doc
         for k in ('doc_hmac', 'doc_tail', 'name', 'awaiting', 'awaiting_document',
                   'identity_buffer', 'name_hmac', 'identity_given_name', 'identity_surname',
                   'identity_last_failure'):
@@ -2822,8 +2868,16 @@ def _handle_vehicle_registration_turn(conn, bid, st, incoming, channel):
 
 
 def _maybe_rebind_open_claim(conn, bid, customer_id, st, incoming, media_list):
-    """Reattach a single open claim so continuity is not lost after state gaps."""
+    """Reattach an open claim only when the user is clearly continuing that expediente.
+
+    Never steal a fresh «enviar parte» to finalize/contact an old HUMAN_REVIEW claim.
+    """
     from insurance import claims
+    if st.get('active_claim_ref'):
+        return
+    # New claim intent must open a new flow, not revive a previous expediente.
+    if _is_claim_start(incoming or ''):
+        return
     try:
         open_claims = claims.list_open_claims_for_customer(
             conn, bid, customer_id, policy_id=st.get('policy_id'), limit=3,
@@ -2837,16 +2891,12 @@ def _maybe_rebind_open_claim(conn, bid, customer_id, st, incoming, media_list):
     intent = ops_contact.classify_claim_turn_intent(
         incoming or '', claim_state=(open_claims[0] or {}).get('state'),
     )
-    should_bind = bool(media_list) or intent in ('continue_claim', 'provide_info') or st.get('awaiting') in (
-        'claim_contact', 'date',
+    should_bind = bool(media_list) or intent == 'continue_claim' or st.get('awaiting') in (
+        'claim_contact', 'claim',
     )
-    if not should_bind and len(open_claims) == 1:
-        # Soft bind when there is exactly one open expediente; incidental queries still allowed later.
-        should_bind = True
     if not should_bind:
         return
     if len(open_claims) > 1 and intent == 'continue_claim':
-        # Prefer the most recently updated claim; ask only if refs differ and user did not cite one.
         if not re.search(r'\bSIN-\d{4}-\d{6}\b', incoming or '', re.I):
             st['_open_claim_choices'] = [c['claim_ref'] for c in open_claims[:3]]
     chosen = open_claims[0]
@@ -2858,14 +2908,15 @@ def _maybe_rebind_open_claim(conn, bid, customer_id, st, incoming, media_list):
             st['active_product'] = prod
 
 
-def _finalize_open_claim_dispatch(conn, bid, st, claim, customer_id, channel, incoming):
+def _finalize_open_claim_dispatch(conn, bid, st, claim, customer_id, channel, incoming,
+                                  external_id=None):
     """Collect contact if needed, then dual-notify professional + human with specific replies."""
     from insurance import claims
     claim_ref = claim.get('claim_ref')
     if incoming:
         st['_contact_incoming'] = incoming
     contact_reply = _ensure_claim_operational_contact(
-        conn, bid, st, claim, customer_id, channel,
+        conn, bid, st, claim, customer_id, channel, external_id=external_id,
     )
     if contact_reply is not None:
         return contact_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
@@ -2948,7 +2999,7 @@ def _finalize_open_claim_dispatch(conn, bid, st, claim, customer_id, channel, in
     blocked = result.get('blocked_reason')
     if blocked == 'contact_or_address_incomplete':
         contact_reply = _ensure_claim_operational_contact(
-            conn, bid, st, updated or claim, customer_id, channel,
+            conn, bid, st, updated or claim, customer_id, channel, external_id=external_id,
         )
         if contact_reply is not None:
             return contact_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
@@ -2980,8 +3031,27 @@ def _finalize_open_claim_dispatch(conn, bid, st, claim, customer_id, channel, in
     return reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
 
 
-def _seed_claim_contact(conn, bid, customer_id, claim) -> dict:
+def _contact_from_session(st, channel=None, external_id=None) -> dict:
+    """Build contact seed from session-verified facts (never re-prompt these)."""
+    seed = {}
+    if st.get('verified_display_name'):
+        seed['full_name'] = st['verified_display_name']
+    elif st.get('name'):
+        seed['full_name'] = st['name']
+    if st.get('verified_document'):
+        seed['document'] = st['verified_document']
+    # WhatsApp external_id is typically the caller's E.164 number.
+    if channel and str(channel).lower() in ('whatsapp', 'wa') and external_id:
+        digits = re.sub(r'\D', '', str(external_id))
+        if 9 <= len(digits) <= 15:
+            seed['phone'] = ('+' + digits) if not str(external_id).strip().startswith('+') else str(external_id).strip()
+    return ops_contact.empty_contact(**seed)
+
+
+def _seed_claim_contact(conn, bid, customer_id, claim, st=None, channel=None, external_id=None) -> dict:
     contact = claims_module_contact(claim)
+    session_seed = _contact_from_session(st or {}, channel=channel, external_id=external_id)
+    contact = ops_contact.merge_contact(session_seed, contact)
     if not contact.get('full_name'):
         try:
             row = conn.execute(
@@ -3001,14 +3071,20 @@ def claims_module_contact(claim) -> dict:
     return claims.claim_operational_contact(claim)
 
 
-def _ensure_claim_operational_contact(conn, bid, st, claim, customer_id, channel):
-    """Ask/merge phone, address, DNI and name before professional dispatch. Remembers across turns."""
+def _ensure_claim_operational_contact(conn, bid, st, claim, customer_id, channel, external_id=None):
+    """Ask only for missing phone/address; never re-ask verified name/DNI."""
     from insurance import claims
-    del channel  # reserved for future channel-specific phrasing
-    contact = _seed_claim_contact(conn, bid, customer_id, claim)
+    contact = _seed_claim_contact(
+        conn, bid, customer_id, claim, st=st, channel=channel, external_id=external_id,
+    )
     live_text = st.pop('_contact_incoming', None)
     if live_text:
         contact = ops_contact.extract_contact_with_llm(live_text, known=contact)
+        # Persist any identity tokens the user volunteered into session so later turns remember.
+        if contact.get('full_name') and not st.get('verified_display_name'):
+            st['verified_display_name'] = contact['full_name']
+        if contact.get('document') and not st.get('verified_document'):
+            st['verified_document'] = str(contact['document']).strip().upper()
     missing = ops_contact.missing_fields(contact, required=ops_contact.CLAIM_REQUIRED)
     claims.update_claim(conn, claim['claim_uuid'], operational_contact=contact)
     if not missing:
@@ -3032,6 +3108,9 @@ def _handle_policy_cancellation(conn, business, sc, st, customer, customer_id, i
     prod = st.get('active_product') or _selected_policy_product(conn, bid, st.get('policy_id'))
     label = products.product_label(prod) if prod else None
     draft = st.get('cancellation_contact') or ops_contact.empty_contact()
+    draft = ops_contact.merge_contact(
+        _contact_from_session(st, channel=channel, external_id=external_id), draft,
+    )
     if not draft.get('full_name'):
         try:
             row = conn.execute(

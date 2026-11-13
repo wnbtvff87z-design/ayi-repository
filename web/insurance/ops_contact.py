@@ -14,15 +14,18 @@ import unicodedata
 log = logging.getLogger(__name__)
 
 CONTACT_FIELDS = ('full_name', 'document', 'phone', 'address', 'email')
-CLAIM_REQUIRED = ('full_name', 'document', 'phone', 'address')
+# After identity verification, never re-ask name/DNI for a claim: only phone + address.
+CLAIM_REQUIRED = ('phone', 'address')
+CLAIM_REQUIRED_UNVERIFIED = ('full_name', 'document', 'phone', 'address')
 CANCELLATION_REQUIRED = ('full_name', 'document', 'phone', 'email')
 
 _PHONE_RE = re.compile(
     r'(?:\+?\d{1,3}[\s.\-]?)?(?:\(?\d{2,4}\)?[\s.\-]?)?\d{3}[\s.\-]?\d{2,4}[\s.\-]?\d{0,4}'
 )
 _EMAIL_RE = re.compile(r'[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}', re.I)
+# Strict Spanish DNI/NIE only — never treat a bare phone (9 digits) as document.
 _DOC_RE = re.compile(
-    r'\b(?:\d{8}[A-Z]|[XYZ]\d{7}[A-Z]|\d{7,10}[A-Z]?)\b', re.I
+    r'\b(?:\d{8}[A-Z]|[XYZ]\d{7}[A-Z])\b', re.I
 )
 _CANCEL_RE = re.compile(
     r'\b(?:'
@@ -111,6 +114,12 @@ def classify_claim_turn_intent(text: str, *, claim_state: str | None = None) -> 
         except Exception as exc:
             log.info('Claim-turn intent LLM unavailable (%s); local fallback', type(exc).__name__)
 
+    # Opening a NEW claim is not "continue existing expediente".
+    if re.search(
+        r'\b(?:enviar|declarar|dar)\s+(?:un\s+)?(?:parte|siniestro)\b|\b(?:opci[oó]n\s*)?2\b',
+        folded,
+    ):
+        return 'provide_info'
     if _CLAIM_CONTINUE_RE.search(folded):
         return 'continue_claim'
     if '?' in (text or '') or '¿' in (text or ''):
@@ -129,11 +138,19 @@ def empty_contact(**seed) -> dict:
 
 
 def merge_contact(base: dict | None, incoming: dict | None) -> dict:
+    """Merge incoming onto base. Never blank out known fields; prefer keeping a solid DNI."""
     out = empty_contact(**(base or {}))
     for key in CONTACT_FIELDS:
         val = (incoming or {}).get(key)
-        if val:
-            out[key] = str(val).strip()
+        if not val:
+            continue
+        val = str(val).strip()
+        if key == 'document' and out.get('document'):
+            # Do not replace a known DNI/NIE with a phone-like token.
+            digits = re.sub(r'\D', '', val)
+            if len(digits) == len(val) and 9 <= len(digits) <= 15 and not re.search(r'[A-Z]', val, re.I):
+                continue
+        out[key] = val
     if (incoming or {}).get('notes'):
         out['notes'] = str(incoming['notes']).strip()
     return out
@@ -153,6 +170,16 @@ def contact_complete(contact: dict | None, required=CLAIM_REQUIRED) -> bool:
     return not missing_fields(contact, required=required)
 
 
+_NAME_RE = re.compile(
+    r'(?:me\s+llamo|mi\s+nombre\s+es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+){1,4})',
+    re.I,
+)
+_ADDR_HINT_RE = re.compile(
+    r'(?:vivo\s+en|direcci[oó]n(?:\s+es)?|domicilio(?:\s+en)?)\s*[:\-]?\s*(.+)$',
+    re.I,
+)
+
+
 def _local_extract(text: str) -> dict:
     """Deterministic extractors for structured tokens; never invents names/addresses."""
     found = {}
@@ -164,13 +191,43 @@ def _local_extract(text: str) -> dict:
     docs = _DOC_RE.findall(text)
     if docs:
         found['document'] = docs[0].upper()
+    name_m = _NAME_RE.search(text)
+    if name_m:
+        found['full_name'] = re.sub(r'\s+', ' ', name_m.group(1)).strip(' .,;')
     # Prefer phone-like tokens that are not the document id.
+    phone_span = None
     for match in _PHONE_RE.finditer(text):
         raw = re.sub(r'[\s.\-()]', '', match.group(0))
         digits = re.sub(r'\D', '', raw)
         if 9 <= len(digits) <= 15 and raw.upper() != found.get('document'):
             found['phone'] = match.group(0).strip()
+            phone_span = match.span()
             break
+    addr_m = _ADDR_HINT_RE.search(text)
+    if addr_m:
+        found['address'] = addr_m.group(1).strip(' .,;')
+    elif phone_span or found.get('document'):
+        # Remainder after removing known identity/phone tokens often is the street address.
+        remainder = text
+        if found.get('full_name'):
+            remainder = re.sub(re.escape(found['full_name']), ' ', remainder, flags=re.I)
+        if found.get('document'):
+            remainder = re.sub(re.escape(found['document']), ' ', remainder, flags=re.I)
+        if found.get('phone'):
+            remainder = re.sub(re.escape(found['phone']), ' ', remainder, flags=re.I)
+        remainder = re.sub(
+            r'(?i)\b(?:mi\s+nombre\s+es|me\s+llamo|mi\s+dni(?:\s+es)?|dni|nie|tel[eé]fono|phone|email|correo)\b',
+            ' ',
+            remainder,
+        )
+        remainder = re.sub(r'[,;|/]+', ' ', remainder)
+        remainder = re.sub(r'\s+', ' ', remainder).strip(' .,;')
+        # Require some address-like signal (digit or street word) to avoid capturing noise.
+        if remainder and (re.search(r'\d', remainder) or re.search(
+            r'(?i)\b(?:calle|avda|avenida|plaza|camino|pasaje|s[oó]tano|piso|portal|n[uú]m)\b',
+            remainder,
+        )):
+            found['address'] = remainder
     return found
 
 
@@ -235,15 +292,17 @@ def compose_natural_prompt(*, purpose: str, missing: list[str], known: dict | No
             from insurance import llm
             system = (
                 'Eres un asistente de seguros amable y claro. Escribes UN solo mensaje breve en español '
-                'para pedir al cliente los datos que faltan. Tono natural, sin listas rígidas si puedes '
+                'para pedir al cliente SOLO los datos que faltan. Tono natural, sin listas rígidas si puedes '
                 'integrarlo en una o dos frases. No uses jerga interna. No inventes coberturas. '
+                'PROHIBIDO pedir nombre, apellidos, DNI, NIE u otros campos que ya consten en ya_tenemos. '
                 'No menciones otros productos distintos del indicado. Devuelve JSON {"reply":"..."}.'
             )
             user = json.dumps({
                 'proposito': purpose,
                 'producto': product_label,
                 'faltan': missing_human,
-                'ya_tenemos': list(known.keys()),
+                'ya_tenemos': {k: True for k in known.keys()},
+                'regla': 'Nunca vuelvas a pedir un dato marcado en ya_tenemos.',
             }, ensure_ascii=False)
             res = llm.interpret([
                 {'role': 'system', 'content': system},
