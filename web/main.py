@@ -10,7 +10,9 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from booking import BookingError,db,init_schema,url,headers,availability,options
-from dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
+# Import the sector router via sector_dialog (not dialog): insurance/dialog.py must never
+# shadow this name when web/insurance is accidentally present on PYTHONPATH/sys.path.
+from sector_dialog import BusinessSectorError, InsuranceDisabledSectorError as DisabledInsuranceSectorError, process, sector_of
 from insurance.cases import CaseWorkflowError, MIN_KEY_BYTES
 app=Flask(__name__);log=logging.getLogger(__name__)
 _insurance_log_level=getattr(logging,os.getenv('LOG_LEVEL','INFO').strip().upper(),logging.INFO)
