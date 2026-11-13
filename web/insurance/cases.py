@@ -65,6 +65,10 @@ AIRTABLE_PRODUCTS = {
     'automóvil': 'Auto',
     'moto': 'Moto',
     'motocicleta': 'Moto',
+    'salud': 'Salud',
+    'health': 'Salud',
+    'sanitario': 'Salud',
+    'sanitaria': 'Salud',
 }
 AIRTABLE_URGENCIES = {'normal': 'Normal', 'high': 'Alta', 'critical': 'Crítica'}
 AIRTABLE_STATUSES = {'pending': 'Pendiente', 'resolved': 'Resuelto'}

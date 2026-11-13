@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-KNOWN_PRODUCTS = frozenset({'hogar', 'vida', 'auto', 'moto'})
+KNOWN_PRODUCTS = frozenset({'hogar', 'vida', 'auto', 'moto', 'salud'})
 
 # Display / Airtable aliases → canonical codes used in PostgreSQL and business logic.
 PRODUCT_ALIASES = {
@@ -25,6 +25,10 @@ PRODUCT_ALIASES = {
     'moto': 'moto',
     'motocicleta': 'moto',
     'ciclomotor': 'moto',
+    'salud': 'salud',
+    'health': 'salud',
+    'sanitario': 'salud',
+    'sanitaria': 'salud',
 }
 
 VEHICLE_PRODUCTS = frozenset({'auto', 'moto'})
@@ -89,6 +93,7 @@ def product_label(value) -> str:
         'vida': 'vida',
         'auto': 'automóvil',
         'moto': 'motocicleta',
+        'salud': 'salud',
     }.get(code, code or 'producto')
 
 

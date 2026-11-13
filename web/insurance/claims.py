@@ -18,12 +18,19 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-from insurance import cases, identity, llm, products
+from insurance import cases, email_recipients, identity, llm, ops_contact, products
 
 log = logging.getLogger(__name__)
 
 # Never hardcode a personal mailbox as emergency professional recipient.
 DEFAULT_TARGET_EMAIL = ""
+
+
+def max_failed_evidence_attempts() -> int:
+    try:
+        return max(1, int(os.getenv('INSURANCE_MAX_EVIDENCE_RETRIES', '3') or '3'))
+    except (TypeError, ValueError):
+        return 3
 
 
 class ClaimsSchemaUnavailableError(RuntimeError):
@@ -126,6 +133,8 @@ def ensure_claims_schema(conn):
         "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS dispatch_authorization jsonb NOT NULL DEFAULT '{}'::jsonb;",
         "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS human_review_notes jsonb NOT NULL DEFAULT '[]'::jsonb;",
         "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS review_package jsonb NOT NULL DEFAULT '{}'::jsonb;",
+        "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS operational_contact jsonb NOT NULL DEFAULT '{}'::jsonb;",
+        "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS evidence_attempts jsonb NOT NULL DEFAULT '{}'::jsonb;",
         """CREATE TABLE IF NOT EXISTS insurance_evidence_rules (
             rule_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             business_id text NOT NULL DEFAULT '*',
@@ -386,6 +395,7 @@ def update_claim(conn, claim_uuid, **fields):
             'structured_interpretation', 'coverage_evaluation', 'photos', 'invoices',
             'service_notification_details', 'affected_items', 'evidence_matrix',
             'dispatch_authorization', 'human_review_notes', 'review_package',
+            'operational_contact', 'evidence_attempts',
         ):
             set_parts.append(f"{k}=%s::jsonb")
             params.append(json.dumps(v, ensure_ascii=False, default=str))
@@ -2156,7 +2166,8 @@ def get_service_professional_recipient(conn, business_id, service_type):
     1. Global test override via NOTIFICATION_OVERRIDE_EMAIL (for testing/development).
     2. Service-specific environment variables (e.g. SERVICE_FONTANERIA_EMAIL, SERVICE_CRISTALERIA_EMAIL).
     3. PostgreSQL insurance_professionals record (ignoring example.com test domains).
-    4. General fallback SERVICE_DEFAULT_EMAIL.
+    4. email_recipients.json (or INSURANCE_EMAIL_RECIPIENTS_PATH) — easy local/Railway fallback.
+    5. SERVICE_DEFAULT_EMAIL / file service_default_email.
     Returns (email, prof_dict, source) or (None, None, 'not_configured').
     """
     override = (os.getenv('NOTIFICATION_OVERRIDE_EMAIL') or "").strip()
@@ -2169,14 +2180,7 @@ def get_service_professional_recipient(conn, business_id, service_type):
         p_phone = prof['phone'] if prof else None
         return override, {'name': p_name, 'phone': p_phone, 'email': override, 'service_type': service_type}, 'test_override'
 
-    env_keys = {
-        'fontanería': 'SERVICE_FONTANERIA_EMAIL',
-        'cristalería': 'SERVICE_CRISTALERIA_EMAIL',
-        'pintura': 'SERVICE_PINTURA_EMAIL',
-        'mobiliario': 'SERVICE_MOBILIARIO_EMAIL',
-        'asistencia': 'SERVICE_ASISTENCIA_EMAIL',
-    }
-    svc_env_key = env_keys.get(service_type)
+    svc_env_key = email_recipients.service_env_key(service_type)
     if svc_env_key:
         env_val = (os.getenv(svc_env_key) or "").strip()
         if env_val:
@@ -2192,11 +2196,157 @@ def get_service_professional_recipient(conn, business_id, service_type):
             if p_email and not (p_email.endswith('.example.com') or '@seguroshogar.example.com' in p_email):
                 return p_email, dict(prof), 'database'
 
-    default_email = (os.getenv('SERVICE_DEFAULT_EMAIL') or "").strip()
+    file_email, file_prof = email_recipients.professional_from_file(service_type)
+    if file_email:
+        return file_email, file_prof, 'recipients_file'
+
+    default_email = email_recipients.service_default_email()
     if default_email:
         return default_email, {'name': f"Servicio Central de {service_type.capitalize()}", 'email': default_email, 'service_type': service_type}, 'env_default'
 
     return None, None, 'not_configured'
+
+
+def claim_operational_contact(claim) -> dict:
+    raw = (claim or {}).get('operational_contact') or {}
+    return ops_contact.empty_contact(**raw) if isinstance(raw, dict) else ops_contact.empty_contact()
+
+
+def evidence_attempt_state(claim) -> dict:
+    raw = (claim or {}).get('evidence_attempts') or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    failed = raw.get('failed_media') if isinstance(raw.get('failed_media'), list) else []
+    return {
+        'failed_count': int(raw.get('failed_count') or len(failed) or 0),
+        'failed_media': failed,
+        'last_reason': raw.get('last_reason'),
+        'escalated_at': raw.get('escalated_at'),
+    }
+
+
+def record_failed_evidence_attempt(conn, claim, *, kind, filename, reason, media=None):
+    """Persist a failed invoice/photo validation attempt for retry → human escalation."""
+    state = evidence_attempt_state(claim)
+    entry = {
+        'kind': kind,
+        'filename': filename,
+        'reason': reason,
+        'at': datetime.now().isoformat(),
+    }
+    if media and isinstance(media, dict):
+        # Keep enough to re-attach later without inventing bytes.
+        entry['media'] = {
+            k: media.get(k)
+            for k in ('filename', 'mimetype', 'content_type', 'url', 'path', 'filepath', 'size_bytes')
+            if media.get(k) is not None
+        }
+        if media.get('content_bytes'):
+            entry['media']['content_bytes'] = media.get('content_bytes')
+        if media.get('extracted_fields'):
+            entry['media']['extracted_fields'] = media.get('extracted_fields')
+        if media.get('analysis'):
+            entry['media']['analysis'] = media.get('analysis')
+    failed = list(state['failed_media'])
+    failed.append(entry)
+    next_state = {
+        'failed_count': len(failed),
+        'failed_media': failed[-12:],
+        'last_reason': reason,
+        'escalated_at': state.get('escalated_at'),
+    }
+    update_claim(conn, claim['claim_uuid'], evidence_attempts=next_state)
+    return next_state
+
+
+def should_escalate_failed_evidence(claim) -> bool:
+    state = evidence_attempt_state(claim)
+    return state['failed_count'] >= max_failed_evidence_attempts()
+
+
+def escalate_illegible_evidence_to_human(conn, business_id, claim, *, blocking_docs=None):
+    """Email a human agent explaining repeated illegible/invalid evidence, with attachments."""
+    claim = get_claim(conn, business_id, claim['claim_uuid']) or claim
+    state = evidence_attempt_state(claim)
+    contact = claim_operational_contact(claim)
+    failed = state.get('failed_media') or []
+    desc = (claim.get('original_description') or '').replace('\n', ' ')
+    if len(desc) > 60:
+        desc = desc[:57] + '...'
+    subject = (
+        f"[EVIDENCIA ILEGIBLE - {claim.get('claim_ref')}] "
+        f"{state.get('failed_count', 0)} intentos fallidos — {desc}"
+    )
+    lines = [
+        f"El asistente deriva el siniestro {claim.get('claim_ref')} a un agente humano.",
+        '',
+        'Motivo:',
+        f"El cliente ha enviado {state.get('failed_count', 0)} evidencia(s) ilegible(s) o no válida(s) "
+        f"tras varios intentos. La IA no puede validar la factura/fotos para enviar al profesional.",
+        '',
+        'Qué necesita el agente humano (igual que pedía el asistente):',
+        '- Una factura legible y verdadera (emisor, número, fecha, importe, descripción del trabajo).',
+        '- Fotografías nítidas del daño coherentes con el incidente declarado.',
+        '- Cuando la documentación sea válida, autorizar/enviar al fontanero, pintor u otro profesional.',
+    ]
+    if blocking_docs:
+        lines.append('')
+        lines.append('Requisitos aún pendientes:')
+        for item in blocking_docs[:6]:
+            lines.append(f"- {item}")
+    lines.extend([
+        '',
+        'Contacto operativo aportado (si consta):',
+        f"- Nombre: {contact.get('full_name') or '[falta]'}",
+        f"- DNI/NIE: {contact.get('document') or '[falta]'}",
+        f"- Teléfono: {contact.get('phone') or '[falta]'}",
+        f"- Dirección: {contact.get('address') or '[falta]'}",
+        f"- Email: {contact.get('email') or '[falta]'}",
+        '',
+        'Declaración del cliente:',
+        claim.get('original_description') or '[n/d]',
+        '',
+        'Detalle de intentos fallidos:',
+    ])
+    attachments = []
+    for idx, item in enumerate(failed, 1):
+        lines.append(
+            f"- Intento {idx}: tipo={item.get('kind')} archivo={item.get('filename')} "
+            f"motivo={item.get('reason')}"
+        )
+        media = item.get('media')
+        if isinstance(media, dict):
+            attachments.append(media)
+
+    body = '\n'.join(lines)
+    summary_att = {
+        'filename': f"claim_{claim.get('claim_ref')}_ilegible.txt",
+        'content_bytes': body.encode('utf-8'),
+        'mimetype': 'text/plain',
+    }
+    human_email = email_recipients.human_agent_email()
+    delivered = False
+    if human_email:
+        delivered = bool(deliver_real_email(
+            human_email, subject, body,
+            attachments=[summary_att] + attachments,
+            detailed=False,
+        ))
+    else:
+        log.warning('HUMAN_AGENT_EMAIL / recipients file missing; illegible escalation not emailed')
+
+    next_attempts = {
+        **state,
+        'escalated_at': datetime.now().isoformat(),
+        'escalation_email_sent': delivered,
+    }
+    update_claim(
+        conn, claim['claim_uuid'],
+        evidence_attempts=next_attempts,
+        state=ClaimState.READY_FOR_HUMAN_REVIEW,
+    )
+    update_claim(conn, claim['claim_uuid'], state=ClaimState.HUMAN_REVIEW)
+    return delivered
 
 
 def _resolve_attachment_bytes(att):
@@ -2666,35 +2816,32 @@ def auto_dispatch_readiness(conn, business_id, claim):
     if not dest_email:
         return False, 'recipient_not_configured', ctx
 
-    # Contact / address: prefer customer columns when present; incomplete → human exception.
-    phone = address = None
+    # Contact for professional call-back: operational_contact collected in dialog first.
+    contact = claim_operational_contact(claim)
+    phone = contact.get('phone')
+    address = contact.get('address')
+    document = contact.get('document')
+    full_name = contact.get('full_name')
     try:
         crow = conn.execute(
-            'SELECT phone, address, display_name FROM insurance_customers '
+            'SELECT display_name FROM insurance_customers '
             'WHERE business_id=%s AND customer_id=%s',
             (business_id, claim.get('customer_id')),
         ).fetchone()
-        if crow:
-            phone, address = crow.get('phone'), crow.get('address')
-            ctx['customer_name'] = crow.get('display_name')
+        if crow and not full_name:
+            full_name = crow.get('display_name')
     except Exception:
         pass
-    ctx['customer_phone'] = phone
-    ctx['risk_address'] = address
-    # If schema exposes contact fields and both are empty, block auto-dispatch.
-    # When columns are absent (legacy), do not invent data but allow dispatch.
-    try:
-        cols = {
-            r['column_name']
-            for r in conn.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='insurance_customers' AND column_name IN ('phone','address')"
-            ).fetchall()
-        }
-        if 'phone' in cols and 'address' in cols and not (phone and address):
-            return False, 'contact_or_address_incomplete', ctx
-    except Exception:
-        pass
+    ctx.update(
+        customer_name=full_name,
+        customer_phone=phone,
+        risk_address=address,
+        customer_document=document,
+        customer_email=contact.get('email'),
+    )
+    if not ops_contact.contact_complete(contact, required=ops_contact.CLAIM_REQUIRED):
+        ctx['missing_contact'] = ops_contact.missing_fields(contact, required=ops_contact.CLAIM_REQUIRED)
+        return False, 'contact_or_address_incomplete', ctx
 
     # Unanalyzed videos that were offered as evidence and are the only media → block.
     photos = claim.get('photos') or []
@@ -2824,30 +2971,21 @@ def send_service_notification_email(conn, business_id, claim, *, require_authori
             })
             return False
 
-    customer_name = None
-    customer_phone = None
-    risk_address = None
+    contact = claim_operational_contact(claim)
+    customer_name = contact.get('full_name')
+    customer_phone = contact.get('phone')
+    risk_address = contact.get('address')
+    customer_document = contact.get('document')
+    customer_email = contact.get('email')
     try:
         crow = conn.execute(
-            'SELECT display_name, phone, address FROM insurance_customers '
-            'WHERE business_id=%s AND customer_id=%s',
+            'SELECT display_name FROM insurance_customers WHERE business_id=%s AND customer_id=%s',
             (business_id, claim.get('customer_id')),
         ).fetchone()
-        if crow:
+        if crow and not customer_name:
             customer_name = crow.get('display_name')
-            customer_phone = crow.get('phone')
-            risk_address = crow.get('address')
     except Exception:
-        # Optional columns may not exist in all schemas; never invent contact data.
-        try:
-            crow = conn.execute(
-                'SELECT display_name FROM insurance_customers WHERE business_id=%s AND customer_id=%s',
-                (business_id, claim.get('customer_id')),
-            ).fetchone()
-            if crow:
-                customer_name = crow.get('display_name')
-        except Exception:
-            pass
+        pass
 
     policy_product = None
     try:
@@ -2877,11 +3015,14 @@ def send_service_notification_email(conn, business_id, claim, *, require_authori
         f"Estimado/a {prof_name},",
         "",
         f"{dispatch_label} del siniestro {claim['claim_ref']}.",
+        "Por favor contacte al asegurado para valorar la intervención.",
         "",
         "Datos del asegurado / actuación:",
-        f"- Nombre: {customer_name or '[no disponible en sistema]'}",
-        f"- Teléfono: {customer_phone or '[no disponible en sistema]'}",
-        f"- Dirección del riesgo/trabajo: {risk_address or '[no disponible en sistema]'}",
+        f"- Nombre y apellidos: {customer_name or '[no disponible]'}",
+        f"- DNI/NIE: {customer_document or '[no disponible]'}",
+        f"- Teléfono: {customer_phone or '[no disponible]'}",
+        f"- Email: {customer_email or '[no disponible]'}",
+        f"- Dirección del riesgo/trabajo: {risk_address or '[no disponible]'}",
         f"- Referencia siniestro: {claim['claim_ref']}",
         f"- Tipo de póliza: {policy_product or 'hogar'}",
         f"- Póliza / referencia: {claim.get('policy_id')}"
@@ -2989,9 +3130,9 @@ def send_human_agent_email(conn, business_id, claim, summary=None):
     if not summary:
         summary = build_human_summary(conn, business_id, claim)
 
-    human_email = (os.getenv('HUMAN_AGENT_EMAIL') or "").strip()
+    human_email = email_recipients.human_agent_email()
     if not human_email:
-        log.warning("HUMAN_AGENT_EMAIL not configured; skipping human agent email for %s", claim.get('claim_ref'))
+        log.warning("HUMAN_AGENT_EMAIL / recipients file not configured; skipping human agent email for %s", claim.get('claim_ref'))
         return False
     desc = (claim.get('original_description') or '').replace('\n', ' ')
     if len(desc) > 40:

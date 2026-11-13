@@ -1,0 +1,32 @@
+{
+  "_comment": "Edita este archivo para apuntar correos de humanos y profesionales. En Railway puedes montarlo o usar INSURANCE_EMAIL_RECIPIENTS_PATH / variables de entorno (tienen prioridad). NOTIFICATION_OVERRIDE_EMAIL fuerza TODO a un buzón de prueba.",
+  "human_agent_email": "marianodanielcortina88@hotmail.com",
+  "service_default_email": "marianodanielcortina88@hotmail.com",
+  "professionals": {
+    "fontanería": {
+      "name": "Fontanería (prueba)",
+      "email": "marianodanielcortina88@hotmail.com",
+      "phone": null
+    },
+    "pintura": {
+      "name": "Pintura (prueba)",
+      "email": "marianodanielcortina88@hotmail.com",
+      "phone": null
+    },
+    "cristalería": {
+      "name": "Cristalería (prueba)",
+      "email": "marianodanielcortina88@hotmail.com",
+      "phone": null
+    },
+    "mobiliario": {
+      "name": "Mobiliario (prueba)",
+      "email": "marianodanielcortina88@hotmail.com",
+      "phone": null
+    },
+    "asistencia": {
+      "name": "Asistencia (prueba)",
+      "email": "marianodanielcortina88@hotmail.com",
+      "phone": null
+    }
+  }
+}
