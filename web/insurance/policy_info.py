@@ -264,5 +264,19 @@ def describe(policy, metadata_intent):
     else:
         reply += ' No he podido confirmar una versión vigente para la fecha actual.'
     if metadata_intent == 'policy_validity':
-        reply += ' Las fechas son de la versión registrada; no hay una fecha de renovación confirmada.'
+        if policy.get('valid_from') and policy.get('valid_to'):
+            reply += (
+                ' Ese intervalo es la vigencia de cobertura registrada en la póliza '
+                '(desde cuándo cubre y hasta cuándo); no hay una fecha de renovación confirmada '
+                'aparte de ese fin de vigencia.'
+            )
+        elif policy.get('valid_from') and not policy.get('valid_to'):
+            reply += (
+                ' Consta el inicio de vigencia, pero no hay fecha de fin registrada; '
+                'no hay una fecha de renovación confirmada.'
+            )
+        else:
+            reply += (
+                ' Las fechas son de la versión registrada; no hay una fecha de renovación confirmada.'
+            )
     return reply + ' Son datos registrados, no una confirmación de cobertura de un siniestro.'

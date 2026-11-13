@@ -9,7 +9,10 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 
 from insurance import cases as _cases, identity, memory, products, references, retrieval, citations
-from insurance import incident_context, incident_dates, policy_info, voice_identity, voice_trace, orchestrator
+from insurance import (
+    email_recipients, incident_context, incident_dates, ops_contact, policy_info,
+    voice_identity, voice_trace, orchestrator,
+)
 
 from insurance.cases import CasePersistenceError, create_or_update_case
 
@@ -777,6 +780,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                             'reference_policy', 'reference_version_id'):
                     st.pop(key, None)
                 prod_sel = _selected_policy_product(conn, bid, selected_id)
+                if prod_sel:
+                    st['active_product'] = prod_sel
                 plate_hint = _policy_registration_prompt(conn, bid, selected_id, prod_sel, st)
                 if plate_hint:
                     return finish(plate_hint, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
@@ -795,6 +800,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                 'reference_policy', 'reference_version_id'):
                         st.pop(key, None)
                     prod_sel = _selected_policy_product(conn, bid, candidate['policy_id'])
+                    if prod_sel:
+                        st['active_product'] = prod_sel
                     plate_hint = _policy_registration_prompt(conn, bid, candidate['policy_id'], prod_sel, st)
                     if plate_hint:
                         return finish(plate_hint, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
@@ -828,6 +835,8 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         pol_id = policies[0]['policy_id']
                         prod = _selected_policy_product(conn, bid, pol_id)
                         st['policy_id'] = pol_id
+                        if prod:
+                            st['active_product'] = prod
                         ver_row = conn.execute(
                             'SELECT version_id FROM insurance_policy_versions '
                             'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
@@ -877,6 +886,18 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                 if plate_reply:
                     return finish(plate_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
+            # --- POLICY CANCELLATION / BAJA → humano con datos de contacto ---
+            if customer_id and (
+                st.get('awaiting') == 'policy_cancellation_contact'
+                or (ops_contact.is_cancellation_request(incoming) and not st.get('active_claim_ref'))
+            ):
+                cancel_reply = _handle_policy_cancellation(
+                    conn, business, sc, st, customer, customer_id, incoming, channel, external_id, corr,
+                )
+                if cancel_reply is not None:
+                    reply, out = cancel_reply
+                    return finish(reply, out)
+
             # --- CLAIMING FLOW INTERCEPTION ---
             if customer_id:
                 m_claim = re.search(r'\b(SIN-\d{4}-\d{6})\b', incoming, re.I)
@@ -918,6 +939,7 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                         'auto': 'cobertura a terceros, lunas, asistencia en viaje',
                         'moto': 'cobertura a terceros, robo, asistencia',
                         'vida': 'capital asegurado, beneficiarios, exclusiones',
+                        'salud': 'cuadro médico, hospitalización, copagos o exclusiones',
                     }.get(products.normalize_product_or_none(prod) or '', 'coberturas, límites o exclusiones')
                     reply = (
                         f"¿Qué quieres consultar sobre tu póliza de {label}?"
@@ -1496,6 +1518,41 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         )
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
                                     if blocking and media_list:
+                                        # Count illegible / invalid evidence attempts; escalate after several tries.
+                                        for media in media_list:
+                                            inv_match = None
+                                            for inv in (updated_claim.get('invoices') or [])[::-1]:
+                                                if inv.get('filename') == media.get('filename'):
+                                                    inv_match = inv
+                                                    break
+                                            fields = (inv_match or {}).get('extracted_fields') or {}
+                                            status, reason = claims.classify_invoice_validation(fields)
+                                            if status != claims.InvoiceValidationStatus.VALIDA:
+                                                claims.record_failed_evidence_attempt(
+                                                    conn, updated_claim,
+                                                    kind='invoice' if inv_match else 'media',
+                                                    filename=media.get('filename') or 'archivo',
+                                                    reason=reason or status,
+                                                    media=inv_match or media,
+                                                )
+                                        refreshed = claims.get_claim(conn, bid, claim['claim_uuid']) or updated_claim
+                                        if claims.should_escalate_failed_evidence(refreshed):
+                                            docs_list = [
+                                                (r.get('demonstrates') or r.get('proof_category') or 'documento obligatorio')
+                                                for r in blocking[:6]
+                                            ]
+                                            claims.escalate_illegible_evidence_to_human(
+                                                conn, bid, refreshed, blocking_docs=docs_list,
+                                            )
+                                            claims.save_human_summary(conn, bid, claims.get_claim(conn, bid, claim['claim_uuid']))
+                                            st.pop('active_claim_ref', None)
+                                            st.pop('awaiting', None)
+                                            return finish(
+                                                f"He recibido varios archivos que no he podido validar como factura o foto nítida "
+                                                f"para el siniestro {claim_ref}. He pasado el expediente a un agente humano "
+                                                f"explicando el motivo y adjuntando lo recibido, para que te indiquen cómo continuar.",
+                                                {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value},
+                                            )
                                         claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
                                         docs = '; '.join(
                                             (r.get('demonstrates') or r.get('proof_category') or 'documento obligatorio')
@@ -1508,9 +1565,16 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         )
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
-                                    # Evidence conversationally complete: attempt automatic professional
-                                    # dispatch when coverage + mandatory evidence allow it. Human review
-                                    # is reserved for exceptions — never ask about reimbursements.
+                                    # Evidence conversationally complete: collect operational contact,
+                                    # then automatic professional dispatch. Human review for exceptions.
+                                    if incoming and not media_list:
+                                        st['_contact_incoming'] = incoming
+                                    contact_reply = _ensure_claim_operational_contact(
+                                        conn, bid, st, updated_claim, customer_id, channel,
+                                    )
+                                    if contact_reply is not None:
+                                        return finish(contact_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
+
                                     claims.update_claim(
                                         conn, claim['claim_uuid'], state=claims.ClaimState.EVIDENCE_VALIDATION
                                     )
@@ -1542,6 +1606,18 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         st.pop('active_claim_ref', None)
                                         st.pop('awaiting', None)
                                         return finish(reply, {'insurance_result': ResultKind.POLICY_INFORMATION.value})
+
+                                    if auto_reason == 'contact_or_address_incomplete':
+                                        if incoming and not media_list:
+                                            st['_contact_incoming'] = incoming
+                                        contact_reply = _ensure_claim_operational_contact(
+                                            conn, bid, st, updated_claim, customer_id, channel,
+                                        )
+                                        if contact_reply is not None:
+                                            return finish(
+                                                contact_reply,
+                                                {'insurance_result': ResultKind.MISSING_INFORMATION.value},
+                                            )
 
                                     package = {
                                         'prepared_at': datetime.now().isoformat(),
@@ -2745,6 +2821,163 @@ def _handle_vehicle_registration_turn(conn, bid, st, incoming, channel):
         f"He anotado la matrícula {original} para esta conversación (no actualiza los datos maestros). "
         f"¿Qué quieres consultar sobre tu póliza de {label}?"
     )
+
+
+def _seed_claim_contact(conn, bid, customer_id, claim) -> dict:
+    contact = claims_module_contact(claim)
+    if not contact.get('full_name'):
+        try:
+            row = conn.execute(
+                'SELECT display_name FROM insurance_customers '
+                'WHERE business_id=%s AND customer_id=%s',
+                (bid, customer_id),
+            ).fetchone()
+            if row and row.get('display_name'):
+                contact['full_name'] = row['display_name']
+        except Exception:
+            pass
+    return contact
+
+
+def claims_module_contact(claim) -> dict:
+    from insurance import claims
+    return claims.claim_operational_contact(claim)
+
+
+def _ensure_claim_operational_contact(conn, bid, st, claim, customer_id, channel):
+    """Ask/merge phone, address, DNI and name before professional dispatch. Remembers across turns."""
+    from insurance import claims
+    del channel  # reserved for future channel-specific phrasing
+    contact = _seed_claim_contact(conn, bid, customer_id, claim)
+    live_text = st.pop('_contact_incoming', None)
+    if live_text:
+        contact = ops_contact.extract_contact_with_llm(live_text, known=contact)
+    missing = ops_contact.missing_fields(contact, required=ops_contact.CLAIM_REQUIRED)
+    claims.update_claim(conn, claim['claim_uuid'], operational_contact=contact)
+    if not missing:
+        st.pop('awaiting', None)
+        return None
+    prod = _selected_policy_product(conn, bid, claim.get('policy_id') or st.get('policy_id'))
+    st['awaiting'] = 'claim_contact'
+    return ops_contact.compose_natural_prompt(
+        purpose='claim_dispatch',
+        missing=missing,
+        known=contact,
+        product_label=products.product_label(prod) if prod else None,
+    )
+
+
+def _handle_policy_cancellation(conn, business, sc, st, customer, customer_id, incoming,
+                                channel, external_id, corr):
+    """Collect contact and hand off baja/no-renovación to a human agent (never mixes products)."""
+    from insurance import claims
+    bid = business.get('business_id')
+    prod = st.get('active_product') or _selected_policy_product(conn, bid, st.get('policy_id'))
+    label = products.product_label(prod) if prod else None
+    draft = st.get('cancellation_contact') or ops_contact.empty_contact()
+    if not draft.get('full_name'):
+        try:
+            row = conn.execute(
+                'SELECT display_name FROM insurance_customers '
+                'WHERE business_id=%s AND customer_id=%s',
+                (bid, customer_id),
+            ).fetchone()
+            if row and row.get('display_name'):
+                draft['full_name'] = row['display_name']
+        except Exception:
+            pass
+    if incoming and st.get('awaiting') == 'policy_cancellation_contact':
+        draft = ops_contact.extract_contact_with_llm(incoming, known=draft)
+    elif incoming and ops_contact.is_cancellation_request(incoming):
+        draft = ops_contact.extract_contact_with_llm(incoming, known=draft)
+        if not draft.get('notes'):
+            draft['notes'] = incoming.strip()[:500]
+        st['cancellation_desire'] = incoming.strip()[:500]
+    missing = ops_contact.missing_fields(draft, required=ops_contact.CANCELLATION_REQUIRED)
+    st['cancellation_contact'] = draft
+    if missing:
+        st['awaiting'] = 'policy_cancellation_contact'
+        prompt = ops_contact.compose_natural_prompt(
+            purpose='cancellation',
+            missing=missing,
+            known=draft,
+            product_label=label,
+        )
+        return prompt, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+
+    # Complete → human case + email bound to selected policy/product only.
+    desire = st.get('cancellation_desire') or draft.get('notes') or incoming
+    valid_from = valid_to = contract_number = None
+    policy_id = st.get('policy_id')
+    if policy_id:
+        try:
+            prow = conn.execute(
+                'SELECT contract_number, product FROM insurance_policies '
+                'WHERE business_id=%s AND policy_id=%s',
+                (bid, policy_id),
+            ).fetchone()
+            if prow:
+                contract_number = prow.get('contract_number')
+                prod = products.normalize_product_or_none(prow.get('product')) or prod
+                label = products.product_label(prod) if prod else label
+            ver = conn.execute(
+                'SELECT valid_from, valid_to FROM insurance_policy_versions '
+                'WHERE business_id=%s AND policy_id=%s AND valid_from<=%s '
+                'AND (valid_to IS NULL OR valid_to>=%s) '
+                'ORDER BY valid_from DESC LIMIT 1',
+                (bid, policy_id, _business_date(business), _business_date(business)),
+            ).fetchone()
+            if not ver:
+                ver = conn.execute(
+                    'SELECT valid_from, valid_to FROM insurance_policy_versions '
+                    'WHERE business_id=%s AND policy_id=%s '
+                    'ORDER BY valid_from DESC LIMIT 1',
+                    (bid, policy_id),
+                ).fetchone()
+            if ver:
+                valid_from, valid_to = ver.get('valid_from'), ver.get('valid_to')
+        except Exception:
+            pass
+
+    subject, body = ops_contact.build_cancellation_email_body(
+        contact=draft, product=prod, policy_id=policy_id,
+        contract_number=contract_number, desire=desire,
+        valid_from=valid_from, valid_to=valid_to,
+    )
+    human_email = email_recipients.human_agent_email()
+    if human_email:
+        try:
+            claims.deliver_real_email(human_email, subject, body, attachments=None, detailed=False)
+        except Exception as exc:
+            log.warning('Cancellation human email failed: %s', type(exc).__name__)
+
+    case_id = _case(
+        business, customer, desire or 'Solicitud de baja / no renovación',
+        channel, external_id,
+        product=prod or label or business.get('insurance_product'),
+        policy_id=policy_id, policy_version_id=st.get('version_id'),
+        customer_id=customer_id,
+        reason='policy_cancellation_request',
+        urgency='normal',
+        next_action='Contactar al cliente con amabilidad sobre baja/no renovación y explicar cómo proceder.',
+        context={
+            'cancellation': True,
+            'contact': {k: draft.get(k) for k in ops_contact.CONTACT_FIELDS},
+            'valid_from': str(valid_from) if valid_from else None,
+            'valid_to': str(valid_to) if valid_to else None,
+            'correlation_id': corr,
+        },
+        diagnostic_code='policy_cancellation_request',
+    )
+    for key in (
+        'awaiting', 'cancellation_contact', 'cancellation_desire',
+    ):
+        st.pop(key, None)
+    ack = ops_contact.compose_cancellation_ack(product_label=label, desire=desire)
+    out = {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
+    if case_id:
+        out['case_id'] = str(case_id)
+    return ack, out
 
 
 def process(business, state, history, text, channel, external_id, customer, resolved_sector=None, media_list=None):
