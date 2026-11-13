@@ -52,6 +52,73 @@ def is_cancellation_request(text: str) -> bool:
     return bool(_CANCEL_RE.search(folded))
 
 
+# Structural continuation of an open claim (not specialty selection).
+_CLAIM_CONTINUE_RE = re.compile(
+    r'\b(?:'
+    r'env[ií]a(?:me|le|nos|d)?|'
+    r'mand(?:a|ame|ale|ad)|'
+    r'notific(?:a|ame|ad)|'
+    r'ya\s+(?:te\s+)?(?:envi[eé]|mand[eé]|adjunt[eé])|'
+    r'te\s+(?:envi[eé]|mand[eé]|adjunt[eé])|'
+    r'contin[uú]a(?:r|mos)?|'
+    r'procede(?:r)?|'
+    r'tramita(?:r)?|'
+    r'retoma(?:r)?|'
+    r'seguir\s+con\s+(?:el\s+)?(?:parte|siniestro|expediente)|'
+    r'al\s+profesional|'
+    r'correo|e[\-\s]?mail'
+    r')\b',
+    re.I,
+)
+
+
+def classify_claim_turn_intent(text: str, *, claim_state: str | None = None) -> str:
+    """Return continue_claim | cancel_claim | provide_info | incidental_query.
+
+    Specialty (fontanería/pintura/…) must come from structured incident interpretation,
+    never from keyword routing here.
+    """
+    if is_cancellation_request(text):
+        return 'cancel_claim'
+    folded = _fold(text or '')
+    if not folded:
+        return 'provide_info'
+
+    api_key = (os.getenv('OPENAI_API_KEY') or '').strip()
+    model = (os.getenv('INSURANCE_LLM_MODEL') or '').strip()
+    if api_key and model and len(folded) > 2:
+        try:
+            from insurance import llm
+            system = (
+                'Clasificas el mensaje de un asegurado con un parte/siniestro YA abierto. '
+                'Devuelve SOLO JSON {"intent":"..."}. '
+                'intent debe ser uno de: continue_claim, cancel_claim, provide_info, incidental_query. '
+                'continue_claim = pide seguir el trámite, enviar/notificar al profesional, '
+                'confirma que ya mandó fotos/factura, o insiste en el correo. '
+                'No elijas especialidad profesional. '
+                'incidental_query = pregunta de coberturas/póliza ajena al trámite del parte. '
+                'provide_info = aporta datos, documentos o responde a una petición del asistente.'
+            )
+            res = llm.interpret([
+                {'role': 'system', 'content': system},
+                {'role': 'user', 'content': json.dumps({
+                    'mensaje': text, 'estado_expediente': claim_state,
+                }, ensure_ascii=False)},
+            ], max_tokens=80, max_chars=512)
+            intent = (res or {}).get('intent') if isinstance(res, dict) else None
+            if intent in ('continue_claim', 'cancel_claim', 'provide_info', 'incidental_query'):
+                return intent
+        except Exception as exc:
+            log.info('Claim-turn intent LLM unavailable (%s); local fallback', type(exc).__name__)
+
+    if _CLAIM_CONTINUE_RE.search(folded):
+        return 'continue_claim'
+    if '?' in (text or '') or '¿' in (text or ''):
+        if any(w in folded for w in ('cobertura', 'poliza', 'póliza', 'seguro', 'franquicia', 'limite', 'límite')):
+            return 'incidental_query'
+    return 'provide_info'
+
+
 def empty_contact(**seed) -> dict:
     contact = {k: None for k in CONTACT_FIELDS}
     contact['notes'] = None

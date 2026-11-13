@@ -900,6 +900,10 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
 
             # --- CLAIMING FLOW INTERCEPTION ---
             if customer_id:
+                # Recover open expediente so continuity does not fall back to coverage Q&A.
+                if not st.get('active_claim_ref'):
+                    _maybe_rebind_open_claim(conn, bid, customer_id, st, incoming, media_list)
+
                 m_claim = re.search(r'\b(SIN-\d{4}-\d{6})\b', incoming, re.I)
                 if m_claim:
                     claim_ref = m_claim.group(1).upper()
@@ -1152,13 +1156,26 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                     else:
                         claim_state = claim['state']
                         claim_ref = claim['claim_ref']
+                        # Keep policy binding aligned with the open claim (anti product-mix).
+                        if claim.get('policy_id'):
+                            st['policy_id'] = claim['policy_id']
+                            prod_bind = _selected_policy_product(conn, bid, claim['policy_id'])
+                            if prod_bind:
+                                st['active_product'] = prod_bind
 
-                        if claim_state in (claims.ClaimState.CLOSED, claims.ClaimState.APPROVED, claims.ClaimState.REJECTED, claims.ClaimState.READY_FOR_HUMAN_REVIEW, claims.ClaimState.HUMAN_REVIEW):
+                        if claim_state in (
+                            claims.ClaimState.CLOSED,
+                            claims.ClaimState.APPROVED,
+                            claims.ClaimState.REJECTED,
+                        ):
                             st.pop('active_claim_ref', None)
                             st.pop('awaiting', None)
                         else:
                             folded_incoming = references.fold(incoming).strip(' .?!¿¡')
-                            is_cancellation = folded_incoming in (
+                            turn_claim_intent = ops_contact.classify_claim_turn_intent(
+                                incoming, claim_state=claim_state,
+                            )
+                            is_cancellation = turn_claim_intent == 'cancel_claim' or folded_incoming in (
                                 'cancelar', 'salir', 'reiniciar', 'volver', 'cancelar parte',
                                 'no quiero seguir', 'no quiero continuar', 'anular', 'anular parte'
                             ) or bool(re.search(r'\b(?:cancelar|anular)\s*(?:el\s*)?(?:parte|siniestro)\b', folded_incoming))
@@ -1172,14 +1189,81 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                     {'insurance_result': ResultKind.MISSING_INFORMATION.value}
                                 )
 
-                            is_resume = bool(re.search(
+                            is_resume = turn_claim_intent == 'continue_claim' or bool(re.search(
                                 r'\b(?:seguir|continuar|continuamos|adelante|proseguir|retomar|'
                                 r'al parte|volver al parte|al parte q quiero enviar|al parte que quiero enviar|'
                                 r'continuar con el parte|seguir con el parte)\b',
                                 folded_incoming
                             )) or folded_incoming in ('si', 'sí', 'vale', 'de acuerdo', 'ok', 'seguir', 'continuar')
 
-                            is_incidental = _is_claim_incidental_query(incoming, claim_state)
+                            is_incidental = (
+                                turn_claim_intent == 'incidental_query'
+                                or _is_claim_incidental_query(incoming, claim_state)
+                            ) and turn_claim_intent != 'continue_claim'
+
+                            # Mid/late claim states: continue/finalize instead of coverage Q&A.
+                            mid_finalize_states = (
+                                claims.ClaimState.PHOTOS_RECEIVED,
+                                claims.ClaimState.INVOICE_RECEIVED,
+                                claims.ClaimState.EVIDENCE_VALIDATION,
+                                claims.ClaimState.READY_FOR_AUTO_DISPATCH,
+                                claims.ClaimState.DISPATCH_PENDING,
+                                claims.ClaimState.DISPATCHED_TO_PROFESSIONAL,
+                                claims.ClaimState.READY_FOR_HUMAN_REVIEW,
+                                claims.ClaimState.HUMAN_REVIEW,
+                                claims.ClaimState.ADDITIONAL_DOCUMENTS_REQUIRED,
+                            )
+                            if (
+                                claim_state in mid_finalize_states
+                                or st.get('awaiting') == 'claim_contact'
+                                or (turn_claim_intent == 'continue_claim' and claim_state not in (
+                                    claims.ClaimState.INFORMATION_GATHERING,
+                                    claims.ClaimState.PHOTOS_REQUESTED,
+                                ))
+                            ) and not is_incidental:
+                                is_query = False
+                                if media_list and claim_state in (
+                                    claims.ClaimState.READY_FOR_HUMAN_REVIEW,
+                                    claims.ClaimState.HUMAN_REVIEW,
+                                    claims.ClaimState.ADDITIONAL_DOCUMENTS_REQUIRED,
+                                    claims.ClaimState.INVOICE_RECEIVED,
+                                    claims.ClaimState.EVIDENCE_VALIDATION,
+                                ):
+                                    # Allow late media by routing into invoice handling below.
+                                    try:
+                                        claims.update_claim(
+                                            conn, claim['claim_uuid'],
+                                            state=claims.ClaimState.INVOICE_REQUESTED,
+                                        )
+                                        claim_state = claims.ClaimState.INVOICE_REQUESTED
+                                        claim = claims.get_claim(conn, bid, claim['claim_uuid'])
+                                    except Exception:
+                                        pass
+                                elif claim_state == claims.ClaimState.DISPATCHED_TO_PROFESSIONAL or (
+                                    (claim.get('notification_results') or {}).get('professional', {}) or {}
+                                ).get('status') in ('ACCEPTED', 'SIMULATED') or (
+                                    claim.get('service_notified')
+                                    and (claim.get('service_notification_details') or {}).get('status') == 'ACCEPTED'
+                                ):
+                                    # Idempotent client reply; may still retry human-only notify.
+                                    result = claims.dispatch_claim_notifications(conn, bid, claim)
+                                    reply = claims.compose_dual_dispatch_client_reply(result)
+                                    if result.get('professional_ok'):
+                                        st.pop('awaiting', None)
+                                        if result.get('human_ok'):
+                                            st.pop('active_claim_ref', None)
+                                    return finish(reply, {
+                                        'insurance_result': (
+                                            ResultKind.POLICY_INFORMATION.value
+                                            if result.get('professional_ok')
+                                            else ResultKind.HUMAN_CASE_REQUIRED.value
+                                        ),
+                                    })
+                                elif not media_list and claim_state != claims.ClaimState.INVOICE_REQUESTED:
+                                    reply, out = _finalize_open_claim_dispatch(
+                                        conn, bid, st, claim, customer_id, channel, incoming,
+                                    )
+                                    return finish(reply, out)
 
                             if is_incidental:
                                 # Incidental question allowed to flow to policy consultation
@@ -1565,97 +1649,11 @@ def _answer(business, state, text, channel, external_id, customer, media_list=No
                                         )
                                         return finish(reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
 
-                                    # Evidence conversationally complete: collect operational contact,
-                                    # then automatic professional dispatch. Human review for exceptions.
-                                    if incoming and not media_list:
-                                        st['_contact_incoming'] = incoming
-                                    contact_reply = _ensure_claim_operational_contact(
-                                        conn, bid, st, updated_claim, customer_id, channel,
+                                    # Evidence conversationally complete → dual notify (profesional + humano).
+                                    reply, out = _finalize_open_claim_dispatch(
+                                        conn, bid, st, updated_claim, customer_id, channel, incoming,
                                     )
-                                    if contact_reply is not None:
-                                        return finish(contact_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value})
-
-                                    claims.update_claim(
-                                        conn, claim['claim_uuid'], state=claims.ClaimState.EVIDENCE_VALIDATION
-                                    )
-                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
-                                    auto_ok, auto_reason, auto_ctx = claims.try_auto_dispatch_professional(
-                                        conn, bid, updated_claim
-                                    )
-                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
-                                    if auto_ok:
-                                        package = {
-                                            'prepared_at': datetime.now().isoformat(),
-                                            'awaiting_action': None,
-                                            'professional_dispatch_allowed': True,
-                                            'dispatch_mode': 'automatic',
-                                            'coverage_preliminary': status,
-                                            'note': 'Envío automático al profesional tras validación de evidencias y cobertura.',
-                                            'recipient': (auto_ctx or {}).get('dest_email'),
-                                        }
-                                        claims.update_claim(conn, claim['claim_uuid'], review_package=package)
-                                        reply = (
-                                            f"He registrado tu parte con referencia {claim_ref}.\n"
-                                            f"La cobertura preliminar es compatible y las evidencias obligatorias están validadas, "
-                                            f"así que he notificado automáticamente al profesional correspondiente "
-                                            f"({(auto_ctx or {}).get('service_type') or 'asistencia'}). "
-                                            f"Se pondrá en contacto contigo para valorar la intervención. "
-                                            f"Esto no implica autorización de pago ni indemnización."
-                                        )
-                                        claims.save_human_summary(conn, bid, updated_claim)
-                                        st.pop('active_claim_ref', None)
-                                        st.pop('awaiting', None)
-                                        return finish(reply, {'insurance_result': ResultKind.POLICY_INFORMATION.value})
-
-                                    if auto_reason == 'contact_or_address_incomplete':
-                                        if incoming and not media_list:
-                                            st['_contact_incoming'] = incoming
-                                        contact_reply = _ensure_claim_operational_contact(
-                                            conn, bid, st, updated_claim, customer_id, channel,
-                                        )
-                                        if contact_reply is not None:
-                                            return finish(
-                                                contact_reply,
-                                                {'insurance_result': ResultKind.MISSING_INFORMATION.value},
-                                            )
-
-                                    package = {
-                                        'prepared_at': datetime.now().isoformat(),
-                                        'awaiting_action': 'approve_reject_or_request_more_info',
-                                        'professional_dispatch_allowed': False,
-                                        'dispatch_blocked_reason': auto_reason,
-                                        'coverage_preliminary': status,
-                                        'note': (
-                                            'Revisión humana por excepción: no se cumplen las condiciones '
-                                            'de envío automático al profesional.'
-                                        ),
-                                    }
-                                    claims.update_claim(
-                                        conn, claim['claim_uuid'],
-                                        review_package=package,
-                                        state=claims.ClaimState.READY_FOR_HUMAN_REVIEW,
-                                    )
-                                    claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
-                                    updated_claim = claims.get_claim(conn, bid, claim['claim_uuid'])
-                                    if status == claims.CoverageStatus.SUPPORTED_BY_POLICY:
-                                        reply = (
-                                            f"He registrado tu parte con referencia {claim_ref}.\n"
-                                            f"La evaluación de cobertura es preliminar, pero el expediente requiere "
-                                            f"revisión humana antes de continuar "
-                                            f"({auto_reason or 'condiciones de envío automático no cumplidas'}). "
-                                            f"Nos pondremos en contacto contigo si hace falta más información."
-                                        )
-                                    else:
-                                        reply = (
-                                            f"¡Siniestro registrado correctamente con la referencia {claim_ref}!\n"
-                                            f"He enviado toda la documentación a nuestro equipo para su revisión. "
-                                            f"Nos pondremos en contacto contigo lo antes posible."
-                                        )
-
-                                    claims.save_human_summary(conn, bid, updated_claim)
-                                    st.pop('active_claim_ref', None)
-                                    st.pop('awaiting', None)
-                                    return finish(reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value})
+                                    return finish(reply, out)
             if just_verified and st.get('question') and not st.get('pending_human'):
                 try:
                     interpretation = orchestrator.interpret(
@@ -2821,6 +2819,165 @@ def _handle_vehicle_registration_turn(conn, bid, st, incoming, channel):
         f"He anotado la matrícula {original} para esta conversación (no actualiza los datos maestros). "
         f"¿Qué quieres consultar sobre tu póliza de {label}?"
     )
+
+
+def _maybe_rebind_open_claim(conn, bid, customer_id, st, incoming, media_list):
+    """Reattach a single open claim so continuity is not lost after state gaps."""
+    from insurance import claims
+    try:
+        open_claims = claims.list_open_claims_for_customer(
+            conn, bid, customer_id, policy_id=st.get('policy_id'), limit=3,
+        )
+        if not open_claims and st.get('policy_id'):
+            open_claims = claims.list_open_claims_for_customer(conn, bid, customer_id, limit=3)
+    except Exception:
+        return
+    if not open_claims:
+        return
+    intent = ops_contact.classify_claim_turn_intent(
+        incoming or '', claim_state=(open_claims[0] or {}).get('state'),
+    )
+    should_bind = bool(media_list) or intent in ('continue_claim', 'provide_info') or st.get('awaiting') in (
+        'claim_contact', 'date',
+    )
+    if not should_bind and len(open_claims) == 1:
+        # Soft bind when there is exactly one open expediente; incidental queries still allowed later.
+        should_bind = True
+    if not should_bind:
+        return
+    if len(open_claims) > 1 and intent == 'continue_claim':
+        # Prefer the most recently updated claim; ask only if refs differ and user did not cite one.
+        if not re.search(r'\bSIN-\d{4}-\d{6}\b', incoming or '', re.I):
+            st['_open_claim_choices'] = [c['claim_ref'] for c in open_claims[:3]]
+    chosen = open_claims[0]
+    st['active_claim_ref'] = chosen['claim_ref']
+    if chosen.get('policy_id'):
+        st['policy_id'] = chosen['policy_id']
+        prod = _selected_policy_product(conn, bid, chosen['policy_id'])
+        if prod:
+            st['active_product'] = prod
+
+
+def _finalize_open_claim_dispatch(conn, bid, st, claim, customer_id, channel, incoming):
+    """Collect contact if needed, then dual-notify professional + human with specific replies."""
+    from insurance import claims
+    claim_ref = claim.get('claim_ref')
+    if incoming:
+        st['_contact_incoming'] = incoming
+    contact_reply = _ensure_claim_operational_contact(
+        conn, bid, st, claim, customer_id, channel,
+    )
+    if contact_reply is not None:
+        return contact_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+
+    # Re-evaluate evidence matrix before dispatch (fresh, no stale gate).
+    claim = claims.get_claim(conn, bid, claim['claim_uuid']) or claim
+    ev_matrix = claims.evaluate_received_evidence(
+        claim.get('evidence_matrix') or [],
+        claim.get('photos') or [],
+        claim.get('invoices') or [],
+        claim.get('original_description') or '',
+    )
+    claims.update_claim(conn, claim['claim_uuid'], evidence_matrix=ev_matrix)
+    blocking = claims.get_blocking_mandatory_requirements(ev_matrix)
+    if blocking:
+        docs = '; '.join(
+            (r.get('demonstrates') or r.get('proof_category') or 'documento obligatorio')
+            for r in blocking[:3]
+        )
+        try:
+            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.INVOICE_REQUESTED)
+        except Exception:
+            pass
+        return (
+            f'Para el expediente {claim_ref} aún faltan evidencias obligatorias: {docs}. '
+            f'Adjunta un documento válido para continuar.',
+            {'insurance_result': ResultKind.MISSING_INFORMATION.value},
+        )
+
+    # Re-check policy authorization/version just before send.
+    ok_pol, _ver, pol_err = claims.verify_policy_for_claim(
+        conn, bid, customer_id, claim.get('policy_id'),
+    )
+    if not ok_pol:
+        try:
+            claims.update_claim(
+                conn, claim['claim_uuid'],
+                state=claims.ClaimState.READY_FOR_HUMAN_REVIEW,
+            )
+            claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+        except Exception:
+            pass
+        claims.save_human_summary(conn, bid, claims.get_claim(conn, bid, claim['claim_uuid']))
+        return (
+            claims.client_message_for_dispatch_block(
+                'coverage_not_confirmed' if pol_err == 'version_not_in_force_for_date'
+                else (pol_err or 'identity_or_policy_missing'),
+                claim_ref=claim_ref,
+            ),
+            {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value},
+        )
+
+    try:
+        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.EVIDENCE_VALIDATION)
+    except Exception:
+        pass
+    claim = claims.get_claim(conn, bid, claim['claim_uuid'])
+    result = claims.dispatch_claim_notifications(conn, bid, claim)
+    reply = claims.compose_dual_dispatch_client_reply(result)
+    updated = result.get('claim') or claims.get_claim(conn, bid, claim['claim_uuid'])
+
+    if result.get('professional_ok'):
+        package = {
+            'prepared_at': datetime.now().isoformat(),
+            'awaiting_action': None,
+            'professional_dispatch_allowed': True,
+            'dispatch_mode': 'automatic',
+            'coverage_preliminary': (updated.get('coverage_evaluation') or {}).get('status'),
+            'note': 'Envío automático al profesional + notificación humana independiente.',
+            'recipient': ((result.get('notifications') or {}).get('professional') or {}).get('recipient'),
+            'human_recipient': ((result.get('notifications') or {}).get('human') or {}).get('recipient'),
+            'notification_results': result.get('notifications'),
+        }
+        claims.update_claim(conn, claim['claim_uuid'], review_package=package)
+        st.pop('awaiting', None)
+        if result.get('human_ok'):
+            st.pop('active_claim_ref', None)
+        return reply, {'insurance_result': ResultKind.POLICY_INFORMATION.value}
+
+    blocked = result.get('blocked_reason')
+    if blocked == 'contact_or_address_incomplete':
+        contact_reply = _ensure_claim_operational_contact(
+            conn, bid, st, updated or claim, customer_id, channel,
+        )
+        if contact_reply is not None:
+            return contact_reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+
+    if blocked in (
+        'mandatory_evidence_incomplete', 'video_not_analyzed', 'incident_ambiguous',
+        'incident_interpretation_failed',
+    ):
+        return reply, {'insurance_result': ResultKind.MISSING_INFORMATION.value}
+
+    package = {
+        'prepared_at': datetime.now().isoformat(),
+        'awaiting_action': 'approve_reject_or_request_more_info',
+        'professional_dispatch_allowed': False,
+        'dispatch_blocked_reason': blocked,
+        'note': 'Revisión humana por excepción tras intento de envío automático.',
+        'notification_results': result.get('notifications'),
+    }
+    try:
+        claims.update_claim(
+            conn, claim['claim_uuid'],
+            review_package=package,
+            state=claims.ClaimState.READY_FOR_HUMAN_REVIEW,
+        )
+        claims.update_claim(conn, claim['claim_uuid'], state=claims.ClaimState.HUMAN_REVIEW)
+    except Exception:
+        pass
+    # Keep active_claim_ref so the client can still continue / retry with more docs.
+    return reply, {'insurance_result': ResultKind.HUMAN_CASE_REQUIRED.value}
 
 
 def _seed_claim_contact(conn, bid, customer_id, claim) -> dict:

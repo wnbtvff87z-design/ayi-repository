@@ -135,6 +135,7 @@ def ensure_claims_schema(conn):
         "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS review_package jsonb NOT NULL DEFAULT '{}'::jsonb;",
         "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS operational_contact jsonb NOT NULL DEFAULT '{}'::jsonb;",
         "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS evidence_attempts jsonb NOT NULL DEFAULT '{}'::jsonb;",
+        "ALTER TABLE insurance_claims ADD COLUMN IF NOT EXISTS notification_results jsonb NOT NULL DEFAULT '{}'::jsonb;",
         """CREATE TABLE IF NOT EXISTS insurance_evidence_rules (
             rule_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             business_id text NOT NULL DEFAULT '*',
@@ -395,7 +396,7 @@ def update_claim(conn, claim_uuid, **fields):
             'structured_interpretation', 'coverage_evaluation', 'photos', 'invoices',
             'service_notification_details', 'affected_items', 'evidence_matrix',
             'dispatch_authorization', 'human_review_notes', 'review_package',
-            'operational_contact', 'evidence_attempts',
+            'operational_contact', 'evidence_attempts', 'notification_results',
         ):
             set_parts.append(f"{k}=%s::jsonb")
             params.append(json.dumps(v, ensure_ascii=False, default=str))
@@ -2864,21 +2865,377 @@ def try_auto_dispatch_professional(conn, business_id, claim):
 
     Human authorization is NOT required. On failure or unreadiness, returns
     (False, reason) so the caller can route to human review.
+    Prefer dispatch_claim_notifications() for the dual professional+human path.
     """
-    ready, reason, ctx = auto_dispatch_readiness(conn, business_id, claim)
-    if not ready:
-        return False, reason, ctx
-    update_claim(conn, claim['claim_uuid'], state=ClaimState.READY_FOR_AUTO_DISPATCH)
-    update_claim(conn, claim['claim_uuid'], state=ClaimState.DISPATCH_PENDING)
-    refreshed = get_claim(conn, business_id, claim['claim_uuid'])
-    sent = send_service_notification_email(
-        conn, business_id, refreshed, require_authorization=False, dispatch_mode='automatic',
-    )
-    if sent:
-        update_claim(conn, claim['claim_uuid'], state=ClaimState.DISPATCHED_TO_PROFESSIONAL)
+    result = dispatch_claim_notifications(conn, business_id, claim)
+    ctx = result.get('context') or {}
+    if result.get('blocked_reason'):
+        return False, result['blocked_reason'], ctx
+    prof = (result.get('notifications') or {}).get('professional') or {}
+    if prof.get('status') in ('ACCEPTED', 'SIMULATED'):
         return True, None, ctx
-    details = (get_claim(conn, business_id, claim['claim_uuid']) or {}).get('service_notification_details') or {}
-    return False, details.get('reason') or details.get('status') or 'dispatch_failed', ctx
+    return False, prof.get('reason') or prof.get('status') or 'dispatch_failed', ctx
+
+
+def empty_notification_slot():
+    return {
+        'status': 'PENDING',
+        'recipient': None,
+        'attempts': 0,
+        'provider': None,
+        'provider_message_id': None,
+        'error': None,
+        'idempotency_key': None,
+        'last_attempt_at': None,
+        'accepted_at': None,
+    }
+
+
+def get_notification_results(claim) -> dict:
+    raw = (claim or {}).get('notification_results') or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    professional = raw.get('professional') if isinstance(raw.get('professional'), dict) else {}
+    human = raw.get('human') if isinstance(raw.get('human'), dict) else {}
+    out = {
+        'professional': {**empty_notification_slot(), **professional},
+        'human': {**empty_notification_slot(), **human},
+    }
+    # Mirror legacy service_notification_details when present and slot empty.
+    legacy = (claim or {}).get('service_notification_details') or {}
+    if (
+        out['professional'].get('status') in (None, 'PENDING')
+        and legacy.get('status') in ('ACCEPTED', 'FAILED', 'UNCERTAIN_TIMEOUT', 'SIMULATED', 'BLOCKED')
+    ):
+        out['professional'].update({
+            'status': legacy.get('status'),
+            'recipient': legacy.get('sent_to'),
+            'provider': legacy.get('provider'),
+            'provider_message_id': legacy.get('provider_message_id'),
+            'error': legacy.get('error') or legacy.get('reason'),
+            'last_attempt_at': legacy.get('sent_at') or legacy.get('attempted_at'),
+            'accepted_at': legacy.get('sent_at') if legacy.get('status') == 'ACCEPTED' else None,
+        })
+    return out
+
+
+def _persist_notification_results(conn, claim_uuid, results):
+    update_claim(conn, claim_uuid, notification_results=results)
+
+
+def client_message_for_dispatch_block(reason_code, *, claim_ref=None, service_type=None) -> str:
+    """Truthful, specific client-facing explanation when auto-dispatch cannot proceed."""
+    ref = f' {claim_ref}' if claim_ref else ''
+    mapping = {
+        'identity_or_policy_missing': (
+            f'Para el expediente{ref} aún falta confirmar la identidad o la póliza vinculada.'
+        ),
+        'incident_interpretation_failed': (
+            f'Necesito más detalle del incidente del expediente{ref} antes de avisar al profesional.'
+        ),
+        'incident_ambiguous': (
+            f'El tipo de trabajo del expediente{ref} no está claro todavía; indícame qué ocurrió con más precisión.'
+        ),
+        'coverage_not_confirmed': (
+            f'La cobertura contractual del expediente{ref} no está confirmada con las cláusulas recuperadas, '
+            f'así que no puedo avisar al profesional automáticamente.'
+        ),
+        'mandatory_evidence_incomplete': (
+            f'Para el expediente{ref} faltan evidencias obligatorias (factura y/o fotografías validadas). '
+            f'Adjunta la documentación que falta.'
+        ),
+        'service_type_missing': (
+            f'No he podido determinar el tipo de asistencia profesional del expediente{ref}.'
+        ),
+        'recipient_not_configured': (
+            f'No hay un correo de profesional configurado'
+            f'{f" para {service_type}" if service_type else ""}. He dejado constancia para el equipo humano.'
+        ),
+        'contact_or_address_incomplete': (
+            f'Para avisar al profesional del expediente{ref} necesito tu teléfono y la dirección del incidente '
+            f'(y DNI/nombre si faltan).'
+        ),
+        'video_not_analyzed': (
+            f'El expediente{ref} solo tiene vídeo sin analizar; envía fotografías nítidas del daño para continuar.'
+        ),
+        'dispatch_failed': (
+            f'No he podido completar el envío del expediente{ref} por un fallo del servicio de correo.'
+        ),
+        'UNCERTAIN_TIMEOUT': (
+            f'El envío del expediente{ref} quedó con resultado incierto (timeout). No reenvío a ciegas; '
+            f'el equipo humano lo revisará.'
+        ),
+    }
+    return mapping.get(reason_code) or (
+        f'No puedo completar el envío automático del expediente{ref} todavía '
+        f'({reason_code or "condiciones pendientes"}).'
+    )
+
+
+def dispatch_claim_notifications(conn, business_id, claim):
+    """Validate readiness and send professional + human notifications independently.
+
+    - No universal human authorization gate.
+    - Professional and human emails have separate idempotency and statuses.
+    - Failure of the human notification never forces a professional resend.
+    - ACCEPTED means the provider accepted the message for delivery.
+    """
+    check_claims_readiness(conn)
+    claim = get_claim(conn, business_id, claim['claim_uuid']) or claim
+    ready, reason, ctx = auto_dispatch_readiness(conn, business_id, claim)
+    results = get_notification_results(claim)
+    if not ready:
+        return {
+            'ok': False,
+            'blocked_reason': reason,
+            'context': ctx,
+            'notifications': results,
+            'claim': claim,
+        }
+
+    service_type = ctx.get('service_type') or (claim.get('coverage_evaluation') or {}).get('service_type')
+    already_prof_ok = (
+        results['professional'].get('status') in ('ACCEPTED', 'SIMULATED')
+        or (
+            claim.get('service_notified')
+            and (claim.get('service_notification_details') or {}).get('status') == 'ACCEPTED'
+        )
+        or claim.get('state') == ClaimState.DISPATCHED_TO_PROFESSIONAL
+    )
+    if not already_prof_ok:
+        try:
+            if claim.get('state') != ClaimState.READY_FOR_AUTO_DISPATCH:
+                update_claim(conn, claim['claim_uuid'], state=ClaimState.READY_FOR_AUTO_DISPATCH)
+            update_claim(conn, claim['claim_uuid'], state=ClaimState.DISPATCH_PENDING)
+        except ClaimTransitionError as exc:
+            log.warning('Claim %s state gate before dispatch: %s', claim.get('claim_ref'), exc)
+        claim = get_claim(conn, business_id, claim['claim_uuid'])
+
+    # --- Professional (idempotent) ---
+    prof_slot = results['professional']
+    if already_prof_ok:
+        prof_slot['status'] = 'ACCEPTED' if prof_slot.get('status') != 'SIMULATED' else 'SIMULATED'
+        results['professional'] = prof_slot
+        _persist_notification_results(conn, claim['claim_uuid'], results)
+    elif prof_slot.get('status') == 'UNCERTAIN_TIMEOUT':
+        # Do not blind-resend.
+        pass
+    else:
+        prof_slot['status'] = 'SENDING'
+        prof_slot['attempts'] = int(prof_slot.get('attempts') or 0) + 1
+        prof_slot['last_attempt_at'] = datetime.now().isoformat()
+        idem = (
+            f"claim_{claim['claim_uuid']}_professional_"
+            f"{service_type}_{_authorization_fingerprint(claim, ctx.get('dest_email'), service_type)[:16]}"
+        )
+        prof_slot['idempotency_key'] = idem
+        results['professional'] = prof_slot
+        _persist_notification_results(conn, claim['claim_uuid'], results)
+
+        sent = send_service_notification_email(
+            conn, business_id, claim, require_authorization=False, dispatch_mode='automatic',
+        )
+        claim = get_claim(conn, business_id, claim['claim_uuid'])
+        details = claim.get('service_notification_details') or {}
+        status = details.get('status') or ('ACCEPTED' if sent else 'FAILED')
+        if status == 'SIMULATED' and sent:
+            # Keep simulated visible but treat as usable success in test/sim mode.
+            pass
+        prof_slot.update({
+            'status': status,
+            'recipient': details.get('sent_to') or ctx.get('dest_email'),
+            'provider': details.get('provider'),
+            'provider_message_id': details.get('provider_message_id'),
+            'error': details.get('error') or details.get('reason'),
+            'last_attempt_at': details.get('sent_at') or datetime.now().isoformat(),
+            'accepted_at': details.get('sent_at') if status in ('ACCEPTED', 'SIMULATED') else None,
+            'attempts': prof_slot.get('attempts') or 1,
+            'idempotency_key': idem,
+        })
+        results['professional'] = prof_slot
+        _persist_notification_results(conn, claim['claim_uuid'], results)
+
+    prof_ok = results['professional'].get('status') in ('ACCEPTED', 'SIMULATED')
+    if prof_ok:
+        try:
+            update_claim(conn, claim['claim_uuid'], state=ClaimState.DISPATCHED_TO_PROFESSIONAL)
+        except ClaimTransitionError:
+            # Already there or compatible — keep going for human notify.
+            pass
+
+    # --- Human agent (independent; never triggers professional resend) ---
+    human_slot = results['human']
+    if human_slot.get('status') not in ('ACCEPTED', 'SIMULATED'):
+        if human_slot.get('status') == 'UNCERTAIN_TIMEOUT':
+            pass
+        else:
+            human_slot['status'] = 'SENDING'
+            human_slot['attempts'] = int(human_slot.get('attempts') or 0) + 1
+            human_slot['last_attempt_at'] = datetime.now().isoformat()
+            human_idem = f"claim_{claim['claim_uuid']}_human_agent_v1"
+            human_slot['idempotency_key'] = human_idem
+            results['human'] = human_slot
+            _persist_notification_results(conn, claim['claim_uuid'], results)
+
+            claim = get_claim(conn, business_id, claim['claim_uuid'])
+            delivered = send_human_agent_notification(
+                conn, business_id, claim,
+                professional_result=results['professional'],
+                idempotency_key=human_idem,
+            )
+            claim = get_claim(conn, business_id, claim['claim_uuid'])
+            human_details = (claim.get('notification_results') or {}).get('human') or {}
+            if isinstance(human_details, dict) and human_details.get('status') in (
+                'ACCEPTED', 'FAILED', 'UNCERTAIN_TIMEOUT', 'SIMULATED'
+            ):
+                human_slot = {**human_slot, **human_details}
+            else:
+                human_slot.update({
+                    'status': 'ACCEPTED' if delivered else 'FAILED',
+                    'accepted_at': datetime.now().isoformat() if delivered else None,
+                    'error': None if delivered else 'human_notification_failed',
+                })
+            results['human'] = human_slot
+            _persist_notification_results(conn, claim['claim_uuid'], results)
+
+    claim = get_claim(conn, business_id, claim['claim_uuid'])
+    human_ok = results['human'].get('status') in ('ACCEPTED', 'SIMULATED')
+    return {
+        'ok': prof_ok,
+        'blocked_reason': None if prof_ok else (
+            results['professional'].get('error')
+            or results['professional'].get('status')
+            or 'dispatch_failed'
+        ),
+        'context': ctx,
+        'notifications': results,
+        'professional_ok': prof_ok,
+        'human_ok': human_ok,
+        'claim': claim,
+        'service_type': service_type,
+    }
+
+
+def send_human_agent_notification(conn, business_id, claim, *, professional_result=None,
+                                  idempotency_key=None):
+    """Independent human-agent email with full case package; does not affect professional send."""
+    summary = build_human_summary(conn, business_id, claim)
+    prof = professional_result or {}
+    extra = [
+        '',
+        '------------------------------------------------------------------',
+        'ESTADO DEL ENVÍO AL PROFESIONAL (independiente)',
+        f"- status: {prof.get('status')}",
+        f"- recipient: {prof.get('recipient')}",
+        f"- provider: {prof.get('provider')}",
+        f"- provider_message_id: {prof.get('provider_message_id')}",
+        f"- error: {prof.get('error')}",
+        '------------------------------------------------------------------',
+    ]
+    body = summary + '\n'.join(extra)
+    human_email = email_recipients.human_agent_email()
+    if not human_email:
+        log.warning('No human agent email configured for claim %s', claim.get('claim_ref'))
+        results = get_notification_results(claim)
+        results['human'].update({
+            'status': 'FAILED',
+            'error': 'HUMAN_AGENT_EMAIL_NOT_CONFIGURED',
+            'last_attempt_at': datetime.now().isoformat(),
+            'idempotency_key': idempotency_key,
+        })
+        _persist_notification_results(conn, claim['claim_uuid'], results)
+        return False
+
+    desc = (claim.get('original_description') or '').replace('\n', ' ')
+    if len(desc) > 40:
+        desc = desc[:37] + '...'
+    subject = f"[NOTIFICACIÓN INTERNA - {claim['claim_ref']}] Siniestro {claim['claim_ref']} - {desc}"
+    attachments = [{
+        'filename': f"claim_{claim['claim_ref']}_resumen.txt",
+        'content_bytes': body.encode('utf-8'),
+        'mimetype': 'text/plain',
+    }]
+    # Prefer validated media; include failed ones only as context for human review.
+    for photo in claim.get('photos') or []:
+        attachments.append(photo)
+    for inv in claim.get('invoices') or []:
+        attachments.append(inv)
+
+    delivery = deliver_real_email(
+        human_email, subject, body, attachments=attachments,
+        idempotency_key=idempotency_key or f"claim_{claim['claim_uuid']}_human_agent_v1",
+        detailed=True,
+    )
+    status = delivery.get('status') if isinstance(delivery, dict) else ('ACCEPTED' if delivery else 'FAILED')
+    results = get_notification_results(claim)
+    results['human'].update({
+        'status': status,
+        'recipient': human_email,
+        'provider': (delivery or {}).get('provider') if isinstance(delivery, dict) else None,
+        'provider_message_id': (delivery or {}).get('message_id') if isinstance(delivery, dict) else None,
+        'error': (delivery or {}).get('error') if isinstance(delivery, dict) else None,
+        'last_attempt_at': (delivery or {}).get('sent_at') if isinstance(delivery, dict) else datetime.now().isoformat(),
+        'accepted_at': (delivery or {}).get('sent_at') if status in ('ACCEPTED', 'SIMULATED') else None,
+        'idempotency_key': idempotency_key,
+        'attempts': int((results['human'].get('attempts') or 0)),
+    })
+    _persist_notification_results(conn, claim['claim_uuid'], results)
+    return status in ('ACCEPTED', 'SIMULATED')
+
+
+def list_open_claims_for_customer(conn, business_id, customer_id, *, policy_id=None, limit=5):
+    """Open (non-terminal) claims for continuity recovery."""
+    check_claims_readiness(conn)
+    terminal = (
+        ClaimState.CLOSED, ClaimState.APPROVED, ClaimState.REJECTED,
+    )
+    sql = (
+        'SELECT * FROM insurance_claims WHERE business_id=%s AND customer_id=%s '
+        'AND state <> ALL(%s)'
+    )
+    params = [business_id, customer_id, list(terminal)]
+    if policy_id:
+        sql += ' AND policy_id=%s'
+        params.append(policy_id)
+    sql += ' ORDER BY updated_at DESC LIMIT %s'
+    params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def compose_dual_dispatch_client_reply(result) -> str:
+    """Client-facing truth about professional + human notification outcomes."""
+    claim = result.get('claim') or {}
+    claim_ref = claim.get('claim_ref') or ''
+    service = result.get('service_type') or (result.get('context') or {}).get('service_type') or 'asistencia'
+    notifs = result.get('notifications') or {}
+    prof = notifs.get('professional') or {}
+    human = notifs.get('human') or {}
+    if result.get('blocked_reason'):
+        return client_message_for_dispatch_block(
+            result['blocked_reason'], claim_ref=claim_ref, service_type=service,
+        )
+    prof_status = prof.get('status')
+    human_status = human.get('status')
+    if prof_status in ('ACCEPTED', 'SIMULATED') and human_status in ('ACCEPTED', 'SIMULATED'):
+        return (
+            f'He completado la validación del expediente {claim_ref}. '
+            f'He enviado la documentación al profesional de {service} y he notificado también '
+            f'al equipo de la compañía. El profesional podrá contactar contigo para valorar la intervención. '
+            f'Esto no supone una aprobación de indemnización ni de importes adicionales.'
+        )
+    if prof_status in ('ACCEPTED', 'SIMULATED') and human_status not in ('ACCEPTED', 'SIMULATED'):
+        return (
+            f'He enviado la información del expediente {claim_ref} al profesional de {service}. '
+            f'La notificación interna a la compañía está pendiente por un problema técnico '
+            f'y se está intentando recuperar. Esto no supone una aprobación de indemnización.'
+        )
+    if prof_status == 'UNCERTAIN_TIMEOUT':
+        return client_message_for_dispatch_block('UNCERTAIN_TIMEOUT', claim_ref=claim_ref, service_type=service)
+    return client_message_for_dispatch_block(
+        prof.get('error') or prof_status or 'dispatch_failed',
+        claim_ref=claim_ref, service_type=service,
+    )
 
 
 def send_service_notification_email(conn, business_id, claim, *, require_authorization=False,
