@@ -6,7 +6,7 @@ import pytest
 WEB = Path(__file__).resolve().parents[1] / 'web'
 sys.path.insert(0, str(WEB))
 
-import dialog
+import sector_dialog as dialog
 import insurance.dialog as insurance_dialog
 import main
 from booking import BookingError
