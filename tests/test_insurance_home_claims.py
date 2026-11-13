@@ -1642,7 +1642,13 @@ def test_auto_dispatch_without_human_authorization(pg_schema, monkeypatch):
                'proof_category': claims.ProofCategory.FOTO_VIDEO_DANO,
                'is_mandatory': True,
                'status': claims.RequirementStatus.ACEPTADO,
-           }])
+           }], operational_contact={
+               'full_name': 'Ana Pérez',
+               'document': '12345678Z',
+               'phone': '600111222',
+               'address': 'Calle Mayor 1, Madrid',
+               'email': 'ana@example.com',
+           })
         claim = claims.get_claim(conn, bid, cuuid)
         # No authorize_professional_dispatch call — automatic path.
         assert not (claim.get('dispatch_authorization') or {}).get('authorized')
@@ -1773,6 +1779,34 @@ def test_wall_repair_not_proven_by_photos_alone():
     assert tech[0].get('needs_human_review') is True
 
 
+def test_failed_evidence_attempts_escalate(pg_schema, monkeypatch):
+    monkeypatch.setattr('insurance.claims.deliver_real_email', lambda *a, **k: True)
+    monkeypatch.setenv('HUMAN_AGENT_EMAIL', 'agent@seguro.test')
+    monkeypatch.setenv('INSURANCE_MAX_EVIDENCE_RETRIES', '2')
+    bid, cid, pid = 'INS-BIZ-001', 'CUS-ILLEG-1', 'POL-ILLEG-1'
+    with pg_schema() as conn:
+        claims.add_customer_and_policy(conn, bid, cid, 'Ana', '12345678Z', pid, 'hogar', '1')
+        cuuid, _cref = claims.create_claim(conn, bid, cid, pid, 'V1', 'WhatsApp', 'Fuga')
+        claim = claims.get_claim(conn, bid, cuuid)
+        claims.record_failed_evidence_attempt(
+            conn, claim, kind='invoice', filename='a.jpg', reason='ilegible',
+            media={'filename': 'a.jpg', 'mimetype': 'image/jpeg'},
+        )
+        claim = claims.get_claim(conn, bid, cuuid)
+        claims.record_failed_evidence_attempt(
+            conn, claim, kind='invoice', filename='b.jpg', reason='borrosa',
+            media={'filename': 'b.jpg', 'mimetype': 'image/jpeg'},
+        )
+        claim = claims.get_claim(conn, bid, cuuid)
+        assert claims.should_escalate_failed_evidence(claim) is True
+        claims.escalate_illegible_evidence_to_human(
+            conn, bid, claim, blocking_docs=['factura legible'],
+        )
+        updated = claims.get_claim(conn, bid, cuuid)
+        assert updated['state'] == claims.ClaimState.HUMAN_REVIEW
+        assert (updated.get('evidence_attempts') or {}).get('escalated_at')
+
+
 def test_video_received_but_not_analyzed_blocks_auto_dispatch(pg_schema, monkeypatch):
     bid = 'INS-BIZ-001'
     cid = 'CUS-VID-1'
@@ -1797,7 +1831,13 @@ def test_video_received_but_not_analyzed_blocks_auto_dispatch(pg_schema, monkeyp
             'proof_category': claims.ProofCategory.FOTO_VIDEO_DANO,
             'is_mandatory': True,
             'status': claims.RequirementStatus.ACEPTADO,
-        }])
+        }], operational_contact={
+            'full_name': 'Ana Pérez',
+            'document': '12345678Z',
+            'phone': '600111222',
+            'address': 'Calle Mayor 1',
+            'email': 'ana@example.com',
+        })
         claim = claims.get_claim(conn, bid, cuuid)
         ready, reason, _ = claims.auto_dispatch_readiness(conn, bid, claim)
         assert ready is False

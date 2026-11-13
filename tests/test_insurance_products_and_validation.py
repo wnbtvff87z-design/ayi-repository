@@ -21,6 +21,8 @@ from insurance import master_sync as sync  # noqa: E402
     ('Automóvil', 'auto'),
     ('Moto', 'moto'),
     ('Motocicleta', 'moto'),
+    ('Salud', 'salud'),
+    ('health', 'salud'),
 ])
 def test_normalize_known_products(raw, expected):
     assert products.normalize_product(raw) == expected
@@ -185,6 +187,32 @@ def test_cases_airtable_product_aliases():
     assert cases.airtable_value('product', 'moto') == 'Moto'
     assert cases.airtable_value('product', 'motocicleta') == 'Moto'
     assert cases.airtable_value('product', 'coche') == 'Auto'
+    assert cases.airtable_value('product', 'salud') == 'Salud'
+
+
+def test_ops_contact_extract_and_cancellation_detection():
+    from insurance import ops_contact
+    assert ops_contact.is_cancellation_request('Quiero darme de baja del seguro')
+    assert ops_contact.is_cancellation_request('No quiero renovar mi póliza')
+    assert not ops_contact.is_cancellation_request('Quiero consultar mi cobertura de cristales')
+    merged = ops_contact.extract_contact_with_llm(
+        'Me llamo Ana Pérez, DNI 12345678Z, teléfono 600111222, email ana@test.com, '
+        'vivo en Calle Mayor 1 Madrid',
+        known={},
+    )
+    assert merged['document'] == '12345678Z'
+    assert merged['phone']
+    assert merged['email'] == 'ana@test.com'
+    assert ops_contact.missing_fields(merged, required=('document', 'phone', 'email')) == []
+
+
+def test_email_recipients_file_has_human_and_professionals():
+    from insurance import email_recipients
+    data = email_recipients.load_recipients(force_reload=True)
+    assert '@' in (data.get('human_agent_email') or '')
+    email, prof = email_recipients.professional_from_file('fontanería')
+    assert email and '@' in email
+    assert prof['service_type'] == 'fontanería'
 
 
 # Reuse master_sync fixtures via conftest-less local copies when imported as module helpers.
